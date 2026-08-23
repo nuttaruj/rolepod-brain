@@ -1,0 +1,500 @@
+# rolepod-brain
+
+Persistent memory for AI coding agents. One binary, one SQLite index, a
+git-versioned markdown wiki — and **nothing running between events**.
+
+Your coding CLI forgets everything when the session ends. rolepod-brain
+captures what happened, consolidates it into readable pages, and hands the
+next session a short list of pointers it can pull from. Install it once and
+stop thinking about it.
+
+## What makes it different
+
+**Your brain never leaves your machine.** No cloud, no remote, no telemetry,
+no account. There is no sync command that uploads anything, because there is
+nowhere for it to upload to — see below for why that is a design decision
+rather than a missing feature.
+
+**No resident process, ever.** No daemon, no server, no supervised worker, no
+port. Hooks spawn a short-lived process that exits; the MCP server lives
+exactly as long as one session; consolidation runs on a timer, which is not a
+daemon. After a reboot there is nothing to start.
+
+```
+$ brain doctor
+ok   no resident process  nothing of ours is running
+```
+
+**No API keys. No tokens. No provider configuration.** Summaries are written
+by whichever CLI you are already signed into, through that vendor's own
+supported headless entry point (`claude -p --model haiku`, `codex exec`). This
+project never holds a credential, because it never has one to hold. If no
+model is reachable it writes rule-based summaries instead — a permanent,
+first-class mode, not a broken one.
+
+**Pointers in, content pulled.** Automatic injection carries titles and ids
+against a hard byte budget. Full content is never pushed into your context;
+the agent calls `brain_search` / `brain_get` when the task actually needs a
+body. `brain doctor` reports the real bytes spent, not the configured limit.
+
+**Secrets are scrubbed before anything is written.** Redaction happens in the
+capture process, ahead of the log. There is no later stage that could catch a
+leak, so there is no window where one exists.
+
+**The log is the truth.** Every observation is an append-only, fsynced JSONL
+line keyed by a ULID. SQLite and the wiki pages are derived: delete the index
+and `brain reindex` rebuilds it. It is also what makes the wiki safe to copy,
+merge or roll back with ordinary git: entries are keyed by ULID, so two logs
+combine without conflicts.
+
+## Install
+
+Requires the Rust toolchain and git.
+
+```sh
+git clone <this repo> rolepod-brain && cd rolepod-brain
+./install.sh
+```
+
+That builds a release binary, installs it to `~/.local/bin/brain`, wires every
+supported CLI it finds, and installs the consolidation timer. It prints a plan
+first and asks before touching anything.
+
+To see what it would do without doing it:
+
+```sh
+brain setup            # dry run; --apply performs it
+```
+
+`setup` backs up each config before writing and only ever replaces entries it
+put there itself. Hooks belonging to other tools are left exactly where they
+are.
+
+## Supported CLIs
+
+| CLI | Capture | MCP recall | Status |
+|---|---|---|---|
+| Claude Code | 8 lifecycle events | registered automatically | verified by our tests and daily use |
+| Codex | 7 lifecycle events | via the plugin | installs as a plugin; capture needs one approval — see below |
+| Gemini CLI | 5 lifecycle events | register manually | capture works; its own summarizer tier is unavailable here |
+| Antigravity (`agy`) | 2 lifecycle events | register manually | capture verified; needs an explicit workspace, see below |
+| OpenCode | 4 lifecycle events | register manually | session capture verified; tool capture wired, not yet exercised |
+| Cursor | 3 lifecycle events | registered automatically | capture verified |
+
+Cursor reports its project under `workspace_roots`. It also sends a `cwd`, but
+that field arrives **empty** — which is why the lookup requires a non-empty
+value rather than merely a present key. Without `workspace_roots` its hooks
+would have been unplaceable, since Cursor runs them from its own config
+directory.
+
+Only `postToolUse` is wired for tool activity: `afterShellExecution` fires for
+the *same* execution, so wiring both would record every shell command twice.
+In headless `cursor-agent -p` runs, tool events are the only ones observed;
+`beforeSubmitPrompt` and `stop` are wired for interactive sessions.
+
+OpenCode has no hook configuration file — `setup` installs a small plugin into
+`~/.config/opencode/plugins/` instead. The plugin takes the project path from
+OpenCode's own plugin factory, so it has none of the placement problem below.
+Its session events are verified live; its tool events are wired against a
+handler signature read from a working plugin, but OpenCode's model provider is
+failing on the author's machine, so that path has not been exercised end to end.
+
+Antigravity gives a hook no working directory and runs it from its own config
+directory, so it can only be placed in a project when the workspace is explicit
+— `agy --add-dir <project>`, or launching it from an added workspace. Without
+that, its events are **skipped rather than filed under a guess**: a memory in
+the wrong project is worse than a missing one.
+
+All CLIs write to **one store per project**. Work in one CLI in the morning
+and another in the afternoon; it is a single memory, tagged by which CLI
+observed what. Codex exposes no session-end event, so consolidation there
+triggers on `Stop` with a debounce.
+
+The table says "verified" only where our own tests cover it. If a CLI is
+missing here, it is not supported yet.
+
+## Use
+
+Nothing, normally. That is the point. When you want to look:
+
+```sh
+brain doctor            # is capture actually working?
+brain stats             # what it has captured, consolidated, and injected
+brain search "auth"     # full-text search this project's memory
+brain where             # which project am I in, and where does it live
+```
+
+Your agent gets five MCP tools: `brain_search`, `brain_get`, `brain_recent`,
+`brain_timeline`, and `brain_note`. On Codex the plugin also ships two skills:
+`using-brain`, describing when to reach for those tools — MCP tools that
+nothing tells the model about tend not to get called — and `brain-report`, for
+turning the memory into something a person reads.
+
+Ask for "a report on this project's history" or "a digest for last week" and
+`brain-report` writes a narrative from the decisions and findings memory holds,
+ranked by what actually carries a story. It is pull-only: produced when asked,
+never injected.
+
+## Where things live
+
+```
+~/.rolepod-brain/
+  brain.db                       # derived index (FTS5) - disposable
+  wiki/                          # git repository - the durable memory
+    <workspace>/<project>/
+      events/YYYY-MM.jsonl       # append-only log - the source of truth
+      pages/sessions/*.md        # consolidated pages
+  config.toml                    # optional; defaults are deliberately light
+```
+
+Projects are keyed by the main git repository root, so every worktree of one
+repo shares one memory. Drop a `.rolepod-brain.toml` in any ancestor directory
+to override the project or workspace explicitly — useful for monorepos and for
+keeping work and personal memory apart.
+
+## Configuration
+
+Everything has a default. A config file is optional.
+
+```toml
+[summarizer]
+mode = "auto"          # auto | claude-code | codex | gemini | off
+                       # "off" = permanent rule-based summaries, fully functional
+
+[injection]
+primer_budget = 4096   # bytes pushed at session start
+session_budget = 8192  # bytes of automatic injection per session, all layers
+
+[consolidation]
+timer = false          # true installs a launchd timer; off by default, because
+                       # the default backstop costs you no background agent
+
+[sanitize]
+extra_patterns = []    # additional regexes to redact
+allowlist = []         # substrings that survive redaction
+```
+
+## Codex installs as a plugin
+
+Codex will not run a hook it has not been told to trust, and it does this
+silently. Entries written straight into `~/.codex/hooks.json` are therefore
+useless — nothing runs them and there is no reliable way to approve them. What
+Codex does have a trust path for is a plugin's own bundled hooks:
+
+```sh
+codex plugin marketplace add nuttaruj/rolepod-brain
+codex plugin add rolepod-brain@rolepod-brain
+```
+
+Then **open Codex interactively once and approve the plugin's hooks**. Until
+that approval exists, the plugin is installed and enabled and still captures
+nothing; a non-interactive `codex exec` cannot grant it. `brain doctor` reports
+whether the plugin is installed, and the event counts in its capture line are
+what tell you whether approval actually took.
+
+One install brings the whole product: the plugin declares the lifecycle hooks,
+the MCP recall tools, and a `using-brain` skill that tells the agent what is
+remembered and when to go looking. Nothing else to register.
+
+The plugin expects `brain` on your `PATH` — `install.sh` puts it in
+`~/.local/bin`. `brain setup` does not write Codex hooks itself; it removes any
+raw entries an older version left behind and points here.
+
+## Surviving a context wipe
+
+`/compact` and `/clear` destroy what the agent knows while the session itself
+continues. Memory has to come straight back, so both paths re-inject the primer
+— Claude Code signals compaction with its own `PostCompact` hook rather than a
+session start, and `/clear` through a session start that says so.
+
+The subtle part is that per-session de-duplication has to reset at the same
+moment. A session id survives a compaction; the context does not. Without the
+reset, the guard that stops us repeating ourselves would suppress exactly the
+memory the fresh context needs — turning our own safeguard into the amnesia it
+exists to prevent. Compaction also kicks consolidation first, so the primer
+that lands a moment later carries a narrative rather than a list of commands.
+
+Codex was previously documented here as having no compaction or session-end
+hooks. That was wrong, and worth saying plainly: the claim came from reading
+this machine's `hooks.json`, which lists what somebody had configured — not
+what Codex supports. A probe settled it. `SessionEnd` fires and is now wired;
+`PreCompact` is wired too, on the weaker evidence that Codex's own trust store
+holds a `pre_compact` entry belonging to another tool. Forcing a real
+compaction to watch it fire was out of scope, so treat that one as wired rather
+than witnessed.
+
+Either way capture is continuous — events land as they happen rather than being
+gathered at session end — so a compaction costs context, never memory.
+
+## Headless runs
+
+A one-shot invocation — `claude -p`, `codex exec` — usually is not a person
+working. It is an orchestrated step: a reviewer, a judge, a summarizer. So
+those runs receive **no automatic injection**. Handing a reviewer the author's
+own narrative quietly destroys its independence, and nothing downstream can see
+that it happened.
+
+They still capture, tagged, and a headless run's observations rank below a
+person's in the primer. For a completely clean room — no injection *and* no
+capture — set `ROLEPOD_BRAIN_SILENT=1` in the environment of the process you
+want left alone. That variable is a stable public contract; orchestrators are
+meant to set it directly.
+
+## When it calls a model
+
+Consolidation is the only thing that spends a model call, and it happens at
+session boundaries — never mid-session, never per turn. What counts as a
+boundary differs per CLI, because their lifecycle surfaces differ:
+
+| CLI | Consolidates on |
+|---|---|
+| Claude Code, Codex | session end, compaction |
+| OpenCode | session idle, compaction |
+| Antigravity, Cursor | end of turn — they expose no session-end event |
+| Gemini CLI | the backstop only; no boundary event reaches us |
+
+`brain doctor` prints this for the CLIs you actually have installed. Whatever a
+boundary misses, the backstop below finishes when the next session opens.
+
+## Nothing runs in the background
+
+There is no launchd agent, no login item, and no timer by default. Consolidation
+happens when a session ends, and a session *opening* finishes anything stale
+left over — which covers every case that matters, because consolidated memory
+only has value when a next session reads it, and that session fires hooks.
+
+Set `timer = true` under `[consolidation]` if you want wall-clock consolidation
+regardless of whether you open a CLI again. `brain setup` will then install a
+launchd agent, and macOS will list it in Login Items.
+
+## What the summaries are written from
+
+Lifecycle hooks see tool calls and prompts. They never see the model's own
+prose — the reasoning it wrote, the decision it explained, the dead end it
+described — which is usually where the *why* lives.
+
+Your CLI already writes that prose to a transcript on disk for its own
+purposes. At consolidation time we read the recent tail of it, hand it to the
+summarizer beside the captured events, and **persist only the summary**. No
+transcript content is ever copied into this memory; the store keeps a path, and
+that is all. If the transcript has been cleaned up by the CLI, consolidation
+quietly proceeds without it.
+
+Claude Code and Codex provide transcripts. OpenCode, Antigravity and Cursor do
+not, and their summaries are written from events alone.
+
+## `ROLEPOD_BRAIN_WORKER` — a contract for other tools
+
+When brain consolidates, it runs your CLI headlessly. Every process it spawns
+carries `ROLEPOD_BRAIN_WORKER=1`, and so does everything below it — including
+the lifecycle hooks that CLI fires on itself.
+
+brain uses this on itself first: its own capture hook exits immediately when it
+sees the variable, which is what stops consolidation from recording its own
+model calls as if they were your work.
+
+**The same signal is available to anyone else.** If you run orchestrators,
+notifiers, or gates on the same lifecycle hooks, they will otherwise fire once
+per consolidation — a desktop notification for a summary you never asked to
+see. One line at the top of such a hook is enough:
+
+```sh
+[ -n "${ROLEPOD_BRAIN_WORKER:-}" ] && exit 0
+```
+
+This is a stable public contract: the variable name will not change for
+internal convenience.
+
+Note what brain deliberately does *not* do: it does not strip the environment
+it inherits. A summarizer child therefore carries whatever session identity
+your orchestrator set. Guessing which variables belong to which tool would
+couple brain to tools it does not own, and pruning the environment down to a
+guessed minimum would break CLIs in ways that fail silently — consolidation
+would simply fall back to rule-based summaries with nobody the wiser. The flag
+above is the honest interface instead.
+
+## When a CLI runs out
+
+If the CLI that produced the work cannot summarize it — rate limited, logged
+out, a model id that no longer exists — consolidation moves to the next CLI you
+are signed into, then to rule-based summaries. Events that only got the
+rule-based treatment stay marked unconsolidated, so the next working run
+rewrites them properly. The ladder loses quality, never data.
+
+Both failure shapes advance: a crash or non-zero exit, and an answer that comes
+back with exit 0 but is unusable — a login prompt, a quota banner, empty
+output. That second case is the one that matters in practice, because an
+exhausted subscription often looks like success. Each attempt is charged to
+that CLI's circuit breaker, and one call tries at most two CLIs, so a prompt
+none of them can handle costs two calls rather than one per CLI you own.
+
+## Redaction
+
+Three layers, in order of how much they can be trusted:
+
+1. **Patterns, at capture.** Secrets are scrubbed before anything is written.
+2. **Instruction, at consolidation.** The summarizer is told never to reproduce
+   a credential — to say "configured the API key", never its value.
+3. **Patterns again, over the model's output.** Everything a model writes goes
+   back through the same scrub before it is persisted.
+
+Layer 3 exists because layer 2 is a request, not a guarantee. Small models
+misread instructions — one returned bare strings where the schema asked for
+objects — and security cannot rest on a model complying. There is a test that
+plants credentials in a summarizer's output and proves they never reach disk.
+
+### `<private>` — the optional escape hatch
+
+Some things no pattern can recognize: a client's name, a figure from a
+contract. Wrap them and they are removed before anything is stored or shown to
+a summarizer:
+
+```
+deploy for <private>Acme Holdings, 4.2M contract</private> next week
+```
+
+An unclosed `<private>` drops everything after it. That is deliberate: you
+typed the tag because what follows must not be kept, and a missing closer is far
+more likely a typo than an invitation.
+
+You never have to learn this. The three layers above run either way.
+
+## Reading it in Obsidian
+
+There is no sync step, because none is needed. In Obsidian choose **Open folder
+as vault** and point it at `~/.rolepod-brain/wiki`. It reads the markdown in
+place, and new pages appear as consolidation writes them.
+
+Three things worth knowing before you do:
+
+**Session pages and `index.md` are regenerated.** Consolidation rewrites them,
+so an edit you make there can be overwritten without warning. Read them freely;
+just do not treat them as a place to write.
+
+**Write alongside instead.** Anything you add is safe as long as it is not a
+session page: a `notes/` folder inside a project's directory is never touched —
+consolidation only ever writes `pages/sessions/*.md` and `index.md`. For notes
+you want the *agent* to see later, use `brain_note`, which puts them in memory
+proper rather than beside it.
+
+Obsidian writes its own configuration into any folder it opens; the wiki's
+`.gitignore` already keeps that out of the history.
+
+## If you want it on more than one machine
+
+**We never sync your brain. The format makes it trivially yours to sync if you
+choose.** It is a folder of markdown in a git repository — Syncthing, `rsync`
+to a NAS you own, a private git remote you push by hand, or Obsidian Sync all
+work on it without this project shipping a line of network code.
+
+That is a different offer from a memory product with a cloud tier: there, your
+memory sits on someone's server in a form they can read, and you pay for the
+privilege. Here the transport is your choice, and so is who can read it.
+
+Choose the channel accordingly, because of what the wiki is: a
+reverse-engineering blueprint of your projects, complete with the reasoning and
+the dead ends. Pick something you trust end to end.
+
+For Obsidian Sync specifically, end-to-end encryption is the default when you
+create a remote vault, and it depends on an encryption password you set and
+keep — the documentation is explicit that losing it means the data stays
+encrypted and unusable, with no recovery by anyone including Obsidian. Verify
+the current terms yourself before trusting any summary of them, including this
+one.
+
+## Fixing what it remembers
+
+A summary written by a cheap model can be wrong, and a wrong memory is injected
+into every later session with exactly the confidence of a right one — which
+nobody notices, because nobody re-reads a wiki looking for sentences that were
+never true.
+
+```sh
+brain forget  <id>          # withdraw it
+brain correct <id> "text"   # replace what it says
+```
+
+Neither deletes anything. Both append an entry that is *about* the earlier one,
+and recall stops showing the old version. The log keeps the original wording,
+the withdrawal, and the correction, so the history of what memory believed
+stays honest. Your agent can do the same through `brain_forget` and
+`brain_correct` when you say something is wrong mid-session — though it may
+only withdraw entries it has actually been shown, not ids it guessed at.
+
+## Moving to another machine
+
+There is no sync, so migration is a command rather than a hope:
+
+```sh
+brain export brain.tar.gz          # on the old machine
+brain import brain.tar.gz          # on the new one
+```
+
+The archive carries the log and the pages; the index is left behind and rebuilt
+on arrival, which also proves the log really is the source of truth. Importing
+onto a machine that already has memory refuses until you pick `--merge` or
+`--replace`, and `--replace` moves the old wiki aside rather than deleting it.
+
+One thing to know: a project's identity normally follows its path, so the same
+repository checked out somewhere else is a different project. Put a
+`.rolepod-brain.toml` with a `name` in it and identity follows the name instead
+— which is what makes an imported brain attach to the work rather than sit
+beside it.
+
+## Removing it
+
+```sh
+brain uninstall            # prints a plan
+brain uninstall --apply    # unwires every CLI
+brain uninstall --apply --wipe   # ...and deletes the memory, after you type DELETE
+```
+
+Hooks belonging to other tools are left exactly where they are. Without
+`--wipe`, your memory stays on disk and the command tells you where.
+
+## Why it stays local
+
+The wiki is the most sensitive file set this machine holds, and that is not an
+exaggeration about privacy in general — it is what the contents actually are.
+
+It accumulates the architecture of every project it watched, the sequence of
+decisions that produced it, and the approaches that were tried and abandoned:
+the weak points already known internally. Someone holding this wiki can
+reconstruct a project *and the reasoning behind it* without ever seeing the
+source. For client or confidential work, that is worse than a source leak.
+
+So:
+
+- **No remote sync.** The code to push anywhere was removed, not disabled.
+  `brain sync` exists only to say so.
+- **No cloud, no account, no telemetry.** Nothing is sent anywhere, ever.
+- **No API keys held.** Summarization borrows a CLI you are already signed
+  into, through its own supported entry point.
+
+What remains is a plain-markdown git repository at `~/.rolepod-brain/wiki` —
+`grep` it, open it in Obsidian, read its history with `git log`, roll it back
+with `git revert`. Back it up the way you back up the rest of your disk; Time
+Machine and `rsync` to a disk you control both work, and the choice is yours
+rather than ours.
+
+Everything that reduces what the wiki holds in the first place — the capture
+sanitizer, the redaction pass over model output, `<private>`, and declining to
+file an event whose project cannot be determined — is defence in depth for the
+day the machine itself is the breach.
+
+## Development## Development
+
+```sh
+cargo test              # unit and end-to-end
+cargo test --release    # also enforces the 50ms hook latency budget
+cargo clippy --all-targets
+```
+
+The end-to-end suite runs against the real binary in an isolated data
+directory and covers the claims above: two CLIs merging into one store,
+cross-CLI recall, secrets never reaching the log, index rebuild from the log,
+and graceful degradation when no model is reachable.
+
+## License
+
+MIT. See `LICENSE`, and `NOTICE` for third-party attribution.

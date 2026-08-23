@@ -1,0 +1,31 @@
+[package]
+name = "rolepod-brain"
+version = "0.9.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "Install-and-forget memory for AI coding agents. No resident process."
+repository = "https://github.com/nuttaruj/rolepod-brain"
+
+[[bin]]
+name = "brain"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+jiff = "0.2"
+regex = "1"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+ulid = "1"
+uuid = { version = "1", features = ["v5", "v4", "serde"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"

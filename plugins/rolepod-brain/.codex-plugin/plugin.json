@@ -1,0 +1,38 @@
+{
+  "name": "rolepod-brain",
+  "version": "0.9.0",
+  "description": "Persistent memory for AI coding agents. Captures your sessions, consolidates them into a searchable markdown wiki, and hands the next session a short list of pointers. One binary, nothing resident.",
+  "author": {
+    "name": "nuttaruj",
+    "url": "https://github.com/nuttaruj"
+  },
+  "homepage": "https://github.com/nuttaruj/rolepod-brain",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nuttaruj/rolepod-brain"
+  },
+  "license": "MIT",
+  "keywords": [
+    "memory",
+    "context",
+    "mcp",
+    "hooks",
+    "consolidation"
+  ],
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Rolepod Brain",
+    "shortDescription": "Session memory that survives context wipes. No daemon, no API keys.",
+    "longDescription": "Captures Codex lifecycle events, consolidates them with the cheap tier of a CLI you are already signed into, and injects pointers - never content - into later sessions. Requires the `brain` binary on PATH (see the repository README). Nothing runs in the background: hooks spawn a short-lived worker, the MCP server lives one session, and consolidation is triggered by session boundaries.",
+    "developerName": "nuttaruj",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write",
+      "Bash"
+    ],
+    "websiteURL": "https://github.com/nuttaruj/rolepod-brain"
+  },
+  "skills": "./skills/"
+}

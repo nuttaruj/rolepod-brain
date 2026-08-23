@@ -1,0 +1,193 @@
+//! Configuration and on-disk layout.
+//!
+//! The whole surface is deliberately small. Every value has a default that
+//! makes an untouched install light, so `config.toml` is optional and usually
+//! absent.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+use crate::ids::ProjectScope;
+use crate::sanitize::SanitizeConfig;
+
+/// Environment variable that relocates the whole data directory. Exists so
+/// tests never touch a real brain.
+pub const DATA_DIR_ENV: &str = "ROLEPOD_BRAIN_HOME";
+
+/// Top-level config, read from `<data_dir>/config.toml` when present.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Config {
+    pub consolidation: ConsolidationConfig,
+    pub summarizer: SummarizerConfig,
+    pub injection: InjectionConfig,
+    pub sanitize: SanitizeConfig,
+}
+
+/// When consolidation catches up on work the session-end trigger missed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConsolidationConfig {
+    /// Install a wall-clock timer as the backstop.
+    ///
+    /// Off by default, and deliberately so: on macOS a launchd agent shows up
+    /// in the user's Login Items as "brain can run in the background", which
+    /// is a real cost to a product whose entire promise is that nothing runs.
+    /// The default backstop is opportunistic instead — a hook notices a stale
+    /// backlog and kicks a detached catch-up. That covers every case that
+    /// matters, because consolidated memory only has value when a next session
+    /// reads it, and that session fires hooks.
+    ///
+    /// Turn it on if you want consolidation to happen on wall-clock time
+    /// regardless of whether you open a CLI again.
+    pub timer: bool,
+}
+
+/// Which model tier consolidates, if any.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SummarizerConfig {
+    /// `auto` borrows the cheap tier of the CLI that produced the events.
+    /// `off` is permanent rule-based consolidation — a first-class mode, not a
+    /// degraded one. Named CLIs pin one summarizer.
+    pub mode: String,
+}
+
+impl Default for SummarizerConfig {
+    fn default() -> Self {
+        Self { mode: "auto".to_string() }
+    }
+}
+
+/// Byte budgets for automatic context injection.
+///
+/// Byte-denominated on purpose: a count of "50 observations" is an
+/// approximation, because 50 long lines and 50 short lines are not the same
+/// spend. These are ceilings, not targets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InjectionConfig {
+    /// Ceiling for the session-start primer.
+    pub primer_budget: usize,
+    /// Ceiling for everything auto-injected in one session, across layers.
+    pub session_budget: usize,
+}
+
+impl Default for InjectionConfig {
+    fn default() -> Self {
+        Self { primer_budget: 4096, session_budget: 8192 }
+    }
+}
+
+/// Resolved paths for one machine.
+#[derive(Debug, Clone)]
+pub struct Paths {
+    pub data_dir: PathBuf,
+}
+
+impl Paths {
+    /// Resolve the data directory: `$ROLEPOD_BRAIN_HOME`, else
+    /// `~/.rolepod-brain`.
+    ///
+    /// # Errors
+    /// Returns an error when no home directory can be determined.
+    pub fn resolve() -> Result<Self> {
+        let data_dir = match std::env::var_os(DATA_DIR_ENV) {
+            Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+            _ => dirs::home_dir()
+                .context("cannot determine home directory")?
+                .join(".rolepod-brain"),
+        };
+        Ok(Self { data_dir })
+    }
+
+    #[must_use]
+    pub fn db(&self) -> PathBuf {
+        self.data_dir.join("brain.db")
+    }
+
+    #[must_use]
+    pub fn wiki(&self) -> PathBuf {
+        self.data_dir.join("wiki")
+    }
+
+    #[must_use]
+    pub fn config_file(&self) -> PathBuf {
+        self.data_dir.join("config.toml")
+    }
+
+    /// Where the hook binary writes its own failures. Hooks must never print
+    /// to the host CLI's stderr, so this is the only place a capture problem
+    /// becomes visible — `brain doctor` reads it.
+    #[must_use]
+    pub fn log_file(&self) -> PathBuf {
+        self.data_dir.join("brain.log")
+    }
+
+    /// Project directory inside the wiki: `wiki/<workspace>/<project>`.
+    #[must_use]
+    pub fn project_dir(&self, scope: &ProjectScope) -> PathBuf {
+        self.wiki()
+            .join(crate::ids::slugify(&scope.workspace))
+            .join(scope.dir_name())
+    }
+
+    /// Create the data directory if it does not exist.
+    ///
+    /// # Errors
+    /// Returns an error when the directory cannot be created.
+    pub fn ensure(&self) -> Result<()> {
+        std::fs::create_dir_all(&self.data_dir)
+            .with_context(|| format!("create data directory {}", self.data_dir.display()))
+    }
+}
+
+impl Config {
+    /// Load config, falling back to defaults when the file is absent.
+    ///
+    /// # Errors
+    /// Returns an error when the file exists but is unreadable or malformed —
+    /// a typo in a budget should be loud, not silently ignored.
+    pub fn load(path: &Path) -> Result<Self> {
+        if !path.is_file() {
+            return Ok(Self::default());
+        }
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read {}", path.display()))?;
+        toml::from_str(&text).with_context(|| format!("parse {}", path.display()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_background_agent_by_default() {
+        // The product's promise is that nothing runs; a Login Items entry out
+        // of the box would contradict it on the user's own screen.
+        assert!(!Config::default().consolidation.timer);
+    }
+
+    #[test]
+    fn defaults_are_light() {
+        let config = Config::default();
+        assert_eq!(config.summarizer.mode, "auto");
+        assert_eq!(config.injection.primer_budget, 4096);
+        assert_eq!(config.injection.session_budget, 8192);
+    }
+
+    #[test]
+    fn partial_config_keeps_other_defaults() {
+        let config: Config = toml::from_str("[summarizer]\nmode = \"off\"\n").unwrap();
+        assert_eq!(config.summarizer.mode, "off");
+        assert_eq!(config.injection.primer_budget, 4096);
+    }
+
+    #[test]
+    fn malformed_config_is_an_error() {
+        assert!(toml::from_str::<Config>("[injection]\nprimer_budget = \"big\"\n").is_err());
+    }
+}

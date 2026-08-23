@@ -1,0 +1,464 @@
+//! `brain doctor` — prove the wiring works, or say exactly what is missing.
+//!
+//! A memory system that silently stops capturing is worse than one that was
+//! never installed, because the user keeps trusting it. This command exists so
+//! that failure is always one command away from being visible.
+
+use std::fmt::Write as _;
+use std::path::Path;
+
+use anyhow::Result;
+use serde_json::Value;
+
+use crate::config::{Config, Paths};
+use crate::store::Store;
+
+/// One check and its outcome.
+pub struct Check {
+    pub ok: bool,
+    pub name: String,
+    pub detail: String,
+}
+
+impl Check {
+    fn pass(name: &str, detail: impl Into<String>) -> Self {
+        Self { ok: true, name: name.to_string(), detail: detail.into() }
+    }
+    fn fail(name: &str, detail: impl Into<String>) -> Self {
+        Self { ok: false, name: name.to_string(), detail: detail.into() }
+    }
+}
+
+/// Run every check.
+///
+/// # Errors
+/// Returns an error only when the data directory cannot be resolved; every
+/// other problem is reported as a failed check, because the point of this
+/// command is to enumerate problems rather than stop at the first.
+pub fn run() -> Result<Vec<Check>> {
+    let paths = Paths::resolve()?;
+    let mut checks = Vec::new();
+
+    checks.push(if paths.data_dir.is_dir() {
+        Check::pass("data directory", paths.data_dir.display().to_string())
+    } else {
+        Check::fail(
+            "data directory",
+            format!("{} does not exist — run `brain setup --apply`", paths.data_dir.display()),
+        )
+    });
+
+    match Config::load(&paths.config_file()) {
+        Ok(config) => checks.push(Check::pass(
+            "config",
+            format!(
+                "summarizer={} primer_budget={}B session_budget={}B",
+                config.summarizer.mode,
+                config.injection.primer_budget,
+                config.injection.session_budget
+            ),
+        )),
+        Err(error) => checks.push(Check::fail("config", error.to_string())),
+    }
+
+    match Store::open(&paths.db()) {
+        Ok(store) => {
+            let total = store.count().unwrap_or(0);
+            let by_cli = store.counts_by_cli().unwrap_or_default();
+            if total == 0 {
+                checks.push(Check::fail(
+                    "capture",
+                    "no events indexed yet — start a session in a wired CLI, then re-run",
+                ));
+            } else {
+                let breakdown = by_cli
+                    .iter()
+                    .map(|(cli, count)| format!("{cli}={count}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                checks.push(Check::pass("capture", format!("{total} events ({breakdown})")));
+            }
+        }
+        Err(error) => checks.push(Check::fail("index", error.to_string())),
+    }
+
+    checks.push(injection_check(&paths));
+    checks.push(taxonomy_check(&paths));
+    checks.extend(summarizer_checks(&paths));
+    checks.extend(hook_checks());
+    checks.extend(trigger_checks());
+    checks.push(timer_check());
+    checks.push(resident_check());
+    checks.push(error_log_check(&paths.log_file()));
+
+    Ok(checks)
+}
+
+/// How much memory has actually been classified.
+///
+/// A model that quietly stops emitting `kind` degrades the primer from a typed
+/// index back to a flat list, and nothing else would report it — the answers
+/// still parse, the summaries still land. This is the check that would notice.
+fn taxonomy_check(paths: &Paths) -> Check {
+    let Ok(store) = Store::open(&paths.db()) else {
+        return Check::fail("taxonomy", "index unreadable");
+    };
+    let Ok(counts) = store.topic_counts() else {
+        return Check::fail("taxonomy", "could not read topic counts");
+    };
+    if counts.is_empty() {
+        return Check::pass("taxonomy", "nothing classified yet (consolidation assigns it)");
+    }
+    let detail = counts
+        .iter()
+        .map(|(topic, count)| format!("{topic}={count}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Check::pass("taxonomy", detail)
+}
+
+/// What automatic injection has actually cost, measured rather than assumed.
+///
+/// The design commits to a per-session ceiling; this is where that promise is
+/// checked against reality instead of against the config file.
+fn injection_check(paths: &Paths) -> Check {
+    let Ok(store) = Store::open(&paths.db()) else {
+        return Check::fail("injection", "index unreadable");
+    };
+    let config = Config::load(&paths.config_file()).unwrap_or_default();
+    let Ok((sessions, total, worst)) = store.injection_stats() else {
+        return Check::fail("injection", "could not read injection stats");
+    };
+
+    if sessions == 0 {
+        return Check::pass("injection", "nothing injected yet");
+    }
+    let mean = total / sessions;
+    let budget = i64::try_from(config.injection.session_budget).unwrap_or(i64::MAX);
+    let detail = format!(
+        "{sessions} session(s), mean {mean}B, worst {worst}B, cap {budget}B"
+    );
+    if worst > budget {
+        Check::fail("injection", format!("{detail} - OVER BUDGET"))
+    } else {
+        Check::pass("injection", detail)
+    }
+}
+
+/// Human-readable age of the last failure.
+fn failure_age(at: Option<&str>) -> Option<String> {
+    let at: jiff::Timestamp = at?.parse().ok()?;
+    let seconds = jiff::Timestamp::now().as_second() - at.as_second();
+    Some(match seconds {
+        ..=90 => "just now".to_string(),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86_400),
+    })
+}
+
+/// Which summarizer rungs are actually reachable.
+///
+/// Model ids rot when a CLI upgrades, and a wrong id fails exactly like an
+/// outage. This lists the table so a rotted entry is visible rather than
+/// silently degrading every session to rule-based output.
+fn summarizer_checks(paths: &Paths) -> Vec<Check> {
+    let mut checks = Vec::new();
+    let installed: Vec<String> = crate::summarizer::SPECS
+        .iter()
+        .filter(|spec| crate::summarizer::installed(spec.program))
+        .map(|spec| format!("{}={}", spec.cli, spec.model))
+        .collect();
+
+    if installed.is_empty() {
+        checks.push(Check::fail(
+            "summarizer",
+            "no supported CLI on PATH — consolidation stays rule-based",
+        ));
+    } else {
+        checks.push(Check::pass("summarizer", installed.join(" ")));
+    }
+
+    if let Ok(store) = Store::open(&paths.db()) {
+        for health in store.summarizer_health().unwrap_or_default() {
+            if health.failures == 0 {
+                continue;
+            }
+            let cli = health.cli;
+            let failures = health.failures;
+            let cooling = store.summarizer_in_cooldown(&cli).unwrap_or(false);
+            let age = failure_age(health.last_failed_at.as_deref());
+            let last_error = health.last_error;
+            // A per-CLI breaker only clears when that CLI is next used, so a
+            // rung nobody has exercised keeps its last error indefinitely.
+            // Without an age, a failure fixed hours ago is indistinguishable
+            // from one happening now, and a report like that gets ignored.
+            checks.push(Check::fail(
+                &format!("summarizer: {cli}"),
+                format!(
+                    "{failures} consecutive failure(s){}{}: {}",
+                    if cooling { ", in cooldown" } else { "" },
+                    age.map_or(String::new(), |age| format!(", last {age}")),
+                    last_error.unwrap_or_default()
+                ),
+            ));
+        }
+    }
+    checks
+}
+
+/// Is our wiring actually present, for every CLI we know how to wire?
+///
+/// Derived from the same target table `setup` writes from, so a newly
+/// supported CLI cannot be silently absent from the health report — the gap
+/// that would let capture be broken for one CLI while doctor stayed green.
+fn hook_checks() -> Vec<Check> {
+    let Ok(exe) = std::env::current_exe() else {
+        return vec![Check::fail("hooks", "cannot locate our own binary")];
+    };
+    let Ok(targets) = crate::setup::targets(&exe) else {
+        return vec![Check::fail("hooks", "cannot resolve home directory")];
+    };
+
+    targets
+        .into_iter()
+        // A CLI that is not installed is not a problem to report.
+        .filter(|target| target.hooks_file.parent().is_some_and(Path::is_dir))
+        .map(|target| {
+            let name = format!("hooks: {}", target.kind);
+            let path = &target.hooks_file;
+
+            // Codex installs through its own plugin flow, which is also what
+            // grants the hooks permission to run - so the question is whether
+            // that plugin is installed, not whether a config file mentions us.
+            if target.layout == crate::setup::Layout::External {
+                return if codex_plugin_installed() {
+                    Check::pass(&name, "installed and enabled as a Codex plugin")
+                } else {
+                    Check::fail(
+                        &name,
+                        "not installed. Codex will not run hooks it has not trusted, and it \
+                         trusts a plugin's bundled hooks: `codex plugin marketplace add \
+                         nuttaruj/rolepod-brain && codex plugin add rolepod-brain@rolepod-brain`",
+                    )
+                };
+            }
+
+            // A plugin target is a file we own outright: present or not.
+            if target.layout == crate::setup::Layout::Plugin {
+                return if path.is_file() {
+                    Check::pass(&name, format!("plugin installed: {}", path.display()))
+                } else {
+                    Check::fail(&name, "plugin missing — run `brain setup --apply`")
+                };
+            }
+
+            let Ok(text) = std::fs::read_to_string(path) else {
+                return Check::fail(
+                    &name,
+                    format!("{} not readable — run `brain setup --apply`", path.display()),
+                );
+            };
+            let Ok(root) = serde_json::from_str::<Value>(&text) else {
+                return Check::fail(&name, format!("{} is not valid JSON", path.display()));
+            };
+
+            // Grouped and flat layouts nest under "hooks"; namespaced ones put
+            // us under our own key.
+            let container = match target.layout {
+                crate::setup::Layout::Namespaced => root.get("brain"),
+                _ => root.get("hooks"),
+            };
+            let wired: Vec<String> = container
+                .and_then(Value::as_object)
+                .map(|events| {
+                    events
+                        .iter()
+                        .filter(|(_, entries)| {
+                            serde_json::to_string(entries)
+                                .unwrap_or_default()
+                                .contains("brain hook")
+                        })
+                        .map(|(event, _)| event.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if wired.is_empty() {
+                return Check::fail(
+                    &name,
+                    format!("not wired in {} — run `brain setup --apply`", path.display()),
+                );
+            }
+
+            Check::pass(&name, format!("{} event(s): {}", wired.len(), wired.join(", ")))
+        })
+        .collect()
+}
+
+/// Is our Codex plugin installed and enabled?
+///
+/// Codex records enabled plugins in `~/.codex/config.toml` as
+/// `[plugins."<name>@<marketplace>"]`. This is the check that matters for
+/// Codex, because installing through the plugin flow is what makes its hooks
+/// trusted — raw entries in `hooks.json` are silently never run.
+fn codex_plugin_installed() -> bool {
+    let Some(home) = dirs::home_dir() else { return false };
+    let Ok(text) = std::fs::read_to_string(home.join(".codex/config.toml")) else {
+        return false;
+    };
+    let Ok(config) = toml::from_str::<toml::Value>(&text) else { return false };
+    config
+        .get("plugins")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|plugins| {
+            plugins.iter().any(|(key, value)| {
+                key.starts_with("rolepod-brain")
+                    && value.get("enabled").and_then(toml::Value::as_bool) != Some(false)
+            })
+        })
+}
+
+/// When each wired CLI actually calls a model.
+///
+/// A model call is the one thing here that costs the user something, so what
+/// causes one should not require reading the source to find out.
+fn trigger_checks() -> Vec<Check> {
+    let Ok(exe) = std::env::current_exe() else { return Vec::new() };
+    let Ok(targets) = crate::setup::targets(&exe) else { return Vec::new() };
+    targets
+        .into_iter()
+        .filter(|target| target.hooks_file.parent().is_some_and(Path::is_dir))
+        .map(|target| {
+            let cli = target.kind.as_str().to_string();
+            Check::pass(
+                &format!("consolidates: {cli}"),
+                crate::hook::consolidation_triggers(&cli),
+            )
+        })
+        .collect()
+}
+
+/// Which backstop is in force, and is it consistent with the config?
+fn timer_check() -> Check {
+    let Some(home) = dirs::home_dir() else {
+        return Check::fail("backstop", "cannot determine home directory");
+    };
+    let plist = home.join("Library/LaunchAgents/dev.rolepod.brain.consolidate.plist");
+    let installed = plist.is_file();
+    let wanted = Paths::resolve()
+        .ok()
+        .and_then(|paths| Config::load(&paths.config_file()).ok())
+        .is_some_and(|config| config.consolidation.timer);
+
+    match (wanted, installed) {
+        (false, false) => Check::pass(
+            "backstop",
+            "hook-opportunistic - a session opening finishes stale work; nothing registered to run in the background",
+        ),
+        (true, true) => Check::pass("backstop", format!("timer installed: {}", plist.display())),
+        (true, false) => {
+            Check::fail("backstop", "timer enabled in config but not installed - run `brain setup --apply`")
+        }
+        (false, true) => Check::fail(
+            "backstop",
+            "a background agent is installed but the config does not ask for one - run `brain setup --apply` to remove it",
+        ),
+    }
+}
+
+/// The core promise: nothing of ours is running right now.
+///
+/// This check runs inside a `brain` process, so it must not count itself.
+fn resident_check() -> Check {
+    let output = std::process::Command::new("ps").args(["-Ao", "pid=,comm="]).output();
+    let Ok(output) = output else {
+        return Check::fail("no resident process", "could not run `ps`");
+    };
+    let me = std::process::id();
+    let stray: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.trim().splitn(2, char::is_whitespace);
+            let pid: u32 = parts.next()?.parse().ok()?;
+            let command = parts.next()?.trim();
+            if pid == me {
+                return None;
+            }
+            let name = Path::new(command).file_name()?.to_string_lossy();
+            (name == "brain").then(|| format!("pid {pid}"))
+        })
+        .collect();
+
+    if stray.is_empty() {
+        Check::pass("no resident process", "nothing of ours is running")
+    } else {
+        // Not automatically wrong — an MCP server lives for the length of a
+        // session — but it is the one invariant worth showing plainly.
+        Check::pass(
+            "no resident process",
+            format!("{} live: {} (expected only while a session is open)", stray.len(), stray.join(", ")),
+        )
+    }
+}
+
+/// Recent capture failures. Hooks never print to the host CLI, so this file is
+/// the only place they surface.
+fn error_log_check(path: &Path) -> Check {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Check::pass("capture errors", "none recorded");
+    };
+    let lines: Vec<&str> = text.lines().filter(|line| !line.trim().is_empty()).collect();
+    if lines.is_empty() {
+        return Check::pass("capture errors", "none recorded");
+    }
+    let recent = lines.iter().rev().take(3).rev().copied().collect::<Vec<_>>().join("\n    ");
+    Check::fail(
+        "capture errors",
+        format!("{} in {}\n    {recent}", lines.len(), path.display()),
+    )
+}
+
+/// Render checks for a terminal. Returns the report and whether all passed.
+#[must_use]
+pub fn render(checks: &[Check]) -> (String, bool) {
+    let mut out = String::new();
+    let mut all_ok = true;
+    for check in checks {
+        if !check.ok {
+            all_ok = false;
+        }
+        let mark = if check.ok { "ok  " } else { "FAIL" };
+        let _ = writeln!(out, "{mark} {:<20} {}", check.name, check.detail);
+    }
+    (out, all_ok)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_marks_failures_and_reports_overall_status() {
+        let checks = vec![
+            Check::pass("a", "fine"),
+            Check::fail("b", "broken"),
+        ];
+        let (out, ok) = render(&checks);
+        assert!(!ok);
+        assert!(out.contains("ok   a"));
+        assert!(out.contains("FAIL b"));
+    }
+
+    #[test]
+    fn all_passing_reports_ok() {
+        let (_, ok) = render(&[Check::pass("a", "fine")]);
+        assert!(ok);
+    }
+
+    #[test]
+    fn missing_error_log_is_a_pass_not_a_failure() {
+        let check = error_log_check(Path::new("/nonexistent/brain.log"));
+        assert!(check.ok);
+    }
+}

@@ -1,0 +1,22 @@
+{
+  "name": "rolepod-brain",
+  "interface": {
+    "displayName": "Rolepod Brain",
+    "shortDescription": "Persistent memory for AI coding agents. Nothing resident, no API keys.",
+    "developerName": "nuttaruj",
+    "websiteURL": "https://github.com/nuttaruj/rolepod-brain"
+  },
+  "plugins": [
+    {
+      "name": "rolepod-brain",
+      "source": {
+        "source": "local",
+        "path": "./plugins/rolepod-brain"
+      },
+      "policy": {
+        "installation": "AVAILABLE"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
