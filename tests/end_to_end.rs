@@ -98,6 +98,15 @@ impl Fixture {
         out
     }
 
+    /// Every knowledge page under this fixture's wiki, whatever project
+    /// directory it landed in.
+    fn knowledge_pages(&self) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        collect_under(&self.home.join("wiki"), "knowledge", &mut found);
+        found.sort();
+        found
+    }
+
     /// Capture enough events that consolidation will not debounce them away.
     fn seed_session(&self, count: usize) {
         for index in 0..count {
@@ -128,10 +137,20 @@ impl Fixture {
 
     /// One JSON-RPC round trip against a freshly spawned MCP server.
     fn mcp(&self, requests: &[&str]) -> Vec<serde_json::Value> {
+        self.mcp_with_path(requests, None)
+    }
+
+    /// The same, with a fake CLI reachable on `PATH`.
+    fn mcp_with_path(&self, requests: &[&str], bin: Option<&Path>) -> Vec<serde_json::Value> {
+        let path = bin.map_or_else(
+            || "/usr/bin:/bin".to_string(),
+            |dir| format!("{}:/usr/bin:/bin", dir.display()),
+        );
         let mut child = Command::new(BRAIN)
             .arg("mcp")
             .current_dir(&self.project)
             .env("ROLEPOD_BRAIN_HOME", &self.home)
+            .env("PATH", path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -195,6 +214,18 @@ fn collect_ext(dir: &Path, ext: &str, out: &mut String) {
             collect_ext(&path, ext, out);
         } else if path.extension().is_some_and(|e| e == ext) {
             out.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+        }
+    }
+}
+
+/// Collect every file beneath a directory named `marker`.
+fn collect_under(dir: &Path, marker: &str, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_under(&path, marker, out);
+        } else if path.components().any(|part| part.as_os_str() == marker) {
+            out.push(path);
         }
     }
 }
@@ -304,6 +335,71 @@ fn secrets_never_reach_the_log() {
     assert!(!log.contains("ghp_abcdefghijklmnopqrstuvwxyz0123"), "GitHub token leaked into log");
     assert!(!log.contains("sk-livekey1234567890abcd"), "API key leaked into log");
     assert!(log.contains("[REDACTED]"), "expected redaction markers");
+}
+
+#[test]
+fn reranking_reorders_a_search_and_a_failed_one_changes_nothing() {
+    let fixture = Fixture::new("rerank");
+    std::fs::write(
+        fixture.home.join("config.toml"),
+        "[search]\nrerank = true\n\n[summarizer]\nmode = \"claude-code\"\n",
+    )
+    .unwrap();
+    for name in ["auth.rs", "auth/login.rs", "auth/token.rs", "auth/session.rs"] {
+        let payload = serde_json::json!({
+            "session_id": "0199a1f2-3c4d-7e8f-9012-3456789abcde",
+            "cwd": fixture.project,
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": fixture.project.join(format!("src/{name}")),
+                "new_string": "fn check() {}"
+            },
+            "tool_response": {"success": true}
+        })
+        .to_string();
+        fixture.hook("claude-code", "PostToolUse", &payload);
+    }
+
+    let search = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"brain_search","arguments":{"query":"auth"}}}"#;
+    let ids = |responses: &[serde_json::Value]| -> Vec<String> {
+        let text = responses.last().expect("a response")["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content")
+            .to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("hits JSON");
+        parsed["hits"]
+            .as_array()
+            .expect("hits array")
+            .iter()
+            .map(|hit| hit["id"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+
+    let plain = ids(&fixture.mcp(&[search]));
+    assert!(plain.len() >= 3, "need several hits to reorder: {plain:?}");
+
+    // A stub that promotes whatever search ranked last.
+    let bin = fixture.fake_cli(
+        "claude",
+        "echo \"$*\" | grep -oE '[0-9A-Z]{26}' | tail -1",
+    );
+    let ranked = ids(&fixture.mcp_with_path(&[search], Some(&bin)));
+    assert_eq!(ranked[0], plain[plain.len() - 1], "the model's pick did not lead: {ranked:?}");
+    // Reranking is a permutation of what search found, never a filter: an
+    // opinion about one hit must not silently shrink the result.
+    let mut before = plain.clone();
+    let mut after = ranked.clone();
+    before.sort();
+    after.sort();
+    assert_eq!(before, after, "reranking changed which hits came back");
+
+    // A CLI that fails leaves the search exactly as the index ranked it.
+    let broken = fixture.fake_cli("claude", "echo 'rate limit exceeded' >&2; exit 1");
+    assert_eq!(
+        ids(&fixture.mcp_with_path(&[search], Some(&broken))),
+        plain,
+        "a failed rerank must be a no-op, not a degraded search"
+    );
 }
 
 #[test]
@@ -430,8 +526,121 @@ fn setup_is_dry_by_default() {
 /// A stub that answers like a working cheap-tier model.
 const GOOD_CLI: &str =
     r#"echo '{"summary":"Refactored the auth path and fixed token expiry.","titles":[]}'"#;
+/// A stub that answers both kinds of call: a session summary, and the
+/// cross-session synthesis. It lifts a real summary id out of the synthesis
+/// prompt, so the provenance link in the page can only be right if the
+/// prompt genuinely carried the summaries it claims to draw from.
+fn knowledge_cli(counter: &Path) -> String {
+    format!(
+        r#"
+case "$*" in
+  *"SESSION SUMMARIES"*)
+    echo x >> {counter}
+    IDS=$(echo "$*" | grep -oE 'id=[0-9A-Z]{{26}}' | cut -d= -f2)
+    ID=$(echo "$IDS" | head -1)
+    ID2=$(echo "$IDS" | head -2 | tail -1)
+    echo "{{\"knowledge\":[{{\"kind\":\"gotcha\",\"title\":\"vitest must run file-by-file here\",\"body\":\"The shared fixture leaks between files.\",\"sources\":[\"$ID\",\"$ID2\"]}},{{\"kind\":\"invented\",\"title\":\"not a real kind\",\"body\":\"b\",\"sources\":[\"$ID\",\"$ID2\"]}},{{\"kind\":\"decision\",\"title\":\"happened once in one session\",\"body\":\"Cited a single summary.\",\"sources\":[\"$ID\"]}}]}}" ;;
+  *) echo '{{"summary":"Refactored the auth path and fixed token expiry.","titles":[]}}' ;;
+esac
+"#,
+        counter = counter.display()
+    )
+}
+
 /// A stub that fails the way a rate-limited CLI does.
 const FAILING_CLI: &str = "echo 'rate limit exceeded' >&2; exit 1";
+
+#[test]
+fn what_recurs_across_sessions_becomes_a_page_that_outlives_them() {
+    let fixture = Fixture::new("knowledge");
+    let counter = fixture.home.parent().unwrap().join("synth-calls");
+    let bin = fixture.fake_cli("claude", &knowledge_cli(&counter));
+    let synth_calls = || std::fs::read_to_string(&counter).unwrap_or_default().lines().count();
+
+    // Four sessions is under the watermark; the fifth crosses it.
+    for session in 0..5 {
+        let payload = serde_json::json!({
+            "session_id": format!("0199a1f2-3c4d-7e8f-9012-34567890000{session}"),
+            "cwd": fixture.project,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": fixture.project.join("src/auth.rs")}
+        })
+        .to_string();
+        fixture.hook("claude-code", "PostToolUse", &payload);
+
+        let done = fixture.brain_with_path(&["consolidate", "--force"], Some(&bin));
+        assert!(done.status.success(), "consolidate {session} failed: {done:?}");
+
+        // Semantic memory must not appear before enough episodes exist to
+        // support it: one session's noise is not what a project knows.
+        let pages = fixture.knowledge_pages();
+        assert_eq!(
+            !pages.is_empty(),
+            session == 4,
+            "knowledge after {} session(s) — watermark is wrong: {pages:?}",
+            session + 1
+        );
+    }
+
+    let pages = fixture.knowledge_pages();
+    assert_eq!(pages.len(), 1, "expected one usable entry of three: {pages:?}");
+    // A single-session claim is a session summary wearing a promotion, and
+    // knowledge outranks summaries in the primer.
+    assert!(
+        !fixture.log_text().contains("happened once in one session"),
+        "an entry supported by one summary was kept"
+    );
+    // An invented kind is dropped rather than given a directory of its own.
+    let path = pages[0].to_string_lossy();
+    assert!(path.contains("knowledge/gotchas/"), "wrong home for a gotcha: {path}");
+    assert!(path.ends_with("vitest-must-run-file-by-file-here.md"), "bad filename: {path}");
+    let page = std::fs::read_to_string(&pages[0]).expect("the gotcha page");
+    assert!(page.contains("tags: [knowledge, gotcha]"), "page not typed: {page}");
+    assert!(page.contains("The shared fixture leaks between files."), "body missing: {page}");
+
+    // Provenance: the page names a summary that actually exists in the log.
+    let source = page
+        .lines()
+        .skip_while(|line| !line.starts_with("## Drawn from"))
+        .find_map(|line| line.split('`').nth(1).map(str::to_owned))
+        .expect("a provenance line naming a source summary");
+    assert!(
+        fixture.log_text().contains(&source),
+        "page cites `{source}`, which is in no log entry"
+    );
+
+    // A page nobody can retrieve is half a memory: the same knowledge has to
+    // reach an agent through ordinary search, not only through the vault.
+    let hits = String::from_utf8_lossy(&fixture.brain(&["search", "vitest"]).stdout).into_owned();
+    assert!(hits.contains("vitest must run file-by-file here"), "not retrievable: {hits}");
+
+    // Five more sessions, and the model rediscovers what it already found.
+    // Knowledge must not accrete a duplicate per synthesis round.
+    for session in 5..10 {
+        let payload = serde_json::json!({
+            "session_id": format!("0199a1f2-3c4d-7e8f-9012-3456789000{session:02}"),
+            "cwd": fixture.project,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": fixture.project.join("src/auth.rs")}
+        })
+        .to_string();
+        fixture.hook("claude-code", "PostToolUse", &payload);
+        assert!(
+            fixture.brain_with_path(&["consolidate", "--force"], Some(&bin)).status.success(),
+            "consolidate {session} failed"
+        );
+    }
+    // The second round must genuinely have run and found nothing new — a
+    // watermark that never re-armed would pass the count check by doing
+    // nothing at all.
+    assert_eq!(synth_calls(), 2, "synthesis did not run once per five sessions");
+    assert_eq!(fixture.knowledge_pages().len(), 1, "synthesis duplicated a known fact");
+    assert_eq!(
+        fixture.log_text().matches("\"kind\":\"knowledge\"").count(),
+        1,
+        "the log gained a duplicate knowledge entry"
+    );
+}
 
 #[test]
 fn consolidation_degrades_to_rule_based_then_catches_up() {
@@ -1670,4 +1879,201 @@ fn uninstall_does_not_touch_memory_without_wipe() {
 
     assert_eq!(fixture.log_text().lines().count(), before, "uninstall deleted memory");
     assert!(fixture.home.join("brain.db").exists(), "the index should survive too");
+}
+
+#[test]
+fn what_gets_read_rises_and_what_gets_flagged_sinks() {
+    // Evidence beats heuristics: an entry an agent went back and read in full
+    // is worth more than one we merely guessed at, and a human calling
+    // something stale outranks both.
+    let fixture = Fixture::new("ranking");
+    for text in ["alpha topic one", "alpha topic two", "alpha topic three"] {
+        let payload = serde_json::json!({
+            "session_id": "0199a1f2-3c4d-7e8f-9012-3456789abcde",
+            "cwd": fixture.project,
+            "prompt": text
+        })
+        .to_string();
+        fixture.hook("claude-code", "UserPromptSubmit", &payload);
+    }
+
+    let ids: Vec<String> = fixture
+        .log_text()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|line| line["id"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(ids.len(), 3);
+
+    let order = |fixture: &Fixture| -> Vec<String> {
+        let out = String::from_utf8_lossy(&fixture.brain(&["search", "alpha"]).stdout).to_string();
+        out.lines()
+            .filter(|line| line.starts_with("01"))
+            .filter_map(|line| line.split_whitespace().next().map(str::to_string))
+            .collect()
+    };
+
+    // Read the LAST one in full, through the tool an agent would use.
+    let pull = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"brain_get","arguments":{{"ids":["{}"]}}}}}}"#,
+        ids[2]
+    );
+    fixture.mcp(&[&pull]);
+
+    // Now flag the first one as stale, via the same surfaced-id rule.
+    let flag = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"brain_feedback","arguments":{{"id":"{}"}}}}}}"#,
+        ids[0]
+    );
+    let responses = fixture.mcp(&[
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"brain_get","arguments":{{"ids":["{}"]}}}}}}"#,
+            ids[0]
+        ),
+        &flag,
+    ]);
+    assert_eq!(
+        responses[1]["result"]["structuredContent"]["flagged"], ids[0].as_str(),
+        "feedback did not take: {responses:?}"
+    );
+
+    // Flagging must not delete anything.
+    let after = order(&fixture);
+    assert_eq!(after.len(), 3, "a flagged entry disappeared: {after:?}");
+    assert_eq!(after.last().unwrap(), &ids[0], "the flagged entry should sink to last");
+
+    // The primer is ranked by usage, so the entry that was read in full leads
+    // and the flagged one trails.
+    let start = serde_json::json!({
+        "session_id": "0199b000-0000-7000-8000-000000000000",
+        "cwd": fixture.project,
+        "source": "startup"
+    })
+    .to_string();
+    let output = fixture.hook("claude-code", "SessionStart", &start);
+    let context = injected_context(&output).expect("a primer");
+    let read_at = context.find(&ids[2]).expect("the read entry should be in the primer");
+    let flagged_at = context.find(&ids[0]).expect("the flagged entry is still present");
+    assert!(read_at < flagged_at, "usage did not outrank a flagged entry in the primer");
+}
+
+#[test]
+fn flagging_produces_a_page_a_human_can_act_on() {
+    let fixture = Fixture::new("lintpage");
+    fixture.seed_session(2);
+    let payload = serde_json::json!({
+        "session_id": "0199a1f2-3c4d-7e8f-9012-3456789abcde",
+        "cwd": fixture.project,
+        "prompt": "the deploy script lives in bin/release"
+    })
+    .to_string();
+    fixture.hook("claude-code", "UserPromptSubmit", &payload);
+    let id = fixture
+        .log_text()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|line| line["title"].as_str().is_some_and(|t| t.contains("deploy script")))
+        .find_map(|line| line["id"].as_str().map(str::to_string))
+        .expect("the flagged event");
+
+    fixture.mcp(&[
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"brain_get","arguments":{{"ids":["{id}"]}}}}}}"#
+        ),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"brain_feedback","arguments":{{"id":"{id}"}}}}}}"#
+        ),
+    ]);
+
+    let bin = fixture.fake_cli("claude", GOOD_CLI);
+    fixture.brain_with_path(&["consolidate", "--force"], Some(&bin));
+
+    let pages = fixture.page_text();
+    assert!(pages.contains("Flagged in"), "no review page was written: {pages}");
+    assert!(pages.contains(&id), "the flagged id should be listed for review");
+    assert!(pages.contains("brain forget"), "the page should say what to do about it");
+}
+
+#[test]
+fn entities_find_work_that_no_title_mentions() {
+    // The point of a second retrieval stream: someone asks about a file, and
+    // the sessions that touched it come back even though the summaries talk
+    // about behaviour rather than filenames.
+    let fixture = Fixture::new("entities");
+    for index in 0..3 {
+        let payload = serde_json::json!({
+            "session_id": format!("0199a1f2-3c4d-7e8f-9012-00000000000{index}"),
+            "cwd": fixture.project,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": fixture.project.join("src/billing.rs")}
+        })
+        .to_string();
+        fixture.hook("claude-code", "PostToolUse", &payload);
+    }
+
+    // A summary that deliberately never says "billing".
+    let bin = fixture.fake_cli(
+        "claude",
+        r#"echo '{"summary":"Reworked how invoices are totalled at period end.","entities":[],"titles":[]}'"#,
+    );
+    fixture.brain_with_path(&["consolidate", "--force"], Some(&bin));
+
+    let responses = fixture.mcp(&[
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"brain_search","arguments":{"query":"src/billing.rs"}}}"#,
+    ]);
+    let hits = responses[0]["result"]["structuredContent"]["hits"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no hits array; response was {:?}", responses[0]));
+    assert!(!hits.is_empty(), "the entity stream found nothing: {responses:?}");
+
+    let titles: Vec<&str> = hits.iter().filter_map(|hit| hit["title"].as_str()).collect();
+    assert!(
+        titles.iter().any(|title| title.contains("invoices") || title.contains("billing")),
+        "expected the work about that file: {titles:?}"
+    );
+}
+
+#[test]
+fn a_recurring_entity_gets_a_page_a_one_off_does_not() {
+    let fixture = Fixture::new("entitypages");
+    // Two sessions touch the same file; one session touches another.
+    for (index, file) in [(0, "src/shared.rs"), (1, "src/shared.rs"), (2, "src/once.rs")] {
+        let payload = serde_json::json!({
+            "session_id": format!("0199a1f2-3c4d-7e8f-9012-00000000000{index}"),
+            "cwd": fixture.project,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": fixture.project.join(file)}
+        })
+        .to_string();
+        fixture.hook("claude-code", "PostToolUse", &payload);
+    }
+
+    let bin = fixture.fake_cli("claude", GOOD_CLI);
+    fixture.brain_with_path(&["consolidate", "--force"], Some(&bin));
+
+    let mut entity_pages = String::new();
+    collect_ext(&fixture.home.join("wiki"), "md", &mut entity_pages);
+    assert!(entity_pages.contains("src/shared.rs"), "no page for the recurring entity");
+
+    // A thing touched once is already one click from its session; a page for
+    // it would add a leaf to the graph and nothing else.
+    let dirs = std::fs::read_dir(fixture.home.join("wiki")).is_ok();
+    assert!(dirs);
+    let once_page = walk_find(&fixture.home.join("wiki"), "once.md");
+    assert!(!once_page, "a one-off entity should not get its own page");
+}
+
+fn walk_find(dir: &Path, name: &str) -> bool {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .any(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                walk_find(&path, name)
+            } else {
+                path.file_name().is_some_and(|f| f == name)
+            }
+        })
 }

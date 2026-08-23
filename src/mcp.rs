@@ -210,6 +210,23 @@ fn tool_definitions() -> Value {
             },
         },
         {
+            "name": "brain_feedback",
+            "description": "Mark a memory as stale or unhelpful without deleting it. \
+                            Use when the user says a remembered thing is out of date \
+                            or was not worth keeping, but is not claiming it is wrong \
+                            — for that, brain_correct or brain_forget. Flagged entries \
+                            sink in what gets shown and are listed for the user to \
+                            review; nothing is destroyed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Event id from a search or an injected pointer."},
+                    "reason": {"type": "string", "description": "Optional: why, in a few words."},
+                },
+                "required": ["id"],
+            },
+        },
+        {
             "name": "brain_recent",
             "description": "Most recent observations in this project, newest first. \
                             Use it to re-orient at the start of a session or after a \
@@ -239,7 +256,34 @@ fn call_tool(paths: &Paths, project: &str, session: &str, params: &Value) -> Res
                 .and_then(Value::as_str)
                 .filter(|q| !q.trim().is_empty())
                 .context("brain_search requires a non-empty `query`")?;
-            let hits = store.search(project, query, limit_from(&arguments))?;
+            let limit = limit_from(&arguments);
+            let config = crate::config::Config::load(&paths.config_file())?;
+            // With a reranker to sort them, it is worth pulling more than the
+            // caller asked for: the entry that answers the question is often
+            // just past the cut.
+            let pool = if config.search.rerank { crate::rerank::POOL.max(limit) } else { limit };
+            let mut hits = store.search(project, query, pool)?;
+
+            // Second retrieval stream: a query that names a file or a service
+            // finds the work about it even when no title contains the word.
+            // Appended rather than interleaved, so text relevance still leads.
+            let by_entity = store
+                .search_by_entity(project, &crate::consolidate::normalize_entity(query), pool)
+                .unwrap_or_default();
+            let seen: std::collections::HashSet<String> =
+                hits.iter().map(|hit| hit.id.clone()).collect();
+            hits.extend(by_entity.into_iter().filter(|hit| !seen.contains(&hit.id)).take(pool));
+            hits.truncate(pool);
+
+            if config.search.rerank {
+                let ladder = crate::summarizer::Ladder::new(&store, &config.summarizer.mode);
+                // Borrow the cheap tier of whichever CLI this session is,
+                // which its own captured events already record.
+                let cli = store.session_cli(session)?.unwrap_or_default();
+                hits = crate::rerank::rerank(&ladder, &cli, query, hits);
+            }
+            hits.truncate(limit);
+
             store.record_recalled(session, hits.iter().map(|hit| hit.id.as_str()))?;
             json!({ "hits": hits, "count": hits.len() })
         }
@@ -286,6 +330,21 @@ fn call_tool(paths: &Paths, project: &str, session: &str, params: &Value) -> Res
                 .context("brain_correct requires `text`")?;
             let outcome = crate::revise::correct(id, text)?;
             json!({ "corrected": id, "was": outcome.target_title, "recorded_as": outcome.id })
+        }
+        "brain_feedback" => {
+            let id = arguments
+                .get("id")
+                .and_then(Value::as_str)
+                .context("brain_feedback requires an `id`")?;
+            anyhow::ensure!(
+                store.already_injected(session, id)? || store.was_recalled(session, id)?,
+                "id {id} has not been surfaced in this session; search for it first"
+            );
+            store.lower_confidence(id)?;
+            json!({
+                "flagged": id,
+                "effect": "ranked lower and listed for review; nothing was deleted",
+            })
         }
         "brain_timeline" => {
             let since = arguments.get("since").and_then(Value::as_str).unwrap_or("");
@@ -382,7 +441,7 @@ mod tests {
     fn every_tool_declares_a_usable_schema() {
         let tools = tool_definitions();
         let tools = tools.as_array().unwrap();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
         for tool in tools {
             assert!(tool.get("name").and_then(Value::as_str).is_some());
             let description = tool.get("description").and_then(Value::as_str).unwrap();

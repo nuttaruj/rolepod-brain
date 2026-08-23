@@ -1,8 +1,8 @@
 //! The versioned observation log — the source of truth.
 //!
 //! Everything else in this program is derived state that `brain reindex` can
-//! rebuild from these files. The schema is a contract (`brief/05-event-schema.md`):
-//! readers must ignore unknown fields so a newer writer never breaks an older
+//! rebuild from these files. The schema is a contract: readers must ignore
+//! unknown fields so a newer writer never breaks an older
 //! reader, and `v` only bumps on a genuinely breaking change.
 //!
 //! Layout: `wiki/<workspace>/<project>/events/YYYY-MM.jsonl`, one JSON object
@@ -33,6 +33,10 @@ pub enum EventKind {
     PageUpdate,
     /// An explicit note from the user or agent.
     Note,
+    /// Something that stayed true across sessions, synthesized from their
+    /// summaries. Session summaries are episodic - what happened, once. This
+    /// is the semantic half, and it outlives the sessions it came from.
+    Knowledge,
     /// A deletion. Append-only holds: removal is an event, and compaction
     /// honours it. Required for the future sync contract.
     Tombstone,
@@ -46,6 +50,7 @@ impl EventKind {
             Self::SessionSummary => "session_summary",
             Self::PageUpdate => "page_update",
             Self::Note => "note",
+            Self::Knowledge => "knowledge",
             Self::Tombstone => "tombstone",
         }
     }

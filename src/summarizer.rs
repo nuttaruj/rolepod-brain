@@ -107,12 +107,23 @@ pub enum Tier {
 pub struct Ladder<'a> {
     store: &'a Store,
     mode: String,
+    timeout: Duration,
 }
 
 impl<'a> Ladder<'a> {
     #[must_use]
     pub fn new(store: &'a Store, mode: &str) -> Self {
-        Self { store, mode: mode.to_string() }
+        Self { store, mode: mode.to_string(), timeout: CALL_TIMEOUT }
+    }
+
+    /// The same ladder on a shorter leash.
+    ///
+    /// Consolidation runs detached and can afford three minutes. A call made
+    /// while someone waits for a search result cannot: past a few seconds the
+    /// unranked answer they already had is the better one.
+    #[must_use]
+    pub fn clone_with_timeout(&self, limit: Duration) -> Ladder<'a> {
+        Ladder { store: self.store, mode: self.mode.clone(), timeout: limit }
     }
 
     /// Is any model allowed at all?
@@ -147,7 +158,7 @@ impl<'a> Ladder<'a> {
             }
             attempts += 1;
 
-            match invoke(spec, prompt) {
+            match invoke(spec, prompt, self.timeout) {
                 Ok(text) if usable(&text) => {
                     self.store.record_summarizer_success(spec.cli)?;
                     return Ok((Tier::Cli(spec.cli.to_string()), text));
@@ -219,7 +230,7 @@ pub fn installed(program: &str) -> bool {
 }
 
 /// Run one CLI once and return its answer.
-fn invoke(spec: &CliSpec, prompt: &str) -> Result<String> {
+fn invoke(spec: &CliSpec, prompt: &str, timeout: Duration) -> Result<String> {
     anyhow::ensure!(
         prompt.len() <= PROMPT_MAX_BYTES,
         "prompt is {} bytes, over the {PROMPT_MAX_BYTES}-byte call ceiling",
@@ -257,7 +268,7 @@ fn invoke(spec: &CliSpec, prompt: &str) -> Result<String> {
         .spawn()
         .with_context(|| format!("spawn {}", spec.program))?;
 
-    let result = wait_with_timeout(&mut child, CALL_TIMEOUT)?;
+    let result = wait_with_timeout(&mut child, timeout)?;
 
     let answer = match (&out_file, spec.output) {
         (Some(path), OutputMode::File) => {
@@ -457,7 +468,7 @@ mod tests {
     #[test]
     fn an_oversized_prompt_is_refused_before_a_process_is_spawned() {
         let spec = &SPECS[0];
-        let error = invoke(spec, &"x".repeat(PROMPT_MAX_BYTES + 1)).unwrap_err();
+        let error = invoke(spec, &"x".repeat(PROMPT_MAX_BYTES + 1), CALL_TIMEOUT).unwrap_err();
         assert!(error.to_string().contains("call ceiling"));
     }
 

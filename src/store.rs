@@ -94,6 +94,13 @@ impl Store {
                     -- a correction always sorts after what it corrects.
                     forgotten    INTEGER NOT NULL DEFAULT 0,
                     corrected_by TEXT,
+                    -- How often an agent pulled this in full after seeing a
+                    -- pointer to it. The only evidence we have that a memory
+                    -- was worth keeping, as opposed to merely present.
+                    read_count   INTEGER NOT NULL DEFAULT 0,
+                    -- Lowered when a human says an entry is stale or wrong.
+                    -- Nothing is destroyed; it just stops crowding the primer.
+                    confidence   INTEGER NOT NULL DEFAULT 0,
                     consolidated INTEGER NOT NULL DEFAULT 0
                 );
 
@@ -162,6 +169,28 @@ impl Store {
                     invocation TEXT NOT NULL
                 );
 
+                -- How many sessions a project has consolidated since its
+                -- durable knowledge pages were last synthesized. The trigger
+                -- for semantic memory, kept as a watermark so nothing needs a
+                -- scheduler.
+                CREATE TABLE IF NOT EXISTS knowledge_state (
+                    project        TEXT PRIMARY KEY,
+                    last_synth_at  TEXT,
+                    sessions_since INTEGER NOT NULL DEFAULT 0
+                );
+
+                -- The concrete things a session was about: files, services,
+                -- tables, commands. A second retrieval stream beside FTS5,
+                -- matched lexically - two mentions are the same entity when
+                -- they are the same string, and nothing cleverer.
+                CREATE TABLE IF NOT EXISTS entities (
+                    name    TEXT NOT NULL,
+                    session TEXT NOT NULL,
+                    project TEXT NOT NULL,
+                    PRIMARY KEY (name, session)
+                );
+                CREATE INDEX IF NOT EXISTS entities_by_project ON entities(project, name);
+
                 -- Which pointers a session has already been shown, so nothing
                 -- is injected twice and the byte budget can be enforced.
                 CREATE TABLE IF NOT EXISTS injected (
@@ -216,6 +245,8 @@ impl Store {
                 ("events", "invocation", "TEXT"),
                 ("events", "forgotten", "INTEGER NOT NULL DEFAULT 0"),
                 ("events", "corrected_by", "TEXT"),
+                ("events", "read_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("events", "confidence", "INTEGER NOT NULL DEFAULT 0"),
                 ("summarizer_health", "last_failed_at", "TEXT"),
             ]
         {
@@ -340,14 +371,18 @@ impl Store {
                  FROM events_fts
                  JOIN events e ON e.rowid = events_fts.rowid
                  WHERE events_fts MATCH ?1 AND e.project = ?2 AND e.forgotten = 0
-                       AND e.kind != 'tombstone' 
-                 ORDER BY rank
+                       AND e.kind != 'tombstone'
+                 -- Relevance decides the order, but an entry a human called
+                 -- stale should not sit at the top of it. Flagging has to
+                 -- change what the user SEES, or it is a counter nobody can
+                 -- observe.
+                 ORDER BY CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END, rank
                  LIMIT ?3",
             )
             .context("prepare search")?;
 
-        let rows = stmt
-            .query_map(params![query, project, limit as i64], |row| {
+        let mut read = |query: &str| -> rusqlite::Result<Vec<Hit>> {
+            stmt.query_map(params![query, project, limit as i64], |row| {
                 Ok(Hit {
                     id: row.get(0)?,
                     ts: row.get(1)?,
@@ -356,10 +391,22 @@ impl Store {
                     title: row.get(4)?,
                     snippet: row.get(5)?,
                 })
-            })
-            .context("run search")?;
+            })?
+            .collect()
+        };
 
-        rows.collect::<rusqlite::Result<Vec<_>>>().context("read search results")
+        // FTS5 has its own query grammar, and the things people naturally
+        // search for break it: `src/billing.rs` is a syntax error near `/`,
+        // as is anything with an unbalanced quote. Falling back to the same
+        // text as a quoted phrase turns a failed search into a literal one,
+        // which is what someone typing a path meant anyway.
+        match read(query) {
+            Ok(hits) => Ok(hits),
+            Err(_) => {
+                let phrase = format!("\"{}\"", query.replace('"', " "));
+                read(&phrase).context("read search results")
+            }
+        }
     }
 
     /// Fetch full events by id, in the order requested.
@@ -517,6 +564,23 @@ impl Store {
     ///
     /// # Errors
     /// Returns an error when the query fails.
+    /// Which CLI a session belongs to, from what it has already captured.
+    ///
+    /// The MCP server is spawned by a host CLI but is told nothing about
+    /// which one; its own session's events are the record of that.
+    pub fn session_cli(&self, session: &str) -> Result<Option<String>> {
+        let cli = self.conn.query_row(
+            "SELECT cli FROM events WHERE session = ?1 ORDER BY id DESC LIMIT 1",
+            [session],
+            |row| row.get::<_, String>(0),
+        );
+        match cli {
+            Ok(cli) => Ok(Some(cli)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     pub fn session_invocation(&self, session: &str) -> Result<Option<String>> {
         self.conn
             .query_row(
@@ -555,12 +619,23 @@ impl Store {
         ids: impl Iterator<Item = &'a str>,
     ) -> Result<()> {
         for id in ids {
-            self.conn
+            let inserted = self
+                .conn
                 .execute(
                     "INSERT OR IGNORE INTO recalled (session, event_id) VALUES (?1, ?2)",
                     params![session, id],
                 )
                 .context("record recalled id")?;
+            // Count a session's first read only. Re-reading the same entry in
+            // one conversation says nothing extra about its worth.
+            if inserted > 0 {
+                self.conn
+                    .execute(
+                        "UPDATE events SET read_count = read_count + 1 WHERE id = ?1",
+                        params![id],
+                    )
+                    .context("count read")?;
+            }
         }
         Ok(())
     }
@@ -580,6 +655,215 @@ impl Store {
             .optional()
             .context("check recalled")?;
         Ok(found.is_some())
+    }
+
+    /// Note that a project consolidated another session.
+    ///
+    /// # Errors
+    /// Returns an error when the write fails.
+    pub fn note_session_consolidated(&self, project: &str) -> Result<i64> {
+        self.conn
+            .execute(
+                "INSERT INTO knowledge_state (project, sessions_since) VALUES (?1, 1)
+                 ON CONFLICT(project) DO UPDATE SET
+                     sessions_since = knowledge_state.sessions_since + 1",
+                params![project],
+            )
+            .context("note consolidated session")?;
+        self.conn
+            .query_row(
+                "SELECT sessions_since FROM knowledge_state WHERE project = ?1",
+                params![project],
+                |row| row.get(0),
+            )
+            .context("read sessions since")
+    }
+
+    /// Reset the counter after synthesizing knowledge pages.
+    ///
+    /// # Errors
+    /// Returns an error when the write fails.
+    pub fn note_knowledge_synthesized(&self, project: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO knowledge_state (project, last_synth_at, sessions_since)
+                 VALUES (?1, ?2, 0)
+                 ON CONFLICT(project) DO UPDATE SET
+                     last_synth_at = excluded.last_synth_at, sessions_since = 0",
+                params![project, jiff::Timestamp::now().to_string()],
+            )
+            .context("note synthesis")?;
+        Ok(())
+    }
+
+    /// Titles of knowledge already synthesized for one project.
+    ///
+    /// Synthesis runs again every few sessions and will happily rediscover
+    /// what it found last time; without this, one durable fact would accrete
+    /// one entry per run until the primer said little else.
+    pub fn knowledge_titles(&self, project: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT title FROM events WHERE project = ?1 AND kind = 'knowledge' AND forgotten = 0",
+        )?;
+        let rows = stmt.query_map([project], |row| row.get::<_, String>(0))?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// Recent session summaries for a project, newest first.
+    ///
+    /// The raw material for durable knowledge: what each session concluded,
+    /// rather than every event it produced.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn recent_summaries(&self, project: &str, limit: usize) -> Result<Vec<Event>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id FROM events
+                 WHERE project = ?1 AND kind = 'session_summary' AND forgotten = 0
+                 ORDER BY id DESC LIMIT ?2",
+            )
+            .context("prepare recent summaries")?;
+        let ids = stmt
+            .query_map(params![project, limit as i64], |row| row.get::<_, String>(0))
+            .context("run recent summaries")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("read summary ids")?;
+        self.get(&ids)
+    }
+
+    /// Record what a session was about.
+    ///
+    /// # Errors
+    /// Returns an error when the write fails.
+    pub fn record_entities(&self, session: &str, project: &str, names: &[String]) -> Result<()> {
+        for name in names {
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO entities (name, session, project) VALUES (?1, ?2, ?3)",
+                    params![name, session, project],
+                )
+                .context("record entity")?;
+        }
+        Ok(())
+    }
+
+    /// Every entity in a project, with how many sessions touched it.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn entities(&self, project: &str) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT name, COUNT(*) FROM entities
+                 WHERE project = ?1 GROUP BY name ORDER BY 2 DESC, 1",
+            )
+            .context("prepare entities")?;
+        let rows = stmt
+            .query_map(params![project], |row| Ok((row.get(0)?, row.get(1)?)))
+            .context("run entities")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("read entities")
+    }
+
+    /// Sessions that touched a named entity.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn sessions_for_entity(&self, project: &str, name: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session FROM entities WHERE project = ?1 AND name = ?2 ORDER BY session",
+            )
+            .context("prepare entity sessions")?;
+        let rows = stmt
+            .query_map(params![project, name], |row| row.get(0))
+            .context("run entity sessions")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("read entity sessions")
+    }
+
+    /// Entries whose session touched a named entity.
+    ///
+    /// The second retrieval stream: a query that names a file or a service can
+    /// find the work about it even when no title happens to contain the word.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn search_by_entity(&self, project: &str, name: &str, limit: usize) -> Result<Vec<Hit>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT e.id, e.ts, e.cli, e.kind, e.title
+                 FROM events e
+                 JOIN entities n ON n.session = e.session AND n.project = e.project
+                 WHERE e.project = ?1 AND n.name = ?2 AND e.forgotten = 0
+                       AND e.kind != 'tombstone'
+                 ORDER BY CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END, e.id DESC
+                 LIMIT ?3",
+            )
+            .context("prepare entity search")?;
+        let rows = stmt
+            .query_map(params![project, name, limit as i64], |row| {
+                Ok(Hit {
+                    id: row.get(0)?,
+                    ts: row.get(1)?,
+                    cli: row.get(2)?,
+                    kind: row.get(3)?,
+                    title: row.get(4)?,
+                    snippet: String::new(),
+                })
+            })
+            .context("run entity search")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("read entity search")
+    }
+
+    /// Lower an entry's standing after a human called it stale or wrong.
+    ///
+    /// Deliberately not a learning system: a counter and a sort key. Nothing
+    /// is destroyed, because a human calling something stale is a judgement
+    /// about usefulness, not a claim that it never happened.
+    ///
+    /// # Errors
+    /// Returns an error when the write fails.
+    pub fn lower_confidence(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE events SET confidence = confidence - 1 WHERE id = ?1",
+                params![id],
+            )
+            .context("lower confidence")?;
+        Ok(())
+    }
+
+    /// Entries a human has flagged, for the lint page.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn flagged(&self, project: &str) -> Result<Vec<Pointer>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, ts, kind, title, topic, hook FROM events
+                 WHERE project = ?1 AND confidence < 0 AND forgotten = 0
+                 ORDER BY confidence, id DESC LIMIT 100",
+            )
+            .context("prepare flagged")?;
+        let rows = stmt
+            .query_map(params![project], |row| {
+                Ok(Pointer {
+                    id: row.get(0)?,
+                    ts: row.get(1)?,
+                    kind: row.get(2)?,
+                    title: row.get(3)?,
+                    topic: row.get(4)?,
+                    has_files: false,
+                    hook: row.get(5)?,
+                })
+            })
+            .context("run flagged")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("read flagged")
     }
 
     /// Does this event exist and is it still remembered?
@@ -936,13 +1220,21 @@ impl Store {
     /// left.
     fn rank(prefix: &str) -> String {
         format!(
+            // Knowledge outranks a session summary because it is what
+            // survived several of them.
             "CASE {prefix}kind
-                 WHEN 'session_summary' THEN 0
-                 WHEN 'note' THEN 1
-                 WHEN 'page_update' THEN 2
+                 WHEN 'knowledge' THEN 0
+                 WHEN 'session_summary' THEN 1
+                 WHEN 'note' THEN 2
+                 WHEN 'page_update' THEN 3
                  ELSE 4
              END,
              CASE WHEN {prefix}invocation = 'headless' THEN 1 ELSE 0 END,
+             -- Evidence beats heuristics: something an agent went back and
+             -- read is worth more than something we merely guessed at, and a
+             -- human calling an entry stale outranks both.
+             -{prefix}confidence,
+             CASE WHEN {prefix}read_count > 0 THEN 0 ELSE 1 END,
              CASE {prefix}topic
                  WHEN 'decision' THEN 0
                  WHEN 'discovery' THEN 1
@@ -1289,6 +1581,30 @@ mod tests {
         let hits = store.search(&project.to_string(), "auth", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].title.contains("auth"));
+    }
+
+    #[test]
+    fn a_query_that_breaks_fts_syntax_still_searches() {
+        // The things people actually type: a path, a snippet with a stray
+        // quote. FTS5 rejects both outright, and a search that errors is
+        // indistinguishable from memory that is missing.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        store
+            .index(&event("Edit: src/billing.rs", "totals at period end", project))
+            .unwrap();
+
+        for query in ["src/billing.rs", "period \"end", "a - b"] {
+            let hits = store
+                .search(&project.to_string(), query, 10)
+                .unwrap_or_else(|error| panic!("query {query:?} errored: {error}"));
+            let _ = hits;
+        }
+        assert_eq!(
+            store.search(&project.to_string(), "src/billing.rs", 10).unwrap().len(),
+            1,
+            "a path query should find the work on that path"
+        );
     }
 
     #[test]

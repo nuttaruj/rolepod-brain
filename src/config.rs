@@ -24,6 +24,20 @@ pub struct Config {
     pub summarizer: SummarizerConfig,
     pub injection: InjectionConfig,
     pub sanitize: SanitizeConfig,
+    pub search: SearchConfig,
+}
+
+/// What happens after the index has answered.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchConfig {
+    /// Let a cheap model reorder search results by what the query was asking.
+    ///
+    /// Off by default, and the default is a claim about cost, not quality:
+    /// every search would spend a model call in the middle of someone's
+    /// session, and text relevance is already right most of the time. Turn it
+    /// on if your searches return the right entry in the wrong place.
+    pub rerank: bool,
 }
 
 /// When consolidation catches up on work the session-end trigger missed.

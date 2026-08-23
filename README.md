@@ -143,7 +143,10 @@ never injected.
   wiki/                          # git repository - the durable memory
     <workspace>/<project>/
       events/YYYY-MM.jsonl       # append-only log - the source of truth
-      pages/sessions/*.md        # consolidated pages
+      pages/sessions/*.md        # one page per consolidated session
+      knowledge/gotchas/*.md     # what stayed true across many sessions
+      entities/*.md              # the things sessions kept being about
+      <project>.md, <topic>.md   # hub notes linking the rest together
   config.toml                    # optional; defaults are deliberately light
 ```
 
@@ -169,10 +172,31 @@ session_budget = 8192  # bytes of automatic injection per session, all layers
 timer = false          # true installs a launchd timer; off by default, because
                        # the default backstop costs you no background agent
 
+[search]
+rerank = false         # true spends one cheap-tier call reordering search
+                       # results by what the query was asking
+
 [sanitize]
 extra_patterns = []    # additional regexes to redact
 allowlist = []         # substrings that survive redaction
 ```
+
+### `search.rerank`
+
+FTS5 ranks by term statistics, which is a good proxy for relevance and a poor
+one for intent. Ask *why did we stop using the queue* and every entry that
+mentions a queue scores; the one that explains the decision can sit seventh.
+
+With `rerank = true`, `brain_search` pulls a wider pool, shows the model the
+titles, and puts the ones it picks first. It is bounded on every axis: one
+call, titles only, six seconds of patience, and the ids it names are reordered
+rather than filtered — an opinion about three hits never shrinks a result of
+thirty. A model that is slow, unreachable or unusable leaves the order exactly
+as the index ranked it, so the worst case is the search you already had.
+
+Off by default because of what it costs, not what it returns: every search
+would spend a model call in the middle of a session. Turn it on if your
+searches keep returning the right entry in the wrong place.
 
 ## Codex installs as a plugin
 
@@ -283,6 +307,36 @@ quietly proceeds without it.
 Claude Code and Codex provide transcripts. OpenCode, Antigravity and Cursor do
 not, and their summaries are written from events alone.
 
+## What outlives a session
+
+A session page answers *what happened on Tuesday*. Most of what you actually
+want back is narrower and longer-lived: that vitest has to run file-by-file in
+this repo, that the retry wrapper was a deliberate choice and not an accident,
+that a migration here needs two steps in a particular order.
+
+Every fifth consolidated session, brain spends one extra cheap-tier call over
+the recent session summaries and asks what has become durably true. What comes
+back is written as pages under `knowledge/` — `gotchas/`, `decisions/`,
+`procedures/` — and recorded in memory proper, so it turns up in `brain_search`
+and in the primer alongside everything else, tagged `KNW`.
+
+Three rules keep these honest:
+
+- **Provenance.** Every page names the session summaries it was drawn from. A
+  durable claim you cannot trace is indistinguishable from an invented one.
+- **It has to recur.** An entry has to cite at least two session summaries or
+  it is discarded — a claim one session supports is a session summary wearing
+  a promotion, and knowledge outranks summaries in the primer. The prompt asks
+  for this too, but the filter is what enforces it. At most five entries are
+  kept per round, so one talkative synthesis cannot crowd out the primer.
+- **No duplicates.** Later rounds rediscover what they found before. Something
+  already known is skipped rather than appended again.
+
+Redaction and the anti-invention rules apply here exactly as they do to session
+summaries. Without a reachable CLI, synthesis simply does not run — deciding
+what recurs is a judgement, and a rule-based stand-in would produce confident
+nonsense.
+
 ## `ROLEPOD_BRAIN_WORKER` — a contract for other tools
 
 When brain consolidates, it runs your CLI headlessly. Every process it spawns
@@ -367,15 +421,15 @@ place, and new pages appear as consolidation writes them.
 
 Three things worth knowing before you do:
 
-**Session pages and `index.md` are regenerated.** Consolidation rewrites them,
+**Generated pages are regenerated.** Consolidation rewrites them,
 so an edit you make there can be overwritten without warning. Read them freely;
 just do not treat them as a place to write.
 
-**Write alongside instead.** Anything you add is safe as long as it is not a
-session page: a `notes/` folder inside a project's directory is never touched —
-consolidation only ever writes `pages/sessions/*.md` and `index.md`. For notes
-you want the *agent* to see later, use `brain_note`, which puts them in memory
-proper rather than beside it.
+**Write alongside instead.** Consolidation writes `pages/`, `knowledge/`,
+`entities/`, the hub notes at the top of a project directory, and `index.md`.
+Anything outside those is left alone — a `notes/` folder inside a project's
+directory is never touched. For notes you want the *agent* to see later, use
+`brain_note`, which puts them in memory proper rather than beside it.
 
 Obsidian writes its own configuration into any folder it opens; the wiki's
 `.gitignore` already keeps that out of the history.
@@ -482,7 +536,7 @@ sanitizer, the redaction pass over model output, `<private>`, and declining to
 file an event whose project cannot be determined — is defence in depth for the
 day the machine itself is the breach.
 
-## Development## Development
+## Development
 
 ```sh
 cargo test              # unit and end-to-end

@@ -1,7 +1,6 @@
 //! Automatic context injection — pointers only, never content.
 //!
-//! The invariant (`brief/03-injection.md`): full-content auto-injection is 0,
-//! at every layer, always. What makes a memory system heavy is never the
+//! The invariant: full-content auto-injection is 0, at every layer, always. What makes a memory system heavy is never the
 //! memory — it is dumping content nobody asked for into every session. So we
 //! push titles and ids, and the agent pulls bodies through MCP when the task
 //! actually needs them.
@@ -56,8 +55,8 @@ pub fn primer(store: &Store, project: &str, config: &InjectionConfig) -> Result<
     let header = "# Project memory\n\nPrior sessions in this project, most useful first. \
                   These are pointers, not content — call `brain_get` with an id, or \
                   `brain_search`, to read any of them. DEC decision, FND finding, \
-                  FIX bugfix, NEW feature, CFG config, TST test, SUM session summary, \
-                  NTE note; lowercase `raw` has not been consolidated yet.\n\n";
+                  FIX bugfix, NEW feature, CFG config, TST test, KNW durable knowledge, \
+                  SUM session summary, NTE note; lowercase `raw` has not been consolidated yet.\n\n";
 
     // The primer is the higher-value spend, but it is still spend: it can
     // never exceed what the whole session is allowed.
@@ -189,6 +188,7 @@ fn tag(pointer: &Pointer) -> &'static str {
         };
     }
     match pointer.kind.as_str() {
+        "knowledge" => "KNW",
         "session_summary" => "SUM",
         "note" => "NTE",
         "page_update" => "---",
@@ -452,6 +452,9 @@ mod tests {
         }
         assert_eq!(tag(&pointer("observation", None, "t", true)), "raw");
         assert_eq!(tag(&pointer("session_summary", None, "t", false)), "SUM");
+        // Knowledge is untyped by the topic taxonomy - it is a different axis
+        // - so it must be tagged by kind rather than falling through to `raw`.
+        assert_eq!(tag(&pointer("knowledge", None, "t", false)), "KNW");
     }
 
     #[test]

@@ -18,6 +18,7 @@ mod inject;
 mod invocation;
 mod mcp;
 mod portable;
+mod rerank;
 mod revise;
 mod sanitize;
 mod setup;
@@ -294,7 +295,21 @@ fn reindex() -> Result<()> {
         }
     }
 
+    // Hub notes are derived from the pages exactly as the index is derived
+    // from the log, and they were only ever refreshed when a project happened
+    // to consolidate something. A project with no pending work would keep
+    // whatever hub state it had - or none at all, if its last consolidation
+    // predated hubs existing. Rebuilding derived state is what this command is
+    // for, so it rebuilds these too.
+    let mut hubs = 0usize;
+    for (scope, dir) in consolidate::known_projects(&paths).unwrap_or_default() {
+        if consolidate::write_hubs(&dir, &scope).is_ok() {
+            hubs += 1;
+        }
+    }
+
     println!("Reindexed {indexed} event(s) from {projects} project(s).");
+    println!("Rebuilt hub notes for {hubs} project(s).");
     if skipped > 0 {
         println!("Skipped {skipped} unreadable line(s); the rest of the log was unaffected.");
     }
