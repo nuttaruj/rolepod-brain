@@ -831,6 +831,63 @@ fn no_memory_can_be_rewritten_without_being_seen_first() {
 }
 
 #[test]
+fn one_loud_session_cannot_own_every_search_result() {
+    // Measured on a real machine: every query returned 10/10 hits from the
+    // session that happened to be running, which held 97% of the project's
+    // events. Memory from thirteen earlier sessions was unreachable through
+    // search - and the hits that did come back were things the agent could
+    // already see in its own context, which is worth nothing to pull.
+    let fixture = Fixture::new("diversify");
+
+    // One session that talked about the term constantly...
+    for index in 0..12 {
+        let payload = serde_json::json!({
+            "session_id": "0199a1f2-3c4d-7e8f-9012-000000000001",
+            "cwd": fixture.project,
+            "prompt": format!("scheduler work item {index}")
+        })
+        .to_string();
+        fixture.hook("claude-code", "UserPromptSubmit", &payload);
+    }
+    // ...and two earlier ones that mentioned it once each.
+    for session in 2..4 {
+        let payload = serde_json::json!({
+            "session_id": format!("0199a1f2-3c4d-7e8f-9012-00000000000{session}"),
+            "cwd": fixture.project,
+            "prompt": "the scheduler decision nobody remembers"
+        })
+        .to_string();
+        fixture.hook("claude-code", "UserPromptSubmit", &payload);
+    }
+
+    let out = fixture.brain(&["search", "scheduler"]);
+    let ids: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|word| word.len() == 26 && word.starts_with("01"))
+        .map(str::to_owned)
+        .collect();
+    assert!(ids.len() >= 4, "expected several hits: {ids:?}");
+
+    let sessions: Vec<String> = ids
+        .iter()
+        .map(|id| {
+            let out = Command::new("sqlite3")
+                .arg(fixture.home.join("brain.db"))
+                .arg(format!("SELECT session FROM events WHERE id='{id}';"))
+                .output()
+                .expect("query session");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        })
+        .collect();
+    let distinct: std::collections::HashSet<&String> = sessions.iter().collect();
+    assert!(
+        distinct.len() >= 3,
+        "one session owned the results - the quiet sessions are unreachable: {sessions:?}"
+    );
+}
+
+#[test]
 fn mcp_recall_returns_what_was_captured() {
     let fixture = Fixture::new("mcp");
     fixture.hook("claude-code", "PostToolUse", &claude_payload(&fixture.project));

@@ -19,6 +19,11 @@ use crate::event::{Event, EventKind, Source};
 /// How long a writer waits for a competing writer before giving up.
 const BUSY_TIMEOUT_MS: u32 = 5_000;
 
+/// How much wider than the caller's limit a search reads before spreading
+/// results across sessions. Four deep enough that a busy session cannot fill
+/// the pool by itself, shallow enough that the query stays one index scan.
+const SEARCH_POOL_FACTOR: usize = 4;
+
 /// One search hit.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Hit {
@@ -29,6 +34,11 @@ pub struct Hit {
     pub title: String,
     /// FTS5-generated excerpt with matches marked.
     pub snippet: String,
+    /// Which session produced it. Carried for spreading results across
+    /// sessions, not for the caller - an agent has no use for a session
+    /// uuid, so it never leaves this process.
+    #[serde(skip)]
+    pub session: String,
 }
 
 /// The derived index.
@@ -366,23 +376,43 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT e.id, e.ts, e.cli, e.kind, e.title,
-                        snippet(events_fts, 1, '[', ']', ' … ', 24)
-                 FROM events_fts
-                 JOIN events e ON e.rowid = events_fts.rowid
-                 WHERE events_fts MATCH ?1 AND e.project = ?2 AND e.forgotten = 0
-                       AND e.kind != 'tombstone'
-                 -- Relevance decides the order, but an entry a human called
-                 -- stale should not sit at the top of it. Flagging has to
-                 -- change what the user SEES, or it is a counter nobody can
-                 -- observe.
-                 ORDER BY CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END, rank
-                 LIMIT ?3",
+                // Two stages, because relevance alone lets one session own
+                // the page. The window takes each session's best few first,
+                // so the pool handed to `spread_across_sessions` contains
+                // the quiet sessions at all - reading a flat top-N never
+                // reaches them when one session holds most of the project.
+                //
+                // The demotion is inside the window too: an entry a human
+                // called stale must not be the hit that represents its
+                // session. Flagging has to change what the user SEES, or it
+                // is a counter nobody can observe.
+                "WITH matched AS (
+                     SELECT e.id, e.ts, e.cli, e.kind, e.title, e.session,
+                            snippet(events_fts, 1, '[', ']', ' … ', 24) AS snip,
+                            CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END AS demoted,
+                            rank AS relevance
+                     FROM events_fts
+                     JOIN events e ON e.rowid = events_fts.rowid
+                     WHERE events_fts MATCH ?1 AND e.project = ?2 AND e.forgotten = 0
+                           AND e.kind != 'tombstone'
+                 )
+                 SELECT id, ts, cli, kind, title, snip, session FROM (
+                     SELECT *, ROW_NUMBER() OVER (
+                         PARTITION BY session ORDER BY demoted, relevance
+                     ) AS per_session FROM matched
+                 )
+                 WHERE per_session <= ?3
+                 ORDER BY demoted, relevance
+                 LIMIT ?4",
             )
             .context("prepare search")?;
 
+        // Read a pool wider than asked for, capped per session: spreading
+        // results is only possible if the quiet sessions' hits were fetched
+        // at all, and a flat pool never reaches them.
+        let pool = limit.saturating_mul(SEARCH_POOL_FACTOR).max(limit);
         let mut read = |query: &str| -> rusqlite::Result<Vec<Hit>> {
-            stmt.query_map(params![query, project, limit as i64], |row| {
+            stmt.query_map(params![query, project, limit as i64, pool as i64], |row| {
                 Ok(Hit {
                     id: row.get(0)?,
                     ts: row.get(1)?,
@@ -390,6 +420,7 @@ impl Store {
                     kind: row.get(3)?,
                     title: row.get(4)?,
                     snippet: row.get(5)?,
+                    session: row.get(6)?,
                 })
             })?
             .collect()
@@ -400,13 +431,14 @@ impl Store {
         // as is anything with an unbalanced quote. Falling back to the same
         // text as a quoted phrase turns a failed search into a literal one,
         // which is what someone typing a path meant anyway.
-        match read(query) {
-            Ok(hits) => Ok(hits),
+        let hits = match read(query) {
+            Ok(hits) => hits,
             Err(_) => {
                 let phrase = format!("\"{}\"", query.replace('"', " "));
-                read(&phrase).context("read search results")
+                read(&phrase).context("read search results")?
             }
-        }
+        };
+        Ok(spread_across_sessions(hits, limit))
     }
 
     /// Fetch full events by id, in the order requested.
@@ -463,7 +495,7 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, ts, cli, kind, title
+                "SELECT id, ts, cli, kind, title, session
                  FROM events WHERE project = ?1 AND forgotten = 0 AND kind != 'tombstone'
                  ORDER BY id DESC LIMIT ?2",
             )
@@ -477,6 +509,7 @@ impl Store {
                     kind: row.get(3)?,
                     title: row.get(4)?,
                     snippet: String::new(),
+                    session: row.get(5)?,
                 })
             })
             .context("run recent")?;
@@ -798,7 +831,7 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT e.id, e.ts, e.cli, e.kind, e.title
+                "SELECT e.id, e.ts, e.cli, e.kind, e.title, e.session
                  FROM events e
                  JOIN entities n ON n.session = e.session AND n.project = e.project
                  WHERE e.project = ?1 AND n.name = ?2 AND e.forgotten = 0
@@ -816,6 +849,7 @@ impl Store {
                     kind: row.get(3)?,
                     title: row.get(4)?,
                     snippet: String::new(),
+                    session: row.get(5)?,
                 })
             })
             .context("run entity search")?;
@@ -1343,7 +1377,7 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, ts, cli, kind, title FROM events
+                "SELECT id, ts, cli, kind, title, session FROM events
                  WHERE project = ?1 AND ts >= ?2 AND forgotten = 0 AND kind != 'tombstone' 
                  ORDER BY id
                  LIMIT ?3",
@@ -1358,6 +1392,7 @@ impl Store {
                     kind: row.get(3)?,
                     title: row.get(4)?,
                     snippet: String::new(),
+                    session: row.get(5)?,
                 })
             })
             .context("run timeline")?;
@@ -1590,6 +1625,47 @@ fn parse_uuid(raw: &str) -> uuid::Uuid {
     uuid::Uuid::try_parse(raw).unwrap_or(uuid::Uuid::nil())
 }
 
+/// Interleave hits so no single session can own the whole result.
+///
+/// Relevance alone is not enough when one session is much louder than the
+/// rest: measured on a real machine, every query returned ten of ten hits
+/// from the session that happened to be running - which held 97% of the
+/// project's events - and memory from thirteen earlier sessions was
+/// unreachable through search. Worse, those hits were things the agent could
+/// already see in its own context, so pulling them bought nothing.
+///
+/// A permutation, never a filter: sessions are visited in the order their
+/// best hit appeared, one hit each per round, so the single most relevant
+/// result stays first and nothing is dropped. A search that matched only one
+/// session returns exactly what it always did.
+fn spread_across_sessions(hits: Vec<Hit>, limit: usize) -> Vec<Hit> {
+    let mut sessions: Vec<(String, std::collections::VecDeque<Hit>)> = Vec::new();
+    for hit in hits {
+        match sessions.iter_mut().find(|(session, _)| *session == hit.session) {
+            Some((_, queue)) => queue.push_back(hit),
+            None => sessions.push((hit.session.clone(), [hit].into())),
+        }
+    }
+
+    let mut out = Vec::with_capacity(limit);
+    while out.len() < limit {
+        let before = out.len();
+        for (_, queue) in &mut sessions {
+            if out.len() >= limit {
+                break;
+            }
+            if let Some(hit) = queue.pop_front() {
+                out.push(hit);
+            }
+        }
+        // Every session is drained; nothing left to interleave.
+        if out.len() == before {
+            break;
+        }
+    }
+    out
+}
+
 fn parse_kind(raw: &str) -> EventKind {
     match raw {
         "session_summary" => EventKind::SessionSummary,
@@ -1604,6 +1680,50 @@ fn parse_kind(raw: &str) -> EventKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hit(id: &str, session: &str) -> Hit {
+        Hit {
+            id: id.to_string(),
+            ts: "2026-08-24T00:00:00Z".to_string(),
+            cli: "claude-code".to_string(),
+            kind: "observation".to_string(),
+            title: id.to_string(),
+            snippet: String::new(),
+            session: session.to_string(),
+        }
+    }
+
+    #[test]
+    fn spreading_results_is_a_permutation_of_the_most_relevant_ones() {
+        // A loud session (twelve hits) and two quiet ones (one each), in
+        // relevance order as FTS returned them.
+        let mut hits: Vec<Hit> = (0..12).map(|i| hit(&format!("loud{i}"), "loud")).collect();
+        hits.push(hit("quiet-a", "a"));
+        hits.push(hit("quiet-b", "b"));
+
+        let out = spread_across_sessions(hits, 6);
+        assert_eq!(out.len(), 6, "the caller asked for six and must get six");
+        assert_eq!(out[0].id, "loud0", "the single most relevant hit still leads");
+
+        let sessions: Vec<&str> = out.iter().map(|hit| hit.session.as_str()).collect();
+        assert!(sessions.contains(&"a") && sessions.contains(&"b"), "quiet sessions unreachable: {sessions:?}");
+        let loud = sessions.iter().filter(|session| **session == "loud").count();
+        assert!(loud < 6, "one session still owns the whole page: {sessions:?}");
+    }
+
+    #[test]
+    fn a_single_session_search_is_left_exactly_as_it_was() {
+        // Nothing to interleave means nothing may change - spreading is a
+        // permutation, never a filter, so a project with one session sees
+        // precisely the ranking FTS produced.
+        let hits: Vec<Hit> = (0..5).map(|i| hit(&format!("only{i}"), "one")).collect();
+        let out = spread_across_sessions(hits, 10);
+        assert_eq!(
+            out.iter().map(|hit| hit.id.clone()).collect::<Vec<_>>(),
+            vec!["only0", "only1", "only2", "only3", "only4"],
+            "a single-session result was reordered or truncated"
+        );
+    }
 
     #[test]
     fn every_event_kind_survives_the_round_trip_through_storage() {

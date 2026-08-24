@@ -112,6 +112,7 @@ mod tests {
             kind: "session_summary".to_string(),
             title: title.to_string(),
             snippet: String::new(),
+            session: "test-session".to_string(),
         }
     }
 
