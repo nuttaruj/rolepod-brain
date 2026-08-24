@@ -183,12 +183,14 @@ fn tool_definitions() -> Value {
             "description": "Withdraw a memory that is wrong or should not have been \
                             kept. Use when the user says a remembered thing is \
                             incorrect or asks you to forget it. Nothing is deleted \
-                            from the log; recall stops returning it. Only ids you \
-                            have already seen this session can be forgotten.",
+                            from the log; recall stops returning it. Search for it \
+                            or fetch it first: only ids this session has actually \
+                            been shown can be withdrawn, and a pointer injected at \
+                            session start does not count.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string", "description": "Event id from a search or an injected pointer."},
+                    "id": {"type": "string", "description": "Event id from a brain_search or brain_get in this session."},
                 },
                 "required": ["id"],
             },
@@ -220,7 +222,7 @@ fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string", "description": "Event id from a search or an injected pointer."},
+                    "id": {"type": "string", "description": "Event id from a brain_search or brain_get in this session."},
                     "reason": {"type": "string", "description": "Optional: why, in a few words."},
                 },
                 "required": ["id"],
@@ -277,9 +279,8 @@ fn call_tool(paths: &Paths, project: &str, session: &str, params: &Value) -> Res
 
             if config.search.rerank {
                 let ladder = crate::summarizer::Ladder::new(&store, &config.summarizer.mode);
-                // Borrow the cheap tier of whichever CLI this session is,
-                // which its own captured events already record.
-                let cli = store.session_cli(session)?.unwrap_or_default();
+                // Borrow the cheap tier of whichever CLI works here.
+                let cli = store.project_cli(project)?.unwrap_or_default();
                 hits = crate::rerank::rerank(&ladder, &cli, query, hits);
             }
             hits.truncate(limit);
@@ -295,7 +296,12 @@ fn call_tool(paths: &Paths, project: &str, session: &str, params: &Value) -> Res
                 .iter()
                 .filter_map(|value| value.as_str().map(str::to_string))
                 .collect();
-            let events = store.get(&ids)?;
+            // An id an agent is still holding - from an older primer, or its
+            // own notes - must not resurrect what was withdrawn. `get` cannot
+            // filter for us: consolidation reads through it and would leave
+            // forgotten events pending forever.
+            let mut events = store.get(&ids)?;
+            events.retain(|event| store.event_exists(&event.id).unwrap_or(false));
             store.record_recalled(session, events.iter().map(|event| event.id.as_str()))?;
             json!({ "events": events, "count": events.len() })
         }
@@ -328,6 +334,15 @@ fn call_tool(paths: &Paths, project: &str, session: &str, params: &Value) -> Res
                 .get("text")
                 .and_then(Value::as_str)
                 .context("brain_correct requires `text`")?;
+            // The same floor forget and feedback enforce, and correct needs it
+            // most: it decides what recall returns and what future sessions
+            // are told, so an agent that could rewrite an id it never saw
+            // could overwrite this project's memory from a guess - or from a
+            // poisoned instruction it read somewhere.
+            anyhow::ensure!(
+                store.already_injected(session, id)? || store.was_recalled(session, id)?,
+                "id {id} has not been surfaced in this session; search for it first"
+            );
             let outcome = crate::revise::correct(id, text)?;
             json!({ "corrected": id, "was": outcome.target_title, "recorded_as": outcome.id })
         }

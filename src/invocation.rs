@@ -150,6 +150,14 @@ fn basename(path: &str) -> &str {
     Path::new(path).file_name().and_then(std::ffi::OsStr::to_str).unwrap_or(path)
 }
 
+/// Serializes the tests that set process-wide environment variables.
+///
+/// The test runner uses threads, and an environment variable is shared by
+/// all of them: a test that silences capture silences every test running
+/// beside it. Passing today is a coincidence of scheduling.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,6 +224,7 @@ mod tests {
 
     #[test]
     fn silence_needs_a_real_value() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::remove_var(SILENT_ENV);
         assert!(!silenced());
         std::env::set_var(SILENT_ENV, "");

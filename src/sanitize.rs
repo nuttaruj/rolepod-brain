@@ -222,29 +222,72 @@ const PRIVATE_CLOSE: &str = "</private>";
 ///   the caller, but the marker still holds at the write boundary.
 #[must_use]
 pub fn strip_private(input: &str) -> String {
-    if !input.contains(PRIVATE_OPEN) {
-        return input.to_string();
-    }
     let mut out = String::with_capacity(input.len());
-    let mut rest = input;
+    let mut cursor = 0usize;
 
-    while let Some(start) = rest.find(PRIVATE_OPEN) {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + PRIVATE_OPEN.len()..];
-        match after.find(PRIVATE_CLOSE) {
-            Some(end) => {
-                out.push_str("[PRIVATE]");
-                rest = &after[end + PRIVATE_CLOSE.len()..];
-            }
-            None => {
-                // Unclosed: nothing after this point is safe to keep.
-                out.push_str("[PRIVATE]");
-                return out;
+    while let Some((start, is_close)) = next_tag(input, cursor) {
+        if is_close {
+            // A close with nothing open is ordinary text, not a marker.
+            out.push_str(&input[cursor..start + PRIVATE_CLOSE.len()]);
+            cursor = start + PRIVATE_CLOSE.len();
+            continue;
+        }
+        out.push_str(&input[cursor..start]);
+        out.push_str("[PRIVATE]");
+
+        // Walk to the close that balances this open. Nesting is almost
+        // certainly a mistake, but guessing which close ends the private
+        // section is how the tail of it ends up in the output.
+        let mut depth = 1usize;
+        let mut scan = start + PRIVATE_OPEN.len();
+        loop {
+            match next_tag(input, scan) {
+                Some((at, false)) => {
+                    depth += 1;
+                    scan = at + PRIVATE_OPEN.len();
+                }
+                Some((at, true)) => {
+                    depth -= 1;
+                    scan = at + PRIVATE_CLOSE.len();
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                // Unbalanced: nothing after this point is safe to keep.
+                None => return out,
             }
         }
+        cursor = scan;
     }
-    out.push_str(rest);
+    out.push_str(&input[cursor..]);
     out
+}
+
+/// Find the next `<private>` or `</private>`, whatever its case.
+///
+/// Case-insensitive because the tag is something a person types by hand, and
+/// a marker that silently does nothing when shouted is worse than no marker:
+/// it is trusted and absent.
+fn next_tag(haystack: &str, from: usize) -> Option<(usize, bool)> {
+    let bytes = haystack.as_bytes();
+    let mut index = from;
+    while index < bytes.len() {
+        if bytes[index] == b'<' {
+            let rest = &haystack[index..];
+            if rest.len() >= PRIVATE_CLOSE.len()
+                && rest[..PRIVATE_CLOSE.len()].eq_ignore_ascii_case(PRIVATE_CLOSE)
+            {
+                return Some((index, true));
+            }
+            if rest.len() >= PRIVATE_OPEN.len()
+                && rest[..PRIVATE_OPEN.len()].eq_ignore_ascii_case(PRIVATE_OPEN)
+            {
+                return Some((index, false));
+            }
+        }
+        index += 1;
+    }
+    None
 }
 
 /// Truncate to at most `max` UTF-8 bytes, keeping the head, never splitting a
@@ -321,6 +364,31 @@ pub fn truncate_head_tail(input: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_private_marker_holds_however_it_is_written() {
+        // A marker a person types by hand has to work when they shout it.
+        assert_eq!(strip_private("a <PRIVATE>secret</PRIVATE> b"), "a [PRIVATE] b");
+        assert_eq!(strip_private("a <Private>secret</private> b"), "a [PRIVATE] b");
+
+        // Nesting is a mistake, and guessing which close ends the section is
+        // how the inside of it reaches the output.
+        assert_eq!(
+            strip_private("a <private>one <private>two</private> three</private> b"),
+            "a [PRIVATE] b"
+        );
+
+        // Unbalanced fails closed, in both directions.
+        assert_eq!(strip_private("a <private>secret"), "a [PRIVATE]");
+        assert_eq!(
+            strip_private("a <private>one <private>two</private> tail"),
+            "a [PRIVATE]"
+        );
+
+        // A close with nothing open is ordinary text.
+        assert_eq!(strip_private("a </private> b"), "a </private> b");
+        assert_eq!(strip_private("nothing to hide"), "nothing to hide");
+    }
 
     #[test]
     fn builtin_corpus_compiles() {

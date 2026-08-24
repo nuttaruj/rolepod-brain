@@ -560,18 +560,17 @@ impl Store {
             .context("read transcript path")
     }
 
-    /// How this session was invoked, if we have already worked it out.
+    /// Which CLI most recently worked in this project.
     ///
-    /// # Errors
-    /// Returns an error when the query fails.
-    /// Which CLI a session belongs to, from what it has already captured.
-    ///
-    /// The MCP server is spawned by a host CLI but is told nothing about
-    /// which one; its own session's events are the record of that.
-    pub fn session_cli(&self, session: &str) -> Result<Option<String>> {
+    /// The MCP server is spawned by a host CLI and told nothing about which
+    /// one - and the session id it invents for itself matches no hook's, so
+    /// asking about its own session always answered "nobody". The project's
+    /// most recent capture is the closest true answer available, and it is
+    /// only used to decide which cheap tier to borrow first.
+    pub fn project_cli(&self, project: &str) -> Result<Option<String>> {
         let cli = self.conn.query_row(
-            "SELECT cli FROM events WHERE session = ?1 ORDER BY id DESC LIMIT 1",
-            [session],
+            "SELECT cli FROM events WHERE project = ?1 ORDER BY id DESC LIMIT 1",
+            [project],
             |row| row.get::<_, String>(0),
         );
         match cli {
@@ -581,6 +580,10 @@ impl Store {
         }
     }
 
+    /// How this session was invoked, if we have already worked it out.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
     pub fn session_invocation(&self, session: &str) -> Result<Option<String>> {
         self.conn
             .query_row(
@@ -997,11 +1000,17 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT session, COUNT(*), MAX(id), MAX(cli)
-                 FROM events
-                 WHERE project = ?1 AND consolidated = 0 AND kind = 'observation'
-                 GROUP BY session
-                 ORDER BY MAX(id)",
+                // The CLI of the newest event, not MAX(cli), which is
+                // alphabetical: for a session two CLIs touched, "codex" would
+                // beat "claude-code" for no reason but its spelling, and this
+                // value decides whose cheap tier gets asked to summarize.
+                "SELECT e.session, COUNT(*), MAX(e.id),
+                        (SELECT cli FROM events
+                          WHERE session = e.session ORDER BY id DESC LIMIT 1)
+                 FROM events e
+                 WHERE e.project = ?1 AND e.consolidated = 0 AND e.kind = 'observation'
+                 GROUP BY e.session
+                 ORDER BY MAX(e.id)",
             )
             .context("prepare pending sessions")?;
         let rows = stmt
@@ -1259,8 +1268,12 @@ impl Store {
     /// Returns an error when the query fails.
     pub fn primer_pointers(&self, project: &str, limit: usize) -> Result<Vec<Pointer>> {
         let sql = format!(
+            // The same floor every other read enforces. Injection is recall
+            // too - and the costlier half, because it spends bytes in every
+            // future session whether or not anyone asked. A withdrawn memory
+            // that only disappears from search has not been withdrawn.
             "SELECT id, ts, kind, title, topic, files, hook FROM events
-             WHERE project = ?1
+             WHERE project = ?1 AND forgotten = 0 AND kind != 'tombstone'
              ORDER BY {}, id DESC
              LIMIT ?2",
             Self::rank("")
@@ -1479,9 +1492,13 @@ impl Store {
     /// Returns an error when the tables cannot be cleared.
     pub fn clear(&self) -> Result<()> {
         self.conn
-            // `session_state` and `summarizer_health` survive: both are local
-            // bookkeeping the log cannot reconstruct, and dropping them would
-            // make a reindex re-run every consolidation.
+            // Only what a replay rebuilds is cleared. Everything else in this
+            // database is local bookkeeping the log does not contain -
+            // `session_state` and `summarizer_health`, the injection and
+            // recall counters, the knowledge watermark, and `entities`, which
+            // is written by consolidation from a model's reading and cannot
+            // be recomputed by replaying events. Clearing those would not
+            // rebuild them; it would delete them.
             .execute_batch("DELETE FROM event_files; DELETE FROM events;")
             .context("clear index")?;
         Ok(())
@@ -1549,6 +1566,7 @@ fn parse_kind(raw: &str) -> EventKind {
         "session_summary" => EventKind::SessionSummary,
         "page_update" => EventKind::PageUpdate,
         "note" => EventKind::Note,
+        "knowledge" => EventKind::Knowledge,
         "tombstone" => EventKind::Tombstone,
         _ => EventKind::Observation,
     }
@@ -1557,6 +1575,24 @@ fn parse_kind(raw: &str) -> EventKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_event_kind_survives_the_round_trip_through_storage() {
+        // parse_kind's catch-all silently turned a new kind into an
+        // observation, so brain_get reported knowledge as a raw capture. A
+        // list that has to be extended for the test to compile is what stops
+        // the next kind from doing the same.
+        for kind in [
+            EventKind::Observation,
+            EventKind::SessionSummary,
+            EventKind::PageUpdate,
+            EventKind::Note,
+            EventKind::Knowledge,
+            EventKind::Tombstone,
+        ] {
+            assert_eq!(parse_kind(kind.as_str()), kind, "`{}` did not round-trip", kind.as_str());
+        }
+    }
     use uuid::Uuid;
 
     fn event(title: &str, body: &str, project: Uuid) -> Event {

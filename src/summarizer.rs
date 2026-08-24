@@ -86,7 +86,9 @@ pub const SPECS: &[CliSpec] = &[
         args: &["exec", "-m", "{model}", "--skip-git-repo-check", "-o", "{out}"],
     },
     CliSpec {
-        cli: "gemini",
+        // Must match what hooks write as `source.cli`, not what the binary is
+        // called: this string is looked up against captured events.
+        cli: "gemini-cli",
         program: "gemini",
         model: "flash",
         output: OutputMode::Stdout,
@@ -187,11 +189,25 @@ impl<'a> Ladder<'a> {
         // A pinned mode means exactly one rung: the user asked for that CLI,
         // and silently using another would spend the wrong subscription.
         if self.mode != "auto" {
-            return SPECS.iter().filter(|spec| spec.cli == self.mode).collect();
+            let pinned = Self::normalize_cli(&self.mode);
+            return SPECS.iter().filter(|spec| spec.cli == pinned).collect();
         }
+        let preferred_cli = Self::normalize_cli(preferred_cli);
         let mut order: Vec<&CliSpec> = SPECS.iter().filter(|s| s.cli == preferred_cli).collect();
         order.extend(SPECS.iter().filter(|s| s.cli != preferred_cli));
         order
+    }
+
+    /// Accept the name a person would write for a CLI we know by another.
+    ///
+    /// `mode = "gemini"` is what the tool is called; `gemini-cli` is what its
+    /// hooks write. Refusing the shorter one would turn a reasonable config
+    /// into a summarizer that silently never runs.
+    fn normalize_cli(raw: &str) -> &str {
+        match raw {
+            "gemini" => "gemini-cli",
+            other => other,
+        }
     }
 
     /// Is this CLI installed, and not in a cooldown?
@@ -231,6 +247,14 @@ pub fn installed(program: &str) -> bool {
 
 /// Run one CLI once and return its answer.
 fn invoke(spec: &CliSpec, prompt: &str, timeout: Duration) -> Result<String> {
+    // A prompt that begins with a dash would be read as a flag by whichever
+    // CLI receives it. The usual guard is a `--` separator, but not every
+    // spec here can take one - gemini's prompt is the value of `-p` - so the
+    // invariant is enforced on the prompt instead of worked around in argv.
+    anyhow::ensure!(
+        !prompt.trim_start().starts_with('-'),
+        "a prompt may not begin with a dash; it would be parsed as a flag"
+    );
     anyhow::ensure!(
         prompt.len() <= PROMPT_MAX_BYTES,
         "prompt is {} bytes, over the {PROMPT_MAX_BYTES}-byte call ceiling",
@@ -308,25 +332,44 @@ impl CallResult {
 /// A summarizer that hangs must not hold a consolidation run open forever;
 /// the events stay unconsolidated and the next trigger tries again.
 fn wait_with_timeout(child: &mut std::process::Child, limit: Duration) -> Result<CallResult> {
+    // Drain both pipes on their own threads for the whole wait. Reading them
+    // only after the child exits deadlocks as soon as it writes more than a
+    // pipe buffer holds: it blocks on the write, never exits, and this
+    // reports a timeout that never happened.
+    let drain = |pipe: Option<std::process::ChildStdout>| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            if let Some(mut pipe) = pipe {
+                use std::io::Read;
+                let _ = pipe.read_to_string(&mut text);
+            }
+            text
+        })
+    };
+    let out = drain(child.stdout.take());
+    let err = std::thread::spawn({
+        let pipe = child.stderr.take();
+        move || {
+            let mut text = String::new();
+            if let Some(mut pipe) = pipe {
+                use std::io::Read;
+                let _ = pipe.read_to_string(&mut text);
+            }
+            text
+        }
+    });
+
     let start = std::time::Instant::now();
     loop {
         match child.try_wait().context("poll summarizer")? {
             Some(status) => {
-                let mut stdout = String::new();
-                let mut stderr = String::new();
-                if let Some(mut pipe) = child.stdout.take() {
-                    use std::io::Read;
-                    let _ = pipe.read_to_string(&mut stdout);
-                }
-                if let Some(mut pipe) = child.stderr.take() {
-                    use std::io::Read;
-                    let _ = pipe.read_to_string(&mut stderr);
-                }
                 return Ok(CallResult {
                     success: status.success(),
                     code: status.code(),
-                    stdout,
-                    stderr,
+                    // The child is gone, so both pipes are at EOF and these
+                    // threads are already finishing.
+                    stdout: out.join().unwrap_or_default(),
+                    stderr: err.join().unwrap_or_default(),
                 });
             }
             None => {
@@ -356,6 +399,54 @@ pub const fn failure_threshold() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_child_that_writes_more_than_a_pipe_holds_still_finishes() {
+        // Reading the pipes only after the child exits deadlocks: the child
+        // blocks writing into a full pipe, never exits, and the wait reports
+        // a timeout that never happened. A summary is usually small, but a
+        // CLI printing a banner or a verbose trace is not.
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "head -c 300000 /dev/zero | tr '\\0' 'x'"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        let result = wait_with_timeout(&mut child, Duration::from_secs(10))
+            .expect("a child that writes a lot is not a timeout");
+        assert!(result.success);
+        assert_eq!(result.stdout.len(), 300_000, "output was truncated");
+    }
+
+    /// Every summarizer rung must be named the way hooks name it.
+    ///
+    /// `SPECS.cli` is looked up against `source.cli` on captured events, so a
+    /// spec named after its binary instead of its wire name silently stops
+    /// the ladder from ever preferring the CLI the user is actually in. That
+    /// is invisible in every test that does not compare the two lists.
+    #[test]
+    fn a_prompt_that_would_be_read_as_a_flag_is_refused() {
+        let spec = &SPECS[0];
+        let error = invoke(spec, "--help me", CALL_TIMEOUT).unwrap_err();
+        assert!(error.to_string().contains("begin with a dash"), "{error}");
+    }
+
+    #[test]
+    fn every_spec_is_named_the_way_setup_names_the_same_cli() {
+        let exe = std::path::PathBuf::from("/usr/local/bin/brain");
+        let wired: Vec<String> = crate::setup::targets(&exe)
+            .expect("targets")
+            .iter()
+            .map(|target| target.kind.as_str().to_string())
+            .collect();
+        for spec in SPECS {
+            assert!(
+                wired.iter().any(|name| name == spec.cli),
+                "summarizer knows `{}`, which no host CLI writes: {wired:?}",
+                spec.cli
+            );
+        }
+    }
 
     #[test]
     fn every_spec_substitutes_its_placeholders() {

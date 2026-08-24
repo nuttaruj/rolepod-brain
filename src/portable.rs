@@ -90,25 +90,162 @@ pub fn import(archive: &Path, existing: Existing) -> Result<String> {
                 .with_context(|| format!("move {} aside", wiki.display()))?;
             notes.push(format!("previous wiki moved to {}", aside.display()));
         }
-        // Merging relies on the same property that makes the logs safe to
-        // union-merge in git: ids are globally unique and time-ordered, so two
-        // logs concatenate without contradicting each other.
         (true, Existing::Merge) | (false, _) => {}
     }
 
-    run(
+    // Unpack somewhere else first. `tar -xzf` straight into the data
+    // directory REPLACES same-named files, and the whole point of a named
+    // marker is that the same project on two machines has the same project
+    // id, the same directory, and the same events/YYYY-MM.jsonl - so a
+    // merge that let tar win would silently destroy the local month. The
+    // logs are the source of truth and are not in the wiki's git history,
+    // so there would be nothing to recover from.
+    // What tar refuses is not the same on every platform: bsdtar rejects a
+    // `..` member, GNU tar historically extracts it. An archive is attacker
+    // controlled the moment someone is talked into importing one, so the
+    // check belongs here rather than in whichever tar is installed.
+    refuse_escaping_members(archive)?;
+
+    let staging = paths
+        .data_dir
+        .join(format!("import.staging.{}", jiff::Zoned::now().strftime("%Y%m%d-%H%M%S")));
+    std::fs::create_dir_all(&staging)
+        .with_context(|| format!("create {}", staging.display()))?;
+    let unpacked = run(
         "tar",
         &[
             "-xzf".to_string(),
             archive.display().to_string(),
             "-C".to_string(),
-            paths.data_dir.display().to_string(),
+            staging.display().to_string(),
         ],
     )
-    .context("unpack the archive")?;
-    notes.push(format!("unpacked into {}", paths.data_dir.display()));
+    .context("unpack the archive");
+    let merged = unpacked.and_then(|()| graft(&staging, &paths.data_dir));
+    // Staging is scratch space; leaving it behind would look like a second
+    // brain sitting next to the real one.
+    let _ = std::fs::remove_dir_all(&staging);
+    let counts = merged?;
+
+    notes.push(format!(
+        "merged into {} ({} file(s), {} new event(s))",
+        paths.data_dir.display(),
+        counts.files,
+        counts.events
+    ));
 
     Ok(notes.join("; "))
+}
+
+/// What a graft did, for the caller to report.
+struct Grafted {
+    files: usize,
+    events: usize,
+}
+
+/// Move an unpacked archive into place without losing what is already there.
+///
+/// Pages are regenerated from the log, so the incoming copy simply wins.
+/// Logs are the source of truth and are merged line by line instead: ids are
+/// ULIDs, so the union of two logs is well-defined, ordered, and identical
+/// whichever machine performs it.
+fn graft(staging: &Path, data_dir: &Path) -> Result<Grafted> {
+    let mut counts = Grafted { files: 0, events: 0 };
+    let mut stack = vec![staging.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
+            let path = entry.context("read entry")?.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let relative = path.strip_prefix(staging).unwrap_or(&path);
+            let dest = data_dir.join(relative);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("create {}", parent.display()))?;
+            }
+            counts.files += 1;
+            if path.extension().is_some_and(|ext| ext == "jsonl") && dest.is_file() {
+                counts.events += union_logs(&path, &dest)?;
+            } else {
+                std::fs::copy(&path, &dest)
+                    .with_context(|| format!("write {}", dest.display()))?;
+            }
+        }
+    }
+    Ok(counts)
+}
+
+/// Merge one incoming log into an existing one, keyed by event id.
+///
+/// Returns how many lines the local log did not already have. Sorting by id
+/// is sorting by time, because ULIDs are time-ordered - so the merged log
+/// reads in the order things actually happened on both machines.
+fn union_logs(incoming: &Path, local: &Path) -> Result<usize> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut ids: Vec<String> = Vec::new();
+    let mut added = 0usize;
+    for (path, is_local) in [(local, true), (incoming, false)] {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read {}", path.display()))?;
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            match line_id(line) {
+                Some(id) if ids.contains(&id) => {}
+                Some(id) => {
+                    ids.push(id);
+                    lines.push(line.to_string());
+                    if !is_local {
+                        added += 1;
+                    }
+                }
+                // A line we cannot read is still someone's data. Keeping it
+                // costs a duplicate at worst; dropping it is unrecoverable.
+                None => lines.push(line.to_string()),
+            }
+        }
+    }
+    lines.sort_by_key(|line| line_id(line));
+    std::fs::write(local, format!("{}\n", lines.join("\n")))
+        .with_context(|| format!("write {}", local.display()))?;
+    Ok(added)
+}
+
+fn line_id(line: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()?
+        .get("id")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Refuse an archive that would write outside where it is unpacked.
+///
+/// Absolute paths and `..` components are the whole attack: an import is a
+/// file someone was sent, and unpacking it must not be able to touch a
+/// hook config, a shell profile, or anything else outside the data
+/// directory.
+fn refuse_escaping_members(archive: &Path) -> Result<()> {
+    let listing = Command::new("tar")
+        .args(["-tzf", &archive.display().to_string()])
+        .output()
+        .context("list the archive")?;
+    anyhow::ensure!(
+        listing.status.success(),
+        "cannot read {}: {}",
+        archive.display(),
+        String::from_utf8_lossy(&listing.stderr).trim()
+    );
+    for member in String::from_utf8_lossy(&listing.stdout).lines() {
+        let member = member.trim();
+        let escapes = member.starts_with('/')
+            || member.starts_with("~/")
+            || Path::new(member)
+                .components()
+                .any(|part| part == std::path::Component::ParentDir);
+        anyhow::ensure!(!escapes, "archive contains an unsafe path: {member}");
+    }
+    Ok(())
 }
 
 fn run(program: &str, args: &[String]) -> Result<()> {

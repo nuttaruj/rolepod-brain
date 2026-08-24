@@ -126,6 +126,10 @@ impl Fixture {
             .args(["hook", "--cli", cli, "--event", event])
             .current_dir(&self.project)
             .env("ROLEPOD_BRAIN_HOME", &self.home)
+            // Same reason brain_with_path owns HOME: the capture path reads
+            // $HOME too, and a fixture that leaves it pointing at the real
+            // machine is testing the machine, not the fixture.
+            .env("HOME", self.home.parent().unwrap())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -400,6 +404,143 @@ fn reranking_reorders_a_search_and_a_failed_one_changes_nothing() {
         plain,
         "a failed rerank must be a no-op, not a degraded search"
     );
+}
+
+#[test]
+fn only_a_cli_s_own_transcript_directory_is_read_from() {
+    // Consolidation reads the recorded transcript and hands it to a model, so
+    // an unchecked path in a hook payload is a way to make brain fetch a file
+    // and post it somewhere.
+    let fixture = Fixture::new("transcriptpath");
+    let fake_home = fixture.home.parent().unwrap().to_path_buf();
+    let real = fake_home.join(".claude/projects/some-project");
+    std::fs::create_dir_all(&real).unwrap();
+    let transcript = real.join("session.jsonl");
+    std::fs::write(&transcript, "{\"type\":\"assistant\",\"message\":\"hello\"}\n").unwrap();
+
+    let secret = fake_home.join("id_rsa");
+    std::fs::write(&secret, "PRIVATE KEY").unwrap();
+
+    let send = |path: &std::path::Path, session: &str| {
+        let payload = serde_json::json!({
+            "session_id": session,
+            "cwd": fixture.project,
+            "transcript_path": path,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": fixture.project.join("src/auth.rs")}
+        })
+        .to_string();
+        fixture.hook("claude-code", "PostToolUse", &payload);
+    };
+    send(&transcript, "0199a1f2-3c4d-7e8f-9012-3456789abcd1");
+    send(&secret, "0199a1f2-3c4d-7e8f-9012-3456789abcd2");
+
+    let recorded = Command::new("sqlite3")
+        .arg(fixture.home.join("brain.db"))
+        .arg("SELECT path FROM session_transcript;")
+        .output()
+        .expect("query transcripts");
+    let recorded = String::from_utf8_lossy(&recorded.stdout).to_string();
+    assert!(
+        recorded.contains("session.jsonl"),
+        "a real transcript was rejected - the feature is off, not secured: {recorded}"
+    );
+    assert!(!recorded.contains("id_rsa"), "an arbitrary file was accepted as a transcript");
+}
+
+#[test]
+fn an_archive_that_writes_outside_the_data_directory_is_refused() {
+    // An import is a file someone was sent. Unpacking it must not be able to
+    // reach a hook config or a shell profile, whatever the local tar allows.
+    let fixture = Fixture::new("tarescape");
+    let archive = fixture.home.parent().unwrap().join("evil.tar.gz");
+    let payload = fixture.home.parent().unwrap().join("payload.txt");
+    std::fs::write(&payload, "owned").unwrap();
+    let script = format!(
+        "import tarfile\n\
+         t = tarfile.open(r'{}', 'w:gz')\n\
+         info = t.gettarinfo(r'{}')\n\
+         info.name = '../../escaped.txt'\n\
+         t.addfile(info, open(r'{}', 'rb'))\n\
+         t.close()\n",
+        archive.display(),
+        payload.display(),
+        payload.display()
+    );
+    let built = Command::new("python3").args(["-c", &script]).output().expect("build archive");
+    assert!(built.status.success(), "could not build the test archive: {built:?}");
+
+    let refused = fixture.brain(&["import", "--merge", &archive.to_string_lossy()]);
+    assert!(!refused.status.success(), "an escaping archive was accepted");
+    let why = String::from_utf8_lossy(&refused.stderr);
+    assert!(why.contains("unsafe path"), "refused for the wrong reason: {why}");
+    assert!(
+        !fixture.home.parent().unwrap().join("escaped.txt").exists(),
+        "the archive wrote outside the data directory"
+    );
+}
+
+#[test]
+fn a_sensitive_path_is_redacted_in_the_file_list_too() {
+    // Titles were scrubbed and the parallel files[] array was not, so the
+    // path the sanitizer exists to hide sat intact in the column beside it.
+    let fixture = Fixture::new("filescrub");
+    let payload = serde_json::json!({
+        "session_id": "0199a1f2-3c4d-7e8f-9012-3456789abcde",
+        "cwd": fixture.project,
+        "tool_name": "Read",
+        "tool_input": {"file_path": "/Users/someone/.ssh/id_rsa"}
+    })
+    .to_string();
+    fixture.hook("claude-code", "PostToolUse", &payload);
+
+    let log = fixture.log_text();
+    assert!(!log.contains("id_rsa"), "a credential path was stored verbatim: {log}");
+    assert!(!log.contains(".ssh"), "a credential path was stored verbatim: {log}");
+}
+
+#[test]
+fn no_memory_can_be_rewritten_without_being_seen_first() {
+    // Correct is the most powerful operation there is: it decides what recall
+    // returns from then on. An agent acting on a poisoned instruction must not
+    // be able to overwrite memory by naming an id it never saw.
+    let fixture = Fixture::new("correctguard");
+    let payload = serde_json::json!({
+        "session_id": "0199a1f2-3c4d-7e8f-9012-3456789abcde",
+        "cwd": fixture.project,
+        "prompt": "the scheduler double-books on Tuesdays"
+    })
+    .to_string();
+    fixture.hook("claude-code", "UserPromptSubmit", &payload);
+    let id = fixture
+        .log_text()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find_map(|line| line["id"].as_str().map(str::to_string))
+        .expect("an event to correct");
+
+    let call = |name: &str, args: String| {
+        format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{name}","arguments":{args}}}}}"#)
+    };
+    let correct = call("brain_correct", format!(r#"{{"id":"{id}","text":"it never double-booked"}}"#));
+
+    let blind = fixture.mcp(&[&correct]);
+    let text = serde_json::to_string(&blind).unwrap_or_default();
+    assert!(
+        text.contains("has not been surfaced"),
+        "a blind correction was accepted: {text}"
+    );
+    assert!(
+        !fixture.log_text().contains("it never double-booked"),
+        "the correction was written despite being refused"
+    );
+
+    // Having actually seen it, the same call works.
+    let search = call("brain_search", r#"{"query":"scheduler"}"#.to_string());
+    let allowed = fixture.mcp(&[&search, &correct]);
+    let text = serde_json::to_string(&allowed).unwrap_or_default();
+    assert!(!text.contains("has not been surfaced"), "a legitimate correction was refused: {text}");
+    assert!(fixture.log_text().contains("it never double-booked"), "the correction was not written");
 }
 
 #[test]
@@ -1630,6 +1771,41 @@ fn a_wrong_memory_can_be_withdrawn_and_stays_withdrawn() {
         .to_string();
     assert!(after.contains("No matches"), "a forgotten memory still surfaces: {after}");
 
+    // ...and gone from the primer, which is the other half of recall and the
+    // half that costs bytes in every future session. Asserting only search is
+    // how a withdrawn memory kept being injected.
+    let start = serde_json::json!({
+        "session_id": "0199a1f2-3c4d-7e8f-9012-3456789abcdf",
+        "cwd": fixture.project,
+        "source": "startup"
+    })
+    .to_string();
+    let primer = String::from_utf8_lossy(
+        &fixture.hook("claude-code", "SessionStart", &start).stdout,
+    )
+    .to_string();
+    assert!(
+        !primer.contains("double-books"),
+        "a forgotten memory is still injected at session start: {primer}"
+    );
+    // The tombstone deliberately says nothing about its target, so injecting
+    // it spends bytes on pure bookkeeping.
+    assert!(
+        !primer.contains("Withdrew a memory"),
+        "bookkeeping is being injected as if it were memory: {primer}"
+    );
+
+    // ...and an agent still holding the id cannot pull it back either.
+    let request = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"brain_get","arguments":{{"ids":["{id}"]}}}}}}"#
+    );
+    let pulled = fixture.mcp(&[&request]);
+    let text = pulled.last().expect("a response")["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(!text.contains("double-books"), "brain_get resurrected a withdrawn memory: {text}");
+
     // ...but the log keeps both the original and the withdrawal.
     let log = fixture.log_text();
     assert!(log.contains("double-books"), "the log must not lose what was said");
@@ -1788,6 +1964,50 @@ fn a_brain_survives_being_moved_to_another_machine() {
 
     let found = String::from_utf8_lossy(&new.brain(&["search", "scheduler"]).stdout).to_string();
     assert!(found.contains("scheduler"), "memory did not survive the move: {found}");
+}
+
+#[test]
+fn merging_two_machines_keeps_both_sides_of_the_same_month() {
+    // The designed use of a named marker: the same project on two machines,
+    // which means the same project id, the same directory, and the same
+    // events/YYYY-MM.jsonl on both sides.
+    let laptop = Fixture::new("mergelaptop");
+    let desktop = Fixture::new("mergedesktop");
+    for machine in [&laptop, &desktop] {
+        std::fs::write(
+            machine.project.join(".rolepod-brain.toml"),
+            "[project]\nname = \"acme-api\"\n",
+        )
+        .unwrap();
+    }
+
+    let payload = |fixture: &Fixture, prompt: &str| {
+        serde_json::json!({
+            "session_id": "0199a1f2-3c4d-7e8f-9012-3456789abcde",
+            "cwd": fixture.project,
+            "prompt": prompt
+        })
+        .to_string()
+    };
+    laptop.hook("claude-code", "UserPromptSubmit", &payload(&laptop, "the laptop found a leak"));
+    desktop.hook("claude-code", "UserPromptSubmit", &payload(&desktop, "the desktop fixed a race"));
+
+    let archive = laptop.home.parent().unwrap().join("laptop.tar.gz");
+    assert!(laptop.brain(&["export", &archive.to_string_lossy()]).status.success());
+
+    let merged = desktop.brain(&["import", "--merge", &archive.to_string_lossy()]);
+    assert!(merged.status.success(), "merge failed: {merged:?}");
+    assert!(desktop.brain(&["reindex"]).status.success(), "reindex after merge failed");
+
+    // Both sides survive: a merge that silently drops the local month is
+    // unrecoverable, because the logs are the source of truth.
+    let log = desktop.log_text();
+    assert!(log.contains("the laptop found a leak"), "the imported side is missing");
+    assert!(log.contains("the desktop fixed a race"), "the local side was overwritten");
+    for prompt in ["laptop found a leak", "desktop fixed a race"] {
+        let found = String::from_utf8_lossy(&desktop.brain(&["search", prompt]).stdout).to_string();
+        assert!(!found.contains("No matches"), "{prompt} is not searchable: {found}");
+    }
 }
 
 #[test]

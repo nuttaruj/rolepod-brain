@@ -125,7 +125,9 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
     // Code and Codex put it in every payload; the other three CLIs write no
     // transcript at all.
     if let Some(path) = first_string(&payload, &["transcript_path", "transcriptPath"]) {
-        let _ = store.record_transcript_path(&session_key, path);
+        if is_transcript_of(agent.as_str(), path) {
+            let _ = store.record_transcript_path(&session_key, path);
+        }
     }
 
     let mut event = Event::new(
@@ -137,7 +139,15 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
         title,
         body,
     );
-    event.files = files_for(&payload, &scope.root);
+    // The same scrub the title and body get. A path is the one field the
+    // sanitizer explicitly treats as sensitive by convention - .ssh, .aws,
+    // .gnupg - and storing it unscrubbed in a parallel array meant the thing
+    // being redacted out of the title sat intact in the column beside it.
+    event.files = files_for(&payload, &scope.root)
+        .iter()
+        .map(|path| sanitizer.scrub(path))
+        .filter(|path| !path.is_empty())
+        .collect();
     if invocation.is_headless() {
         // Tagged, not dropped: a headless run's observations are still true,
         // they are simply worth less than a person's working session, and the
@@ -534,6 +544,32 @@ fn files_for(payload: &Value, root: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
+/// Is this path where the named CLI actually keeps its transcripts?
+///
+/// A hook payload arrives on stdin from whatever invoked us. Consolidation
+/// later reads the path it names and hands the contents to a model, so an
+/// unchecked path is a way to ask brain to fetch a file and post it
+/// somewhere - the classic confused deputy. Confining it to each CLI's own
+/// transcript directory costs nothing: no CLI writes its transcripts
+/// anywhere else.
+fn is_transcript_of(cli: &str, path: &str) -> bool {
+    let Some(home) = dirs::home_dir() else { return false };
+    let roots: &[&str] = match cli {
+        "claude-code" => &[".claude/projects"],
+        "codex" => &[".codex/sessions"],
+        // The other CLIs write no transcript at all, so any path claiming to
+        // be one is by definition not theirs.
+        _ => return false,
+    };
+    // Resolve before comparing: `~/.claude/projects/../../.ssh/id_rsa` is
+    // inside the directory only until someone reads it.
+    let Ok(resolved) = std::fs::canonicalize(path) else { return false };
+    roots.iter().any(|root| {
+        std::fs::canonicalize(home.join(root))
+            .is_ok_and(|root| resolved.starts_with(&root))
+    })
+}
+
 /// Pull a filesystem path out of a tool input, whatever the tool calls it.
 fn tool_path(input: &Value) -> Option<String> {
     // `AbsolutePath` is Antigravity's spelling; the rest are Claude Code's and
@@ -739,6 +775,8 @@ mod tests {
 
     #[test]
     fn a_silenced_process_captures_nothing() {
+        let _guard =
+            invocation::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::set_var(invocation::SILENT_ENV, "1");
         let payload = json!({"prompt": "should leave no trace"}).to_string();
         let ack = capture("claude-code", "UserPromptSubmit", Some(payload)).unwrap();
@@ -802,6 +840,8 @@ mod tests {
     fn a_worker_child_captures_nothing() {
         // Guards the loop: consolidation spawns a host CLI, whose hooks call
         // us, and capturing there would feed the brain its own output.
+        let _guard =
+            invocation::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::set_var(WORKER_ENV, "1");
         let payload = json!({"prompt": "should not be captured"}).to_string();
         let ack = capture("claude-code", "UserPromptSubmit", Some(payload)).unwrap();

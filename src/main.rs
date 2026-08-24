@@ -303,7 +303,7 @@ fn reindex() -> Result<()> {
     // for, so it rebuilds these too.
     let mut hubs = 0usize;
     for (scope, dir) in consolidate::known_projects(&paths).unwrap_or_default() {
-        if consolidate::write_hubs(&dir, &scope).is_ok() {
+        if consolidate::write_hubs(&dir, &scope, &store).is_ok() {
             hubs += 1;
         }
     }
