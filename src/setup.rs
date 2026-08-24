@@ -558,6 +558,13 @@ const CONFIG_TEMPLATE: &str = r#"# rolepod-brain configuration.
 [injection]
 # Byte ceilings for automatic context injection. Ceilings, not targets: a
 # short primer of real signal beats a full one padded with noise.
+#
+# primer_budget caps the memory list pushed at session start (~1k tokens at
+# the default); session_budget caps EVERYTHING injected automatically in one
+# session, primer included. Raising them costs input tokens in every future
+# session; lowering them keeps only the top-ranked lines, and the agent can
+# still pull anything through brain_search, which has no budget. `brain
+# doctor` shows what sessions actually spend - tune from that.
 # primer_budget = 4096
 # session_budget = 8192
 

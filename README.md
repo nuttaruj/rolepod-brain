@@ -183,8 +183,16 @@ mode = "auto"          # auto | claude-code | codex | gemini | off
 # "claude-code" = "sonnet"
 
 [injection]
-primer_budget = 4096   # bytes pushed at session start
-session_budget = 8192  # bytes of automatic injection per session, all layers
+primer_budget = 4096   # bytes pushed at session start (~1k tokens)
+session_budget = 8192  # ceiling for ALL automatic injection in one session
+
+# Raising these buys the agent more memory up front - and costs input tokens
+# in EVERY future session, which is the definition of a hidden recurring
+# spend. Lowering them keeps only the top-ranked lines (durable knowledge
+# first, then summaries); the agent can always pull more through
+# brain_search, which has no budget because the agent asked. `brain doctor`
+# reports what sessions actually spend against the cap - tune from that
+# number, not from a guess.
 
 [search]
 rerank = false         # true spends one cheap-tier call reordering search
