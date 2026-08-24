@@ -37,7 +37,11 @@ pub fn export(archive: &Path) -> Result<String> {
     let wiki = paths.wiki();
     anyhow::ensure!(wiki.is_dir(), "no wiki at {} to export", wiki.display());
 
-    let mut members = vec!["wiki".to_string()];
+    let wiki_member = wiki
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| crate::config::WIKI_DIR.to_string());
+    let mut members = vec![wiki_member];
     if paths.config_file().is_file() {
         members.push("config.toml".to_string());
     }
@@ -160,7 +164,11 @@ fn graft(staging: &Path, data_dir: &Path) -> Result<Grafted> {
                 continue;
             }
             let relative = path.strip_prefix(staging).unwrap_or(&path);
-            let dest = data_dir.join(relative);
+            // Both wiki names map onto whichever this machine uses. Without
+            // this, importing an archive from a pre-0.12 install onto a
+            // migrated machine unpacks a second tree under the old name -
+            // one the resolution in `Paths::wiki` would never look at again.
+            let dest = data_dir.join(normalize_wiki_member(data_dir, relative));
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("create {}", parent.display()))?;
@@ -175,6 +183,22 @@ fn graft(staging: &Path, data_dir: &Path) -> Result<Grafted> {
         }
     }
     Ok(counts)
+}
+
+/// Map either wiki directory name onto the one this machine uses.
+fn normalize_wiki_member(data_dir: &Path, relative: &Path) -> PathBuf {
+    let mut parts = relative.components();
+    let Some(first) = parts.next() else { return relative.to_path_buf() };
+    let first = first.as_os_str().to_string_lossy();
+    if first != crate::config::WIKI_DIR && first != crate::config::LEGACY_WIKI_DIR {
+        return relative.to_path_buf();
+    }
+    let current = Paths { data_dir: data_dir.to_path_buf() }
+        .wiki()
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| crate::config::WIKI_DIR.to_string());
+    PathBuf::from(current).join(parts.as_path())
 }
 
 /// Merge one incoming log into an existing one, keyed by event id.

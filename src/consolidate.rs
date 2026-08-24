@@ -1272,13 +1272,32 @@ pub fn known_projects(paths: &Paths) -> Result<Vec<(ProjectScope, PathBuf)>> {
 /// # Errors
 /// Returns an error when a rename or the wiki commit fails.
 pub fn migrate_layout(paths: &Paths) -> Result<Vec<String>> {
+    let mut moved_names = Vec::new();
+    // The top level first: `wiki/` becomes the product's name, because that
+    // name is what Obsidian shows for the vault - and renaming a vault
+    // inside Obsidian renames the real directory, so the pretty name must
+    // BE the real directory.
+    let legacy_wiki = paths.data_dir.join(crate::config::LEGACY_WIKI_DIR);
+    let pretty_wiki = paths.data_dir.join(crate::config::WIKI_DIR);
+    if legacy_wiki.is_dir() {
+        anyhow::ensure!(
+            !pretty_wiki.exists(),
+            "both {} and {} exist — merge them by hand (brain import --merge can help), then re-run",
+            legacy_wiki.display(),
+            pretty_wiki.display()
+        );
+        std::fs::rename(&legacy_wiki, &pretty_wiki)
+            .with_context(|| format!("rename {} to {}", legacy_wiki.display(), pretty_wiki.display()))?;
+        moved_names.push(format!("{} -> {}", legacy_wiki.display(), pretty_wiki.display()));
+    }
+
     let wiki = paths.wiki();
     let mut projects = known_projects(paths)?;
     // Sorted by current directory, so which of two colliding projects wins
     // the clean name does not depend on filesystem enumeration order.
     projects.sort_by(|a, b| a.1.cmp(&b.1));
 
-    let mut moved = Vec::new();
+    let mut moved = moved_names;
     for (scope, current) in projects {
         let parent = if scope.workspace == "default" {
             wiki.clone()

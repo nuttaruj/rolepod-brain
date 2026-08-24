@@ -82,6 +82,7 @@ pub fn run() -> Result<Vec<Check>> {
         Err(error) => checks.push(Check::fail("index", error.to_string())),
     }
 
+    checks.extend(split_tree_check(&paths));
     checks.push(injection_check(&paths));
     checks.push(taxonomy_check(&paths));
     checks.extend(summarizer_checks(&paths));
@@ -115,6 +116,40 @@ fn taxonomy_check(paths: &Paths) -> Check {
         .collect::<Vec<_>>()
         .join(" ");
     Check::pass("taxonomy", detail)
+}
+
+/// Is there exactly one wiki tree?
+///
+/// Two ways to get a second one, both observed on a real machine in one day:
+/// the vault gets renamed inside Obsidian (which renames the real directory,
+/// so the next hook finds nothing and starts a fresh tree), or a hook races
+/// a layout migration and recreates the legacy home it was mid-write to.
+/// Either way, new memory quietly lands in a tree recall never reads - a
+/// split brain, and nothing else in this report would show it.
+fn split_tree_check(paths: &Paths) -> Vec<Check> {
+    let pretty = paths.data_dir.join(crate::config::WIKI_DIR);
+    let legacy = paths.data_dir.join(crate::config::LEGACY_WIKI_DIR);
+    if pretty.is_dir() && legacy.is_dir() {
+        return vec![Check::fail(
+            "wiki tree",
+            format!(
+                "both {} and {} exist — capture reads only the first. Merge them \
+                 (brain import --merge can help), then re-run brain reindex",
+                pretty.display(),
+                legacy.display()
+            ),
+        )];
+    }
+    // A `default/` directory inside the wiki that still holds projects is
+    // the same disease at the next level down: `brain reindex` fixes it.
+    let stale = paths.wiki().join("default");
+    if stale.is_dir() && std::fs::read_dir(&stale).is_ok_and(|mut dir| dir.next().is_some()) {
+        return vec![Check::fail(
+            "wiki tree",
+            "a legacy default/ level still holds projects — run brain reindex",
+        )];
+    }
+    Vec::new()
 }
 
 /// What automatic injection has actually cost, measured rather than assumed.

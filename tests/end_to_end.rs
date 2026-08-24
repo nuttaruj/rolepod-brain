@@ -92,9 +92,18 @@ impl Fixture {
     }
 
     /// Every consolidated page on disk.
+    /// The wiki directory, whichever name this fixture's brain gave it.
+    fn wiki(&self) -> PathBuf {
+        let pretty = self.home.join("Rolepod Brain");
+        if pretty.is_dir() {
+            return pretty;
+        }
+        self.home.join("wiki")
+    }
+
     fn page_text(&self) -> String {
         let mut out = String::new();
-        collect_ext(&self.home.join("wiki"), "md", &mut out);
+        collect_ext(&self.wiki(), "md", &mut out);
         out
     }
 
@@ -102,7 +111,7 @@ impl Fixture {
     /// directory it landed in.
     fn knowledge_pages(&self) -> Vec<PathBuf> {
         let mut found = Vec::new();
-        collect_under(&self.home.join("wiki"), "knowledge", &mut found);
+        collect_under(&self.wiki(), "knowledge", &mut found);
         found.sort();
         found
     }
@@ -177,12 +186,12 @@ impl Fixture {
     /// Every event-log line on disk, across all projects.
     fn log_text(&self) -> String {
         let mut out = String::new();
-        collect_jsonl(&self.home.join("wiki"), &mut out);
+        collect_jsonl(&self.wiki(), &mut out);
         out
     }
 
     fn project_dirs(&self) -> Vec<PathBuf> {
-        let wiki = self.home.join("wiki");
+        let wiki = self.wiki();
         let mut dirs = Vec::new();
         // Same classification the product uses: an event log makes a
         // directory a project, whatever depth it sits at.
@@ -287,14 +296,15 @@ fn codex_payload(cwd: &Path) -> String {
 
 #[test]
 fn a_legacy_tree_keeps_working_and_reindex_moves_it_home() {
-    // The old layout was wiki/default/<slug>--<id>/. It must keep working
+    // The old layout was wiki/default/<slug>--<id>/ - old top-level name,
+    // extra workspace level, permanent suffix. All three must keep working
     // untouched - an install that never migrates is degraded in looks only -
-    // and `brain reindex` must move it to wiki/<slug>/ without losing a line.
+    // and `brain reindex` must move the lot to `Rolepod Brain/<slug>/`
+    // without losing a line.
     let fixture = Fixture::new("legacymove");
     fixture.hook("claude-code", "PostToolUse", &claude_payload(&fixture.project));
 
-    // Reconstruct the legacy home by hand from what was captured.
-    let wiki = fixture.home.join("wiki");
+    // Reconstruct the full legacy shape by hand from what was captured.
     let flat = fixture.project_dirs().pop().expect("a captured project");
     let idfrag: String = fixture
         .log_text()
@@ -303,25 +313,32 @@ fn a_legacy_tree_keeps_working_and_reindex_moves_it_home() {
         .find_map(|line| line["project"].as_str().map(|id| id.replace('-', "")[..8].to_string()))
         .expect("a project id");
     let slug = flat.file_name().unwrap().to_string_lossy().into_owned();
-    let legacy = wiki.join("default").join(format!("{slug}--{idfrag}"));
+    let old_wiki = fixture.home.join("wiki");
+    std::fs::rename(fixture.wiki(), &old_wiki).unwrap();
+    let legacy = old_wiki.join("default").join(format!("{slug}--{idfrag}"));
     std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-    std::fs::rename(&flat, &legacy).unwrap();
+    std::fs::rename(old_wiki.join(&slug), &legacy).unwrap();
 
-    // Capture keeps landing in the legacy home, not a fresh flat one.
+    // Capture keeps landing in the legacy home, not a fresh pretty tree.
     fixture.hook("claude-code", "UserPromptSubmit", &codex_payload(&fixture.project));
     assert!(
-        legacy.join("events").is_dir() && !flat.exists(),
+        legacy.join("events").is_dir() && !fixture.home.join("Rolepod Brain").exists(),
         "pre-migration capture abandoned the legacy home"
     );
     let lines_before = fixture.log_text().lines().count();
     assert_eq!(lines_before, 2, "both events should be in the legacy log");
 
-    // Migration: reindex moves it, keeps every line, and removes the level.
+    // Migration: reindex renames the top level, moves the project, keeps
+    // every line, and removes the empty workspace level.
     let out = fixture.brain(&["reindex"]);
     assert!(out.status.success(), "reindex failed: {out:?}");
-    assert!(flat.join("events").is_dir(), "the project did not move home: {flat:?}");
-    assert!(!legacy.exists(), "the legacy home should be gone");
-    assert!(!wiki.join("default").exists(), "the empty default/ level should be removed");
+    let home = fixture.home.join("Rolepod Brain").join(&slug);
+    assert!(home.join("events").is_dir(), "the project did not move home: {home:?}");
+    assert!(!old_wiki.exists(), "the old wiki/ name should be gone");
+    assert!(
+        !fixture.home.join("Rolepod Brain/default").exists(),
+        "the empty default/ level should be removed"
+    );
     assert_eq!(fixture.log_text().lines().count(), lines_before, "the move lost log lines");
 
     // The memory survived the move end to end.
@@ -394,7 +411,7 @@ fn a_named_workspace_keeps_its_own_level() {
 
     let dirs = fixture.project_dirs();
     assert_eq!(dirs.len(), 1, "one project expected: {dirs:?}");
-    let relative = dirs[0].strip_prefix(fixture.home.join("wiki")).unwrap();
+    let relative = dirs[0].strip_prefix(fixture.wiki()).unwrap();
     assert_eq!(
         relative,
         Path::new("work/api"),
@@ -1163,7 +1180,7 @@ fn the_wiki_is_git_versioned() {
     let bin = fixture.fake_cli("claude", GOOD_CLI);
     fixture.brain_with_path(&["consolidate", "--force"], Some(&bin));
 
-    let wiki = fixture.home.join("wiki");
+    let wiki = fixture.wiki();
     assert!(wiki.join(".git").exists(), "wiki should be a git repository");
 
     let log = Command::new("git")
@@ -2196,7 +2213,7 @@ fn a_brain_survives_being_moved_to_another_machine() {
         .output()
         .expect("list archive");
     let listing = String::from_utf8_lossy(&listing.stdout);
-    assert!(listing.contains("wiki/"), "the wiki should travel");
+    assert!(listing.contains("Rolepod Brain/"), "the wiki should travel: {listing}");
     assert!(!listing.contains("brain.db"), "the derived index must not travel");
 
     // A fresh machine, where the repository lives somewhere else entirely.
@@ -2255,6 +2272,60 @@ fn merging_two_machines_keeps_both_sides_of_the_same_month() {
         let found = String::from_utf8_lossy(&desktop.brain(&["search", prompt]).stdout).to_string();
         assert!(!found.contains("No matches"), "{prompt} is not searchable: {found}");
     }
+}
+
+#[test]
+fn doctor_notices_a_split_brain() {
+    // Renaming the vault in Obsidian renames the real directory, so the next
+    // hook starts a fresh tree and new memory quietly lands where recall
+    // never looks. Nothing else reports that; doctor must.
+    let fixture = Fixture::new("splitbrain");
+    fixture.hook("claude-code", "PostToolUse", &claude_payload(&fixture.project));
+    let healthy = String::from_utf8_lossy(&fixture.brain(&["doctor"]).stdout).to_string();
+    assert!(!healthy.contains("wiki tree"), "one tree should not be reported at all: {healthy}");
+
+    std::fs::create_dir_all(fixture.home.join("wiki/orphan/events")).unwrap();
+    let split = String::from_utf8_lossy(&fixture.brain(&["doctor"]).stdout).to_string();
+    assert!(
+        split.contains("FAIL wiki tree"),
+        "two trees must be reported as a failure: {split}"
+    );
+}
+
+#[test]
+fn an_archive_from_an_old_install_lands_in_the_new_tree() {
+    // A pre-0.12 export carries its tree under `wiki/`. Imported onto a
+    // machine whose tree is `Rolepod Brain/`, it must merge into that tree -
+    // unpacking it verbatim would plant a second tree under a name the
+    // resolution never looks at again, which is data loss with extra steps.
+    let old = Fixture::new("oldarchive");
+    old.hook("claude-code", "UserPromptSubmit", &codex_payload(&old.project));
+    // Make the export look exactly like an old install's: tree named wiki/.
+    std::fs::rename(old.wiki(), old.home.join("wiki")).unwrap();
+    let archive = old.home.parent().unwrap().join("old-install.tar.gz");
+    assert!(old.brain(&["export", &archive.to_string_lossy()]).status.success());
+    let listing = Command::new("tar")
+        .args(["-tzf", &archive.to_string_lossy()])
+        .output()
+        .expect("list archive");
+    assert!(
+        String::from_utf8_lossy(&listing.stdout).contains("wiki/"),
+        "precondition: the archive must carry the legacy name"
+    );
+
+    let new = Fixture::new("newmachine");
+    new.hook("claude-code", "PostToolUse", &claude_payload(&new.project));
+    assert!(new.home.join("Rolepod Brain").is_dir(), "precondition: a migrated machine");
+
+    let merged = new.brain(&["import", "--merge", &archive.to_string_lossy()]);
+    assert!(merged.status.success(), "merge failed: {merged:?}");
+    assert!(
+        !new.home.join("wiki").exists(),
+        "the legacy name was resurrected beside the real tree"
+    );
+    assert!(new.brain(&["reindex"]).status.success());
+    let found = String::from_utf8_lossy(&new.brain(&["search", "auth"]).stdout).to_string();
+    assert!(!found.contains("No matches"), "the imported memory is unfindable: {found}");
 }
 
 #[test]
@@ -2519,14 +2590,14 @@ fn a_recurring_entity_gets_a_page_a_one_off_does_not() {
     fixture.brain_with_path(&["consolidate", "--force"], Some(&bin));
 
     let mut entity_pages = String::new();
-    collect_ext(&fixture.home.join("wiki"), "md", &mut entity_pages);
+    collect_ext(&fixture.wiki(), "md", &mut entity_pages);
     assert!(entity_pages.contains("src/shared.rs"), "no page for the recurring entity");
 
     // A thing touched once is already one click from its session; a page for
     // it would add a leaf to the graph and nothing else.
-    let dirs = std::fs::read_dir(fixture.home.join("wiki")).is_ok();
+    let dirs = std::fs::read_dir(fixture.wiki()).is_ok();
     assert!(dirs);
-    let once_page = walk_find(&fixture.home.join("wiki"), "once.md");
+    let once_page = walk_find(&fixture.wiki(), "once.md");
     assert!(!once_page, "a one-off entity should not get its own page");
 }
 

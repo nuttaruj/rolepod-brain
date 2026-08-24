@@ -140,7 +140,7 @@ never injected.
 ```
 ~/.rolepod-brain/
   brain.db                       # derived index (FTS5) - disposable
-  wiki/                          # git repository - the durable memory
+  Rolepod Brain/                 # git repository - the durable memory
     <project>/
       events/YYYY-MM.jsonl       # append-only log - the source of truth
       pages/sessions/*.md        # one page per consolidated session
@@ -154,10 +154,10 @@ Projects live directly under `wiki/` by their plain names. Two exceptions,
 both earned rather than default: a project whose basename collides with
 another's gets a `--<id>` suffix so two projects never share a directory, and
 a project assigned to a named workspace (via the marker file below) nests
-under `wiki/<workspace>/`. Trees written by versions before 0.11 kept every
-project under `wiki/default/` with a permanent suffix; they keep working
-untouched, and `brain reindex` moves them to their human-first homes without
-losing a line.
+under `wiki/<workspace>/`. Trees written by older versions lived at `wiki/` with every project under
+`wiki/default/` and a permanent suffix; they keep working untouched, and
+`brain reindex` moves the whole tree to its human-first shape without losing
+a line.
 
 Projects are keyed by the main git repository root, so every worktree of one
 repo shares one memory. Drop a `.rolepod-brain.toml` in any ancestor directory
@@ -446,8 +446,13 @@ You never have to learn this. The three layers above run either way.
 ## Reading it in Obsidian
 
 There is no sync step, because none is needed. In Obsidian choose **Open folder
-as vault** and point it at `~/.rolepod-brain/wiki`. It reads the markdown in
-place, and new pages appear as consolidation writes them.
+as vault** and point it at `~/.rolepod-brain/Rolepod Brain`. It reads the
+markdown in place, new pages appear as consolidation writes them, and the
+vault shows up in Obsidian's switcher under the product's name — the directory
+is named for exactly that reason, because Obsidian names a vault after its
+folder. One caution that follows from the same fact: renaming the vault inside
+Obsidian renames the real directory, and brain looks for its memory by name.
+If you have renamed it, rename it back.
 
 Three things worth knowing before you do:
 
@@ -555,7 +560,7 @@ So:
 - **No API keys held.** Summarization borrows a CLI you are already signed
   into, through its own supported entry point.
 
-What remains is a plain-markdown git repository at `~/.rolepod-brain/wiki` —
+What remains is a plain-markdown git repository at `~/.rolepod-brain/Rolepod Brain` —
 `grep` it, open it in Obsidian, read its history with `git log`, roll it back
 with `git revert`. Back it up the way you back up the rest of your disk; Time
 Machine and `rsync` to a disk you control both work, and the choice is yours

@@ -16,6 +16,13 @@ use crate::sanitize::SanitizeConfig;
 /// tests never touch a real brain.
 pub const DATA_DIR_ENV: &str = "ROLEPOD_BRAIN_HOME";
 
+/// What the wiki directory is called - and therefore what the Obsidian vault
+/// is called, because Obsidian names a vault after its folder.
+pub const WIKI_DIR: &str = "Rolepod Brain";
+
+/// The name every version before 0.12 used.
+pub const LEGACY_WIKI_DIR: &str = "wiki";
+
 /// Top-level config, read from `<data_dir>/config.toml` when present.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -122,9 +129,30 @@ impl Paths {
         self.data_dir.join("brain.db")
     }
 
+    /// The wiki directory - the durable memory, and an Obsidian vault.
+    ///
+    /// Named for the product because Obsidian names a vault after its
+    /// folder, and a vault called "wiki" in the switcher says nothing.
+    /// The name is load-bearing the other way too: renaming a vault inside
+    /// Obsidian renames the real directory, so the pretty name has to be
+    /// the real name - a symlink would be silently left behind pointing at
+    /// nothing the moment someone renamed the vault it fronted.
+    ///
+    /// A tree written by a version that called it `wiki/` keeps working
+    /// untouched; `brain reindex` renames it. When both exist, the new name
+    /// wins - that is the migrated state, and migration refuses to create
+    /// the both-exist state itself.
     #[must_use]
     pub fn wiki(&self) -> PathBuf {
-        self.data_dir.join("wiki")
+        let pretty = self.data_dir.join(WIKI_DIR);
+        if pretty.is_dir() {
+            return pretty;
+        }
+        let legacy = self.data_dir.join(LEGACY_WIKI_DIR);
+        if legacy.is_dir() {
+            return legacy;
+        }
+        pretty
     }
 
     #[must_use]
