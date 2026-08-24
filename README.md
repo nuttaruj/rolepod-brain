@@ -445,14 +445,23 @@ You never have to learn this. The three layers above run either way.
 
 ## Reading it in Obsidian
 
-There is no sync step, because none is needed. In Obsidian choose **Open folder
-as vault** and point it at `~/.rolepod-brain/Rolepod Brain`. It reads the
-markdown in place, new pages appear as consolidation writes them, and the
-vault shows up in Obsidian's switcher under the product's name — the directory
-is named for exactly that reason, because Obsidian names a vault after its
-folder. One caution that follows from the same fact: renaming the vault inside
-Obsidian renames the real directory, and brain looks for its memory by name.
-If you have renamed it, rename it back.
+There is no sync step, because none is needed:
+
+1. In Obsidian, choose **Open folder as vault**.
+2. In the folder picker, press **Cmd+Shift+G** (macOS) and paste
+   `~/.rolepod-brain/Rolepod Brain` — the `.rolepod-brain` directory is
+   hidden, so it will not appear in the list on its own. (Cmd+Shift+.
+   toggles hidden folders if you prefer to browse; on Linux, type the path
+   into the location bar.)
+3. Open it. That is the whole setup.
+
+Obsidian reads the markdown in place, new pages appear as consolidation
+writes them, and the vault shows up in the switcher under the product's name
+— the directory is named for exactly that reason, because Obsidian names a
+vault after its folder. One caution that follows from the same fact: renaming
+the vault inside Obsidian renames the real directory, and brain looks for its
+memory by name. If you have renamed it, rename it back — `brain doctor` will
+tell you if capture has started a second tree in the meantime.
 
 Three things worth knowing before you do:
 
