@@ -26,6 +26,12 @@ const MARKER: &str = "brain hook";
 /// Name the MCP server is registered under in both CLIs.
 const MCP_SERVER_NAME: &str = "brain";
 
+/// What our plugin is called in every marketplace that carries it.
+///
+/// The same string keys three different registries - a JSON map, a directory
+/// name, and a TOML table - so it is written once here.
+const PLUGIN_NAME: &str = "rolepod-brain";
+
 /// How long a host CLI waits for our hook before moving on.
 ///
 /// The unit is not universal: Claude Code and Codex read seconds, Gemini CLI
@@ -912,6 +918,13 @@ fn wire_hooks(target: &Target, exe: &Path, apply: bool) -> Result<Vec<Change>> {
 }
 
 fn register_mcp(target: &Target, apply: bool) -> Vec<Change> {
+    // The plugin declares the same server. Registering it again would leave
+    // two entries pointing at one binary, which is the duplicate-registration
+    // bug this project already shipped once for Codex - so when the plugin is
+    // installed we withdraw rather than compete with it.
+    if plugin_installed(&target.kind) {
+        return withdraw_mcp(target, apply);
+    }
     if let Some(path) = &target.mcp_file {
         return register_mcp_file(target, path, apply);
     }
@@ -1008,6 +1021,111 @@ fn register_mcp_file(target: &Target, path: &Path, apply: bool) -> Vec<Change> {
             detail: format!("registered MCP server `{MCP_SERVER_NAME}` in {}", path.display()),
         }],
         Err(error) => vec![Change { target: label, detail: format!("MCP registration failed: {error:#}") }],
+    }
+}
+
+/// Is our plugin installed for this CLI?
+///
+/// Each CLI records that fact somewhere different, and none of them agree on
+/// a format. What they agree on is the consequence: an installed plugin
+/// already supplies the MCP server and the skills, so anything `setup` writes
+/// on top of it is a second copy.
+#[must_use]
+pub fn plugin_installed(kind: &AgentKind) -> bool {
+    let Some(home) = dirs::home_dir() else { return false };
+    match kind.as_str() {
+        // A JSON registry keyed `<plugin>@<marketplace>`.
+        "claude-code" => std::fs::read_to_string(home.join(".claude/plugins/installed_plugins.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|root| root.get("plugins")?.as_object().cloned())
+            .is_some_and(|plugins| {
+                plugins.keys().any(|key| key.starts_with(&format!("{PLUGIN_NAME}@")))
+            }),
+        // No registry file: an installed plugin is a directory under the
+        // marketplace it came from.
+        "cursor" => std::fs::read_dir(home.join(".cursor/plugins/cache"))
+            .into_iter()
+            .flatten()
+            .filter_map(std::result::Result::ok)
+            .any(|marketplace| marketplace.path().join(PLUGIN_NAME).is_dir()),
+        // TOML, and the only CLI where installing the plugin is what makes
+        // the hooks run at all.
+        "codex" => codex_plugin_installed(&home),
+        _ => false,
+    }
+}
+
+/// Codex records enabled plugins in `~/.codex/config.toml`.
+fn codex_plugin_installed(home: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(home.join(".codex/config.toml")) else {
+        return false;
+    };
+    let Ok(config) = toml::from_str::<toml::Value>(&text) else { return false };
+    config
+        .get("plugins")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|plugins| {
+            plugins.iter().any(|(key, value)| {
+                key.starts_with(PLUGIN_NAME)
+                    && value.get("enabled").and_then(toml::Value::as_bool) != Some(false)
+            })
+        })
+}
+
+/// Step aside from an MCP registration the plugin now owns.
+///
+/// Removing our standalone entry rather than leaving it: two registrations of
+/// one server is not twice the memory, it is one server listed twice in every
+/// tool menu, and the agent has no way to tell they are the same.
+fn withdraw_mcp(target: &Target, apply: bool) -> Vec<Change> {
+    let label = target.kind.as_str().to_string();
+    let detail = |what: String| vec![Change { target: label.clone(), detail: what }];
+
+    if let Some(path) = &target.mcp_file {
+        if !apply {
+            return detail(format!(
+                "plugin installed — would remove our standalone MCP entry from {}",
+                path.display()
+            ));
+        }
+        let removed = (|| -> Result<bool> {
+            let mut root = read_json(path)?;
+            let Some(servers) =
+                root.get_mut("mcpServers").and_then(serde_json::Value::as_object_mut)
+            else {
+                return Ok(false);
+            };
+            if servers.remove(MCP_SERVER_NAME).is_none() {
+                return Ok(false);
+            }
+            let _ = backup(path)?;
+            write_json(path, &root)?;
+            Ok(true)
+        })();
+        return match removed {
+            Ok(true) => detail(format!(
+                "plugin installed — removed our standalone MCP entry from {}",
+                path.display()
+            )),
+            Ok(false) => detail("plugin supplies the MCP server".to_string()),
+            Err(error) => detail(format!("could not remove the standalone MCP entry: {error:#}")),
+        };
+    }
+
+    let Some((program, _)) = &target.mcp_register else {
+        return detail("plugin supplies the MCP server".to_string());
+    };
+    let args = vec!["mcp".to_string(), "remove".to_string(), "--scope".to_string(),
+                    "user".to_string(), MCP_SERVER_NAME.to_string()];
+    if !apply {
+        return detail(format!("plugin installed — would run: {program} {}", args.join(" ")));
+    }
+    match Command::new(program).args(&args).output() {
+        // Not registered is the state we wanted; the CLI says so on stderr
+        // and a non-zero exit, which is not a failure of this step.
+        Ok(_) => detail("plugin supplies the MCP server".to_string()),
+        Err(error) => detail(format!("could not reach `{program}`: {error}")),
     }
 }
 
@@ -1109,6 +1227,113 @@ mod tests {
             assert!(codex.events.contains(event), "override for an unwired event: {event}");
             assert!(*seconds <= codex.timeout, "an override should only ever lower the timeout");
         }
+    }
+
+    /// Each CLI records an installed plugin somewhere different, and getting
+    /// any of them wrong means a second MCP registration nobody notices.
+    #[test]
+    fn an_installed_plugin_is_recognised_in_each_cli_s_own_registry() {
+        let home = std::env::temp_dir().join(format!("brain-plugin-detect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let _guard = crate::invocation::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+
+        let claude = AgentKind::parse("claude-code");
+        let cursor = AgentKind::parse("cursor");
+        let codex = AgentKind::parse("codex");
+
+        // Nothing installed anywhere.
+        for kind in [&claude, &cursor, &codex] {
+            assert!(!plugin_installed(kind), "{} claimed an absent plugin", kind.as_str());
+        }
+
+        // Claude Code: a JSON registry keyed `<plugin>@<marketplace>`.
+        std::fs::create_dir_all(home.join(".claude/plugins")).unwrap();
+        std::fs::write(
+            home.join(".claude/plugins/installed_plugins.json"),
+            format!(r#"{{"version":2,"plugins":{{"{PLUGIN_NAME}@{PLUGIN_NAME}":[{{"scope":"user"}}]}}}}"#),
+        )
+        .unwrap();
+        assert!(plugin_installed(&claude));
+        assert!(!plugin_installed(&cursor), "one CLI's registry answered for another");
+
+        // Cursor: a directory under the marketplace it came from.
+        std::fs::create_dir_all(home.join(".cursor/plugins/cache/somewhere").join(PLUGIN_NAME))
+            .unwrap();
+        assert!(plugin_installed(&cursor));
+
+        // Codex: a TOML table, and `enabled = false` means not installed.
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(
+            home.join(".codex/config.toml"),
+            format!("[plugins.\"{PLUGIN_NAME}@{PLUGIN_NAME}\"]\nenabled = false\n"),
+        )
+        .unwrap();
+        assert!(!plugin_installed(&codex), "a disabled plugin is not an installed one");
+        std::fs::write(
+            home.join(".codex/config.toml"),
+            format!("[plugins.\"{PLUGIN_NAME}@{PLUGIN_NAME}\"]\nenabled = true\n"),
+        )
+        .unwrap();
+        assert!(plugin_installed(&codex));
+
+        // A CLI with no plugin story must never claim one.
+        assert!(!plugin_installed(&AgentKind::parse("opencode")));
+
+        match previous {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Every path a plugin manifest names must exist, and the file Claude
+    /// Code and Cursor auto-discover must not be Codex's.
+    ///
+    /// These manifests are read by three different CLIs and by none of our
+    /// code, so nothing else here would notice a path that stopped resolving.
+    #[test]
+    fn the_plugin_manifests_point_at_files_that_exist() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let read = |path: std::path::PathBuf| -> Value {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|_| panic!("missing manifest {}", path.display()));
+            serde_json::from_str(&text)
+                .unwrap_or_else(|error| panic!("{} is not JSON: {error}", path.display()))
+        };
+
+        // The marketplace entry has to name the directory the plugin is in.
+        let marketplace = read(repo.join(".claude-plugin/marketplace.json"));
+        let listed = marketplace["plugins"][0]["source"].as_str().expect("a source path");
+        let root = repo.join(listed.trim_start_matches("./"));
+        assert!(root.is_dir(), "marketplace names {listed}, which is not a directory");
+        assert_eq!(marketplace["plugins"][0]["name"], PLUGIN_NAME);
+
+        // One plugin, three CLIs, three manifests - each of which has to agree
+        // on the name the registries are keyed by.
+        for manifest in [".claude-plugin", ".cursor-plugin", ".codex-plugin"] {
+            let plugin = read(root.join(manifest).join("plugin.json"));
+            assert_eq!(plugin["name"], PLUGIN_NAME, "{manifest} disagrees about the name");
+        }
+
+        // Codex resolves its paths from the plugin root.
+        let codex = read(root.join(".codex-plugin/plugin.json"));
+        for key in ["hooks", "mcpServers", "skills"] {
+            let path = codex[key].as_str().unwrap_or_else(|| panic!("{key} is not a path"));
+            let resolved = root.join(path.trim_start_matches("./"));
+            assert!(resolved.exists(), "{key} points at {path}, which does not exist");
+        }
+
+        // Claude Code and Cursor auto-discover `hooks/hooks.json` at the
+        // plugin root. Ours speaks Codex's event names and tags every capture
+        // `--cli codex`, so a file under that name would make those CLIs
+        // record their sessions as Codex's - on top of the hooks `setup`
+        // already wrote for them.
+        assert!(
+            !root.join("hooks/hooks.json").exists(),
+            "hooks/hooks.json is the name Claude Code and Cursor claim; Codex's must not use it"
+        );
     }
 
     #[test]

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "rolepod-brain",
+  "description": "Persistent memory for AI coding agents — one merged store per project, shared across every CLI you use.",
+  "owner": {
+    "name": "nuttaruj"
+  },
+  "plugins": [
+    {
+      "name": "rolepod-brain",
+      "description": "Session memory that survives context wipes: a searchable markdown wiki, an MCP server to query it, and a short list of pointers at the start of every session. No daemon, no API keys, nothing leaves the machine.",
+      "source": "./plugins/rolepod-brain",
+      "category": "productivity"
+    }
+  ]
+}

@@ -407,6 +407,55 @@ fn reranking_reorders_a_search_and_a_failed_one_changes_nothing() {
 }
 
 #[test]
+fn an_installed_plugin_takes_over_the_mcp_registration() {
+    // The plugin declares the same server brain would register standalone.
+    // Two entries for one binary is the duplicate-registration bug this
+    // project already shipped once, so setup has to step aside - and remove
+    // the entry it wrote before the plugin existed.
+    let fixture = Fixture::new("pluginmcp");
+    let home = fixture.home.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(home.join(".cursor")).unwrap();
+    std::fs::write(
+        home.join(".cursor/mcp.json"),
+        r#"{"mcpServers":{"brain":{"command":"/old/brain","args":["mcp"]},"other":{"command":"x"}}}"#,
+    )
+    .unwrap();
+
+    // Without the plugin, setup owns the registration.
+    let plain = fixture.brain(&["setup", "--apply", "--cli", "cursor"]);
+    assert!(plain.status.success(), "setup failed: {plain:?}");
+    let servers = |label: &str| -> serde_json::Value {
+        let text = std::fs::read_to_string(home.join(".cursor/mcp.json"))
+            .unwrap_or_else(|_| panic!("{label}: no mcp.json"));
+        serde_json::from_str(&text).expect("mcp.json is JSON")
+    };
+    assert!(servers("standalone")["mcpServers"]["brain"].is_object(), "brain was not registered");
+
+    // Now the plugin is installed, the way Cursor records it: a directory
+    // named after the plugin under the marketplace it came from.
+    std::fs::create_dir_all(home.join(".cursor/plugins/cache/rolepod-brain/rolepod-brain")).unwrap();
+
+    let deferred = fixture.brain(&["setup", "--apply", "--cli", "cursor"]);
+    assert!(deferred.status.success(), "setup failed: {deferred:?}");
+    let after = servers("deferred");
+    assert!(
+        after["mcpServers"]["brain"].is_null(),
+        "our standalone entry survived alongside the plugin's: {after}"
+    );
+    assert!(after["mcpServers"]["other"].is_object(), "a foreign server was removed");
+    assert!(
+        String::from_utf8_lossy(&deferred.stdout).contains("plugin"),
+        "setup did not say why it stepped aside: {}",
+        String::from_utf8_lossy(&deferred.stdout)
+    );
+
+    // Capture still belongs to setup: the plugin does not declare hooks for
+    // this CLI, so removing them would silently stop the memory.
+    let hooks = std::fs::read_to_string(home.join(".cursor/hooks.json")).expect("hooks.json");
+    assert!(hooks.contains("brain hook --cli cursor"), "capture hooks were dropped: {hooks}");
+}
+
+#[test]
 fn only_a_cli_s_own_transcript_directory_is_read_from() {
     // Consolidation reads the recorded transcript and hands it to a model, so
     // an unchecked path in a hook payload is a way to make brain fetch a file

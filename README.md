@@ -198,17 +198,43 @@ Off by default because of what it costs, not what it returns: every search
 would spend a model call in the middle of a session. Turn it on if your
 searches keep returning the right entry in the wrong place.
 
-## Codex installs as a plugin
+## Installing as a plugin
+
+Claude Code, Cursor and Codex all read plugins from a marketplace repository,
+and this one is a marketplace:
+
+```sh
+# Claude Code
+/plugin marketplace add nuttaruj/rolepod-brain
+/plugin install rolepod-brain@rolepod-brain
+
+# Cursor
+cursor-agent plugin marketplace add nuttaruj/rolepod-brain
+cursor-agent plugin install rolepod-brain@rolepod-brain
+
+# Codex
+codex plugin marketplace add nuttaruj/rolepod-brain
+codex plugin add rolepod-brain@rolepod-brain
+```
+
+**The plugin is not a replacement for `brain setup`, except on Codex.** What it
+carries is the MCP recall tools and the skills — the part a CLI can serve from
+a manifest. Capture is still wired by `brain setup --apply`, because a hook has
+to name the absolute path of your binary and tag each event with the CLI it
+came from, and a manifest shipped in a repository knows neither. When the
+plugin is installed, `brain setup` notices and withdraws its own MCP
+registration rather than adding a second entry for the same server.
+
+The plugin expects `brain` on your `PATH` — `install.sh` puts it in
+`~/.local/bin`.
+
+### Codex is the exception
 
 Codex will not run a hook it has not been told to trust, and it does this
 silently. Entries written straight into `~/.codex/hooks.json` are therefore
 useless — nothing runs them and there is no reliable way to approve them. What
-Codex does have a trust path for is a plugin's own bundled hooks:
-
-```sh
-codex plugin marketplace add nuttaruj/rolepod-brain
-codex plugin add rolepod-brain@rolepod-brain
-```
+Codex does have a trust path for is a plugin's own bundled hooks, so on Codex
+the plugin carries capture as well.
 
 Then **open Codex interactively once and approve the plugin's hooks**. Until
 that approval exists, the plugin is installed and enabled and still captures
@@ -216,13 +242,8 @@ nothing; a non-interactive `codex exec` cannot grant it. `brain doctor` reports
 whether the plugin is installed, and the event counts in its capture line are
 what tell you whether approval actually took.
 
-One install brings the whole product: the plugin declares the lifecycle hooks,
-the MCP recall tools, and a `using-brain` skill that tells the agent what is
-remembered and when to go looking. Nothing else to register.
-
-The plugin expects `brain` on your `PATH` — `install.sh` puts it in
-`~/.local/bin`. `brain setup` does not write Codex hooks itself; it removes any
-raw entries an older version left behind and points here.
+`brain setup` does not write Codex hooks itself; it removes any raw entries an
+older version left behind and points here.
 
 ## Surviving a context wipe
 

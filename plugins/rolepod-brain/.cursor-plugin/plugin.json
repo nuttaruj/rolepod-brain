@@ -1,0 +1,19 @@
+{
+  "name": "rolepod-brain",
+  "displayName": "Rolepod Brain",
+  "version": "0.10.2",
+  "description": "Persistent memory for AI coding agents. Captures your sessions, consolidates them into a searchable markdown wiki, and hands the next session a short list of pointers. Install the `brain` binary and run `brain setup --apply` for capture; this plugin carries the MCP server and skills. Nothing runs in the background.",
+  "author": {
+    "name": "nuttaruj"
+  },
+  "homepage": "https://github.com/nuttaruj/rolepod-brain",
+  "repository": "https://github.com/nuttaruj/rolepod-brain",
+  "license": "MIT",
+  "keywords": [
+    "memory",
+    "context",
+    "mcp",
+    "cursor",
+    "consolidation"
+  ]
+}

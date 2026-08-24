@@ -1,6 +1,6 @@
 {
   "name": "rolepod-brain",
-  "version": "0.9.0",
+  "version": "0.10.2",
   "description": "Persistent memory for AI coding agents. Captures your sessions, consolidates them into a searchable markdown wiki, and hands the next session a short list of pointers. One binary, nothing resident.",
   "author": {
     "name": "nuttaruj",
@@ -19,7 +19,7 @@
     "hooks",
     "consolidation"
   ],
-  "hooks": "./hooks/hooks.json",
+  "hooks": "./hooks/codex-hooks.json",
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Rolepod Brain",

@@ -232,7 +232,7 @@ fn hook_checks() -> Vec<Check> {
             // grants the hooks permission to run - so the question is whether
             // that plugin is installed, not whether a config file mentions us.
             if target.layout == crate::setup::Layout::External {
-                return if codex_plugin_installed() {
+                return if crate::setup::plugin_installed(&target.kind) {
                     Check::pass(&name, "installed and enabled as a Codex plugin")
                 } else {
                     Check::fail(
@@ -294,29 +294,6 @@ fn hook_checks() -> Vec<Check> {
             Check::pass(&name, format!("{} event(s): {}", wired.len(), wired.join(", ")))
         })
         .collect()
-}
-
-/// Is our Codex plugin installed and enabled?
-///
-/// Codex records enabled plugins in `~/.codex/config.toml` as
-/// `[plugins."<name>@<marketplace>"]`. This is the check that matters for
-/// Codex, because installing through the plugin flow is what makes its hooks
-/// trusted — raw entries in `hooks.json` are silently never run.
-fn codex_plugin_installed() -> bool {
-    let Some(home) = dirs::home_dir() else { return false };
-    let Ok(text) = std::fs::read_to_string(home.join(".codex/config.toml")) else {
-        return false;
-    };
-    let Ok(config) = toml::from_str::<toml::Value>(&text) else { return false };
-    config
-        .get("plugins")
-        .and_then(toml::Value::as_table)
-        .is_some_and(|plugins| {
-            plugins.iter().any(|(key, value)| {
-                key.starts_with("rolepod-brain")
-                    && value.get("enabled").and_then(toml::Value::as_bool) != Some(false)
-            })
-        })
 }
 
 /// When each wired CLI actually calls a model.
