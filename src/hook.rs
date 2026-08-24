@@ -219,7 +219,7 @@ fn inject_for(
         // Both entry points into a fresh context get the primer: a normal
         // session start, and the moment after a compaction.
         "session_start" | "post_compact" => {
-            inject::primer(store, &project, &config.injection).ok()
+            inject::primer(store, &project, session, &config.injection).ok()
         }
         "post_tool_use" => event.files.first().and_then(|path| {
             let injection =

@@ -135,9 +135,18 @@ fn injection_check(paths: &Paths) -> Check {
     }
     let mean = total / sessions;
     let budget = i64::try_from(config.injection.session_budget).unwrap_or(i64::MAX);
-    let detail = format!(
-        "{sessions} session(s), mean {mean}B, worst {worst}B, cap {budget}B"
-    );
+    // The worst number on record has no age of its own - a session's spend
+    // is permanent once written - so without this a bug fixed today reads
+    // identically to one happening right now. The age is reported, not used
+    // to downgrade the check: this really did happen, and saying when is
+    // more honest than either hiding it or crying wolf forever.
+    let age = store
+        .worst_injection_at()
+        .ok()
+        .flatten()
+        .and_then(|ts| failure_age(Some(&ts)))
+        .map_or_else(String::new, |age| format!(" ({age})"));
+    let detail = format!("{sessions} session(s), mean {mean}B, worst {worst}B{age}, cap {budget}B");
     if worst > budget {
         Check::fail("injection", format!("{detail} - OVER BUDGET"))
     } else {
@@ -179,9 +188,17 @@ fn summarizer_checks(paths: &Paths) -> Vec<Check> {
         checks.push(Check::pass("summarizer", installed.join(" ")));
     }
 
+    // A rung the current table no longer names - renamed or dropped - cannot
+    // fail again, because nothing will ever record success OR failure
+    // against that key again. Reporting it is not a live warning; it is
+    // orphaned state outliving the identity that wrote it, exactly the class
+    // of bug the "gemini" -> "gemini-cli" rename itself produced: that rename
+    // is what orphaned this row in the first place.
+    let live_rungs: Vec<&str> = crate::summarizer::SPECS.iter().map(|spec| spec.cli).collect();
+
     if let Ok(store) = Store::open(&paths.db()) {
         for health in store.summarizer_health().unwrap_or_default() {
-            if health.failures == 0 {
+            if health.failures == 0 || !live_rungs.contains(&health.cli.as_str()) {
                 continue;
             }
             let cli = health.cli;

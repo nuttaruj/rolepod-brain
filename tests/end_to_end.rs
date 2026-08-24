@@ -407,6 +407,81 @@ fn reranking_reorders_a_search_and_a_failed_one_changes_nothing() {
 }
 
 #[test]
+fn an_over_budget_injection_is_reported_with_its_age() {
+    // injected_bytes has no timestamp of its own - a session's spend is
+    // permanent once recorded - so without an age, a bug fixed today reads
+    // identically to one happening right now. Doctor derives it from the
+    // worst session's own most recent captured event.
+    let fixture = Fixture::new("injbudgetage");
+    fixture.seed_session(1);
+    let session = fixture
+        .log_text()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find_map(|line| line["session"].as_str().map(str::to_string))
+        .expect("a captured session");
+
+    Command::new("sqlite3")
+        .arg(fixture.home.join("brain.db"))
+        .arg(format!(
+            "INSERT INTO injected_bytes (session, bytes) VALUES ('{session}', 99999);"
+        ))
+        .output()
+        .expect("seed injected_bytes");
+
+    let report = String::from_utf8_lossy(&fixture.brain(&["doctor"]).stdout).to_string();
+    assert!(report.contains("OVER BUDGET"), "the overspend was not reported: {report}");
+    // Match the check's own column, not a bare substring: the temp fixture
+    // path is also part of the report, and could itself contain "injection".
+    let line = report
+        .lines()
+        .find(|line| line.trim_start_matches("FAIL").trim_start_matches("ok").trim_start().starts_with("injection"))
+        .unwrap_or_default();
+    assert!(
+        line.contains("ago") || line.contains("just now"),
+        "the overspend was reported with no age, indistinguishable from happening right now: {line}"
+    );
+}
+
+#[test]
+fn a_renamed_rung_s_stale_failure_does_not_haunt_doctor_forever() {
+    // A real row found on a real machine: the gemini spec was renamed
+    // "gemini" -> "gemini-cli" to match what hooks actually write, which
+    // orphaned an existing health row under the old key. Nothing will ever
+    // record success OR failure against "gemini" again, so the row can never
+    // clear itself - and doctor reported it as a live failure regardless.
+    let fixture = Fixture::new("staleorphan");
+    fixture.seed_session(1);
+    // brain.db has to exist first; its own health is not what this test
+    // is about, so the exit code is not asserted.
+    let _ = fixture.brain(&["doctor"]);
+
+    let seed = |cli: &str, error: &str| {
+        Command::new("sqlite3")
+            .arg(fixture.home.join("brain.db"))
+            .arg(format!(
+                "INSERT INTO summarizer_health (cli, failures, last_error, last_failed_at)                  VALUES ('{cli}', 2, '{error}', NULL);"
+            ))
+            .output()
+            .expect("seed summarizer_health");
+    };
+    // The orphan: a name no current spec uses.
+    seed("gemini", "prompt is 24709 bytes, over the 24576-byte call ceiling");
+    // A live rung, failing right now, must still be reported.
+    seed("codex", "rate limit exceeded");
+
+    let report = String::from_utf8_lossy(&fixture.brain(&["doctor"]).stdout).to_string();
+    assert!(
+        !report.contains("summarizer: gemini "),
+        "an orphaned rung with no current spec was reported as a live failure: {report}"
+    );
+    assert!(
+        report.contains("summarizer: codex"),
+        "a live rung's real failure was suppressed along with the orphan: {report}"
+    );
+}
+
+#[test]
 fn an_installed_plugin_takes_over_the_mcp_registration() {
     // The plugin declares the same server brain would register standalone.
     // Two entries for one binary is the duplicate-registration bug this

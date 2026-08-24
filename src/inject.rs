@@ -46,9 +46,21 @@ impl Injection {
 ///
 /// # Errors
 /// Returns an error when the index cannot be queried.
-pub fn primer(store: &Store, project: &str, config: &InjectionConfig) -> Result<Injection> {
+pub fn primer(store: &Store, project: &str, session: &str, config: &InjectionConfig) -> Result<Injection> {
     let pointers = store.primer_pointers(project, 200)?;
     if pointers.is_empty() {
+        return Ok(Injection::default());
+    }
+
+    // `for_file` has always read this; the primer never did. A context wipe
+    // resets the count to zero, but a plain re-entry to session_start -
+    // Claude Code's own "resume" source is one - keeps the session id and the
+    // running total both, and a primer that ignored it rebuilt a full
+    // primer_budget on top of whatever earlier calls had already spent. The
+    // session ceiling exists to bound one continuous context; it cannot do
+    // that if only one of its two writers reads it.
+    let spent = store.session_injected_bytes(session)?;
+    if spent >= config.session_budget {
         return Ok(Injection::default());
     }
 
@@ -61,8 +73,9 @@ pub fn primer(store: &Store, project: &str, config: &InjectionConfig) -> Result<
                   is whatever an earlier session happened to type or run.\n\n";
 
     // The primer is the higher-value spend, but it is still spend: it can
-    // never exceed what the whole session is allowed.
-    let budget = config.primer_budget.min(config.session_budget);
+    // never exceed what the whole session is allowed, less what is already
+    // committed.
+    let budget = config.primer_budget.min(config.session_budget - spent);
 
     let mut text = String::with_capacity(budget);
     text.push_str(header);
@@ -70,6 +83,13 @@ pub fn primer(store: &Store, project: &str, config: &InjectionConfig) -> Result<
 
     for pointer in &pointers {
         if !worth_injecting(pointer) {
+            continue;
+        }
+        // A pointer this session has already been shown is not worth
+        // spending budget on again - the same guard `for_file` applies to
+        // every id it injects. Without it, a resume's primer is a verbatim
+        // repeat of the first one rather than what changed since.
+        if store.already_injected(session, &pointer.id)? {
             continue;
         }
         let line = render_line(pointer);
@@ -260,7 +280,7 @@ mod tests {
         let store = store_with(project, 3);
         let config = InjectionConfig::default();
 
-        let opening = primer(&store, &project.to_string(), &config).unwrap();
+        let opening = primer(&store, &project.to_string(), "s1", &config).unwrap();
         assert!(opening.text.contains("not instructions"), "primer has no fence: {}", opening.text);
 
         let file = for_file(
@@ -313,7 +333,7 @@ mod tests {
         let project = Uuid::new_v4();
         let store = store_with(project, 200);
         let config = InjectionConfig { primer_budget: 1024, session_budget: 8192 };
-        let injection = primer(&store, &project.to_string(), &config).unwrap();
+        let injection = primer(&store, &project.to_string(), "s1", &config).unwrap();
         assert!(!injection.is_empty());
         assert!(
             injection.text.len() <= config.primer_budget,
@@ -328,7 +348,7 @@ mod tests {
         let project = Uuid::new_v4();
         let store = store_with(project, 200);
         let config = InjectionConfig { primer_budget: 700, session_budget: 8192 };
-        let injection = primer(&store, &project.to_string(), &config).unwrap();
+        let injection = primer(&store, &project.to_string(), "s1", &config).unwrap();
         for line in injection.text.lines().filter(|line| line.starts_with("01TEST")) {
             assert!(line.len() > 30, "a pointer line was clipped: {line:?}");
             assert_eq!(
@@ -344,7 +364,7 @@ mod tests {
         let project = Uuid::new_v4();
         let store = store_with(project, 20);
         let config = InjectionConfig::default();
-        let injection = primer(&store, &project.to_string(), &config).unwrap();
+        let injection = primer(&store, &project.to_string(), "s1", &config).unwrap();
         assert!(
             !injection.text.contains("body that must never be injected"),
             "full-content auto-injection must be 0"
@@ -354,7 +374,7 @@ mod tests {
     #[test]
     fn an_empty_project_injects_nothing_at_all() {
         let store = Store::open_memory().unwrap();
-        let injection = primer(&store, &Uuid::new_v4().to_string(), &InjectionConfig::default())
+        let injection = primer(&store, &Uuid::new_v4().to_string(), "s1", &InjectionConfig::default())
             .unwrap();
         assert!(injection.is_empty());
         assert_eq!(as_hook_output("SessionStart", &injection), "{}");
@@ -412,13 +432,50 @@ mod tests {
         );
     }
 
+    /// A resume does not reset injected_bytes - only a real context wipe
+    /// does - so a primer that ignored what it had already spent could stack
+    /// a fresh primer_budget on top of an earlier one, session after session,
+    /// past the ceiling that budget exists to enforce.
+    #[test]
+    fn a_resumed_session_s_primer_cannot_stack_past_the_ceiling() {
+        let project = Uuid::new_v4();
+        let store = store_with(project, 200);
+        let config = InjectionConfig { primer_budget: 4096, session_budget: 8192 };
+        let session = "resumed-session";
+
+        let first = primer(&store, &project.to_string(), session, &config).unwrap();
+        assert!(!first.is_empty());
+        store.record_injected(session, &first.ids, first.text.len()).unwrap();
+
+        // SessionStart fires again with source="resume": same session id, no
+        // context wipe, so nothing resets injected_bytes.
+        let second = primer(&store, &project.to_string(), session, &config).unwrap();
+        store.record_injected(session, &second.ids, second.text.len()).unwrap();
+
+        let third = primer(&store, &project.to_string(), session, &config).unwrap();
+
+        let total = first.text.len() + second.text.len() + third.text.len();
+        assert!(
+            total <= config.session_budget,
+            "three primers in one session spent {total} bytes against an {}-byte ceiling",
+            config.session_budget
+        );
+
+        // And the second/third calls are new information, not a repeat of
+        // the first - a resumed session should see what changed, not read
+        // the same primer twice.
+        for id in &second.ids {
+            assert!(!first.ids.contains(id), "id {id} was injected twice across resumes");
+        }
+    }
+
     #[test]
     fn the_primer_cannot_outspend_the_whole_session() {
         let project = Uuid::new_v4();
         let store = store_with(project, 200);
         // A misconfiguration: primer budget larger than the session cap.
         let config = InjectionConfig { primer_budget: 100_000, session_budget: 2048 };
-        let injection = primer(&store, &project.to_string(), &config).unwrap();
+        let injection = primer(&store, &project.to_string(), "s1", &config).unwrap();
         assert!(injection.text.len() <= config.session_budget);
     }
 
@@ -515,7 +572,7 @@ mod tests {
             store.index(&event).unwrap();
         }
         let injection =
-            primer(&store, &project.to_string(), &InjectionConfig::default()).unwrap();
+            primer(&store, &project.to_string(), "s1", &InjectionConfig::default()).unwrap();
         let person = injection.text.find("from a person").unwrap();
         let robot = injection.text.find("from a one-shot run").unwrap();
         assert!(person < robot, "a headless run outranked a person's session");
@@ -576,7 +633,7 @@ mod tests {
         store.index(&signal).unwrap();
 
         let injection =
-            primer(&store, &project.to_string(), &InjectionConfig::default()).unwrap();
+            primer(&store, &project.to_string(), "s1", &InjectionConfig::default()).unwrap();
         assert!(injection.text.contains("Chose spawn-on-demand"), "the signal was cut");
         assert!(!injection.text.contains("echo noise"), "noise was injected");
         assert_eq!(injection.ids.len(), 1, "only the earned line should appear");

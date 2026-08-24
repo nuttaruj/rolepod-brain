@@ -1467,6 +1467,35 @@ impl Store {
             .context("read injection stats")
     }
 
+    /// When the worst-offending session was last active.
+    ///
+    /// `injected_bytes` has no timestamp of its own - a session's spend is
+    /// permanent once recorded, with nothing to age it out - so a bug fixed
+    /// today stays reported as an active failure forever unless the reader
+    /// can tell how old the worst number is. The session's own most recent
+    /// captured event is the closest true answer available, the same idiom
+    /// `project_cli` already uses to answer "which CLI, really" without a
+    /// dedicated column of its own.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn worst_injection_at(&self) -> Result<Option<String>> {
+        let ts = self.conn.query_row(
+            "SELECT e.ts FROM events e
+             WHERE e.session = (
+                 SELECT session FROM injected_bytes ORDER BY bytes DESC LIMIT 1
+             )
+             ORDER BY e.id DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        );
+        match ts {
+            Ok(ts) => Ok(Some(ts)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     /// How many events carry each topic, for `brain doctor`.
     ///
     /// # Errors
