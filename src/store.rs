@@ -174,6 +174,15 @@ impl Store {
                     path    TEXT NOT NULL
                 );
 
+                -- What we last wrote to a page, so an edit made by hand in
+                -- the vault can be told apart from our own output and read
+                -- back into the log instead of being overwritten.
+                CREATE TABLE IF NOT EXISTS page_state (
+                    path    TEXT PRIMARY KEY,
+                    hash    TEXT NOT NULL,
+                    session TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS session_invocation (
                     session    TEXT PRIMARY KEY,
                     invocation TEXT NOT NULL
@@ -372,10 +381,6 @@ impl Store {
     /// Returns an error when the query cannot be executed. A malformed FTS5
     /// query (an unbalanced quote typed by an agent) is reported as an error
     /// rather than silently returning nothing.
-    pub fn search(&self, project: &str, query: &str, limit: usize) -> Result<Vec<Hit>> {
-        self.search_scoped(project, query, None, limit)
-    }
-
     /// Search, optionally narrowed to one topic.
     ///
     /// Relevance ranking answers "what mentions this"; a scope answers "what
@@ -386,7 +391,7 @@ impl Store {
     ///
     /// # Errors
     /// Returns an error when the query fails.
-    pub fn search_scoped(
+    pub fn search(
         &self,
         project: &str,
         query: &str,
@@ -614,6 +619,85 @@ impl Store {
             )
             .optional()
             .context("read transcript path")
+    }
+
+    /// Remember what we wrote to a page.
+    ///
+    /// # Errors
+    /// Returns an error when the write fails.
+    pub fn record_page(&self, path: &str, hash: &str, session: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO page_state (path, hash, session) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(path) DO UPDATE SET hash = excluded.hash, session = excluded.session",
+                params![path, hash, session],
+            )
+            .context("record page state")?;
+        Ok(())
+    }
+
+    /// Every page whose file no longer matches what we wrote, with the
+    /// session it belongs to.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn pages_edited_by_hand(&self) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, hash, session FROM page_state")
+            .context("prepare page state")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })
+            .context("run page state")?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// The consolidated summary for one session, if it has one.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn summary_for_session(&self, session: &str) -> Result<Option<(String, String)>> {
+        let found = self.conn.query_row(
+            "SELECT id, body FROM events
+             WHERE session = ?1 AND kind = 'session_summary' AND forgotten = 0
+             ORDER BY id DESC LIMIT 1",
+            [session],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        );
+        match found {
+            Ok(pair) => Ok(Some(pair)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// A session's summary text, but only when a HUMAN corrected it.
+    ///
+    /// The summary row also holds whatever the last summarizer produced, so
+    /// reading it unconditionally would freeze the first summary forever -
+    /// a rule-based run could never be replaced by a model's better one.
+    /// The join is what distinguishes "someone edited this in the vault"
+    /// from "this is simply the current text".
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn human_corrected_summary(&self, session: &str) -> Result<Option<String>> {
+        let found = self.conn.query_row(
+            "SELECT s.body FROM events s
+             JOIN events c ON c.id = s.corrected_by
+             WHERE s.session = ?1 AND s.kind = 'session_summary' AND s.forgotten = 0
+                   AND c.cli = 'human'
+             ORDER BY s.id DESC LIMIT 1",
+            [session],
+            |row| row.get::<_, String>(0),
+        );
+        match found {
+            Ok(body) => Ok(Some(body)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
     }
 
     /// Which CLI most recently worked in this project.
@@ -1790,7 +1874,7 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let project = Uuid::new_v4();
         store.index(&event("Fixed the auth middleware", "token expiry used <", project)).unwrap();
-        let hits = store.search(&project.to_string(), "auth", 10).unwrap();
+        let hits = store.search(&project.to_string(), "auth", None, 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].title.contains("auth"));
     }
@@ -1808,12 +1892,12 @@ mod tests {
 
         for query in ["src/billing.rs", "period \"end", "a - b"] {
             let hits = store
-                .search(&project.to_string(), query, 10)
+                .search(&project.to_string(), query, None, 10)
                 .unwrap_or_else(|error| panic!("query {query:?} errored: {error}"));
             let _ = hits;
         }
         assert_eq!(
-            store.search(&project.to_string(), "src/billing.rs", 10).unwrap().len(),
+            store.search(&project.to_string(), "src/billing.rs", None, 10).unwrap().len(),
             1,
             "a path query should find the work on that path"
         );
@@ -1826,7 +1910,7 @@ mod tests {
         let theirs = Uuid::new_v4();
         store.index(&event("shared word here", "body", mine)).unwrap();
         store.index(&event("shared word here", "body", theirs)).unwrap();
-        assert_eq!(store.search(&mine.to_string(), "shared", 10).unwrap().len(), 1);
+        assert_eq!(store.search(&mine.to_string(), "shared", None, 10).unwrap().len(), 1);
     }
 
     #[test]
@@ -1837,7 +1921,7 @@ mod tests {
         store.index(&event).unwrap();
         store.index(&event).unwrap();
         assert_eq!(store.count().unwrap(), 1);
-        assert_eq!(store.search(&project.to_string(), "once", 10).unwrap().len(), 1);
+        assert_eq!(store.search(&project.to_string(), "once", None, 10).unwrap().len(), 1);
     }
 
     #[test]
@@ -1885,6 +1969,6 @@ mod tests {
         store.index(&event("gone soon", "body", project)).unwrap();
         store.clear().unwrap();
         assert_eq!(store.count().unwrap(), 0);
-        assert!(store.search(&project.to_string(), "gone", 10).unwrap().is_empty());
+        assert!(store.search(&project.to_string(), "gone", None, 10).unwrap().is_empty());
     }
 }

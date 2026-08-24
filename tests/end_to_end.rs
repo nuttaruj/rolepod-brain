@@ -888,6 +888,98 @@ fn one_loud_session_cannot_own_every_search_result() {
 }
 
 #[test]
+fn an_edit_you_make_in_obsidian_becomes_memory_rather_than_being_overwritten() {
+    // Pages are derived: consolidation rewrites them, so an edit made in
+    // Obsidian used to be lost the next time that session was consolidated -
+    // and the README's answer was "do not edit them". A memory system whose
+    // wrong answers cannot be fixed where you read them is a memory system
+    // you learn to distrust.
+    //
+    // The fix does not make pages authoritative - that would break the rule
+    // that the log is the only source of truth and `reindex` can rebuild
+    // everything. It reads the edit BACK into the log as a correction, so the
+    // page stays derived and your words survive every future rebuild.
+    let fixture = Fixture::new("adoptedit");
+    fixture.seed_session(2);
+    let bin = fixture.fake_cli("claude", GOOD_CLI);
+    assert!(fixture.brain_with_path(&["consolidate", "--force"], Some(&bin)).status.success());
+
+    let mut pages = Vec::new();
+    collect_under(&fixture.wiki(), "sessions", &mut pages);
+    let page = pages
+        .into_iter()
+        .find(|path| path.extension().is_some_and(|ext| ext == "md"))
+        .expect("a session page");
+    let before = std::fs::read_to_string(&page).unwrap();
+    assert!(before.contains("Refactored the auth path"), "precondition: {before}");
+
+    // The human corrects it where they read it.
+    let edited = before.replace(
+        "Refactored the auth path and fixed token expiry.",
+        "Actually reverted the auth refactor; token expiry was never the bug.",
+    );
+    assert_ne!(edited, before, "the test's own edit did not apply");
+    std::fs::write(&page, &edited).unwrap();
+
+    // Any later consolidation must adopt the edit instead of erasing it.
+    fixture.seed_session(2);
+    assert!(fixture.brain_with_path(&["consolidate", "--force"], Some(&bin)).status.success());
+
+    let after = std::fs::read_to_string(&page).unwrap();
+    assert!(
+        after.contains("Actually reverted the auth refactor"),
+        "the human's correction was overwritten: {after}"
+    );
+
+    // And it is in the log, which is what makes it survive a rebuild.
+    assert!(
+        fixture.log_text().contains("Actually reverted the auth refactor"),
+        "the edit never reached the log, so it is one reindex from gone"
+    );
+    assert!(fixture.brain(&["reindex"]).status.success());
+    let found = String::from_utf8_lossy(&fixture.brain(&["search", "reverted"]).stdout).to_string();
+    assert!(!found.contains("No matches"), "the correction did not survive a rebuild: {found}");
+}
+
+#[test]
+fn the_wiki_can_say_what_it_used_to_believe() {
+    // Every consolidation already commits the wiki, so the record of how a
+    // page changed exists in full - there was just no way to ask for it.
+    // This is the cheapest possible temporal answer: not "when was this true
+    // in the world", but "when did memory start saying so".
+    let fixture = Fixture::new("pagehistory");
+    fixture.seed_session(2);
+    let bin = fixture.fake_cli("claude", GOOD_CLI);
+    assert!(fixture.brain_with_path(&["consolidate", "--force"], Some(&bin)).status.success());
+
+    // A second consolidation rewrites the hub notes, giving a page two versions.
+    fixture.seed_session(2);
+    let second = fixture.fake_cli(
+        "claude",
+        r#"echo '{"summary":"A different account of the same work.","titles":[]}'"#,
+    );
+    assert!(fixture.brain_with_path(&["consolidate", "--force"], Some(&second)).status.success());
+
+    let out = fixture.brain(&["history", "checkout"]);
+    assert!(out.status.success(), "history failed: {out:?}");
+    let report = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(report.contains("checkout"), "the page was not identified: {report}");
+    assert!(
+        report.matches("consolidate").count() >= 1,
+        "no revisions listed: {report}"
+    );
+
+    // A page nobody has written must say so rather than fail.
+    let missing = fixture.brain(&["history", "nothing-by-this-name"]);
+    assert!(missing.status.success(), "a missing page should not be an error: {missing:?}");
+    assert!(
+        String::from_utf8_lossy(&missing.stdout).contains("No page"),
+        "expected a plain answer: {}",
+        String::from_utf8_lossy(&missing.stdout)
+    );
+}
+
+#[test]
 fn forgetting_an_entity_spares_its_siblings() {
     // The third forgetting primitive: "forget everything about X" when the
     // caller does not know the ids. The property that makes it correct is

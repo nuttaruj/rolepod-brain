@@ -119,6 +119,7 @@ Nothing, normally. That is the point. When you want to look:
 
 ```sh
 brain search "auth" --topic decision   # only what was DECIDED about auth
+brain history decisions --diff        # what a page used to say, and when it changed
 brain doctor            # is capture actually working?
 brain stats             # what it has captured, consolidated, and injected
 brain search "auth"     # full-text search this project's memory
@@ -514,9 +515,17 @@ tell you if capture has started a second tree in the meantime.
 
 Three things worth knowing before you do:
 
-**Generated pages are regenerated.** Consolidation rewrites them,
-so an edit you make there can be overwritten without warning. Read them freely;
-just do not treat them as a place to write.
+**You can correct a summary where you read it.** If a session page says
+something wrong, fix the text under `## Summary` in Obsidian. The next
+consolidation reads your wording back into the log as a correction, so it
+survives every later rewrite — and every `brain reindex`, because the log is
+what pages are rendered from. `brain consolidate` says how many edits it
+adopted.
+
+Only the summary section works this way. The rest of a page — timeline,
+files, frontmatter — is rendered from the log verbatim, so changes there are
+simply rewritten. Hub notes, entity pages and `index.md` are regenerated
+whole.
 
 **Write alongside instead.** Consolidation writes `pages/`, `knowledge/`,
 `entities/`, the hub notes at the top of a project directory, and `index.md`.

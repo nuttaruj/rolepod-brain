@@ -78,6 +78,8 @@ pub struct Outcome {
     pub events: usize,
     pub skipped: usize,
     pub tiers: Vec<String>,
+    /// Hand edits read back out of the vault into the log.
+    pub adopted: usize,
 }
 
 /// Consolidate pending work.
@@ -110,6 +112,11 @@ pub fn run(session: Option<&str>, all_projects: bool, force: bool) -> Result<Out
     let mut outcome = Outcome::default();
     for (scope, project_dir) in projects {
         let project = scope.project_id.to_string();
+        // Before writing anything, take back what a human wrote by hand.
+        // Skipping this would overwrite their correction with our own older
+        // wording, which is how a memory system teaches people not to
+        // correct it.
+        outcome.adopted += adopt_hand_edits(&project_dir, &scope, &store)?;
         for pending in store.sessions_pending(&project)? {
             if let Some(only) = session {
                 if pending.session != only {
@@ -254,8 +261,16 @@ fn consolidate_session(
     entities.dedup();
     entities.retain(|name| !name.is_empty());
 
+    // A correction a human wrote into the page is the newest word on this
+    // session, so it - not the model's older summary - is what gets rendered.
+    let summary = latest_summary_text(store, &pending.session, &summary)?;
     let page_path =
         write_page(project_dir, scope, pending, &summary, &events, &retitled, &entities)?;
+    // Fingerprint what we just wrote, so the next run can tell a hand edit
+    // from our own output.
+    if let Ok(written) = std::fs::read_to_string(&page_path) {
+        store.record_page(&page_path.to_string_lossy(), &page_hash(&written), &pending.session)?;
+    }
     store.record_entities(&pending.session, &scope.project_id.to_string(), &entities)?;
 
     let log = EventLog::open(project_dir)?;
@@ -704,8 +719,93 @@ fn write_page(
         }
     }
 
-    std::fs::write(&path, page).with_context(|| format!("write {}", path.display()))?;
+    std::fs::write(&path, &page).with_context(|| format!("write {}", path.display()))?;
     Ok(path)
+}
+
+/// The newest wording for a session: a human's correction if one exists,
+/// otherwise what the summarizer just produced.
+///
+/// A human's correction is applied to the summary row in place and marked
+/// by `corrected_by`, which is what tells it apart from the summarizer's own
+/// current text - reading the row unconditionally would freeze the first
+/// summary forever, so a rule-based run could never be replaced by a
+/// model's better one. It is also why the edit survives `reindex`, which
+/// renders from the log rather than from whatever is on disk.
+fn latest_summary_text(store: &Store, session: &str, fresh: &str) -> Result<String> {
+    Ok(store
+        .human_corrected_summary(session)?
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or_else(|| fresh.to_string()))
+}
+
+/// Read a page's summary section back into the log when a human changed it.
+///
+/// Pages are derived state - `reindex` rebuilds them - so an edit made in
+/// the vault is not authoritative and cannot simply be kept: the next
+/// consolidation would write over it, and a rebuild would erase it. Reading
+/// the edit back as a correction event puts the human's words where every
+/// future render takes them from, which keeps the page derived AND the edit
+/// permanent.
+///
+/// Only the summary section is adopted. The rest of a page - timeline,
+/// files, frontmatter - is rendered from the log verbatim, so a change there
+/// has nothing to correct and is simply rewritten.
+fn adopt_hand_edits(project_dir: &Path, scope: &ProjectScope, store: &Store) -> Result<usize> {
+    let mut adopted = 0;
+    for (path, recorded, session) in store.pages_edited_by_hand()? {
+        let path = PathBuf::from(&path);
+        if !path.starts_with(project_dir) {
+            continue;
+        }
+        let Ok(current) = std::fs::read_to_string(&path) else { continue };
+        if page_hash(&current) == recorded {
+            continue;
+        }
+
+        let Some(edited) = summary_section(&current) else { continue };
+        let Some((summary_id, recorded_summary)) = store.summary_for_session(&session)? else {
+            continue;
+        };
+        if edited.trim() == recorded_summary.trim() {
+            // Changed elsewhere in the page; nothing to correct.
+            store.record_page(&path.to_string_lossy(), &page_hash(&current), &session)?;
+            continue;
+        }
+
+        let mut event = Event::new(
+            scope.workspace_id,
+            scope.project_id,
+            uuid::Uuid::nil(),
+            Source { cli: "human".to_string(), hook: "correct".to_string() },
+            EventKind::Note,
+            first_line(&edited),
+            edited,
+        );
+        event.links = vec![summary_id];
+        event.consolidated = true;
+        EventLog::open(project_dir)?.append(&event)?;
+        store.index(&event)?;
+        store.record_page(&path.to_string_lossy(), &page_hash(&current), &session)?;
+        adopted += 1;
+    }
+    Ok(adopted)
+}
+
+/// The text under `## Summary`, which is the part a human would correct.
+fn summary_section(page: &str) -> Option<String> {
+    let body = page.split("## Summary").nth(1)?;
+    let text = body.split("\n## ").next()?.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// Cheap content fingerprint. Not cryptographic: it answers "is this the
+/// file we wrote", where the only adversary is a text editor.
+fn page_hash(text: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 /// The page already written for this session, found by its frontmatter.

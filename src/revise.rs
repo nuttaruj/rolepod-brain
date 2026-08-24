@@ -90,7 +90,7 @@ pub fn forget_entity(name: &str, apply: bool) -> Result<Vec<Outcome>> {
     anyhow::ensure!(!name.trim().is_empty(), "name something to forget");
     let (paths, store, scope) = context()?;
     let project = scope.project_id.to_string();
-    let targets = store.search_scoped(&project, name, None, ENTITY_FORGET_MAX)?;
+    let targets = store.search(&project, name, None, ENTITY_FORGET_MAX)?;
 
     if !apply {
         return Ok(targets

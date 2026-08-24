@@ -12,6 +12,7 @@ mod config;
 mod consolidate;
 mod doctor;
 mod event;
+mod history;
 mod hook;
 mod ids;
 mod inject;
@@ -83,6 +84,14 @@ enum Commands {
     },
     /// Check that capture, storage, and wiring are actually working.
     Doctor,
+    /// What a wiki page used to say, from the wiki's own git history.
+    History {
+        /// Part of the page's path or name, e.g. `decisions` or a session date.
+        query: String,
+        /// Show what each revision changed, not just when it happened.
+        #[arg(long)]
+        diff: bool,
+    },
     /// Remove brain from every CLI. Prints a plan; use --apply to perform it.
     Uninstall {
         /// Perform the changes instead of only printing them.
@@ -198,6 +207,12 @@ fn run(command: Commands) -> Result<()> {
         Commands::Mcp => mcp::serve(),
         Commands::Consolidate { session, all, force } => {
             let outcome = consolidate::run(session.as_deref(), all, force)?;
+            if outcome.adopted > 0 {
+                println!(
+                    "Adopted {} hand-edited page(s) into memory.",
+                    outcome.adopted
+                );
+            }
             if outcome.sessions == 0 {
                 println!(
                     "Nothing to consolidate ({} session(s) waiting for more events or a debounce).",
@@ -239,6 +254,7 @@ fn run(command: Commands) -> Result<()> {
         Commands::Uninstall { apply, wipe } => uninstall(apply, wipe),
         Commands::Reindex => reindex(),
         Commands::Search { query, limit, topic } => search(&query, limit, topic.as_deref()),
+        Commands::History { query, diff } => history::report(&query, diff),
         Commands::Stats => stats(),
         Commands::Export { file } => {
             let path = file.map_or_else(portable::default_archive, std::path::PathBuf::from);
@@ -378,7 +394,7 @@ fn search(query: &str, limit: usize, topic: Option<&str>) -> Result<()> {
             event::TOPICS.join(", ")
         );
     }
-    let hits = store.search_scoped(&scope.project_id.to_string(), query, scoped, limit)?;
+    let hits = store.search(&scope.project_id.to_string(), query, scoped, limit)?;
 
     if hits.is_empty() {
         let where_ = scoped.map_or(String::new(), |topic| format!(" under topic `{topic}`"));
