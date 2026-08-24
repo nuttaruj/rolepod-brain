@@ -191,7 +191,7 @@ rerank = false         # true spends one cheap-tier call reordering search
                        # results by what the query was asking
 
 [sanitize]
-extra_patterns = []    # additional regexes to redact
+extra_patterns = []    # additional regexes to redact (see Redaction below)
 allowlist = []         # substrings that survive redaction
 ```
 
@@ -433,6 +433,39 @@ Layer 3 exists because layer 2 is a request, not a guarantee. Small models
 misread instructions — one returned bare strings where the schema asked for
 objects — and security cannot rest on a model complying. There is a test that
 plants credentials in a summarizer's output and proves they never reach disk.
+
+### Extending the patterns
+
+The built-in patterns cover the generic shapes — cloud keys, `*_TOKEN=`,
+`*_PASSWORD=`, credential paths like `.ssh/`. What they cannot know is what
+counts as a secret *in your organisation*. `extra_patterns` adds your own
+regexes on top; anything they match is replaced with `[REDACTED]` before it
+is written anywhere:
+
+```toml
+[sanitize]
+extra_patterns = [
+  "EMP-[0-9]{6}",                        # employee ids
+  "[a-z0-9-]+\\.internal\\.acme\\.com",  # internal hostnames
+  "ACME-(PROD|STAGE)-[A-Za-z0-9]{16}",   # your license-key format
+]
+```
+
+`allowlist` is the opposite valve — for **false positives**, strings a
+built-in pattern catches that are not secrets at all. The classic case is
+code that assigns something *named* like a credential:
+
+```toml
+[sanitize]
+# `DESIGN_TOKEN = "spacing-4"` is a CSS value, but the generic `*_TOKEN=`
+# pattern cannot know that. Allowlisted substrings survive redaction.
+allowlist = ["DESIGN_TOKEN", "CSRF_TOKEN_HEADER"]
+```
+
+If your session pages keep showing `[REDACTED]` where real content should be,
+an allowlist entry is usually the fix; if you spot something in a page that
+should never have been written, an extra pattern is. An invalid regex fails
+loudly at startup rather than silently disabling itself.
 
 ### `<private>` — the optional escape hatch
 

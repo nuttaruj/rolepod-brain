@@ -568,8 +568,13 @@ const CONFIG_TEMPLATE: &str = r#"# rolepod-brain configuration.
 # rerank = false
 
 [sanitize]
-# Additional regexes to redact beyond the built-in credential patterns, and
-# substrings that survive redaction.
+# Your own redaction on top of the built-in credential patterns. Anything an
+# extra pattern matches becomes [REDACTED] before it is written anywhere:
+#   extra_patterns = ["EMP-[0-9]{6}", "[a-z0-9-]+\\.internal\\.example\\.com"]
+# The allowlist is for false positives - strings a built-in pattern catches
+# that are not secrets, like a `DESIGN_TOKEN = "spacing-4"` assignment the
+# generic `*_TOKEN=` pattern cannot tell from a credential:
+#   allowlist = ["DESIGN_TOKEN"]
 # extra_patterns = []
 # allowlist = []
 "#;
