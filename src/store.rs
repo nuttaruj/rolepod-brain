@@ -373,6 +373,26 @@ impl Store {
     /// query (an unbalanced quote typed by an agent) is reported as an error
     /// rather than silently returning nothing.
     pub fn search(&self, project: &str, query: &str, limit: usize) -> Result<Vec<Hit>> {
+        self.search_scoped(project, query, None, limit)
+    }
+
+    /// Search, optionally narrowed to one topic.
+    ///
+    /// Relevance ranking answers "what mentions this"; a scope answers "what
+    /// did we DECIDE about this", which is a different question and the one
+    /// worth asking when memory is large. The topic is the taxonomy
+    /// consolidation already assigns, so this costs a WHERE clause rather
+    /// than a new index.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn search_scoped(
+        &self,
+        project: &str,
+        query: &str,
+        topic: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Hit>> {
         let mut stmt = self
             .conn
             .prepare(
@@ -395,6 +415,8 @@ impl Store {
                      JOIN events e ON e.rowid = events_fts.rowid
                      WHERE events_fts MATCH ?1 AND e.project = ?2 AND e.forgotten = 0
                            AND e.kind != 'tombstone'
+                                 AND e.hook != 'correct'
+                           AND (?5 IS NULL OR e.topic = ?5)
                  )
                  SELECT id, ts, cli, kind, title, snip, session FROM (
                      SELECT *, ROW_NUMBER() OVER (
@@ -412,7 +434,7 @@ impl Store {
         // at all, and a flat pool never reaches them.
         let pool = limit.saturating_mul(SEARCH_POOL_FACTOR).max(limit);
         let mut read = |query: &str| -> rusqlite::Result<Vec<Hit>> {
-            stmt.query_map(params![query, project, limit as i64, pool as i64], |row| {
+            stmt.query_map(params![query, project, limit as i64, pool as i64, topic], |row| {
                 Ok(Hit {
                     id: row.get(0)?,
                     ts: row.get(1)?,
@@ -497,6 +519,7 @@ impl Store {
             .prepare(
                 "SELECT id, ts, cli, kind, title, session
                  FROM events WHERE project = ?1 AND forgotten = 0 AND kind != 'tombstone'
+                       AND hook != 'correct'
                  ORDER BY id DESC LIMIT ?2",
             )
             .context("prepare recent")?;
@@ -836,6 +859,7 @@ impl Store {
                  JOIN entities n ON n.session = e.session AND n.project = e.project
                  WHERE e.project = ?1 AND n.name = ?2 AND e.forgotten = 0
                        AND e.kind != 'tombstone'
+                             AND e.hook != 'correct'
                  ORDER BY CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END, e.id DESC
                  LIMIT ?3",
             )
@@ -1308,6 +1332,7 @@ impl Store {
             // that only disappears from search has not been withdrawn.
             "SELECT id, ts, kind, title, topic, files, hook FROM events
              WHERE project = ?1 AND forgotten = 0 AND kind != 'tombstone'
+                   AND hook != 'correct'
              ORDER BY {}, id DESC
              LIMIT ?2",
             Self::rank("")
@@ -1347,7 +1372,8 @@ impl Store {
              FROM event_files f
              JOIN events e ON e.id = f.event_id
              WHERE f.project = ?1 AND f.path = ?2 AND e.forgotten = 0
-                   AND e.kind != 'tombstone' 
+                   AND e.kind != 'tombstone'
+                         AND e.hook != 'correct'
              ORDER BY {}, e.id DESC
              LIMIT ?3",
             Self::rank("e.")
@@ -1378,7 +1404,8 @@ impl Store {
             .conn
             .prepare(
                 "SELECT id, ts, cli, kind, title, session FROM events
-                 WHERE project = ?1 AND ts >= ?2 AND forgotten = 0 AND kind != 'tombstone' 
+                 WHERE project = ?1 AND ts >= ?2 AND forgotten = 0 AND kind != 'tombstone'
+                       AND hook != 'correct'
                  ORDER BY id
                  LIMIT ?3",
             )

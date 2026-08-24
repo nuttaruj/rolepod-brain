@@ -63,6 +63,76 @@ pub fn forget(id: &str) -> Result<Outcome> {
     Ok(Outcome { id: event.id, target_title: title })
 }
 
+/// Withdraw every memory that mentions one thing.
+///
+/// The third forgetting primitive, after purge-by-id and supersede: "forget
+/// everything about this customer / this key / this repository", where the
+/// caller does not know - and should not have to enumerate - the ids.
+///
+/// **Siblings must survive.** Entities are recorded per session, so tombstoning
+/// whole sessions would destroy every unrelated memory those sessions also
+/// hold. This matches at the event level instead: only entries whose own text
+/// mentions the thing are withdrawn.
+///
+/// Two-step by design, like `setup`: the first call lists what would go, and
+/// nothing happens without `apply`. A bulk withdrawal the caller cannot
+/// preview is a bulk withdrawal they cannot verify.
+///
+/// Honest about its reach: this is lexical. A memory that refers to the same
+/// entity by another name, or in another script, is not found - published
+/// measurements put deterministic matching in the single digits on
+/// obfuscated identifiers. It withdraws what it lists; it does not promise
+/// the list is complete.
+///
+/// # Errors
+/// Returns an error when the query or a write fails.
+pub fn forget_entity(name: &str, apply: bool) -> Result<Vec<Outcome>> {
+    anyhow::ensure!(!name.trim().is_empty(), "name something to forget");
+    let (paths, store, scope) = context()?;
+    let project = scope.project_id.to_string();
+    let targets = store.search_scoped(&project, name, None, ENTITY_FORGET_MAX)?;
+
+    if !apply {
+        return Ok(targets
+            .into_iter()
+            .map(|hit| Outcome { id: hit.id, target_title: hit.title })
+            .collect());
+    }
+
+    let log = EventLog::open(&paths.project_dir(&scope))?;
+    let mut done = Vec::new();
+    for hit in targets {
+        if !store.event_exists(&hit.id)? {
+            continue;
+        }
+        let mut event = Event::new(
+            scope.workspace_id,
+            scope.project_id,
+            uuid::Uuid::nil(),
+            Source { cli: "brain".to_string(), hook: "forget".to_string() },
+            EventKind::Tombstone,
+            // Says nothing about its target, for the same reason single
+            // withdrawal does not: a tombstone that names what it removed
+            // puts the removed thing back into search.
+            "Withdrew a memory".to_string(),
+            String::new(),
+        );
+        event.links = vec![hit.id.clone()];
+        event.consolidated = true;
+        log.append(&event)?;
+        store.index(&event)?;
+        done.push(Outcome { id: hit.id, target_title: hit.title });
+    }
+    Ok(done)
+}
+
+/// Ceiling on one bulk withdrawal.
+///
+/// A cap the user can see beats an unbounded sweep they cannot: if a name
+/// matches more than this, the right move is a narrower name, not a larger
+/// blast radius.
+const ENTITY_FORGET_MAX: usize = 200;
+
 /// Replace what an entry says.
 ///
 /// # Errors

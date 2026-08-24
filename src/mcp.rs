@@ -120,6 +120,15 @@ fn tool_definitions() -> Value {
                         "type": "integer",
                         "description": "Maximum hits (default 10, max 50).",
                     },
+                    "topic": {
+                        "type": "string",
+                        "description": "Narrow to one kind of memory: decision, \
+                                        bugfix, feature, discovery, config, test. \
+                                        Use it when the question is about a KIND of \
+                                        thing - `topic: \"decision\"` answers \"what \
+                                        did we decide\" without wading through every \
+                                        mention.",
+                    },
                 },
                 "required": ["query"],
             },
@@ -264,7 +273,14 @@ fn call_tool(paths: &Paths, project: &str, session: &str, params: &Value) -> Res
             // caller asked for: the entry that answers the question is often
             // just past the cut.
             let pool = if config.search.rerank { crate::rerank::POOL.max(limit) } else { limit };
-            let mut hits = store.search(project, query, pool)?;
+            // An unknown topic would silently return nothing, which reads to
+            // an agent as "no memory" rather than "wrong scope" - so a value
+            // outside the taxonomy is ignored and the search runs unscoped.
+            let topic = arguments
+                .get("topic")
+                .and_then(Value::as_str)
+                .and_then(crate::event::normalize_topic);
+            let mut hits = store.search_scoped(project, query, topic, pool)?;
 
             // Second retrieval stream: a query that names a file or a service
             // finds the work about it even when no title contains the word.

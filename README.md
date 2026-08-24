@@ -118,6 +118,7 @@ missing here, it is not supported yet.
 Nothing, normally. That is the point. When you want to look:
 
 ```sh
+brain search "auth" --topic decision   # only what was DECIDED about auth
 brain doctor            # is capture actually working?
 brain stats             # what it has captured, consolidated, and injected
 brain search "auth"     # full-text search this project's memory
@@ -556,9 +557,20 @@ nobody notices, because nobody re-reads a wiki looking for sentences that were
 never true.
 
 ```sh
-brain forget  <id>          # withdraw it
-brain correct <id> "text"   # replace what it says
+brain forget  <id>                    # withdraw one entry
+brain correct <id> "text"             # replace what it says
+brain forget --entity acme-corp       # list everything that mentions it
+brain forget --entity acme-corp --apply   # …then withdraw all of it
 ```
+
+`--entity` is for "forget everything about this customer / this key / this
+repo", where you do not know the ids and should not have to list them. It
+matches at the entry level so **unrelated memories from the same sessions
+survive** — the whole point of forgetting one thing rather than one session.
+It prints what would go and does nothing without `--apply`, and it is honest
+about its reach: matching is by text, so a mention under a different name or
+in another script is not found. It withdraws what it listed; it does not
+claim the list is complete.
 
 Neither deletes anything. Both append an entry that is *about* the earlier one,
 and recall stops showing the old version. The log keeps the original wording,

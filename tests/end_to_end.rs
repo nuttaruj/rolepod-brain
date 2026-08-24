@@ -888,6 +888,129 @@ fn one_loud_session_cannot_own_every_search_result() {
 }
 
 #[test]
+fn forgetting_an_entity_spares_its_siblings() {
+    // The third forgetting primitive: "forget everything about X" when the
+    // caller does not know the ids. The property that makes it correct is
+    // that everything NOT about X survives - entities are recorded per
+    // session, so a session-level sweep would destroy unrelated memory the
+    // same sessions happen to hold.
+    let fixture = Fixture::new("amnesia");
+    let say = |prompt: &str| {
+        let payload = serde_json::json!({
+            "session_id": "0199a1f2-3c4d-7e8f-9012-3456789abcde",
+            "cwd": fixture.project,
+            "prompt": prompt
+        })
+        .to_string();
+        fixture.hook("claude-code", "UserPromptSubmit", &payload);
+    };
+    say("acmecorp billing needs a retry");
+    say("acmecorp asked for a data export");
+    say("the scheduler double-books on Tuesdays");
+
+    // Preview first: nothing may change until --apply.
+    let preview = fixture.brain(&["forget", "--entity", "acmecorp"]);
+    assert!(preview.status.success(), "preview failed: {preview:?}");
+    let listed = String::from_utf8_lossy(&preview.stdout).to_string();
+    assert!(listed.contains("billing") && listed.contains("data export"), "preview: {listed}");
+    assert!(listed.contains("--apply"), "the preview must say how to perform it: {listed}");
+    let still =
+        String::from_utf8_lossy(&fixture.brain(&["search", "acmecorp"]).stdout).to_string();
+    assert!(still.contains("billing"), "a preview withdrew something: {still}");
+
+    let done = fixture.brain(&["forget", "--entity", "acmecorp", "--apply"]);
+    assert!(done.status.success(), "apply failed: {done:?}");
+
+    let gone = String::from_utf8_lossy(&fixture.brain(&["search", "acmecorp"]).stdout).to_string();
+    assert!(gone.contains("No matches"), "the entity survived its own amnesia: {gone}");
+
+    // The sibling memory, from the same session, is untouched.
+    let sibling =
+        String::from_utf8_lossy(&fixture.brain(&["search", "scheduler"]).stdout).to_string();
+    assert!(
+        sibling.contains("double-books"),
+        "an unrelated memory in the same session was destroyed: {sibling}"
+    );
+
+    // Append-only holds: the log still carries what was withdrawn.
+    assert!(fixture.log_text().contains("data export"), "the log lost the original");
+}
+
+#[test]
+fn search_can_be_scoped_to_one_kind_of_memory() {
+    // "What mentions the scheduler" and "what did we DECIDE about the
+    // scheduler" are different questions. Relevance answers the first;
+    // only a scope answers the second.
+    let fixture = Fixture::new("scopedsearch");
+    fixture.seed_session(1);
+    let db = fixture.home.join("brain.db");
+    let seed = |id: &str, title: &str, topic: &str| {
+        Command::new("sqlite3")
+            .arg(&db)
+            .arg(format!(
+                "INSERT INTO events (id, ts, workspace, project, session, cli, hook, kind, title, body, topic)
+                 SELECT '{id}', ts, workspace, project, session, cli, 'stop', 'session_summary',
+                        '{title}', '', '{topic}' FROM events LIMIT 1;"
+            ))
+            .output()
+            .expect("seed event");
+    };
+    seed("01SCOPE0000000000000000DEC", "scheduler: chose cron over a queue", "decision");
+    seed("01SCOPE0000000000000000FIX", "scheduler double-booking fixed", "bugfix");
+
+    let all = String::from_utf8_lossy(&fixture.brain(&["search", "scheduler"]).stdout).to_string();
+    assert!(all.contains("chose cron") && all.contains("double-booking"), "unscoped: {all}");
+
+    let scoped =
+        String::from_utf8_lossy(&fixture.brain(&["search", "scheduler", "--topic", "decision"]).stdout)
+            .to_string();
+    assert!(scoped.contains("chose cron"), "the decision was scoped out: {scoped}");
+    assert!(!scoped.contains("double-booking"), "the bugfix leaked into a decision scope: {scoped}");
+
+    // A typo must read as "wrong scope", never as "nothing remembered".
+    let typo = fixture.brain(&["search", "scheduler", "--topic", "desicion"]);
+    let warned = String::from_utf8_lossy(&typo.stderr).to_string();
+    assert!(warned.contains("Unknown topic"), "a bad topic was silently accepted: {warned}");
+    assert!(
+        String::from_utf8_lossy(&typo.stdout).contains("chose cron"),
+        "a bad topic should fall back to searching everything"
+    );
+}
+
+#[test]
+fn a_correction_replaces_a_memory_rather_than_joining_it() {
+    // A correction is applied in place: the target's text is overwritten. The
+    // correction event itself is bookkeeping - a receipt that the change
+    // happened - and if it also matches searches, one memory answers twice
+    // and the agent has to work out which copy is authoritative.
+    let fixture = Fixture::new("correctonce");
+    let payload = serde_json::json!({
+        "session_id": "0199a1f2-3c4d-7e8f-9012-3456789abcde",
+        "cwd": fixture.project,
+        "prompt": "the scheduler double-books on Tuesdays"
+    })
+    .to_string();
+    fixture.hook("claude-code", "UserPromptSubmit", &payload);
+    let id = fixture
+        .log_text()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find_map(|line| line["id"].as_str().map(str::to_string))
+        .expect("an event to correct");
+
+    let out = fixture.brain(&["correct", &id, "the scheduler double-books on Wednesdays"]);
+    assert!(out.status.success(), "correct failed: {out:?}");
+
+    let hits = String::from_utf8_lossy(&fixture.brain(&["search", "scheduler"]).stdout).to_string();
+    let count = hits
+        .lines()
+        .filter(|line| line.split_whitespace().next().is_some_and(|w| w.len() == 26))
+        .count();
+    assert_eq!(count, 1, "the correction surfaced alongside what it corrected: {hits}");
+    assert!(hits.contains("Wednesdays"), "the corrected text should be what surfaces: {hits}");
+}
+
+#[test]
 fn mcp_recall_returns_what_was_captured() {
     let fixture = Fixture::new("mcp");
     fixture.hook("claude-code", "PostToolUse", &claude_payload(&fixture.project));

@@ -101,6 +101,9 @@ enum Commands {
         /// Maximum hits.
         #[arg(short = 'k', long, default_value_t = 10)]
         limit: usize,
+        /// Narrow to one kind: decision, bugfix, feature, discovery, config, test.
+        #[arg(long)]
+        topic: Option<String>,
     },
     /// What this brain has actually done. Local counters; nothing is sent anywhere.
     Stats,
@@ -122,8 +125,15 @@ enum Commands {
     },
     /// Withdraw a memory. Appends a tombstone; nothing is deleted.
     Forget {
-        /// Event id, as shown by `brain search`.
-        id: String,
+        /// Event id, as shown by `brain search`. Omit when using --entity.
+        id: Option<String>,
+        /// Withdraw every memory mentioning this instead of one id.
+        /// Prints what would go; use --apply to perform it.
+        #[arg(long)]
+        entity: Option<String>,
+        /// Perform an --entity withdrawal instead of only listing it.
+        #[arg(long)]
+        apply: bool,
     },
     /// Replace what a memory says, keeping the original in the log.
     Correct {
@@ -228,7 +238,7 @@ fn run(command: Commands) -> Result<()> {
         }
         Commands::Uninstall { apply, wipe } => uninstall(apply, wipe),
         Commands::Reindex => reindex(),
-        Commands::Search { query, limit } => search(&query, limit),
+        Commands::Search { query, limit, topic } => search(&query, limit, topic.as_deref()),
         Commands::Stats => stats(),
         Commands::Export { file } => {
             let path = file.map_or_else(portable::default_archive, std::path::PathBuf::from);
@@ -250,12 +260,44 @@ fn run(command: Commands) -> Result<()> {
             print!("{report}");
             Ok(())
         }
-        Commands::Forget { id } => {
-            let outcome = revise::forget(&id)?;
-            println!("Forgot {id} — \"{}\"", outcome.target_title);
-            println!("Recorded as {}. The log keeps both; recall no longer shows it.", outcome.id);
-            Ok(())
-        }
+        Commands::Forget { id, entity, apply } => match (id, entity) {
+            (Some(id), None) => {
+                let outcome = revise::forget(&id)?;
+                println!("Forgot {id} — \"{}\"", outcome.target_title);
+                println!(
+                    "Recorded as {}. The log keeps both; recall no longer shows it.",
+                    outcome.id
+                );
+                Ok(())
+            }
+            (None, Some(entity)) => {
+                let outcomes = revise::forget_entity(&entity, apply)?;
+                if outcomes.is_empty() {
+                    println!("Nothing mentions `{entity}` in this project.");
+                    return Ok(());
+                }
+                for outcome in &outcomes {
+                    println!("{}  {}", outcome.id, outcome.target_title);
+                }
+                if apply {
+                    println!(
+                        "\nWithdrew {} memor(y/ies) mentioning `{entity}`. The log keeps every one.",
+                        outcomes.len()
+                    );
+                } else {
+                    println!(
+                        "\n{} memor(y/ies) mention `{entity}`. Matching is by text, so a mention \
+                         under another name is not listed. Re-run with --apply to withdraw these.",
+                        outcomes.len()
+                    );
+                }
+                Ok(())
+            }
+            (Some(_), Some(_)) => {
+                anyhow::bail!("pass an id or --entity, not both")
+            }
+            (None, None) => anyhow::bail!("pass an event id, or --entity NAME"),
+        },
         Commands::Correct { id, text } => {
             let outcome = revise::correct(&id, &text)?;
             println!("Corrected {id} — was \"{}\"", outcome.target_title);
@@ -323,14 +365,24 @@ fn reindex() -> Result<()> {
     Ok(())
 }
 
-fn search(query: &str, limit: usize) -> Result<()> {
+fn search(query: &str, limit: usize, topic: Option<&str>) -> Result<()> {
     let paths = Paths::resolve()?;
     let scope = ids::resolve_scope(&std::env::current_dir().unwrap_or_default());
     let store = Store::open(&paths.db())?;
-    let hits = store.search(&scope.project_id.to_string(), query, limit)?;
+    // A typo'd topic must not read as "nothing remembered": say so and search
+    // everything, rather than returning an empty page the user cannot explain.
+    let scoped = topic.and_then(event::normalize_topic);
+    if let (Some(asked), None) = (topic, scoped) {
+        eprintln!(
+            "Unknown topic `{asked}` — searching everything. Known: {}",
+            event::TOPICS.join(", ")
+        );
+    }
+    let hits = store.search_scoped(&scope.project_id.to_string(), query, scoped, limit)?;
 
     if hits.is_empty() {
-        println!("No matches in {}.", scope.project);
+        let where_ = scoped.map_or(String::new(), |topic| format!(" under topic `{topic}`"));
+        println!("No matches in {}{where_}.", scope.project);
         return Ok(());
     }
     for hit in hits {
