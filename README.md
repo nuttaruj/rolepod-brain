@@ -37,6 +37,12 @@ against a hard byte budget. Full content is never pushed into your context;
 the agent calls `brain_search` / `brain_get` when the task actually needs a
 body. `brain doctor` reports the real bytes spent, not the configured limit.
 
+**A file's memory arrives before the file does.** Open a file and what we
+already know about it lands ahead of its contents, while that can still change
+what the turn does — not after the agent has read it and already has an answer.
+The pre-read hook only injects; it never captures, so it adds nothing to store
+and nothing to summarize.
+
 **Secrets are scrubbed before anything is written.** Redaction happens in the
 capture process, ahead of the log. There is no later stage that could catch a
 leak, so there is no window where one exists.
@@ -74,7 +80,7 @@ are.
 
 | CLI | Capture | MCP recall | Status |
 |---|---|---|---|
-| Claude Code | 7 lifecycle events | registered automatically | verified by our tests and daily use |
+| Claude Code | 8 lifecycle events | registered automatically | verified by our tests and daily use |
 | Codex | 7 lifecycle events | via the plugin | installs as a plugin; capture needs one approval — see below |
 | Gemini CLI | 5 lifecycle events | register manually | capture works; its own summarizer tier is unavailable here |
 | Antigravity (`agy`) | 2 lifecycle events | register manually | capture verified; needs an explicit workspace, see below |

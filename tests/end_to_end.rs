@@ -2978,3 +2978,66 @@ fn walk_find(dir: &Path, name: &str) -> bool {
             }
         })
 }
+
+/// Memory about a file has to arrive before the agent reads it.
+///
+/// It used to arrive on `PostToolUse` - after the read returned, with the file
+/// already in the agent's context. By then the agent has the answer it went
+/// looking for and no reason to weigh what we know against it. `PreToolUse`
+/// scoped to `Read` puts the same pointers in front of the content instead,
+/// where they can still change what the turn does.
+///
+/// The pre-event must not also capture: `PreToolUse` was dropped as a capture
+/// surface after 1,433 measured events showed it duplicating `PostToolUse`
+/// 96% of the time, and bringing it back for injection must not bring that
+/// back with it.
+#[test]
+fn a_file_s_memory_arrives_before_the_agent_reads_it() {
+    let fixture = Fixture::new("preread");
+    let session = "0199a1f2-3c4d-7e8f-9012-3456789abcd7";
+
+    // Something worth knowing about one particular file.
+    for turn in 0..3 {
+        let payload = serde_json::json!({
+            "session_id": "0199aaaa-1111-7000-8000-000000000000",
+            "cwd": fixture.project,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": fixture.project.join("src/auth.rs")},
+            "prompt": format!("expiry compared with the wrong operator, take {turn}")
+        })
+        .to_string();
+        fixture.hook("claude-code", "PostToolUse", &payload);
+    }
+
+    let read = serde_json::json!({
+        "session_id": session,
+        "cwd": fixture.project,
+        "tool_name": "Read",
+        "tool_input": {"file_path": fixture.project.join("src/auth.rs")}
+    })
+    .to_string();
+
+    let before = fixture.hook("claude-code", "PreToolUse", &read);
+    let injected = injected_context(&before)
+        .expect("a Read must be met with what we already know about the file");
+    assert!(injected.contains("auth.rs"), "the wrong file's memory came back: {injected}");
+
+    // The read itself is still captured once, by the post-event only.
+    let stored = Command::new("sqlite3")
+        .arg(fixture.home.join("brain.db"))
+        .arg("SELECT COUNT(*) FROM events WHERE hook = 'pre_tool_use';")
+        .output()
+        .expect("count pre-tool events");
+    assert_eq!(
+        String::from_utf8_lossy(&stored.stdout).trim(),
+        "0",
+        "the pre-event captured as well as injected - the duplication is back"
+    );
+
+    // And having answered before the read, we do not answer again after it.
+    let after = fixture.hook("claude-code", "PostToolUse", &read);
+    assert!(
+        injected_context(&after).is_none(),
+        "the same file's memory was injected twice in one session"
+    );
+}

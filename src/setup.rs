@@ -91,6 +91,10 @@ pub struct Target {
     /// Per-event timeout overrides, for events the CLI caps lower than its
     /// general default.
     pub timeout_overrides: &'static [(&'static str, u32)],
+    /// Per-event tool matchers, for events we want only a slice of. Absent
+    /// means every tool, which is the right default for a capture surface and
+    /// the wrong one for an injection surface aimed at a single tool.
+    pub matchers: &'static [(&'static str, &'static str)],
     /// Command that registers an MCP server, if the CLI provides one.
     pub mcp_register: Option<(&'static str, Vec<String>)>,
     /// Standard `{"mcpServers": {…}}` file to register into, for CLIs that
@@ -109,15 +113,20 @@ pub fn targets(exe: &Path) -> Result<Vec<Target>> {
             grouped_events: &[],
             hooks_file: home.join(".claude/settings.json"),
             timeout_overrides: &[],
+            // `PreToolUse` is wired for one tool only. It is not a capture
+            // surface - see `hook::captures` - it is there so that what we know
+            // about a file reaches the agent before the file's contents do.
+            matchers: &[("PreToolUse", "Read")],
             // Verified against the installed Claude Code binary's own event
             // names, not documentation.
             //
-            // `PreToolUse` is deliberately absent. Measured over 1,433 real
-            // captures: 701 pre against 676 post, and the pre title is the
-            // same command text with no result attached — 96% pure duplication
-            // that doubled storage and every consolidation prompt. The 25
-            // pre-without-post events are denied or aborted calls; if that
-            // signal is ever wanted, `PermissionRequest` carries it directly.
+            // `PreToolUse` is here to inject, never to capture. Measured over
+            // 1,433 real captures: 701 pre against 676 post, and the pre title
+            // is the same command text with no result attached — 96% pure
+            // duplication that doubled storage and every consolidation prompt.
+            // So it is scoped to `Read`, and `hook::captures` drops it on the
+            // floor afterwards; all it does is get memory about a file in
+            // front of the agent while that can still change anything.
             //
             // `PostCompact` is absent too, and for a harder reason: Claude Code
             // will not accept `additionalContext` under that event name, so the
@@ -128,6 +137,7 @@ pub fn targets(exe: &Path) -> Result<Vec<Target>> {
             events: &[
                 "SessionStart",
                 "UserPromptSubmit",
+                "PreToolUse",
                 "PostToolUse",
                 "Stop",
                 "SubagentStop",
@@ -167,6 +177,7 @@ pub fn targets(exe: &Path) -> Result<Vec<Target>> {
             // config asks for more. Capture still works, but a warning the
             // user sees every time is a cost we impose on them for nothing.
             timeout_overrides: &[("SessionEnd", 3)],
+            matchers: &[],
             // `SessionEnd` and `PreCompact` were once believed absent here,
             // because they were missing from this machine's live hooks.json -
             // but that file lists what someone CONFIGURED, not what the CLI
@@ -204,6 +215,7 @@ pub fn targets(exe: &Path) -> Result<Vec<Target>> {
             grouped_events: &[],
             hooks_file: home.join(".gemini/settings.json"),
             timeout_overrides: &[],
+            matchers: &[],
             // Gemini names its lifecycle differently from the other two.
             // Verified from a live settings file that already had working
             // third-party hooks registered on these exact keys.
@@ -227,6 +239,7 @@ pub fn targets(exe: &Path) -> Result<Vec<Target>> {
             grouped_events: &["PreToolUse", "PostToolUse"],
             hooks_file: home.join(".gemini/config/hooks.json"),
             timeout_overrides: &[],
+            matchers: &[],
             // Antigravity's own embedded docs list exactly five events:
             // PreInvocation, PostInvocation, PreToolUse, PostToolUse, Stop.
             // There is no SessionStart and no user-prompt event, so `Stop` is
@@ -253,6 +266,7 @@ pub fn targets(exe: &Path) -> Result<Vec<Target>> {
             // loading from it. The binary's own strings are ambiguous here.
             hooks_file: home.join(".config/opencode/plugins/rolepod-brain.js"),
             timeout_overrides: &[],
+            matchers: &[],
             // Verified against the installed binary's own event names and a
             // working third-party plugin on this machine. `session.idle` is
             // the session boundary; OpenCode has no session-end event.
@@ -267,6 +281,7 @@ pub fn targets(exe: &Path) -> Result<Vec<Target>> {
             grouped_events: &[],
             hooks_file: home.join(".cursor/hooks.json"),
             timeout_overrides: &[],
+            matchers: &[],
             // camelCase, a fifth spelling. `postToolUse` covers tool activity
             // on its own: probing showed `afterShellExecution` firing for the
             // SAME execution - same command, same duration, same generation -
@@ -818,7 +833,15 @@ fn wire_hooks(target: &Target, exe: &Path, apply: bool) -> Result<Vec<Change>> {
         });
         let grouped = target.layout == Layout::Grouped
             || target.grouped_events.contains(event);
-        let entry = if grouped { json!({ "hooks": [handler] }) } else { handler };
+        let matcher = target.matchers.iter().find(|(name, _)| name == event).map(|(_, m)| *m);
+        let entry = match (grouped, matcher) {
+            (true, Some(matcher)) => json!({ "matcher": matcher, "hooks": [handler] }),
+            (true, None) => json!({ "hooks": [handler] }),
+            // A matcher is meaningless outside the grouped shape: a CLI that
+            // takes bare entries has nowhere to put one, and writing the hook
+            // unscoped anyway would wire it to every tool there is.
+            (false, _) => handler,
+        };
 
         let groups = hooks
             .as_object_mut()
@@ -1403,14 +1426,21 @@ mod tests {
     }
 
     #[test]
-    fn no_target_wires_a_before_tool_event() {
+    fn a_before_tool_event_may_inject_but_never_capture() {
         // Measured duplication: the before-event repeats the after-event's
-        // command text without its result.
+        // command text without its result, 96% of the time. So wiring one is
+        // allowed on exactly two conditions - it is scoped to the tool we
+        // actually want to get in front of, and the capture path refuses it.
         for target in targets(Path::new("/usr/local/bin/brain")).unwrap() {
             for event in target.events {
+                if !matches!(*event, "PreToolUse" | "BeforeTool") {
+                    continue;
+                }
+                let scoped = target.matchers.iter().any(|(name, _)| name == event);
+                assert!(scoped, "{} wires {event} against every tool", target.kind);
                 assert!(
-                    !matches!(*event, "PreToolUse" | "BeforeTool"),
-                    "{} still wires {event}",
+                    !crate::hook::captures(&crate::hook::normalize_hook(event)),
+                    "{} wires {event} as a capture surface; the duplication is back",
                     target.kind
                 );
             }
@@ -1459,6 +1489,7 @@ mod tests {
             events: &["Stop"],
             timeout: HOOK_TIMEOUT_SECS,
             timeout_overrides: &[],
+            matchers: &[],
             layout: Layout::Grouped,
             grouped_events: &[],
             mcp_file: None,
@@ -1509,6 +1540,7 @@ mod tests {
             events: &["Stop"],
             timeout: HOOK_TIMEOUT_SECS,
             timeout_overrides: &[],
+            matchers: &[],
             layout: Layout::Grouped,
             grouped_events: &[],
             mcp_file: None,
@@ -1553,6 +1585,7 @@ mod tests {
             events: &["PostToolUse", "Stop"],
             timeout: HOOK_TIMEOUT_SECS,
             timeout_overrides: &[],
+            matchers: &[],
             mcp_file: None,
             mcp_register: None,
         };
@@ -1605,6 +1638,7 @@ mod tests {
             events: &["stop", "afterFileEdit"],
             timeout: HOOK_TIMEOUT_SECS,
             timeout_overrides: &[],
+            matchers: &[],
             mcp_file: None,
             mcp_register: None,
         };
@@ -1682,6 +1716,7 @@ mod tests {
             events: &["Stop"],
             timeout: HOOK_TIMEOUT_SECS,
             timeout_overrides: &[],
+            matchers: &[],
             layout: Layout::Grouped,
             grouped_events: &[],
             mcp_file: None,

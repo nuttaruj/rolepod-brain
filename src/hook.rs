@@ -157,13 +157,19 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
             .insert("invocation".to_string(), Value::String(invocation.as_str().to_string()));
     }
 
-    let project_dir = paths.project_dir(&scope);
-    let log = EventLog::open(&project_dir)?;
-    // Log first: it is the source of truth. If indexing then fails, the event
-    // is still durable and `brain reindex` recovers the index.
-    log.append(&event)?;
+    // `pre_tool_use` is an injection surface, not a capture one. It reaches us
+    // only for `Read`, and only so that what we know about a file lands before
+    // its contents do; capturing it as well would restore the 96% duplication
+    // against `post_tool_use` that took it off the capture list to begin with.
+    if captures(&hook) {
+        let project_dir = paths.project_dir(&scope);
+        let log = EventLog::open(&project_dir)?;
+        // Log first: it is the source of truth. If indexing then fails, the
+        // event is still durable and `brain reindex` recovers the index.
+        log.append(&event)?;
 
-    store.index(&event)?;
+        store.index(&event)?;
+    }
 
     // A context wipe keeps the session id but destroys everything the agent
     // knew. Our own de-duplication is keyed to that surviving id, so without
@@ -221,7 +227,12 @@ fn inject_for(
         // `wipes_context`, which explains why `post_compact` is not a second
         // route into this arm.
         "session_start" => inject::primer(store, &project, session, &config.injection).ok(),
-        "post_tool_use" => event.files.first().and_then(|path| {
+        // Both sides of a tool call reach the same file injection, and the
+        // first one to arrive wins: `pre_tool_use` for a `Read`, where memory
+        // still has time to change what the turn does, and `post_tool_use` for
+        // everything else. `record_injected_file` is what keeps the second from
+        // repeating the first.
+        "pre_tool_use" | "post_tool_use" => event.files.first().and_then(|path| {
             let injection =
                 inject::for_file(store, &project, session, path, &event.id, &config.injection)
                     .ok()?;
@@ -239,6 +250,18 @@ fn inject_for(
     }
     let _ = store.record_injected(session, &injection.ids, injection.text.len());
     inject::as_hook_output(event_name, &injection)
+}
+
+/// Is this hook a capture surface, or only an injection one?
+///
+/// Nearly all of them are both. `pre_tool_use` is the exception: we ask for it
+/// only to get in front of a `Read`, and its payload is the same tool call
+/// `post_tool_use` reports a moment later with a result attached. Storing both
+/// measured out at 96% duplication across 1,433 real events - double the rows
+/// and double the consolidation prompt for no extra fact.
+#[must_use]
+pub fn captures(hook: &str) -> bool {
+    hook != "pre_tool_use"
 }
 
 /// Did this event just destroy the agent's context?
