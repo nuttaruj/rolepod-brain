@@ -74,7 +74,17 @@ pub const SPECS: &[CliSpec] = &[
         program: "claude",
         model: "haiku",
         output: OutputMode::Stdout,
-        args: &["-p", "--model", "{model}"],
+        // A summarizer call is text in, text out - it needs no tool, and a
+        // bare `-p` loads the user's whole MCP roster anyway. That is not
+        // just startup cost: a worker with tools can ASK for one, and a
+        // headless session's permission prompt goes to the user's paired
+        // phone - a push notification about a browser tool, from a
+        // background job they never see, mid-whatever they were doing.
+        // `--strict-mcp-config` with no config empties the MCP list;
+        // `--tools=` (the = matters: the flag is variadic and would swallow
+        // the prompt) empties the built-in set. Nothing loaded, nothing to
+        // ask about.
+        args: &["-p", "--model", "{model}", "--strict-mcp-config", "--tools="],
     },
     CliSpec {
         cli: "codex",
@@ -416,6 +426,25 @@ mod tests {
             .expect("a child that writes a lot is not a timeout");
         assert!(result.success);
         assert_eq!(result.stdout.len(), 300_000, "output was truncated");
+    }
+
+    /// A worker must not be able to raise a permission prompt.
+    ///
+    /// A headless claude session with tools available can ask to use one,
+    /// and that prompt lands on the user's paired phone as a push
+    /// notification from a background job. Observed for real: "Claude needs
+    /// your permission: Javascript Tool" on a lock screen, from a
+    /// consolidation the user never saw. The flags below are what make that
+    /// impossible rather than merely unlikely.
+    #[test]
+    fn the_claude_worker_is_spawned_with_nothing_to_ask_about() {
+        let spec = SPECS.iter().find(|spec| spec.cli == "claude-code").expect("claude spec");
+        assert!(spec.args.contains(&"--strict-mcp-config"), "MCP servers must not load");
+        assert!(
+            spec.args.contains(&"--tools="),
+            "built-in tools must be disabled, and with `=`: the flag is \
+             variadic, and a bare --tools \"\" swallows the prompt argument"
+        );
     }
 
     /// Every summarizer rung must be named the way hooks name it.
