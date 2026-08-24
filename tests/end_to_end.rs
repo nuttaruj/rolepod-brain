@@ -3041,3 +3041,105 @@ fn a_file_s_memory_arrives_before_the_agent_reads_it() {
         "the same file's memory was injected twice in one session"
     );
 }
+
+/// Two sessions in one project can consolidate at the same instant.
+///
+/// Nothing stops it: every session boundary spawns a detached run, and a person
+/// working two terminals on one repo hits boundaries whenever they hit them.
+/// The wiki is a git repo with a single index, so two runs committing at once
+/// is the classic way to corrupt one — and a race that double-summarizes is a
+/// second model call the user pays for and a duplicate memory injected forever.
+///
+/// The lock this exercises was only ever tested for the stale case: a crashed
+/// run must not wedge consolidation. That is the easy half. This is the half
+/// that actually happens.
+#[test]
+fn two_consolidations_racing_in_one_project_do_not_corrupt_or_double_up() {
+    let fixture = Fixture::new("race");
+    let sessions =
+        ["0199a1f2-3c4d-7e8f-9012-3456789abc01", "0199a1f2-3c4d-7e8f-9012-3456789abc02"];
+
+    for session in sessions {
+        for index in 0..6 {
+            let payload = serde_json::json!({
+                "session_id": session,
+                "cwd": fixture.project,
+                "tool_name": "Edit",
+                "tool_input": {"file_path": fixture.project.join(format!("src/mod{index}.rs"))},
+                "prompt": format!("session {session} step {index}")
+            })
+            .to_string();
+            fixture.hook("claude-code", "PostToolUse", &payload);
+        }
+    }
+
+    // Started together, deliberately without staggering: the point is the
+    // overlap, and a run that finishes before the other starts proves nothing.
+    let mut racing = Vec::new();
+    for _ in 0..2 {
+        racing.push(
+            Command::new(BRAIN)
+                .args(["consolidate", "--force"])
+                .current_dir(&fixture.project)
+                .env("ROLEPOD_BRAIN_HOME", &fixture.home)
+                .env("HOME", fixture.home.parent().unwrap())
+                .env("PATH", "/usr/bin:/bin")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn consolidation"),
+        );
+    }
+    for child in racing {
+        let output = child.wait_with_output().expect("consolidation output");
+        assert!(
+            output.status.success(),
+            "a racing consolidation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // One summary per session. Two would mean the watermark lost the race and
+    // the user paid twice for one narrative.
+    let counted = Command::new("sqlite3")
+        .arg(fixture.home.join("brain.db"))
+        .arg(
+            "SELECT session || '=' || COUNT(*) FROM events \
+             WHERE kind = 'session_summary' GROUP BY session ORDER BY session;",
+        )
+        .output()
+        .expect("count summaries");
+    let counted = String::from_utf8_lossy(&counted.stdout);
+    let counted: Vec<&str> = counted.lines().filter(|line| !line.is_empty()).collect();
+    assert_eq!(counted.len(), 2, "expected one row per session, got {counted:?}");
+    for row in &counted {
+        assert!(row.ends_with("=1"), "a session was summarized more than once: {counted:?}");
+    }
+
+    // And the wiki's git index survived being written from two processes.
+    for project_dir in fixture.project_dirs() {
+        let mut wiki = project_dir.as_path();
+        while let Some(parent) = wiki.parent() {
+            if wiki.join(".git").is_dir() {
+                break;
+            }
+            wiki = parent;
+        }
+        if !wiki.join(".git").is_dir() {
+            continue;
+        }
+        let status = Command::new("git")
+            .args(["-C", &wiki.to_string_lossy(), "status", "--porcelain"])
+            .output()
+            .expect("git status");
+        assert!(
+            status.status.success(),
+            "the wiki git index is unusable after the race: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        assert!(
+            !wiki.join(".brain-git.lock").exists(),
+            "a finished run left its lock behind; the next consolidation waits for nothing"
+        );
+    }
+}

@@ -127,6 +127,45 @@ pub fn run(session: Option<&str>, all_projects: bool, force: bool) -> Result<Out
                 outcome.skipped += 1;
                 continue;
             }
+
+            // One consolidation per session at a time. Two runs overlap for
+            // ordinary reasons - a session ending spawns a run for itself
+            // while another session opening spawns the catch-up for
+            // everything pending - and nothing above this point stops them
+            // both picking up the same backlog. That costs a second model
+            // call the user pays for and leaves two copies of one narrative
+            // in memory forever.
+            let lock = LockFile::acquire_reporting(&session_lock(&project_dir, &pending.session));
+            let (_lock, waited) = match lock {
+                Ok(held) => held,
+                // Still held after the wait window: this session's work is
+                // being done by someone, which is the outcome we wanted.
+                Err(_) => {
+                    outcome.skipped += 1;
+                    continue;
+                }
+            };
+
+            // Only a run that had to wait can conclude anything from the
+            // watermark. It waited on the process that just wrote it, so a
+            // watermark covering our own backlog means our work is already
+            // done - `--force` means "skip the debounce", never "summarize the
+            // same events twice".
+            //
+            // A run that walked straight in gets no such conclusion, and must
+            // not draw one: a rule-based run records a watermark too, on
+            // purpose, precisely so a later run can produce the real summary
+            // once a model is reachable again.
+            let already_done = waited
+                && store
+                    .session_run(&pending.session)?
+                    .and_then(|run| run.last_event_id)
+                    .is_some_and(|covered| covered == pending.newest_event_id);
+            if already_done {
+                outcome.skipped += 1;
+                continue;
+            }
+
             let tier =
                 consolidate_session(&paths, &store, &ladder, &scope, &project_dir, &pending)?;
             outcome.sessions += 1;
@@ -1281,10 +1320,22 @@ impl LockFile {
     const STALE: std::time::Duration = std::time::Duration::from_secs(120);
 
     fn acquire(path: &Path) -> Result<Self> {
+        Self::acquire_reporting(path).map(|(lock, _)| lock)
+    }
+
+    /// Acquire, and say whether anyone else was holding it.
+    ///
+    /// Contention is the one signal that separates two runs of the same wave
+    /// from a genuinely later one. A caller that had to wait knows another
+    /// process just finished this exact work; a caller that walked straight in
+    /// knows nothing of the sort, however recently the work was done.
+    fn acquire_reporting(path: &Path) -> Result<(Self, bool)> {
+        let mut waited = false;
         for _ in 0..100 {
             match std::fs::OpenOptions::new().create_new(true).write(true).open(path) {
-                Ok(_) => return Ok(Self { path: path.to_path_buf() }),
+                Ok(_) => return Ok((Self { path: path.to_path_buf() }, waited)),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    waited = true;
                     if is_stale(path) {
                         let _ = std::fs::remove_file(path);
                         continue;
@@ -1298,6 +1349,15 @@ impl LockFile {
         }
         anyhow::bail!("could not acquire {} within 5s", path.display())
     }
+}
+
+/// Where one session's consolidation lock lives.
+///
+/// Per session rather than per project: two sessions consolidating at once is
+/// work happening in parallel, which is fine and worth keeping. It is two runs
+/// on the SAME session that duplicate.
+fn session_lock(project_dir: &Path, session: &str) -> PathBuf {
+    project_dir.join(format!(".brain-session-{session}.lock"))
 }
 
 fn is_stale(path: &Path) -> bool {
