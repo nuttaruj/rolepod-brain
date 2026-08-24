@@ -119,13 +119,21 @@ pub enum Tier {
 pub struct Ladder<'a> {
     store: &'a Store,
     mode: String,
+    /// Per-CLI model overrides from config; a CLI not named keeps its
+    /// spec's cheap default.
+    models: std::collections::HashMap<String, String>,
     timeout: Duration,
 }
 
 impl<'a> Ladder<'a> {
     #[must_use]
-    pub fn new(store: &'a Store, mode: &str) -> Self {
-        Self { store, mode: mode.to_string(), timeout: CALL_TIMEOUT }
+    pub fn new(store: &'a Store, config: &crate::config::SummarizerConfig) -> Self {
+        Self {
+            store,
+            mode: config.mode.clone(),
+            models: config.models.clone(),
+            timeout: CALL_TIMEOUT,
+        }
     }
 
     /// The same ladder on a shorter leash.
@@ -135,7 +143,12 @@ impl<'a> Ladder<'a> {
     /// unranked answer they already had is the better one.
     #[must_use]
     pub fn clone_with_timeout(&self, limit: Duration) -> Ladder<'a> {
-        Ladder { store: self.store, mode: self.mode.clone(), timeout: limit }
+        Ladder {
+            store: self.store,
+            mode: self.mode.clone(),
+            models: self.models.clone(),
+            timeout: limit,
+        }
     }
 
     /// Is any model allowed at all?
@@ -170,7 +183,7 @@ impl<'a> Ladder<'a> {
             }
             attempts += 1;
 
-            match invoke(spec, prompt, self.timeout) {
+            match invoke(spec, self.model_for(spec), prompt, self.timeout) {
                 Ok(text) if usable(&text) => {
                     self.store.record_summarizer_success(spec.cli)?;
                     return Ok((Tier::Cli(spec.cli.to_string()), text));
@@ -220,6 +233,13 @@ impl<'a> Ladder<'a> {
         }
     }
 
+    /// The model this rung should run: the user's override, or the spec's
+    /// cheap default.
+    #[must_use]
+    pub fn model_for(&self, spec: &CliSpec) -> &str {
+        self.models.get(spec.cli).map_or(spec.model, String::as_str)
+    }
+
     /// Is this CLI installed, and not in a cooldown?
     fn available(&self, spec: &CliSpec) -> Result<bool> {
         if !installed(spec.program) {
@@ -256,7 +276,7 @@ pub fn installed(program: &str) -> bool {
 }
 
 /// Run one CLI once and return its answer.
-fn invoke(spec: &CliSpec, prompt: &str, timeout: Duration) -> Result<String> {
+fn invoke(spec: &CliSpec, model: &str, prompt: &str, timeout: Duration) -> Result<String> {
     // A prompt that begins with a dash would be read as a flag by whichever
     // CLI receives it. The usual guard is a `--` separator, but not every
     // spec here can take one - gemini's prompt is the value of `-p` - so the
@@ -279,7 +299,7 @@ fn invoke(spec: &CliSpec, prompt: &str, timeout: Duration) -> Result<String> {
         .args
         .iter()
         .map(|arg| match *arg {
-            "{model}" => spec.model.to_string(),
+            "{model}" => model.to_string(),
             "{out}" => out_file.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
             other => other.to_string(),
         })
@@ -410,6 +430,13 @@ pub const fn failure_threshold() -> i64 {
 mod tests {
     use super::*;
 
+    fn config(mode: &str) -> crate::config::SummarizerConfig {
+        crate::config::SummarizerConfig {
+            mode: mode.to_string(),
+            models: std::collections::HashMap::new(),
+        }
+    }
+
     #[test]
     fn a_child_that_writes_more_than_a_pipe_holds_still_finishes() {
         // Reading the pipes only after the child exits deadlocks: the child
@@ -426,6 +453,23 @@ mod tests {
             .expect("a child that writes a lot is not a timeout");
         assert!(result.success);
         assert_eq!(result.stdout.len(), 300_000, "output was truncated");
+    }
+
+    /// The quality knob: a named CLI runs the model the user chose, and
+    /// everything unnamed keeps its cheap default - so paying for better
+    /// summaries on one CLI can never hand another CLI a model name it
+    /// does not recognise.
+    #[test]
+    fn a_model_override_applies_only_to_the_cli_it_names() {
+        let store = Store::open_memory().unwrap();
+        let mut config = config("auto");
+        config.models.insert("claude-code".to_string(), "sonnet".to_string());
+        let ladder = Ladder::new(&store, &config);
+
+        let claude = SPECS.iter().find(|spec| spec.cli == "claude-code").unwrap();
+        let codex = SPECS.iter().find(|spec| spec.cli == "codex").unwrap();
+        assert_eq!(ladder.model_for(claude), "sonnet");
+        assert_eq!(ladder.model_for(codex), "gpt-5.6-luna", "an unnamed CLI keeps its default");
     }
 
     /// A worker must not be able to raise a permission prompt.
@@ -456,7 +500,7 @@ mod tests {
     #[test]
     fn a_prompt_that_would_be_read_as_a_flag_is_refused() {
         let spec = &SPECS[0];
-        let error = invoke(spec, "--help me", CALL_TIMEOUT).unwrap_err();
+        let error = invoke(spec, spec.model, "--help me", CALL_TIMEOUT).unwrap_err();
         assert!(error.to_string().contains("begin with a dash"), "{error}");
     }
 
@@ -500,7 +544,7 @@ mod tests {
     #[test]
     fn auto_mode_prefers_the_cli_that_saw_the_events() {
         let store = Store::open_memory().unwrap();
-        let ladder = Ladder::new(&store, "auto");
+        let ladder = Ladder::new(&store, &config("auto"));
         let order = ladder.order("codex");
         assert_eq!(order[0].cli, "codex");
         assert_eq!(order.len(), SPECS.len(), "every other CLI stays as a fallback");
@@ -509,7 +553,7 @@ mod tests {
     #[test]
     fn a_pinned_mode_never_silently_uses_another_subscription() {
         let store = Store::open_memory().unwrap();
-        let ladder = Ladder::new(&store, "claude-code");
+        let ladder = Ladder::new(&store, &config("claude-code"));
         let order = ladder.order("codex");
         assert_eq!(order.len(), 1);
         assert_eq!(order[0].cli, "claude-code");
@@ -518,7 +562,7 @@ mod tests {
     #[test]
     fn off_mode_never_reaches_for_a_model() {
         let store = Store::open_memory().unwrap();
-        let ladder = Ladder::new(&store, "off");
+        let ladder = Ladder::new(&store, &config("off"));
         assert!(!ladder.enabled());
         let (tier, text) = ladder.run("anything", "claude-code", |_| true).unwrap();
         assert_eq!(tier, Tier::RuleBased);
@@ -588,7 +632,8 @@ mod tests {
     #[test]
     fn an_oversized_prompt_is_refused_before_a_process_is_spawned() {
         let spec = &SPECS[0];
-        let error = invoke(spec, &"x".repeat(PROMPT_MAX_BYTES + 1), CALL_TIMEOUT).unwrap_err();
+        let error =
+            invoke(spec, spec.model, &"x".repeat(PROMPT_MAX_BYTES + 1), CALL_TIMEOUT).unwrap_err();
         assert!(error.to_string().contains("call ceiling"));
     }
 

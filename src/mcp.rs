@@ -278,7 +278,7 @@ fn call_tool(paths: &Paths, project: &str, session: &str, params: &Value) -> Res
             hits.truncate(pool);
 
             if config.search.rerank {
-                let ladder = crate::summarizer::Ladder::new(&store, &config.summarizer.mode);
+                let ladder = crate::summarizer::Ladder::new(&store, &config.summarizer);
                 // Borrow the cheap tier of whichever CLI works here.
                 let cli = store.project_cli(project)?.unwrap_or_default();
                 hits = crate::rerank::rerank(&ladder, &cli, query, hits);

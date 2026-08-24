@@ -208,10 +208,17 @@ fn failure_age(at: Option<&str>) -> Option<String> {
 /// silently degrading every session to rule-based output.
 fn summarizer_checks(paths: &Paths) -> Vec<Check> {
     let mut checks = Vec::new();
+    // Effective models, overrides applied: a report that shows the spec's
+    // default while config runs something else is a report about a machine
+    // that does not exist.
+    let overrides = Config::load(&paths.config_file()).unwrap_or_default().summarizer.models;
     let installed: Vec<String> = crate::summarizer::SPECS
         .iter()
         .filter(|spec| crate::summarizer::installed(spec.program))
-        .map(|spec| format!("{}={}", spec.cli, spec.model))
+        .map(|spec| {
+            let model = overrides.get(spec.cli).map_or(spec.model, String::as_str);
+            format!("{}={model}", spec.cli)
+        })
         .collect();
 
     if installed.is_empty() {

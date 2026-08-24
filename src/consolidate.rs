@@ -91,7 +91,7 @@ pub fn run(session: Option<&str>, all_projects: bool, force: bool) -> Result<Out
     paths.ensure()?;
     let config = Config::load(&paths.config_file())?;
     let store = Store::open(&paths.db())?;
-    let ladder = Ladder::new(&store, &config.summarizer.mode);
+    let ladder = Ladder::new(&store, &config.summarizer);
 
     // Each entry is a scope AND the directory its memory already lives in.
     // Rebuilding the directory from a scope was a real bug: the scope

@@ -1048,6 +1048,37 @@ fn what_recurs_across_sessions_becomes_a_page_that_outlives_them() {
 }
 
 #[test]
+fn a_model_override_reaches_the_spawned_command_line() {
+    // The quality knob has to actually turn: config names a better model for
+    // one CLI, and that name - not the cheap default - must be what the
+    // spawned process is handed.
+    let fixture = Fixture::new("modeloverride");
+    std::fs::write(
+        fixture.home.join("config.toml"),
+        "[summarizer]\nmode = \"claude-code\"\n\n[summarizer.models]\n\"claude-code\" = \"sonnet\"\n",
+    )
+    .unwrap();
+    fixture.seed_session(4);
+
+    let argv_log = fixture.home.parent().unwrap().join("argv.txt");
+    let bin = fixture.fake_cli(
+        "claude",
+        &format!(
+            "echo \"$@\" >> {argv}\n{answer}",
+            argv = argv_log.display(),
+            answer = r#"echo '{"summary":"quality paid for","titles":[]}'"#
+        ),
+    );
+    let out = fixture.brain_with_path(&["consolidate", "--force"], Some(&bin));
+    assert!(out.status.success(), "consolidate failed: {out:?}");
+
+    let argv = std::fs::read_to_string(&argv_log).expect("the stub should have been called");
+    assert!(argv.contains("--model sonnet"), "the override never reached the spawn: {argv}");
+    assert!(!argv.contains("haiku"), "the cheap default leaked through anyway: {argv}");
+    assert!(fixture.page_text().contains("quality paid for"), "the summary was not written");
+}
+
+#[test]
 fn consolidation_degrades_to_rule_based_then_catches_up() {
     let fixture = Fixture::new("ladder");
     fixture.seed_session(4);

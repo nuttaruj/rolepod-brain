@@ -74,11 +74,21 @@ pub struct SummarizerConfig {
     /// `off` is permanent rule-based consolidation — a first-class mode, not a
     /// degraded one. Named CLIs pin one summarizer.
     pub mode: String,
+    /// Per-CLI model overrides: `claude-code = "sonnet"` makes that CLI's
+    /// summaries worth more, at that CLI's price.
+    ///
+    /// Per-CLI rather than one global name, because model names do not
+    /// travel: "sonnet" means something to `claude` and nothing to `codex`,
+    /// and a global override under `auto` mode would hand every other rung a
+    /// model it cannot run — which fails exactly like an outage and charges
+    /// the breaker for it. A CLI not named here keeps its cheap default:
+    /// quality is opt-in per CLI, never an accident of config.
+    pub models: std::collections::HashMap<String, String>,
 }
 
 impl Default for SummarizerConfig {
     fn default() -> Self {
-        Self { mode: "auto".to_string() }
+        Self { mode: "auto".to_string(), models: std::collections::HashMap::new() }
     }
 }
 

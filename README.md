@@ -173,6 +173,13 @@ Everything has a default. A config file is optional.
 mode = "auto"          # auto | claude-code | codex | gemini | off
                        # "off" = permanent rule-based summaries, fully functional
 
+[summarizer.models]    # optional per-CLI model overrides. Memory quality is
+                       # a spend decision: the default is each CLI's cheap
+                       # tier, and naming a better model here buys better
+                       # summaries at that CLI's price. Per-CLI because model
+                       # names do not travel between vendors.
+# "claude-code" = "sonnet"
+
 [injection]
 primer_budget = 4096   # bytes pushed at session start
 session_budget = 8192  # bytes of automatic injection per session, all layers
