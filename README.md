@@ -74,7 +74,7 @@ are.
 
 | CLI | Capture | MCP recall | Status |
 |---|---|---|---|
-| Claude Code | 8 lifecycle events | registered automatically | verified by our tests and daily use |
+| Claude Code | 7 lifecycle events | registered automatically | verified by our tests and daily use |
 | Codex | 7 lifecycle events | via the plugin | installs as a plugin; capture needs one approval — see below |
 | Gemini CLI | 5 lifecycle events | register manually | capture works; its own summarizer tier is unavailable here |
 | Antigravity (`agy`) | 2 lifecycle events | register manually | capture verified; needs an explicit workspace, see below |
@@ -273,8 +273,12 @@ older version left behind and points here.
 
 `/compact` and `/clear` destroy what the agent knows while the session itself
 continues. Memory has to come straight back, so both paths re-inject the primer
-— Claude Code signals compaction with its own `PostCompact` hook rather than a
-session start, and `/clear` through a session start that says so.
+— Claude Code reports each of them as a session start that names its source.
+
+Claude Code also has a `PostCompact` hook, and we deliberately do not register
+it: that event will not accept injected context, so a hook that answers it fails
+validation, drops the primer, and prints a schema dump at the user instead. The
+session start already covers compaction, and it works.
 
 The subtle part is that per-session de-duplication has to reset at the same
 moment. A session id survives a compaction; the context does not. Without the

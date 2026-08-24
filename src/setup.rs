@@ -118,6 +118,13 @@ pub fn targets(exe: &Path) -> Result<Vec<Target>> {
             // that doubled storage and every consolidation prompt. The 25
             // pre-without-post events are denied or aborted calls; if that
             // signal is ever wanted, `PermissionRequest` carries it directly.
+            //
+            // `PostCompact` is absent too, and for a harder reason: Claude Code
+            // will not accept `additionalContext` under that event name, so the
+            // hook run fails schema validation and the primer is thrown away.
+            // Compaction still reaches us - `SessionStart` fires with
+            // `source: "compact"` - so this event only ever added a duplicate
+            // empty capture and an error the user sees every time.
             events: &[
                 "SessionStart",
                 "UserPromptSubmit",
@@ -125,7 +132,6 @@ pub fn targets(exe: &Path) -> Result<Vec<Target>> {
                 "Stop",
                 "SubagentStop",
                 "PreCompact",
-                "PostCompact",
                 "SessionEnd",
             ],
             timeout: HOOK_TIMEOUT_SECS,
@@ -1685,5 +1691,36 @@ mod tests {
         assert!(!path.exists(), "dry run must not create the file");
         assert!(changes[0].detail.starts_with("would write"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Claude Code rejects `hookSpecificOutput.additionalContext` under
+    /// `PostCompact`. The whole hook run fails schema validation, the primer is
+    /// discarded, and the user gets a wall of schema text where they expected
+    /// their session back - measured live, on this machine, every compaction.
+    ///
+    /// Compaction already reaches us the other way: `SessionStart` fires with
+    /// `source: "compact"`, which is where the primer actually lands. So
+    /// registering `PostCompact` too bought one duplicate empty capture and one
+    /// guaranteed error. Other memory plugins for this CLI, read rather than
+    /// assumed, do not register `PostCompact` either; they match compaction on
+    /// the session start, as we now do.
+    #[test]
+    fn compaction_is_captured_through_session_start_only() {
+        let targets = targets(Path::new("/usr/bin/brain")).unwrap();
+        let claude = targets
+            .iter()
+            .find(|target| target.kind == AgentKind::ClaudeCode)
+            .expect("Claude Code is a wired target");
+
+        assert!(
+            !claude.events.contains(&"PostCompact"),
+            "PostCompact injection is rejected by Claude Code's own output schema"
+        );
+        assert!(
+            claude.events.contains(&"SessionStart"),
+            "nothing would notice a compaction at all"
+        );
+        // The consolidation boundary is the other side of the same event.
+        assert!(claude.events.contains(&"PreCompact"));
     }
 }

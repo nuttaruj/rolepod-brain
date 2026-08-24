@@ -2138,13 +2138,14 @@ fn memory_comes_back_after_a_context_wipe() {
     let first = injected_context(&first).expect("primer on a normal start");
     assert!(first.contains("scheduler double-book"));
 
+    // Compaction arrives as a `SessionStart` whose source says so - not as
+    // `PostCompact`, which Claude Code refuses to accept context from.
     // Without the reset, this second injection would be suppressed as a
     // duplicate - the session id survived even though the context did not.
     let after = fixture.hook(
         "claude-code",
-        "PostCompact",
-        &serde_json::json!({"session_id": session, "cwd": fixture.project, "trigger": "auto"})
-            .to_string(),
+        "SessionStart",
+        &start_payload(&fixture.project, session, "compact"),
     );
     let after = injected_context(&after)
         .expect("compaction wiped the context; memory must come straight back");

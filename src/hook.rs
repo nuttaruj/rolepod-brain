@@ -216,11 +216,11 @@ fn inject_for(
     let project = scope.project_id.to_string();
 
     let injection = match hook {
-        // Both entry points into a fresh context get the primer: a normal
-        // session start, and the moment after a compaction.
-        "session_start" | "post_compact" => {
-            inject::primer(store, &project, session, &config.injection).ok()
-        }
+        // The one entry point into a fresh context. Compaction arrives here
+        // too, as a `session_start` whose source says `compact` - see
+        // `wipes_context`, which explains why `post_compact` is not a second
+        // route into this arm.
+        "session_start" => inject::primer(store, &project, session, &config.injection).ok(),
         "post_tool_use" => event.files.first().and_then(|path| {
             let injection =
                 inject::for_file(store, &project, session, path, &event.id, &config.injection)
@@ -243,10 +243,12 @@ fn inject_for(
 
 /// Did this event just destroy the agent's context?
 ///
-/// Two paths, because Claude Code uses different ones: compaction fires
-/// `PostCompact` (its docs: "After compaction (receives summary)"), while
-/// `/clear` comes through as a `SessionStart` whose `source` says so. Handling
-/// only one would leave the other silently amnesiac.
+/// `SessionStart` carries both cases Claude Code actually gives us: `compact`
+/// and `clear`. `post_compact` stays answered here because it is true - that
+/// event does wipe context - but we no longer register for it. Claude Code
+/// rejects `additionalContext` under `PostCompact`, failing the whole hook run
+/// and discarding the primer, so injecting there was never anything but a
+/// visible error on top of the `SessionStart` that already worked.
 #[must_use]
 pub fn wipes_context(hook: &str, payload: &Value) -> bool {
     if hook == "post_compact" {
@@ -786,7 +788,8 @@ mod tests {
 
     #[test]
     fn both_context_wipe_paths_are_recognized() {
-        // Compaction arrives as PostCompact, not as a SessionStart.
+        // A host that sends `post_compact` is still telling the truth about
+        // context, even though we no longer register for the event.
         assert!(wipes_context("post_compact", &json!({"trigger": "auto"})));
         assert!(wipes_context("session_start", &json!({"source": "clear"})));
         assert!(wipes_context("session_start", &json!({"source": "compact"})));
