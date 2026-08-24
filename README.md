@@ -166,7 +166,9 @@ keeping work and personal memory apart.
 
 ## Configuration
 
-Everything has a default. A config file is optional.
+Everything has a default. `brain setup` leaves a fully-commented
+`~/.rolepod-brain/config.toml` with every knob visible at its default —
+uncomment a line to change it; it never overwrites a file you have edited.
 
 ```toml
 [summarizer]

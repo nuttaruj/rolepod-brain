@@ -295,6 +295,29 @@ fn codex_payload(cwd: &Path) -> String {
 }
 
 #[test]
+fn setup_leaves_a_config_a_person_can_discover_but_never_overwrites_one() {
+    let fixture = Fixture::new("configtemplate");
+    fixture.seed_session(1);
+    assert!(fixture.brain(&["setup", "--apply", "--cli", "claude-code"]).status.success());
+
+    let config = fixture.home.join("config.toml");
+    let template = std::fs::read_to_string(&config).expect("setup should write the template");
+    assert!(template.contains("# rerank = false"), "the knobs should be visible: {template}");
+    // Inert as written: doctor reports pure defaults.
+    let report = String::from_utf8_lossy(&fixture.brain(&["doctor"]).stdout).to_string();
+    assert!(report.contains("summarizer=auto"), "the template changed behavior: {report}");
+
+    // A file the user has touched is theirs, forever.
+    std::fs::write(&config, "[summarizer]\nmode = \"off\"\n").unwrap();
+    assert!(fixture.brain(&["setup", "--apply", "--cli", "claude-code"]).status.success());
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        "[summarizer]\nmode = \"off\"\n",
+        "setup overwrote the user's config"
+    );
+}
+
+#[test]
 fn a_legacy_tree_keeps_working_and_reindex_moves_it_home() {
     // The old layout was wiki/default/<slug>--<id>/ - old top-level name,
     // extra workspace level, permanent suffix. All three must keep working

@@ -529,7 +529,80 @@ pub fn run(only: Option<&str>, apply: bool) -> Result<Vec<Change>> {
     }
 
     changes.extend(install_timer(&exe, apply)?);
+    changes.extend(write_config_template(apply));
     Ok(changes)
+}
+
+/// Every knob, commented out, in the place a person would look for it.
+///
+/// The config has always been optional and absent by default - correct for
+/// install-and-forget, terrible for discovery: the only way to learn a knob
+/// existed was the README. This file changes nothing (everything is
+/// commented, so parsing it yields exactly the defaults) and teaches
+/// everything. Written once, never overwritten: whatever is in this file
+/// after that is the user's.
+const CONFIG_TEMPLATE: &str = r#"# rolepod-brain configuration.
+#
+# Everything here is optional and shown at its default. Uncomment a line to
+# change it; delete this file to return to all defaults. `brain doctor`
+# reports the effective settings.
+
+[summarizer]
+# Which CLI's model writes the summaries.
+#   auto        borrow the CLI that produced the events, cheapest tier
+#   claude-code / codex / gemini   pin one CLI
+#   off         permanent rule-based summaries - fully functional, never
+#               spends a model call
+# mode = "auto"
+
+[summarizer.models]
+# Per-CLI model overrides. Memory quality is a spend decision: the default is
+# each CLI's cheap tier, and naming a better model here buys better summaries
+# at that CLI's price. Per-CLI because model names do not travel between
+# vendors. A CLI not named here keeps its cheap default.
+# "claude-code" = "sonnet"
+
+[injection]
+# Byte ceilings for automatic context injection. Ceilings, not targets: a
+# short primer of real signal beats a full one padded with noise.
+# primer_budget = 4096
+# session_budget = 8192
+
+[consolidation]
+# true installs a wall-clock timer as the consolidation backstop. Off by
+# default: a hook noticing a stale backlog already catches up, and a timer
+# shows up in macOS Login Items as a background agent.
+# timer = false
+
+[search]
+# true spends one cheap-tier model call per search, reordering results by
+# what the query was asking rather than term statistics. A failed or slow
+# call leaves the order exactly as the index ranked it.
+# rerank = false
+
+[sanitize]
+# Additional regexes to redact beyond the built-in credential patterns, and
+# substrings that survive redaction.
+# extra_patterns = []
+# allowlist = []
+"#;
+
+/// Leave the template where a curious user will find it. Never overwrite.
+fn write_config_template(apply: bool) -> Vec<Change> {
+    let Ok(paths) = Paths::resolve() else { return Vec::new() };
+    let path = paths.config_file();
+    if path.exists() {
+        return Vec::new();
+    }
+    let detail = if apply {
+        match std::fs::write(&path, CONFIG_TEMPLATE) {
+            Ok(()) => format!("wrote {} (all defaults, commented out)", path.display()),
+            Err(error) => format!("could not write the config template: {error}"),
+        }
+    } else {
+        format!("would write {} (all defaults, commented out)", path.display())
+    };
+    vec![Change { target: "config".to_string(), detail }]
 }
 
 /// Install the consolidation backstop.
@@ -1227,6 +1300,49 @@ mod tests {
             assert!(codex.events.contains(event), "override for an unwired event: {event}");
             assert!(*seconds <= codex.timeout, "an override should only ever lower the timeout");
         }
+    }
+
+    /// The template must be a no-op as written, and honest about its names.
+    ///
+    /// Commented-out knobs are only documentation if the names are real: a
+    /// typo in the template would send a user editing a key nothing reads,
+    /// which is worse than no template. Uncommenting each knob with a
+    /// non-default value and asserting the parsed config moved is what keeps
+    /// the file and the struct from drifting apart.
+    #[test]
+    fn the_config_template_is_inert_as_written_and_every_knob_is_real() {
+        // As shipped: everything commented, so parsing yields pure defaults.
+        let parsed: crate::config::Config =
+            toml::from_str(CONFIG_TEMPLATE).expect("the template must be valid TOML");
+        let defaults = crate::config::Config::default();
+        assert_eq!(parsed.summarizer.mode, defaults.summarizer.mode);
+        assert_eq!(parsed.injection.primer_budget, defaults.injection.primer_budget);
+        assert_eq!(parsed.injection.session_budget, defaults.injection.session_budget);
+        assert_eq!(parsed.consolidation.timer, defaults.consolidation.timer);
+        assert_eq!(parsed.search.rerank, defaults.search.rerank);
+        assert!(parsed.summarizer.models.is_empty());
+
+        // Every knob uncommented with a NON-default value must actually move
+        // the field it claims to control.
+        let live = CONFIG_TEMPLATE
+            .replace("# mode = \"auto\"", "mode = \"off\"")
+            .replace("# \"claude-code\" = \"sonnet\"", "\"claude-code\" = \"sonnet\"")
+            .replace("# primer_budget = 4096", "primer_budget = 1")
+            .replace("# session_budget = 8192", "session_budget = 2")
+            .replace("# timer = false", "timer = true")
+            .replace("# rerank = false", "rerank = true")
+            .replace("# extra_patterns = []", "extra_patterns = [\"secret-\\\\d+\"]")
+            .replace("# allowlist = []", "allowlist = [\"not-a-secret\"]");
+        let parsed: crate::config::Config =
+            toml::from_str(&live).expect("uncommented template must still parse");
+        assert_eq!(parsed.summarizer.mode, "off");
+        assert_eq!(parsed.summarizer.models.get("claude-code").map(String::as_str), Some("sonnet"));
+        assert_eq!(parsed.injection.primer_budget, 1);
+        assert_eq!(parsed.injection.session_budget, 2);
+        assert!(parsed.consolidation.timer);
+        assert!(parsed.search.rerank);
+        assert_eq!(parsed.sanitize.extra_patterns, vec!["secret-\\d+".to_string()]);
+        assert_eq!(parsed.sanitize.allowlist, vec!["not-a-secret".to_string()]);
     }
 
     /// Each CLI records an installed plugin somewhere different, and getting
