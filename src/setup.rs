@@ -16,7 +16,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use crate::config::{Config, Paths};
+use crate::config::Paths;
 use crate::ids::AgentKind;
 
 /// Substring identifying a hook entry as ours. Present in every command we
@@ -40,13 +40,6 @@ const PLUGIN_NAME: &str = "rolepod-brain";
 /// five milliseconds and every capture would be killed.
 const HOOK_TIMEOUT_SECS: u32 = 5;
 const HOOK_TIMEOUT_MILLIS: u32 = 10_000;
-
-/// launchd label for the consolidation backstop.
-const TIMER_LABEL: &str = "dev.rolepod.brain.consolidate";
-
-/// How often the backstop runs. Long on purpose: it is a safety net for work
-/// the session-end trigger missed, not the primary path.
-const TIMER_INTERVAL_SECS: u32 = 1800;
 
 /// One planned change.
 #[derive(Debug)]
@@ -403,7 +396,7 @@ pub fn uninstall(apply: bool) -> Result<Vec<Change>> {
         changes.extend(strip_mcp(&target, apply));
     }
 
-    changes.extend(remove_timer(apply)?);
+    changes.extend(sweep_legacy_timer(apply)?);
     Ok(changes)
 }
 
@@ -528,7 +521,7 @@ pub fn run(only: Option<&str>, apply: bool) -> Result<Vec<Change>> {
         changes.extend(register_mcp(&target, apply));
     }
 
-    changes.extend(install_timer(&exe, apply)?);
+    changes.extend(sweep_legacy_timer(apply)?);
     changes.extend(write_config_template(apply));
     Ok(changes)
 }
@@ -568,12 +561,6 @@ const CONFIG_TEMPLATE: &str = r#"# rolepod-brain configuration.
 # primer_budget = 4096
 # session_budget = 8192
 
-[consolidation]
-# true installs a wall-clock timer as the consolidation backstop. Off by
-# default: a hook noticing a stale backlog already catches up, and a timer
-# shows up in macOS Login Items as a background agent.
-# timer = false
-
 [search]
 # true spends one cheap-tier model call per search, reordering results by
 # what the query was asking rather than term statistics. A failed or slow
@@ -605,163 +592,52 @@ fn write_config_template(apply: bool) -> Vec<Change> {
     vec![Change { target: "config".to_string(), detail }]
 }
 
-/// Install the consolidation backstop.
+/// Sweep the launchd job an older version may have installed.
 ///
-/// A timer is not a daemon: launchd starts a process, it does its work, it
-/// exits. Nothing resides. This exists because a hook-triggered consolidation
-/// can be missed — a crash, a machine asleep for a week — and the work should
-/// still catch up without the user ever running a command.
-fn install_timer(exe: &Path, apply: bool) -> Result<Vec<Change>> {
-    // Opt-in. Consolidation only has value when a next session reads it, and
-    // that session fires hooks - so a hook noticing a stale backlog is the
-    // default backstop, and it costs the user nothing visible. A launchd agent
-    // costs them a macOS Login Items entry saying "brain can run in the
-    // background", which contradicts the product's promise on their own screen.
-    let wanted = Config::load(&Paths::resolve()?.config_file())
-        .map(|config| config.consolidation.timer)
-        .unwrap_or(false);
-    if !wanted {
-        return remove_timer(apply);
-    }
-    if !cfg!(target_os = "macos") {
-        return Ok(vec![Change {
-            target: "timer".to_string(),
-            detail: "skipped: only launchd is implemented so far".to_string(),
-        }]);
-    }
-    let Some(home) = dirs::home_dir() else {
-        return Ok(vec![Change {
-            target: "timer".to_string(),
-            detail: "skipped: cannot determine home directory".to_string(),
-        }]);
-    };
-
-    let plist_path = home.join("Library/LaunchAgents").join(format!("{TIMER_LABEL}.plist"));
-    let plist = timer_plist(exe, &home);
-
-    if !apply {
-        return Ok(vec![Change {
-            target: "timer".to_string(),
-            detail: format!("would install {} (every {TIMER_INTERVAL_SECS}s)", plist_path.display()),
-        }]);
-    }
-
-    if let Some(parent) = plist_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
-    }
-    std::fs::write(&plist_path, plist)
-        .with_context(|| format!("write {}", plist_path.display()))?;
-
-    // Reload so the change takes effect without a logout. `bootout` on a
-    // service that was never loaded is an expected failure, not a problem.
-    //
-    // Note for anyone reading `launchctl print … | grep runs` later: a
-    // StartInterval job fires immediately on bootstrap when its interval
-    // already elapsed while it was unloaded, so re-running setup inflates that
-    // counter. It is not the timer misfiring, and consolidation's debounce
-    // makes an extra run cheap.
-    let domain = format!("gui/{}", unsafe_uid());
-    let _ = Command::new("launchctl").args(["bootout", &format!("{domain}/{TIMER_LABEL}")]).output();
-    let loaded = Command::new("launchctl")
-        .args(["bootstrap", &domain, &plist_path.to_string_lossy()])
-        .output();
-
-    let detail = match loaded {
-        Ok(output) if output.status.success() => {
-            format!("installed and loaded {}", plist_path.display())
-        }
-        Ok(output) => format!(
-            "wrote {} but launchctl bootstrap failed: {}",
-            plist_path.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ),
-        Err(error) => format!("wrote {} but launchctl is unavailable: {error}", plist_path.display()),
-    };
-    Ok(vec![Change { target: "timer".to_string(), detail }])
-}
-
-/// Unload and delete the background agent, if one is installed.
-///
-/// Run on every `setup` while the timer is off, so a machine that once had the
-/// agent installed loses it - and its Login Items entry - without the user
-/// having to know launchctl.
-fn remove_timer(apply: bool) -> Result<Vec<Change>> {
+/// The timer feature is removed, not disabled: enabling it put a job in the
+/// user's Login Items, which contradicted "nothing runs" on their own
+/// screen, and a feature deliberately kept off for everyone should not
+/// exist. What must still exist is this sweep - removal has to reach the
+/// machines the feature already touched, or an orphaned job keeps waking a
+/// binary that no longer knows why.
+fn sweep_legacy_timer(apply: bool) -> Result<Vec<Change>> {
+    const LEGACY_TIMER_LABEL: &str = "dev.rolepod.brain.consolidate";
     let Some(home) = dirs::home_dir() else { return Ok(Vec::new()) };
-    let plist = home.join("Library/LaunchAgents").join(format!("{TIMER_LABEL}.plist"));
+    let plist = home.join("Library/LaunchAgents").join(format!("{LEGACY_TIMER_LABEL}.plist"));
     if !plist.is_file() {
         return Ok(vec![Change {
             target: "backstop".to_string(),
-            detail: "hook-opportunistic (no background agent)".to_string(),
+            detail: "hook-opportunistic (a session opening finishes stale work)".to_string(),
         }]);
     }
     if !apply {
         return Ok(vec![Change {
             target: "backstop".to_string(),
-            detail: format!("would remove the background agent at {}", plist.display()),
+            detail: format!("would remove the old background agent at {}", plist.display()),
         }]);
     }
 
-    let domain = format!("gui/{}", unsafe_uid());
+    let uid = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map_or_else(|| "501".to_string(), |uid| uid.trim().to_string());
     let _ = Command::new("launchctl")
-        .args(["bootout", &format!("{domain}/{TIMER_LABEL}")])
+        .args(["bootout", &format!("gui/{uid}/{LEGACY_TIMER_LABEL}")])
         .output();
     std::fs::remove_file(&plist)
         .with_context(|| format!("remove {}", plist.display()))?;
     Ok(vec![Change {
         target: "backstop".to_string(),
-        detail: format!(
-            "removed the background agent ({}); backstop is hook-opportunistic",
-            plist.display()
-        ),
+        detail: format!("removed the old background agent ({})", plist.display()),
     }])
 }
 
-/// The current user id, for the launchd GUI domain.
-fn unsafe_uid() -> String {
-    // `id -u` avoids a libc dependency for one number.
-    Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map_or_else(|| "501".to_string(), |uid| uid.trim().to_string())
-}
-
-fn timer_plist(exe: &Path, home: &Path) -> String {
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{TIMER_LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{exe}</string>
-        <string>consolidate</string>
-        <string>--all</string>
-    </array>
-    <key>StartInterval</key>
-    <integer>{TIMER_INTERVAL_SECS}</integer>
-    <key>RunAtLoad</key>
-    <false/>
-    <key>ProcessType</key>
-    <string>Background</string>
-    <key>LowPriorityIO</key>
-    <true/>
-    <key>StandardErrorPath</key>
-    <string>{log}</string>
-</dict>
-</plist>
-"#,
-        exe = exe.display(),
-        log = home.join(".rolepod-brain/timer.log").display(),
-    )
-}
-
-/// A CLI counts as present when its config directory exists — the CLI itself
-/// may live behind a shim we cannot see on `PATH`.
+/// Is this CLI on the machine at all?
+///
+/// Presence is judged by its config directory: a CLI that has never run has
+/// nothing to wire into, and writing config for absent software is clutter.
 fn cli_present(target: &Target) -> bool {
     target.hooks_file.parent().is_some_and(Path::is_dir)
 }
@@ -1302,6 +1178,18 @@ mod tests {
         }
     }
 
+    /// A config written before the timer feature was removed still parses.
+    ///
+    /// Removal must not turn every old config file into a startup error:
+    /// the stale key is ignored, not rejected.
+    #[test]
+    fn a_stale_timer_key_in_an_old_config_is_ignored() {
+        let old = "[consolidation]\ntimer = true\n\n[summarizer]\nmode = \"off\"\n";
+        let parsed: crate::config::Config =
+            toml::from_str(old).expect("an old config must still parse");
+        assert_eq!(parsed.summarizer.mode, "off", "the rest of the config must survive");
+    }
+
     /// The template must be a no-op as written, and honest about its names.
     ///
     /// Commented-out knobs are only documentation if the names are real: a
@@ -1318,7 +1206,6 @@ mod tests {
         assert_eq!(parsed.summarizer.mode, defaults.summarizer.mode);
         assert_eq!(parsed.injection.primer_budget, defaults.injection.primer_budget);
         assert_eq!(parsed.injection.session_budget, defaults.injection.session_budget);
-        assert_eq!(parsed.consolidation.timer, defaults.consolidation.timer);
         assert_eq!(parsed.search.rerank, defaults.search.rerank);
         assert!(parsed.summarizer.models.is_empty());
 
@@ -1329,7 +1216,6 @@ mod tests {
             .replace("# \"claude-code\" = \"sonnet\"", "\"claude-code\" = \"sonnet\"")
             .replace("# primer_budget = 4096", "primer_budget = 1")
             .replace("# session_budget = 8192", "session_budget = 2")
-            .replace("# timer = false", "timer = true")
             .replace("# rerank = false", "rerank = true")
             .replace("# extra_patterns = []", "extra_patterns = [\"secret-\\\\d+\"]")
             .replace("# allowlist = []", "allowlist = [\"not-a-secret\"]");
@@ -1339,7 +1225,6 @@ mod tests {
         assert_eq!(parsed.summarizer.models.get("claude-code").map(String::as_str), Some("sonnet"));
         assert_eq!(parsed.injection.primer_budget, 1);
         assert_eq!(parsed.injection.session_budget, 2);
-        assert!(parsed.consolidation.timer);
         assert!(parsed.search.rerank);
         assert_eq!(parsed.sanitize.extra_patterns, vec!["secret-\\d+".to_string()]);
         assert_eq!(parsed.sanitize.allowlist, vec!["not-a-secret".to_string()]);

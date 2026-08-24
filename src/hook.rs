@@ -315,7 +315,7 @@ pub fn consolidation_triggers(cli: &str) -> &'static str {
 ///
 /// The host CLI is waiting on this hook, so nothing here may block: the child
 /// is fully detached from our stdio and outlives us. If it cannot start, the
-/// timer backstop picks the work up later — this is best-effort by design.
+/// catch-up backstop picks the work up later — this is best-effort by design.
 fn spawn_consolidation(session: Option<&str>) {
     let Ok(exe) = std::env::current_exe() else { return };
     let args: Vec<&str> = match session {

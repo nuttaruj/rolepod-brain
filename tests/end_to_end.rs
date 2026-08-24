@@ -1765,18 +1765,54 @@ fn a_silenced_run_leaves_no_trace_at_all() {
 }
 
 #[test]
-fn setup_installs_no_background_agent_by_default() {
+fn no_code_path_can_produce_a_background_agent() {
+    // The timer feature is removed, not disabled - a feature deliberately
+    // kept off for everyone should not exist. What remains is the sweep for
+    // machines an older version left a launchd job on.
     let fixture = Fixture::new("nobg");
-    let output = fixture.brain(&["setup"]);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("hook-opportunistic") || stdout.contains("would remove"),
-        "setup should not plan a background agent: {stdout}"
-    );
-    assert!(
-        !stdout.contains("would install") || !stdout.contains("LaunchAgents"),
-        "a launchd agent was planned without being asked for: {stdout}"
-    );
+    let plan = String::from_utf8_lossy(&fixture.brain(&["setup"]).stdout).to_string();
+    for word in ["launchd", "LaunchAgents", "Login Items", "timer"] {
+        assert!(!plan.contains(word), "setup plan mentions `{word}`: {plan}");
+    }
+
+    let apply = fixture.brain(&["setup", "--apply", "--cli", "claude-code"]);
+    assert!(apply.status.success());
+    let agents = fixture.home.parent().unwrap().join("Library/LaunchAgents");
+    let planted = std::fs::read_dir(&agents)
+        .into_iter()
+        .flatten()
+        .filter_map(std::result::Result::ok)
+        .count();
+    assert_eq!(planted, 0, "setup --apply wrote into LaunchAgents");
+}
+
+#[test]
+fn a_launchd_job_from_an_older_version_is_found_and_removed() {
+    // Removal has to reach the machines the feature already touched, or an
+    // orphaned job keeps waking a binary that no longer knows why.
+    let fixture = Fixture::new("legacytimer");
+    fixture.seed_session(1);
+    let agents = fixture.home.parent().unwrap().join("Library/LaunchAgents");
+    std::fs::create_dir_all(&agents).unwrap();
+    let plist = agents.join("dev.rolepod.brain.consolidate.plist");
+    std::fs::write(&plist, "<plist/>").unwrap();
+
+    let report = String::from_utf8_lossy(&fixture.brain(&["doctor"]).stdout).to_string();
+    let line = report
+        .lines()
+        .find(|line| line.split_whitespace().nth(1) == Some("backstop"))
+        .unwrap_or("");
+    assert!(line.starts_with("FAIL"), "an orphaned launchd job must be reported: {line}");
+
+    assert!(fixture.brain(&["setup", "--apply", "--cli", "claude-code"]).status.success());
+    assert!(!plist.exists(), "setup --apply should remove the orphaned plist");
+
+    let report = String::from_utf8_lossy(&fixture.brain(&["doctor"]).stdout).to_string();
+    let line = report
+        .lines()
+        .find(|line| line.split_whitespace().nth(1) == Some("backstop"))
+        .unwrap_or("");
+    assert!(line.starts_with("ok"), "backstop should be healthy once swept: {line}");
 }
 
 #[test]

@@ -17,8 +17,8 @@ rather than a missing feature.
 
 **No resident process, ever.** No daemon, no server, no supervised worker, no
 port. Hooks spawn a short-lived process that exits; the MCP server lives
-exactly as long as one session; consolidation runs on a timer, which is not a
-daemon. After a reboot there is nothing to start.
+exactly as long as one session; consolidation runs when a session boundary
+fires. After a reboot there is nothing to start.
 
 ```
 $ brain doctor
@@ -56,9 +56,9 @@ git clone <this repo> rolepod-brain && cd rolepod-brain
 ./install.sh
 ```
 
-That builds a release binary, installs it to `~/.local/bin/brain`, wires every
-supported CLI it finds, and installs the consolidation timer. It prints a plan
-first and asks before touching anything.
+That builds a release binary, installs it to `~/.local/bin/brain`, and wires
+every supported CLI it finds. It prints a plan first and asks before touching
+anything.
 
 To see what it would do without doing it:
 
@@ -185,10 +185,6 @@ mode = "auto"          # auto | claude-code | codex | gemini | off
 [injection]
 primer_budget = 4096   # bytes pushed at session start
 session_budget = 8192  # bytes of automatic injection per session, all layers
-
-[consolidation]
-timer = false          # true installs a launchd timer; off by default, because
-                       # the default backstop costs you no background agent
 
 [search]
 rerank = false         # true spends one cheap-tier call reordering search
@@ -321,14 +317,16 @@ boundary misses, the backstop below finishes when the next session opens.
 
 ## Nothing runs in the background
 
-There is no launchd agent, no login item, and no timer by default. Consolidation
-happens when a session ends, and a session *opening* finishes anything stale
-left over — which covers every case that matters, because consolidated memory
-only has value when a next session reads it, and that session fires hooks.
-
-Set `timer = true` under `[consolidation]` if you want wall-clock consolidation
-regardless of whether you open a CLI again. `brain setup` will then install a
-launchd agent, and macOS will list it in Login Items.
+There is no launchd agent, no login item, no timer — not off by default,
+**gone**: no code path in this product can register anything to run in the
+background. Consolidation happens when a session ends, and a session *opening*
+finishes anything stale left over — which covers every case that matters,
+because consolidated memory only has value when a next session reads it, and
+that session fires hooks. (Early versions had an opt-in wall-clock timer; it
+was removed rather than left disabled, because enabling it put a launchd job
+in Login Items — "brain can run in the background" on your own screen, from
+the product whose promise is that nothing does. `brain setup --apply` removes
+the job from machines that once enabled it.)
 
 ## What the summaries are written from
 

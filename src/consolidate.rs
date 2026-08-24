@@ -1,6 +1,7 @@
 //! Batch consolidation — the only place a model is ever used.
 //!
-//! Runs detached, after a session boundary or on a timer. Never during a
+//! Runs detached, after a session boundary or a stale-backlog catch-up.
+//! Never during a
 //! session, never in a hook's critical path.
 //!
 //! The invariant that makes every trigger safe: consolidation is idempotent

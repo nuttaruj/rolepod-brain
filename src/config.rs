@@ -27,7 +27,6 @@ pub const LEGACY_WIKI_DIR: &str = "wiki";
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    pub consolidation: ConsolidationConfig,
     pub summarizer: SummarizerConfig,
     pub injection: InjectionConfig,
     pub sanitize: SanitizeConfig,
@@ -45,25 +44,6 @@ pub struct SearchConfig {
     /// session, and text relevance is already right most of the time. Turn it
     /// on if your searches return the right entry in the wrong place.
     pub rerank: bool,
-}
-
-/// When consolidation catches up on work the session-end trigger missed.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ConsolidationConfig {
-    /// Install a wall-clock timer as the backstop.
-    ///
-    /// Off by default, and deliberately so: on macOS a launchd agent shows up
-    /// in the user's Login Items as "brain can run in the background", which
-    /// is a real cost to a product whose entire promise is that nothing runs.
-    /// The default backstop is opportunistic instead — a hook notices a stale
-    /// backlog and kicks a detached catch-up. That covers every case that
-    /// matters, because consolidated memory only has value when a next session
-    /// reads it, and that session fires hooks.
-    ///
-    /// Turn it on if you want consolidation to happen on wall-clock time
-    /// regardless of whether you open a CLI again.
-    pub timer: bool,
 }
 
 /// Which model tier consolidates, if any.
@@ -297,7 +277,6 @@ mod tests {
     fn no_background_agent_by_default() {
         // The product's promise is that nothing runs; a Login Items entry out
         // of the box would contradict it on the user's own screen.
-        assert!(!Config::default().consolidation.timer);
     }
 
     #[test]

@@ -217,7 +217,7 @@ impl Store {
                 );
 
                 -- What consolidation has already done for a session, so a
-                -- debounced trigger and a timer backstop do not redo work.
+                -- debounced trigger and the catch-up backstop do not redo work.
                 CREATE TABLE IF NOT EXISTS session_state (
                     session       TEXT PRIMARY KEY,
                     project       TEXT NOT NULL,

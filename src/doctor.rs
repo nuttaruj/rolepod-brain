@@ -375,32 +375,30 @@ fn trigger_checks() -> Vec<Check> {
         .collect()
 }
 
-/// Which backstop is in force, and is it consistent with the config?
+/// The backstop is hook-opportunistic, and nothing else may exist.
+///
+/// The wall-clock timer feature is removed. A machine an older version
+/// installed it on still has the launchd job, though - and an orphaned job
+/// that wakes a binary which no longer knows why is exactly what this report
+/// exists to surface.
 fn timer_check() -> Check {
     let Some(home) = dirs::home_dir() else {
         return Check::fail("backstop", "cannot determine home directory");
     };
     let plist = home.join("Library/LaunchAgents/dev.rolepod.brain.consolidate.plist");
-    let installed = plist.is_file();
-    let wanted = Paths::resolve()
-        .ok()
-        .and_then(|paths| Config::load(&paths.config_file()).ok())
-        .is_some_and(|config| config.consolidation.timer);
-
-    match (wanted, installed) {
-        (false, false) => Check::pass(
+    if plist.is_file() {
+        return Check::fail(
             "backstop",
-            "hook-opportunistic - a session opening finishes stale work; nothing registered to run in the background",
-        ),
-        (true, true) => Check::pass("backstop", format!("timer installed: {}", plist.display())),
-        (true, false) => {
-            Check::fail("backstop", "timer enabled in config but not installed - run `brain setup --apply`")
-        }
-        (false, true) => Check::fail(
-            "backstop",
-            "a background agent is installed but the config does not ask for one - run `brain setup --apply` to remove it",
-        ),
+            format!(
+                "a launchd job from an older version is still installed ({}) - run `brain setup --apply` to remove it",
+                plist.display()
+            ),
+        );
     }
+    Check::pass(
+        "backstop",
+        "hook-opportunistic - a session opening finishes stale work; nothing registered to run in the background",
+    )
 }
 
 /// The core promise: nothing of ours is running right now.
