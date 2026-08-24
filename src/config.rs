@@ -140,12 +140,59 @@ impl Paths {
         self.data_dir.join("brain.log")
     }
 
-    /// Project directory inside the wiki: `wiki/<workspace>/<project>`.
+    /// Project directory inside the wiki.
+    ///
+    /// The layout is human-first: a project in the unnamed workspace lives
+    /// directly under `wiki/` as its bare slug - `wiki/rolepod-brain/` - and
+    /// a named workspace keeps its own level, `wiki/work/api/`. The
+    /// `--<8 hex>` suffix that used to be on every directory now exists only
+    /// to break a genuine collision, because two projects that happen to
+    /// share a basename must never share a directory: that is how one
+    /// project's memory silently becomes another's.
+    ///
+    /// Resolution order, most-specific first:
+    ///
+    /// 1. The suffixed directory, if it exists. A project that ever needed
+    ///    the suffix keeps it - a directory rename breaks nothing today but
+    ///    would re-fire the moment the clean name frees up, and a project
+    ///    whose home moves twice is worse than one with an ugly name.
+    /// 2. The legacy home, `wiki/default/<slug>--<id>`. Kept working so an
+    ///    install that never runs `brain reindex` is degraded in looks only,
+    ///    never in function.
+    /// 3. The bare slug, when it is ours or unclaimed. Ownership is read
+    ///    from the directory's own log, because the directory name no longer
+    ///    carries the id that used to make this check unnecessary.
+    /// 4. The suffixed name, freshly. The bare slug exists and belongs to
+    ///    someone else - another project, or a workspace directory.
     #[must_use]
     pub fn project_dir(&self, scope: &ProjectScope) -> PathBuf {
-        self.wiki()
-            .join(crate::ids::slugify(&scope.workspace))
-            .join(scope.dir_name())
+        let parent = if scope.workspace == "default" {
+            self.wiki()
+        } else {
+            self.wiki().join(crate::ids::slugify(&scope.workspace))
+        };
+
+        let suffixed = parent.join(scope.dir_name());
+        if suffixed.is_dir() {
+            return suffixed;
+        }
+        if scope.workspace == "default" {
+            let legacy = self.wiki().join("default").join(scope.dir_name());
+            if legacy.is_dir() {
+                return legacy;
+            }
+        }
+
+        let clean = parent.join(crate::ids::slugify(&scope.project));
+        // Two brand-new projects with the same slug starting in the same
+        // instant could both see the clean name as unclaimed. The window is
+        // one hook's first-ever event against another project's first-ever
+        // event with a colliding basename; the old always-suffixed layout
+        // closed it by construction, and this one accepts it.
+        if !clean.exists() || dir_belongs_to(&clean, scope.project_id) {
+            return clean;
+        }
+        suffixed
     }
 
     /// Create the data directory if it does not exist.
@@ -156,6 +203,36 @@ impl Paths {
         std::fs::create_dir_all(&self.data_dir)
             .with_context(|| format!("create data directory {}", self.data_dir.display()))
     }
+}
+
+/// Does this wiki directory hold the given project's log?
+///
+/// Reads only the first parseable line of one log file - the project id is on
+/// every line, so one is enough - and never creates anything: `EventLog::open`
+/// makes directories as a side effect, which would turn a question into a
+/// claim.
+fn dir_belongs_to(dir: &Path, project_id: uuid::Uuid) -> bool {
+    let events = dir.join("events");
+    let Ok(entries) = std::fs::read_dir(&events) else { return false };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .collect();
+    files.sort();
+    for file in files {
+        let Ok(handle) = std::fs::File::open(&file) else { continue };
+        let mut first = String::new();
+        use std::io::BufRead;
+        if std::io::BufReader::new(handle).read_line(&mut first).is_err() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&first) {
+            return value.get("project").and_then(serde_json::Value::as_str)
+                == Some(project_id.to_string().as_str());
+        }
+    }
+    false
 }
 
 impl Config {

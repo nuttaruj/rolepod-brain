@@ -1137,6 +1137,12 @@ fn ensure_repo_policy(wiki: &Path) -> Result<()> {
             "# Editor state from opening this wiki as a vault - not memory.\n\
              .obsidian/\n.trash/\n.DS_Store\n",
         ),
+        // Separate entry so wikis whose ignore file predates it get patched.
+        (
+            ".gitignore",
+            ".brain-git.lock",
+            "# Commit serialization, not memory.\n.brain-git.lock\n",
+        ),
     ] {
         let path = wiki.join(name);
         let existing = std::fs::read_to_string(&path).unwrap_or_default();
@@ -1218,11 +1224,24 @@ pub fn known_projects(paths: &Paths) -> Result<Vec<(ProjectScope, PathBuf)>> {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    for workspace in read_dirs(&wiki) {
-        if workspace.file_name().is_some_and(|name| name == ".git") {
+    // One rule classifies every directory: an event log makes it a project,
+    // anything else is a workspace holding projects. A top-level project
+    // belongs to the unnamed workspace; a nested one belongs to the
+    // directory it is in. The legacy `default/` level needs no special case
+    // - it is simply a workspace directory whose name is "default".
+    for entry in read_dirs(&wiki) {
+        if entry.file_name().is_some_and(|name| name == ".git" || name == ".obsidian") {
             continue;
         }
-        for project in read_dirs(&workspace) {
+        if entry.join("events").is_dir() {
+            if let Some(scope) = scope_from_log(&entry, "default") {
+                out.push((scope, entry));
+            }
+            continue;
+        }
+        let workspace = entry.file_name().map(|name| name.to_string_lossy().into_owned());
+        let Some(workspace) = workspace else { continue };
+        for project in read_dirs(&entry) {
             if !project.join("events").is_dir() {
                 continue;
             }
@@ -1234,22 +1253,135 @@ pub fn known_projects(paths: &Paths) -> Result<Vec<(ProjectScope, PathBuf)>> {
     Ok(out)
 }
 
+/// Move every project to its human-first home.
+///
+/// `wiki/default/rolepod-brain--6023cf84/` becomes `wiki/rolepod-brain/`:
+/// the unnamed workspace loses its directory level and the `--<id>` suffix
+/// comes off wherever no collision forces it. Old homes keep working without
+/// this - [`Paths::project_dir`] resolves them - so this is presentation,
+/// run when the user asks for it rather than sprung from a 10ms hook.
+///
+/// The move is `fs::rename` per project, gated by a line count: the logs
+/// under `events/` are the source of truth, and a migration that could lose
+/// one is worse than no migration. A project whose count disagrees after the
+/// rename is moved back.
+///
+/// Idempotent: a project already home is skipped, and collisions resolve the
+/// same way every run because projects are visited in sorted order.
+///
+/// # Errors
+/// Returns an error when a rename or the wiki commit fails.
+pub fn migrate_layout(paths: &Paths) -> Result<Vec<String>> {
+    let wiki = paths.wiki();
+    let mut projects = known_projects(paths)?;
+    // Sorted by current directory, so which of two colliding projects wins
+    // the clean name does not depend on filesystem enumeration order.
+    projects.sort_by(|a, b| a.1.cmp(&b.1));
+
+    let mut moved = Vec::new();
+    for (scope, current) in projects {
+        let parent = if scope.workspace == "default" {
+            wiki.clone()
+        } else {
+            wiki.join(crate::ids::slugify(&scope.workspace))
+        };
+        let clean = parent.join(crate::ids::slugify(&scope.project));
+        let ideal = if current == clean {
+            continue;
+        } else if clean.exists() {
+            // The clean name is taken by something that is not this project
+            // (this project lives at `current`). Suffix at the new location.
+            parent.join(scope.dir_name())
+        } else {
+            clean
+        };
+        if ideal == current {
+            continue;
+        }
+
+        let before = log_line_count(&current);
+        std::fs::create_dir_all(&parent)
+            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::rename(&current, &ideal)
+            .with_context(|| format!("move {} to {}", current.display(), ideal.display()))?;
+        let after = log_line_count(&ideal);
+        if before != after {
+            // Undo rather than continue: a migration that changed a count
+            // has done something no rename can, and every further step
+            // would build on it.
+            let _ = std::fs::rename(&ideal, &current);
+            anyhow::bail!(
+                "{}: {before} log line(s) before the move, {after} after — moved back, nothing else touched",
+                scope.project
+            );
+        }
+        moved.push(format!("{} -> {}", current.display(), ideal.display()));
+    }
+
+    // The legacy level, once it holds nothing.
+    let legacy = wiki.join("default");
+    if legacy.is_dir() && std::fs::read_dir(&legacy).is_ok_and(|mut dir| dir.next().is_none()) {
+        let _ = std::fs::remove_dir(&legacy);
+    }
+
+    if !moved.is_empty() {
+        commit_layout_migration(&wiki, moved.len())?;
+    }
+    Ok(moved)
+}
+
+/// Total log lines across a project's monthly files.
+fn log_line_count(project_dir: &Path) -> usize {
+    std::fs::read_dir(project_dir.join("events"))
+        .into_iter()
+        .flatten()
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .map(|text| text.lines().filter(|line| !line.trim().is_empty()).count())
+        .sum()
+}
+
+/// One commit for the whole move, so wiki history shows it as one act.
+fn commit_layout_migration(wiki: &Path, count: usize) -> Result<()> {
+    if !wiki.join(".git").exists() {
+        return Ok(());
+    }
+    let _guard = LockFile::acquire(&wiki.join(".brain-git.lock"))?;
+    // Policy before `add -A`, or the lock file itself lands in the commit.
+    ensure_repo_policy(wiki)?;
+    run_git(wiki, &["add", "-A"])?;
+    let staged = std::process::Command::new("git")
+        .args(["diff", "--cached", "--quiet"])
+        .current_dir(wiki)
+        .status()
+        .context("check staged changes")?;
+    if staged.success() {
+        return Ok(());
+    }
+    run_git(
+        wiki,
+        &["commit", "-q", "-m", &format!("layout: human-first homes for {count} project(s)")],
+    )
+}
+
 /// Recover a scope from a project's own log and its place on disk.
 ///
 /// The ids come from the log, which is the source of truth for them. The names
 /// come from the directory, which is where they were written - with the
 /// `--<id>` suffix stripped, because that suffix is part of the directory's
 /// name, not the project's.
-fn scope_from_log(project_dir: &Path, workspace_dir: &Path) -> Option<ProjectScope> {
+fn scope_from_log(project_dir: &Path, workspace: &str) -> Option<ProjectScope> {
     let log = EventLog::open(project_dir).ok()?;
     let (events, _) = log.read_all().ok()?;
     let first = events.first()?;
 
     let dir_name = project_dir.file_name()?.to_string_lossy().into_owned();
-    let project = dir_name.rsplit_once("--").map_or(dir_name.as_str(), |(name, _)| name);
+    let project = crate::ids::strip_dir_suffix(&dir_name);
 
     Some(ProjectScope {
-        workspace: workspace_dir.file_name()?.to_string_lossy().into_owned(),
+        workspace: workspace.to_string(),
         workspace_id: first.workspace,
         project: project.to_string(),
         project_id: first.project,
@@ -1958,7 +2090,7 @@ mod naming_tests {
         ))
         .unwrap();
 
-        let scope = scope_from_log(&project, &workspace).expect("scope");
+        let scope = scope_from_log(&project, "default").expect("scope");
         assert_eq!(scope.project, "rolepod-brain", "the --id suffix is the dir's, not the name's");
         assert_eq!(scope.workspace, "default", "the workspace name must not become `unnamed`");
         assert_eq!(

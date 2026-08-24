@@ -184,8 +184,14 @@ impl Fixture {
     fn project_dirs(&self) -> Vec<PathBuf> {
         let wiki = self.home.join("wiki");
         let mut dirs = Vec::new();
-        for workspace in read_dirs(&wiki) {
-            for project in read_dirs(&workspace) {
+        // Same classification the product uses: an event log makes a
+        // directory a project, whatever depth it sits at.
+        for entry in read_dirs(&wiki) {
+            if entry.join("events").is_dir() {
+                dirs.push(entry);
+                continue;
+            }
+            for project in read_dirs(&entry) {
                 if project.join("events").is_dir() {
                     dirs.push(project);
                 }
@@ -277,6 +283,123 @@ fn codex_payload(cwd: &Path) -> String {
         "prompt": "why does the auth middleware reject valid tokens?"
     })
     .to_string()
+}
+
+#[test]
+fn a_legacy_tree_keeps_working_and_reindex_moves_it_home() {
+    // The old layout was wiki/default/<slug>--<id>/. It must keep working
+    // untouched - an install that never migrates is degraded in looks only -
+    // and `brain reindex` must move it to wiki/<slug>/ without losing a line.
+    let fixture = Fixture::new("legacymove");
+    fixture.hook("claude-code", "PostToolUse", &claude_payload(&fixture.project));
+
+    // Reconstruct the legacy home by hand from what was captured.
+    let wiki = fixture.home.join("wiki");
+    let flat = fixture.project_dirs().pop().expect("a captured project");
+    let idfrag: String = fixture
+        .log_text()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find_map(|line| line["project"].as_str().map(|id| id.replace('-', "")[..8].to_string()))
+        .expect("a project id");
+    let slug = flat.file_name().unwrap().to_string_lossy().into_owned();
+    let legacy = wiki.join("default").join(format!("{slug}--{idfrag}"));
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::rename(&flat, &legacy).unwrap();
+
+    // Capture keeps landing in the legacy home, not a fresh flat one.
+    fixture.hook("claude-code", "UserPromptSubmit", &codex_payload(&fixture.project));
+    assert!(
+        legacy.join("events").is_dir() && !flat.exists(),
+        "pre-migration capture abandoned the legacy home"
+    );
+    let lines_before = fixture.log_text().lines().count();
+    assert_eq!(lines_before, 2, "both events should be in the legacy log");
+
+    // Migration: reindex moves it, keeps every line, and removes the level.
+    let out = fixture.brain(&["reindex"]);
+    assert!(out.status.success(), "reindex failed: {out:?}");
+    assert!(flat.join("events").is_dir(), "the project did not move home: {flat:?}");
+    assert!(!legacy.exists(), "the legacy home should be gone");
+    assert!(!wiki.join("default").exists(), "the empty default/ level should be removed");
+    assert_eq!(fixture.log_text().lines().count(), lines_before, "the move lost log lines");
+
+    // The memory survived the move end to end.
+    let found = String::from_utf8_lossy(&fixture.brain(&["search", "auth"]).stdout).to_string();
+    assert!(!found.contains("No matches"), "memory unfindable after migration: {found}");
+
+    // And running it again moves nothing - stdout says so.
+    let again = fixture.brain(&["reindex"]);
+    assert!(
+        !String::from_utf8_lossy(&again.stdout).contains("moved"),
+        "a second migration should have nothing to do"
+    );
+}
+
+#[test]
+fn two_projects_with_one_basename_never_share_a_directory() {
+    // The clean name is a privilege, not a right: the first project keeps
+    // it, the second gets the --<id> suffix, and neither ever writes into
+    // the other's memory - which is how the suffix earned permanence.
+    let fixture = Fixture::new("basenameclash");
+    fixture.hook("claude-code", "PostToolUse", &claude_payload(&fixture.project));
+
+    // A second repository whose directory has the same basename.
+    let rival_root = fixture.home.parent().unwrap().join("elsewhere");
+    let rival = rival_root.join("checkout");
+    std::fs::create_dir_all(&rival).unwrap();
+    run_in(&rival, "git", &["init", "-q"]);
+    let payload = serde_json::json!({
+        "session_id": "0199a1f2-3c4d-7e8f-9012-3456789abcd9",
+        "cwd": rival,
+        "tool_name": "Edit",
+        "tool_input": {"file_path": rival.join("src/other.rs")}
+    })
+    .to_string();
+    let mut child = Command::new(BRAIN)
+        .args(["hook", "--cli", "claude-code", "--event", "PostToolUse"])
+        .current_dir(&rival)
+        .env("ROLEPOD_BRAIN_HOME", &fixture.home)
+        .env("HOME", fixture.home.parent().unwrap())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn hook");
+    child.stdin.as_mut().unwrap().write_all(payload.as_bytes()).unwrap();
+    assert!(child.wait_with_output().expect("hook").status.success());
+
+    let dirs = fixture.project_dirs();
+    assert_eq!(dirs.len(), 2, "two projects must get two directories: {dirs:?}");
+    let names: Vec<String> = dirs
+        .iter()
+        .map(|dir| dir.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert!(names.contains(&"checkout".to_string()), "the first project keeps the clean name: {names:?}");
+    assert!(
+        names.iter().any(|name| name.starts_with("checkout--")),
+        "the second project must be suffixed, not merged: {names:?}"
+    );
+}
+
+#[test]
+fn a_named_workspace_keeps_its_own_level() {
+    let fixture = Fixture::new("namedws");
+    std::fs::write(
+        fixture.project.join(".rolepod-brain.toml"),
+        "[project]\nname = \"api\"\nworkspace = \"work\"\n",
+    )
+    .unwrap();
+    fixture.hook("claude-code", "PostToolUse", &claude_payload(&fixture.project));
+
+    let dirs = fixture.project_dirs();
+    assert_eq!(dirs.len(), 1, "one project expected: {dirs:?}");
+    let relative = dirs[0].strip_prefix(fixture.home.join("wiki")).unwrap();
+    assert_eq!(
+        relative,
+        Path::new("work/api"),
+        "a named workspace nests and the project name is clean"
+    );
 }
 
 #[test]

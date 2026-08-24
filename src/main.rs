@@ -274,6 +274,13 @@ fn run(command: Commands) -> Result<()> {
 fn reindex() -> Result<()> {
     let paths = Paths::resolve()?;
     paths.ensure()?;
+
+    // Layout first, so the index and the hubs below are rebuilt against the
+    // homes projects will actually live in.
+    for moved in consolidate::migrate_layout(&paths)? {
+        println!("moved {moved}");
+    }
+
     let store = Store::open(&paths.db())?;
     store.clear()?;
 
@@ -281,7 +288,7 @@ fn reindex() -> Result<()> {
     let mut skipped = 0usize;
     let mut projects = 0usize;
 
-    for project_dir in project_dirs(&paths)? {
+    for (_, project_dir) in consolidate::known_projects(&paths)? {
         let log = EventLog::open(&project_dir)?;
         let (events, bad_lines) = log.read_all()?;
         skipped += bad_lines;
@@ -314,33 +321,6 @@ fn reindex() -> Result<()> {
         println!("Skipped {skipped} unreadable line(s); the rest of the log was unaffected.");
     }
     Ok(())
-}
-
-/// Every `wiki/<workspace>/<project>` directory on this machine.
-fn project_dirs(paths: &Paths) -> Result<Vec<std::path::PathBuf>> {
-    let wiki = paths.wiki();
-    if !wiki.is_dir() {
-        return Ok(Vec::new());
-    }
-    let mut out = Vec::new();
-    for workspace in std::fs::read_dir(&wiki)
-        .with_context(|| format!("read {}", wiki.display()))?
-        .filter_map(std::result::Result::ok)
-    {
-        if !workspace.path().is_dir() {
-            continue;
-        }
-        for project in std::fs::read_dir(workspace.path())
-            .with_context(|| format!("read {}", workspace.path().display()))?
-            .filter_map(std::result::Result::ok)
-        {
-            if project.path().join("events").is_dir() {
-                out.push(project.path());
-            }
-        }
-    }
-    out.sort();
-    Ok(out)
 }
 
 fn search(query: &str, limit: usize) -> Result<()> {

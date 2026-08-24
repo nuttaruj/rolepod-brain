@@ -88,10 +88,32 @@ impl ProjectScope {
     /// The UUID is the identity; this is the on-disk label. It carries the
     /// slug so the wiki stays greppable and an 8-hex suffix so two projects
     /// with the same basename in different parents never collide.
+    ///
+    /// This is the *suffixed* form. Most projects live under the bare slug -
+    /// [`crate::config::Paths::project_dir`] resolves which - and only a
+    /// collision earns the suffix.
     #[must_use]
     pub fn dir_name(&self) -> String {
         let short = self.project_id.simple().to_string();
         format!("{}--{}", slugify(&self.project), &short[..8])
+    }
+}
+
+/// A directory's name with any `--<8 hex>` disambiguation suffix removed.
+///
+/// `--` cannot occur inside a slug - [`slugify`] collapses every non-alphanumeric
+/// run to one dash - so the separator is unambiguous. The hex check still
+/// matters: a directory someone made by hand could end in `--something`, and
+/// treating that as our suffix would silently rename their project.
+#[must_use]
+pub fn strip_dir_suffix(dir_name: &str) -> &str {
+    match dir_name.rsplit_once("--") {
+        Some((name, tail))
+            if tail.len() == 8 && tail.chars().all(|ch| ch.is_ascii_hexdigit()) =>
+        {
+            name
+        }
+        _ => dir_name,
     }
 }
 
@@ -318,6 +340,18 @@ mod tests {
             "two unrelated checkouts named `repo` must not share memory"
         );
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn only_a_real_hex_suffix_is_stripped() {
+        assert_eq!(strip_dir_suffix("rolepod-brain--6023cf84"), "rolepod-brain");
+        // A clean slug never contains `--`, so it passes through whole.
+        assert_eq!(strip_dir_suffix("rolepod-brain"), "rolepod-brain");
+        // Hand-made directories that merely look suffixed keep their names:
+        // stripping them would silently rename someone's project.
+        assert_eq!(strip_dir_suffix("notes--drafts"), "notes--drafts");
+        assert_eq!(strip_dir_suffix("api--v2"), "api--v2");
+        assert_eq!(strip_dir_suffix("x--12345"), "x--12345", "wrong length is not our suffix");
     }
 
     #[test]

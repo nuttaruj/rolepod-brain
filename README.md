@@ -141,7 +141,7 @@ never injected.
 ~/.rolepod-brain/
   brain.db                       # derived index (FTS5) - disposable
   wiki/                          # git repository - the durable memory
-    <workspace>/<project>/
+    <project>/
       events/YYYY-MM.jsonl       # append-only log - the source of truth
       pages/sessions/*.md        # one page per consolidated session
       knowledge/gotchas/*.md     # what stayed true across many sessions
@@ -149,6 +149,15 @@ never injected.
       <project>.md, <topic>.md   # hub notes linking the rest together
   config.toml                    # optional; defaults are deliberately light
 ```
+
+Projects live directly under `wiki/` by their plain names. Two exceptions,
+both earned rather than default: a project whose basename collides with
+another's gets a `--<id>` suffix so two projects never share a directory, and
+a project assigned to a named workspace (via the marker file below) nests
+under `wiki/<workspace>/`. Trees written by versions before 0.11 kept every
+project under `wiki/default/` with a permanent suffix; they keep working
+untouched, and `brain reindex` moves them to their human-first homes without
+losing a line.
 
 Projects are keyed by the main git repository root, so every worktree of one
 repo shares one memory. Drop a `.rolepod-brain.toml` in any ancestor directory
