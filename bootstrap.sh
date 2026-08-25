@@ -16,6 +16,10 @@
 #   --uninstall         remove brain from every CLI it wired
 #   --binary-only       install the binary and stop
 #
+# Working on brain itself? There is no install script to run: `cargo build
+# --release` and then `target/release/brain setup`. This file is the only
+# supported way to INSTALL, so that installing never means keeping a clone.
+#
 # Env:
 #   BRAIN_BIN_DIR   where to install (default $HOME/.local/bin)
 #   BRAIN_VERSION   a tag to install (default: the latest release)

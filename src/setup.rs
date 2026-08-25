@@ -520,6 +520,20 @@ pub fn run(only: Option<&str>, apply: bool) -> Result<Vec<Change>> {
     let exe = std::env::current_exe().context("locate our own binary")?;
     let mut changes = Vec::new();
 
+    // A name nothing matches wired nothing and said nothing — the run looked
+    // successful and the CLI the person meant was untouched. Refuse instead:
+    // this is the one command whose whole job is to change their machine, and
+    // "did nothing, quietly" is the worst answer it can give.
+    if let Some(only) = only {
+        let known: Vec<String> =
+            targets(&exe)?.iter().map(|target| target.kind.as_str().to_string()).collect();
+        anyhow::ensure!(
+            only == "all" || known.iter().any(|name| name == only),
+            "unknown CLI `{only}`. Known: {}, or `all`",
+            known.join(", ")
+        );
+    }
+
     for target in targets(&exe)? {
         if let Some(only) = only {
             if only != "all" && only != target.kind.as_str() {
@@ -1663,6 +1677,24 @@ mod tests {
     /// only one of them is a problem. Reporting the working machine as broken,
     /// with a remedy that does nothing, is how people learn to stop reading
     /// the output.
+    /// A CLI name nothing matches must be refused, not ignored.
+    ///
+    /// `setup`'s whole job is to change the machine. Wiring nothing and saying
+    /// nothing looks exactly like success, and the CLI the person meant sits
+    /// untouched — now with a documented `--target=<cli>` in front of it, where
+    /// a typo is one keystroke away.
+    #[test]
+    fn an_unknown_cli_name_is_refused_rather_than_ignored() {
+        let error = run(Some("claude"), false).unwrap_err().to_string();
+        assert!(error.contains("unknown CLI `claude`"), "{error}");
+        assert!(error.contains("claude-code"), "the message should name the real one: {error}");
+        assert!(error.contains("`all`"), "the message should mention `all`: {error}");
+
+        // The real names, and `all`, still go through.
+        assert!(run(Some("all"), false).is_ok());
+        assert!(run(Some("cursor"), false).is_ok());
+    }
+
     #[test]
     fn the_plugin_can_say_which_events_it_wires() {
         let home = std::env::temp_dir().join(format!("brain-plugin-events-{}", ulid::Ulid::new()));

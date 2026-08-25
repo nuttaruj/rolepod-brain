@@ -91,17 +91,74 @@ read before you run it. If you would rather not pipe a script to a shell, take
 the binary from [Releases](https://github.com/nuttaruj/rolepod-brain/releases)
 yourself and run `brain setup`.
 
-Building from source instead needs Rust and git:
+### Choosing what gets wired
+
+By default it wires every supported CLI it finds on the machine. To narrow it,
+or to skip the question entirely:
 
 ```sh
-git clone https://github.com/nuttaruj/rolepod-brain && cd rolepod-brain
-./install.sh
+# every CLI found here — the same as passing nothing
+curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh -s -- --target=all
+
+# one CLI: claude-code, codex, cursor, gemini-cli, antigravity, opencode
+curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh -s -- --target=codex
+
+# no prompt, for a scripted or headless install
+curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh -s -- --target=all --yes
+
+# the binary only, wire nothing yet
+curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh -s -- --binary-only
+
+# undo it: removes brain from every CLI it wired
+curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh -s -- --uninstall
 ```
 
-To see what it would do without doing it:
+Uninstalling leaves the binary and your memory alone; it only unwires. `brain
+where` prints where the memory lives if you want that gone too.
+
+### Or install it as a plugin
+
+On Claude Code and Codex the plugin is a complete install on its own — it
+carries the hooks, the MCP tools and the skills, and fetches the binary on your
+first session if it is not already on your PATH.
+
+```sh
+# Claude Code
+claude plugin marketplace add nuttaruj/rolepod-brain
+claude plugin install rolepod-brain@rolepod-brain
+
+# Codex
+codex plugin marketplace add nuttaruj/rolepod-brain
+codex plugin add rolepod-brain@rolepod-brain
+
+# Cursor — carries the MCP tools and skills; run `brain setup --apply` for capture
+cursor-agent plugin marketplace add nuttaruj/rolepod-brain
+cursor-agent plugin install rolepod-brain@rolepod-brain
+```
+
+Updating:
+
+```sh
+claude plugin marketplace update rolepod-brain
+claude plugin update rolepod-brain@rolepod-brain
+brain setup --apply     # only needed the first time the plugin takes over the hooks
+```
+
+That last line matters exactly once. Before the plugin carried hooks, `setup`
+had written its own into `settings.json`; with both in place every event would
+be captured twice. `setup` notices the plugin, stands down, and takes its own
+entries back out — and `brain doctor` then reports capture as coming "via the
+plugin" rather than claiming the machine is unwired.
+
+The two paths are not exclusive. Whichever you use, `brain setup` is the thing
+that reconciles them, and it is safe to re-run at any time.
+
+### Seeing what it would do
 
 ```sh
 brain setup            # dry run; --apply performs it
+brain doctor           # what is actually wired, and what is not working
+brain where            # which project you are in, and where its memory lives
 ```
 
 `setup` backs up each config before writing and only ever replaces entries it
@@ -267,26 +324,14 @@ Off by default because of what it costs, not what it returns: every search
 would spend a model call in the middle of a session. Turn it on if your
 searches keep returning the right entry in the wrong place.
 
-## Installing as a plugin
+## How the plugin fits
 
 Claude Code, Cursor and Codex all read plugins from a marketplace repository,
-and this one is a marketplace:
+and this one is a marketplace. The commands are under
+[Install](#or-install-it-as-a-plugin); what follows is what each CLI actually
+gets, and why they differ.
 
-```sh
-# Claude Code
-/plugin marketplace add nuttaruj/rolepod-brain
-/plugin install rolepod-brain@rolepod-brain
-
-# Cursor
-cursor-agent plugin marketplace add nuttaruj/rolepod-brain
-cursor-agent plugin install rolepod-brain@rolepod-brain
-
-# Codex
-codex plugin marketplace add nuttaruj/rolepod-brain
-codex plugin add rolepod-brain@rolepod-brain
-```
-
-On Claude Code and Codex the plugin is now the whole install: it carries the
+On Claude Code and Codex the plugin is the whole install: it carries the
 hooks as well as the MCP tools and skills, and its `SessionStart` hook fetches
 the binary — announced, checksum-verified, once — if `brain` is not already on
 your PATH. `brain setup` then stands down for that CLI rather than writing a
@@ -295,19 +340,15 @@ second set of hooks beside the plugin's, which would capture every event twice.
 Cursor takes neither file: its hook events have their own names and shape, so
 `setup` still owns Cursor's wiring.
 
-The paragraph below describes what the plugin carried before it carried hooks,
-and still describes Cursor:
+**On Cursor the plugin is not a replacement for `brain setup`.** What it
+carries there is the MCP recall tools and the skills — the part a CLI can serve
+from a manifest — and capture is still wired by `brain setup --apply`. When the
+plugin is installed, `setup` notices and withdraws its own MCP registration
+rather than adding a second entry for the same server.
 
-**The plugin is not a replacement for `brain setup` on Cursor.** What it
-carries is the MCP recall tools and the skills — the part a CLI can serve from
-a manifest. Capture is still wired by `brain setup --apply`, because a hook has
-to name the absolute path of your binary and tag each event with the CLI it
-came from, and a manifest shipped in a repository knows neither. When the
-plugin is installed, `brain setup` notices and withdraws its own MCP
-registration rather than adding a second entry for the same server.
-
-The plugin expects `brain` on your `PATH` — `install.sh` puts it in
-`~/.local/bin`.
+Either way the plugin needs `brain` on your `PATH`. On Claude Code and Codex it
+fetches the binary itself the first time a session starts, if it is not already
+there; it lands in `~/.local/bin`.
 
 ### Codex is the exception
 
