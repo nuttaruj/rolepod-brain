@@ -24,6 +24,24 @@ const BUSY_TIMEOUT_MS: u32 = 5_000;
 /// the pool by itself, shallow enough that the query stays one index scan.
 const SEARCH_POOL_FACTOR: usize = 4;
 
+/// How many top hits seed the graph-neighbour expansion. Three, because a
+/// neighbour of the best hits is context and a neighbour of the tenth is
+/// noise wearing its badge.
+const NEIGHBOUR_SEEDS: usize = 3;
+
+/// Query tokens shorter than this never reach the entity LIKE scan; two
+/// letters inside every path separator is a match for the whole table.
+const ENTITY_TOKEN_MIN: usize = 3;
+
+/// Tokens per query that the entity scan will consider. Enough for any
+/// question a person types; a pasted stack trace stops being a query here.
+const ENTITY_TOKENS_MAX: usize = 8;
+
+/// Events that represent one session in the entity stream. Two: the most
+/// canonical page and one runner-up. The stream nominates sessions, not
+/// events, and a busy session must not fill the pool through it.
+const ENTITY_EVENTS_PER_SESSION: usize = 2;
+
 /// How close a memory has to be before it counts as an answer.
 ///
 /// Cosine on this model's unit vectors: unrelated English text pairs measure
@@ -555,40 +573,56 @@ impl Store {
         let semantic = crate::embed::encode(query)
             .and_then(|vector| self.nearest(project, &vector, topic, pool))
             .unwrap_or_default();
+        let semantic_ids: Vec<String> = semantic.into_iter().map(|(id, _)| id).collect();
+        let semantic = self.hits_by_id(&semantic_ids)?;
 
-        Ok(spread_across_sessions(self.fuse(keyword, &semantic, pool)?, limit))
+        // Two more rankings that need no model at all, which is the point:
+        // they are what keeps recall wide when every model is unreachable.
+        // Entities are what a session DECLARED it was about, so they find
+        // work whose words never matched; neighbours are what else touched
+        // the same things, so a hit pulls in its context.
+        let entity = self.entity_matches(project, query, topic, ENTITY_EVENTS_PER_SESSION, pool)?;
+        let mut seeds: Vec<String> = Vec::new();
+        for hit in keyword.iter().chain(semantic.iter()) {
+            if seeds.len() >= NEIGHBOUR_SEEDS {
+                break;
+            }
+            if !seeds.contains(&hit.id) {
+                seeds.push(hit.id.clone());
+            }
+        }
+        let graph = self.neighbours_of(project, &seeds, topic, pool)?;
+
+        Ok(spread_across_sessions(self.fuse(&[keyword, semantic, entity, graph], pool)?, limit))
     }
 
-    /// Combine the keyword ranking and the semantic one.
+    /// Combine several rankings into one.
     ///
     /// Reciprocal rank fusion, which needs only each list's ORDER — and that
-    /// is the point. An FTS5 `rank` and a cosine similarity are not on the
-    /// same scale and never will be; any attempt to weight one against the
-    /// other directly is a constant someone tuned once against one corpus.
-    /// Position is the only thing both lists agree on the meaning of.
+    /// is the point. An FTS5 `rank`, a cosine similarity, an entity count and
+    /// a shared-neighbour count are not on the same scale and never will be;
+    /// any attempt to weight one against another directly is a constant
+    /// someone tuned once against one corpus. Position is the only thing all
+    /// the lists agree on the meaning of.
     ///
-    /// An entry both rankings found outranks one that only appears in either,
+    /// An entry several rankings found outranks one that only appears in one,
     /// which is exactly the behaviour wanted: the keyword hit that is also
-    /// about the right thing goes first.
-    fn fuse(&self, keyword: Vec<Hit>, semantic: &[(String, f32)], limit: usize) -> Result<Vec<Hit>> {
-        if semantic.is_empty() {
-            return Ok(keyword);
-        }
+    /// about the right thing goes first. The lists are equal-weight on
+    /// purpose — a per-stream weight is a knob nobody can justify a value
+    /// for.
+    fn fuse(&self, lists: &[Vec<Hit>], limit: usize) -> Result<Vec<Hit>> {
         // The conventional damping constant. Large enough that the top of
-        // either list does not dominate outright, so agreement between the two
+        // any one list does not dominate outright, so agreement between
         // rankings can still outweigh a single strong opinion.
         const K: f32 = 60.0;
 
         let mut score: std::collections::HashMap<&str, f32> = std::collections::HashMap::new();
-        for (rank, hit) in keyword.iter().enumerate() {
-            #[allow(clippy::cast_precision_loss)]
-            let contribution = 1.0 / (K + rank as f32 + 1.0);
-            *score.entry(hit.id.as_str()).or_default() += contribution;
-        }
-        for (rank, (id, _)) in semantic.iter().enumerate() {
-            #[allow(clippy::cast_precision_loss)]
-            let contribution = 1.0 / (K + rank as f32 + 1.0);
-            *score.entry(id.as_str()).or_default() += contribution;
+        for list in lists {
+            for (rank, hit) in list.iter().enumerate() {
+                #[allow(clippy::cast_precision_loss)]
+                let contribution = 1.0 / (K + rank as f32 + 1.0);
+                *score.entry(hit.id.as_str()).or_default() += contribution;
+            }
         }
 
         // Fusion keeps only each list's ORDER, which silently discards the one
@@ -608,23 +642,19 @@ impl Store {
         });
         ranked.truncate(limit);
 
-        let known: std::collections::HashMap<&str, &Hit> =
-            keyword.iter().map(|hit| (hit.id.as_str(), hit)).collect();
-        let missing: Vec<String> = ranked
-            .iter()
-            .filter(|(id, _)| !known.contains_key(id))
-            .map(|(id, _)| (*id).to_string())
-            .collect();
-        // Only the semantic-only hits need fetching, and they have no FTS
-        // snippet to inherit - the query never appeared in them, which is why
-        // the other ranking had to find them.
-        let fetched = self.hits_by_id(&missing)?;
-        let fetched: std::collections::HashMap<&str, &Hit> =
-            fetched.iter().map(|hit| (hit.id.as_str(), hit)).collect();
+        // The first list that saw an id supplies its Hit. Keyword goes first
+        // in every caller, so an entry the words found keeps its FTS snippet
+        // - the marked-up excerpt - over another stream's plain body prefix.
+        let mut known: std::collections::HashMap<&str, &Hit> = std::collections::HashMap::new();
+        for list in lists {
+            for hit in list {
+                known.entry(hit.id.as_str()).or_insert(hit);
+            }
+        }
 
         Ok(ranked
             .into_iter()
-            .filter_map(|(id, _)| known.get(id).or_else(|| fetched.get(id)).map(|hit| (*hit).clone()))
+            .filter_map(|(id, _)| known.get(id).map(|hit| (*hit).clone()))
             .collect())
     }
 
@@ -704,6 +734,185 @@ impl Store {
             })
             .context("run related")?;
         rows.collect::<rusqlite::Result<Vec<_>>>().context("read related")
+    }
+
+    /// Sessions whose DECLARED subjects match the query's words.
+    ///
+    /// Entities are what consolidation said a session was about - files,
+    /// symbols, subjects - so this stream finds work whose own text never
+    /// contains the query. It needs no model, which is why it exists: it is
+    /// one of the rankings that keeps zero-LLM recall wide.
+    ///
+    /// A match nominates a SESSION, not an event, because entities are
+    /// recorded per session. Handing back every event in a matching session
+    /// would let one busy session flood the pool, so each session is
+    /// represented by its most canonical few - knowledge first, then the
+    /// summary, then raw captures - the same authority order `related` uses.
+    fn entity_matches(
+        &self,
+        project: &str,
+        query: &str,
+        topic: Option<&str>,
+        per_session: usize,
+        pool: usize,
+    ) -> Result<Vec<Hit>> {
+        // The same normalization entity names went through at write time;
+        // matching raw query text against normalized names would miss on
+        // nothing more than a capital letter.
+        let tokens: Vec<String> = query
+            .split_whitespace()
+            .map(crate::consolidate::normalize_entity)
+            .filter(|token| token.len() >= ENTITY_TOKEN_MIN)
+            .map(|token| token.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
+            .take(ENTITY_TOKENS_MAX)
+            .collect();
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let likes = tokens
+            .iter()
+            .enumerate()
+            .map(|(index, _)| format!("n.name LIKE ?{} ESCAPE '\\'", index + 5))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let sql = format!(
+            "WITH matched AS (
+                 SELECT n.session, COUNT(DISTINCT n.name) AS matched
+                 FROM entities n
+                 WHERE n.project = ?1 AND ({likes})
+                 GROUP BY n.session
+             ),
+             candidates AS (
+                 SELECT e.id, e.ts, e.cli, e.kind, e.title,
+                        substr(COALESCE(e.body, ''), 1, 160) AS snip, e.session,
+                        m.matched,
+                        CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END AS demoted,
+                        CASE e.kind
+                            WHEN 'knowledge' THEN 0
+                            WHEN 'session_summary' THEN 1
+                            ELSE 2
+                        END AS authority,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY e.session
+                            ORDER BY CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END,
+                                     CASE e.kind
+                                         WHEN 'knowledge' THEN 0
+                                         WHEN 'session_summary' THEN 1
+                                         ELSE 2
+                                     END,
+                                     e.id DESC
+                        ) AS per_session
+                 FROM events e
+                 JOIN matched m ON m.session = e.session
+                 WHERE e.project = ?1 AND e.forgotten = 0 AND e.kind != 'tombstone'
+                       AND e.hook != 'correct'
+                       AND (?2 IS NULL OR e.topic = ?2)
+             )
+             SELECT id, ts, cli, kind, title, snip, session FROM candidates
+             WHERE per_session <= ?3
+             ORDER BY demoted, matched DESC, authority, id DESC
+             LIMIT ?4"
+        );
+        let mut stmt = self.conn.prepare(&sql).context("prepare entity matches")?;
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+            Box::new(project.to_string()),
+            Box::new(topic.map(str::to_string)),
+            Box::new(per_session as i64),
+            Box::new(pool as i64),
+        ];
+        for token in &tokens {
+            params.push(Box::new(format!("%{token}%")));
+        }
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params.iter().map(AsRef::as_ref)), |row| {
+                Ok(Hit {
+                    id: row.get(0)?,
+                    ts: row.get(1)?,
+                    cli: row.get(2)?,
+                    kind: row.get(3)?,
+                    title: row.get(4)?,
+                    snippet: row.get(5)?,
+                    session: row.get(6)?,
+                })
+            })
+            .context("run entity matches")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("read entity matches")
+    }
+
+    /// What sits beside the hits another ranking already found.
+    ///
+    /// `related`, widened to several seeds and folded into search: the top
+    /// hits' sessions declared entities, and whatever else touched those
+    /// entities is context the query's words never asked for. Needs no
+    /// model - the other zero-LLM ranking.
+    fn neighbours_of(
+        &self,
+        project: &str,
+        seeds: &[String],
+        topic: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Hit>> {
+        if seeds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let holes = |offset: usize| {
+            (0..seeds.len())
+                .map(|index| format!("?{}", index + offset))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let sql = format!(
+            "WITH subject AS (
+                 SELECT DISTINCT n.name FROM entities n
+                 JOIN events e ON e.session = n.session AND e.project = n.project
+                 WHERE e.id IN ({seed_holes}) AND n.project = ?1
+             )
+             SELECT e.id, e.ts, e.cli, e.kind, e.title,
+                    substr(COALESCE(e.body, ''), 1, 160), e.session,
+                    COUNT(DISTINCT n.name) AS shared
+             FROM events e
+             JOIN entities n ON n.session = e.session AND n.project = e.project
+             WHERE n.name IN (SELECT name FROM subject)
+                   AND e.project = ?1 AND e.id NOT IN ({seed_holes})
+                   AND e.forgotten = 0 AND e.kind != 'tombstone'
+                   AND e.hook != 'correct'
+                   AND (?2 IS NULL OR e.topic = ?2)
+             GROUP BY e.id
+             ORDER BY shared DESC,
+                      CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END,
+                      CASE e.kind
+                          WHEN 'knowledge' THEN 0
+                          WHEN 'session_summary' THEN 1
+                          ELSE 2
+                      END,
+                      e.id DESC
+             LIMIT ?3",
+            seed_holes = holes(4),
+        );
+        let mut stmt = self.conn.prepare(&sql).context("prepare neighbours")?;
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+            Box::new(project.to_string()),
+            Box::new(topic.map(str::to_string)),
+            Box::new(limit as i64),
+        ];
+        for seed in seeds {
+            params.push(Box::new(seed.clone()));
+        }
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params.iter().map(AsRef::as_ref)), |row| {
+                Ok(Hit {
+                    id: row.get(0)?,
+                    ts: row.get(1)?,
+                    cli: row.get(2)?,
+                    kind: row.get(3)?,
+                    title: row.get(4)?,
+                    snippet: row.get(5)?,
+                    session: row.get(6)?,
+                })
+            })
+            .context("run neighbours")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("read neighbours")
     }
 
     /// What this project is, before anyone knows what to ask about it.
@@ -2443,6 +2652,138 @@ mod tests {
             1,
             "a path query should find the work on that path"
         );
+    }
+
+    fn event_in_session(title: &str, body: &str, project: Uuid, session: Uuid) -> Event {
+        let mut event = Event::new(
+            Uuid::nil(),
+            project,
+            session,
+            Source { cli: "claude-code".into(), hook: "post_tool_use".into() },
+            EventKind::Observation,
+            title.into(),
+            body.into(),
+        );
+        event.files = vec!["src/main.rs".to_string()];
+        event
+    }
+
+    #[test]
+    fn an_entity_match_finds_work_the_words_never_mention() {
+        // Consolidation recorded "src/billing.rs" as one of the session's
+        // entities, but no event text ever says "billing". Words alone cannot
+        // find this session; the declared entity is the only trail.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let session = Uuid::new_v4();
+        store
+            .index(&event_in_session("Quarterly totals drift", "rounding at period end", project, session))
+            .unwrap();
+        store
+            .record_entities(&session.to_string(), &project.to_string(), &["src/billing.rs".to_string()])
+            .unwrap();
+
+        let hits =
+            store.search(&project.to_string(), "src/billing.rs", None, 10, Recall::Fused).unwrap();
+        assert_eq!(hits.len(), 1, "the entity stream should surface the session's work");
+        assert!(hits[0].title.contains("Quarterly"));
+    }
+
+    #[test]
+    fn a_graph_neighbour_of_a_keyword_hit_joins_the_results() {
+        // Two sessions touched the same entity. The query matches only the
+        // first session's words; the second is its neighbour through the
+        // shared entity, and that is how it earns a place in the results.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let seed = Uuid::new_v4();
+        let neighbour = Uuid::new_v4();
+        store
+            .index(&event_in_session("Fixed the vermilion middleware", "expiry check", project, seed))
+            .unwrap();
+        store
+            .index(&event_in_session("Connection pool tuning", "idle timeout raised", project, neighbour))
+            .unwrap();
+        for session in [seed, neighbour] {
+            store
+                .record_entities(&session.to_string(), &project.to_string(), &["src/gate.rs".to_string()])
+                .unwrap();
+        }
+
+        let hits = store.search(&project.to_string(), "vermilion", None, 10, Recall::Fused).unwrap();
+        let titles: Vec<&str> = hits.iter().map(|hit| hit.title.as_str()).collect();
+        assert!(titles.iter().any(|t| t.contains("vermilion")), "keyword hit lost: {titles:?}");
+        assert!(
+            titles.iter().any(|t| t.contains("Connection pool")),
+            "the neighbour through the shared entity never surfaced: {titles:?}"
+        );
+    }
+
+    #[test]
+    fn a_forgotten_event_never_returns_through_the_entity_stream() {
+        // brain_forget's contract: forgotten means recall stops returning it,
+        // through EVERY stream. The entity trail must not resurrect it.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let session = Uuid::new_v4();
+        let target = event_in_session("Quarterly totals drift", "rounding at period end", project, session);
+        let target_id = target.id.clone();
+        store.index(&target).unwrap();
+        store
+            .record_entities(&session.to_string(), &project.to_string(), &["src/billing.rs".to_string()])
+            .unwrap();
+
+        let mut tombstone = event_in_session("forgotten", "", project, session);
+        tombstone.kind = EventKind::Tombstone;
+        tombstone.links = vec![target_id];
+        store.index(&tombstone).unwrap();
+
+        let hits =
+            store.search(&project.to_string(), "src/billing.rs", None, 10, Recall::Fused).unwrap();
+        assert!(hits.is_empty(), "a forgotten event resurfaced through its entity: {hits:?}");
+    }
+
+    #[test]
+    fn a_demoted_entry_sorts_last_after_multi_stream_fusion() {
+        // Both events reach the results through the entity stream; the one a
+        // human flagged stale must not represent the search.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let stale = Uuid::new_v4();
+        let fresh = Uuid::new_v4();
+        let stale_event = event_in_session("Old approach", "superseded", project, stale);
+        let stale_id = stale_event.id.clone();
+        store.index(&stale_event).unwrap();
+        store.index(&event_in_session("Current approach", "in force", project, fresh)).unwrap();
+        for session in [stale, fresh] {
+            store
+                .record_entities(&session.to_string(), &project.to_string(), &["src/billing.rs".to_string()])
+                .unwrap();
+        }
+        store.lower_confidence(&stale_id).unwrap();
+
+        let hits =
+            store.search(&project.to_string(), "src/billing.rs", None, 10, Recall::Fused).unwrap();
+        assert_eq!(hits.len(), 2, "both sessions should still be found: {hits:?}");
+        assert_eq!(hits.last().unwrap().title, "Old approach", "the stale entry led the results");
+    }
+
+    #[test]
+    fn a_lexical_recall_stays_words_only() {
+        // Recall::Lexical is an explicit "words only" request; no other
+        // stream may add to it.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let session = Uuid::new_v4();
+        store
+            .index(&event_in_session("Quarterly totals drift", "rounding at period end", project, session))
+            .unwrap();
+        store
+            .record_entities(&session.to_string(), &project.to_string(), &["src/billing.rs".to_string()])
+            .unwrap();
+        let hits =
+            store.search(&project.to_string(), "src/billing.rs", None, 10, Recall::Lexical).unwrap();
+        assert!(hits.is_empty(), "lexical recall used a non-lexical stream: {hits:?}");
     }
 
     #[test]
