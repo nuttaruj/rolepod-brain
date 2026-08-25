@@ -1037,7 +1037,7 @@ fn search_can_be_scoped_to_one_kind_of_memory() {
     fixture.seed_session(1);
     let db = fixture.home.join("brain.db");
     let seed = |id: &str, title: &str, topic: &str| {
-        Command::new("sqlite3")
+        let done = Command::new("sqlite3")
             .arg(&db)
             .arg(format!(
                 "INSERT INTO events (id, ts, workspace, project, session, cli, hook, kind, title, body, topic)
@@ -1046,6 +1046,14 @@ fn search_can_be_scoped_to_one_kind_of_memory() {
             ))
             .output()
             .expect("seed event");
+        // The exit status was ignored here, so a failed insert produced an
+        // empty search and a message about the search rather than about the
+        // seed. A test that hides how it broke costs more than it saves.
+        assert!(
+            done.status.success(),
+            "seeding {id} failed: {}",
+            String::from_utf8_lossy(&done.stderr)
+        );
     };
     seed("01SCOPE0000000000000000DEC", "scheduler: chose cron over a queue", "decision");
     seed("01SCOPE0000000000000000FIX", "scheduler double-booking fixed", "bugfix");
@@ -1928,23 +1936,29 @@ fn an_event_with_no_knowable_workspace_is_skipped_not_guessed() {
     .to_string();
 
     // Run it from a CLI config directory, the way Antigravity actually does.
-    let config_dir = dirs_home().join(".gemini/config");
-    let output = if config_dir.is_dir() {
-        Command::new(BRAIN)
-            .args(["hook", "--cli", "antigravity", "--event", "PostToolUse"])
-            .current_dir(&config_dir)
-            .env("ROLEPOD_BRAIN_HOME", &fixture.home)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                child.stdin.as_mut().unwrap().write_all(payload.as_bytes())?;
-                child.wait_with_output()
-            })
-            .expect("run hook")
-    } else {
-        fixture.hook("antigravity", "PostToolUse", &payload)
-    };
+    //
+    // The directory is created inside the fixture rather than looked for on
+    // the machine. This test used to fall back to running from the project
+    // directory when the host had no `~/.gemini/config` — which is a placeable
+    // location, so the event was filed, and the assertion below failed. On a
+    // developer machine that happens to have Antigravity installed it passed;
+    // in CI it did not. A test that checks a different thing depending on who
+    // is running it is not checking anything.
+    let config_dir = fixture.home.parent().unwrap().join(".gemini/config");
+    std::fs::create_dir_all(&config_dir).expect("create the CLI config dir");
+    let output = Command::new(BRAIN)
+        .args(["hook", "--cli", "antigravity", "--event", "PostToolUse"])
+        .current_dir(&config_dir)
+        .env("ROLEPOD_BRAIN_HOME", &fixture.home)
+        .env("HOME", fixture.home.parent().unwrap())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child.stdin.as_mut().unwrap().write_all(payload.as_bytes())?;
+            child.wait_with_output()
+        })
+        .expect("run hook");
 
     assert!(output.status.success(), "the host must still be acknowledged");
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "{}");
@@ -1952,10 +1966,6 @@ fn an_event_with_no_knowable_workspace_is_skipped_not_guessed() {
         !fixture.log_text().contains("antigravity"),
         "an unplaceable event was filed anyway"
     );
-}
-
-fn dirs_home() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".to_string()))
 }
 
 #[test]

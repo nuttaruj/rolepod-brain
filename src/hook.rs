@@ -392,8 +392,19 @@ fn working_directory(payload: &Value) -> Option<std::path::PathBuf> {
 }
 
 /// Is this path inside a host CLI's own configuration directory?
+///
+/// Both sides are resolved before comparing. `current_dir` hands back the
+/// physical path with every symlink already followed, while `$HOME` is
+/// whatever the user's shell says it is — and on macOS a temporary or
+/// symlinked home differs from its resolved form by a `/private` prefix
+/// alone. Comparing the two as written makes this answer `false` for a
+/// directory that plainly IS a CLI's config, and every event from that host
+/// then lands in a project named `config`.
 fn is_cli_config_dir(path: &std::path::Path) -> bool {
     let Some(home) = dirs::home_dir() else { return false };
+    let resolve = |path: &std::path::Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let path = resolve(path);
+    let home = resolve(&home);
     [".gemini", ".cursor", ".codex", ".claude", ".antigravity", ".config/opencode"]
         .iter()
         .any(|dir| path.starts_with(home.join(dir)))
