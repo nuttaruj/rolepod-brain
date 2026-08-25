@@ -1023,13 +1023,39 @@ fn register_mcp_file(target: &Target, path: &Path, apply: bool) -> Vec<Change> {
     }
 }
 
-/// Is our plugin installed for this CLI?
+/// Which events the installed plugin wires, if it wires any.
 ///
-/// Each CLI records that fact somewhere different, and none of them agree on
-/// a format. What they agree on is the consequence: an installed plugin
-/// already supplies the MCP server and the skills, so anything `setup` writes
-/// on top of it is a second copy.
+/// `doctor` asks this so it can tell "nothing is capturing" apart from
+/// "something else is capturing" — the two look identical from the config file
+/// `setup` writes, and only one of them is a problem.
+///
+/// # Errors
+/// Returns `None` when no installed plugin supplies hooks for this CLI.
 #[must_use]
+pub fn plugin_hook_events(kind: &AgentKind) -> Option<Vec<String>> {
+    if !plugin_installed(kind) || !plugin_carries_hooks(kind) {
+        return None;
+    }
+    let home = dirs::home_dir()?;
+    let (cache, file) = match kind.as_str() {
+        "claude-code" => (home.join(".claude/plugins/cache"), "hooks/hooks.json"),
+        "codex" => (home.join(".codex/plugins/cache"), "hooks/codex-hooks.json"),
+        _ => return None,
+    };
+    let hooks = read_dirs(&cache)
+        .into_iter()
+        .flat_map(|marketplace| read_dirs(&marketplace.join(PLUGIN_NAME)))
+        .map(|version| version.join(file))
+        .filter(|path| path.is_file())
+        .max()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())?;
+    let mut events: Vec<String> =
+        hooks.get("hooks")?.as_object()?.keys().map(ToString::to_string).collect();
+    events.sort();
+    (!events.is_empty()).then_some(events)
+}
+
 /// Does the INSTALLED plugin ship hooks this CLI will actually load?
 ///
 /// Looked for on disk, not assumed from the version we happen to be. A machine
@@ -1110,6 +1136,13 @@ fn sweep_ours(target: &Target, apply: bool) -> Vec<Change> {
     }]
 }
 
+/// Is our plugin installed for this CLI?
+///
+/// Each CLI records that fact somewhere different, and none of them agree on a
+/// format. What they agree on is the consequence: an installed plugin already
+/// supplies the MCP server and the skills, so anything `setup` writes on top of
+/// it is a second copy.
+#[must_use]
 pub fn plugin_installed(kind: &AgentKind) -> bool {
     let Some(home) = dirs::home_dir() else { return false };
     match kind.as_str() {
@@ -1621,6 +1654,56 @@ mod tests {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
         }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `doctor` has to tell "nothing is capturing" from "the plugin is".
+    ///
+    /// They look identical in the config file `setup` writes — empty — and
+    /// only one of them is a problem. Reporting the working machine as broken,
+    /// with a remedy that does nothing, is how people learn to stop reading
+    /// the output.
+    #[test]
+    fn the_plugin_can_say_which_events_it_wires() {
+        let home = std::env::temp_dir().join(format!("brain-plugin-events-{}", ulid::Ulid::new()));
+        let _ = std::fs::remove_dir_all(&home);
+        let _guard =
+            crate::invocation::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+        let _restore = RestoreHome(previous);
+
+        let claude = AgentKind::ClaudeCode;
+        assert!(plugin_hook_events(&claude).is_none(), "no plugin, no events");
+
+        std::fs::create_dir_all(home.join(".claude/plugins")).unwrap();
+        std::fs::write(
+            home.join(".claude/plugins/installed_plugins.json"),
+            format!(r#"{{"version":2,"plugins":{{"{PLUGIN_NAME}@{PLUGIN_NAME}":[{{"scope":"user"}}]}}}}"#),
+        )
+        .unwrap();
+        assert!(
+            plugin_hook_events(&claude).is_none(),
+            "registered but carrying no hooks is not the plugin wiring anything"
+        );
+
+        let hooks = home
+            .join(".claude/plugins/cache")
+            .join(PLUGIN_NAME)
+            .join(PLUGIN_NAME)
+            .join("9.9.9/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(
+            hooks.join("hooks.json"),
+            r#"{"hooks":{"SessionStart":[],"PostToolUse":[]}}"#,
+        )
+        .unwrap();
+        let events = plugin_hook_events(&claude).expect("the plugin wires events");
+        assert_eq!(events, vec!["PostToolUse".to_string(), "SessionStart".to_string()]);
+
+        // Cursor loads neither file, whatever is installed.
+        assert!(plugin_hook_events(&AgentKind::parse("cursor")).is_none());
+
         let _ = std::fs::remove_dir_all(&home);
     }
 

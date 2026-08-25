@@ -380,6 +380,17 @@ fn hook_checks() -> Vec<Check> {
                 .unwrap_or_default();
 
             if wired.is_empty() {
+                // An installed plugin carries the hooks itself, and `setup`
+                // stands down for it on purpose. Reporting that as "not wired,
+                // run setup" would be a failure about a working machine, and
+                // the remedy it names does nothing — which teaches people to
+                // stop reading this output.
+                if let Some(events) = crate::setup::plugin_hook_events(&target.kind) {
+                    return Check::pass(
+                        &name,
+                        format!("{} event(s) via the plugin: {}", events.len(), events.join(", ")),
+                    );
+                }
                 return Check::fail(
                     &name,
                     format!("not wired in {} — run `brain setup --apply`", path.display()),
