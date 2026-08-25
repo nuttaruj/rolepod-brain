@@ -267,9 +267,16 @@ impl Store {
 
                 -- Which pointers a session has already been shown, so nothing
                 -- is injected twice and the byte budget can be enforced.
+                -- `active` separates the two jobs this table does: the de-dup
+                -- guard reads only active rows, while the uptake measurement
+                -- reads all of them. A compaction deactivates instead of
+                -- deleting - erasing the rows also erased the record of every
+                -- pointer the session had pulled, and stats then reported a
+                -- primer nobody used on a brain where the pulls had happened.
                 CREATE TABLE IF NOT EXISTS injected (
                     session  TEXT NOT NULL,
                     event_id TEXT NOT NULL,
+                    active   INTEGER NOT NULL DEFAULT 1,
                     PRIMARY KEY (session, event_id)
                 );
                 CREATE TABLE IF NOT EXISTS injected_bytes (
@@ -336,6 +343,7 @@ impl Store {
                 ("events", "confidence", "INTEGER NOT NULL DEFAULT 0"),
                 ("summarizer_health", "last_failed_at", "TEXT"),
                 ("session_state", "claimed_at", "TEXT"),
+                ("injected", "active", "INTEGER NOT NULL DEFAULT 1"),
             ]
         {
             if self.has_column(table, column)? {
@@ -1049,8 +1057,12 @@ impl Store {
     /// # Errors
     /// Returns an error when the writes fail.
     pub fn reset_injection_state(&self, session: &str) -> Result<()> {
+        // Deactivated, not deleted. These rows are also the uptake
+        // measurement's denominator - and their matches in `recalled` its
+        // numerator - so deleting them here silently un-counted every pull a
+        // session made before it compacted.
         self.conn
-            .execute("DELETE FROM injected WHERE session = ?1", params![session])
+            .execute("UPDATE injected SET active = 0 WHERE session = ?1", params![session])
             .context("reset injected ids")?;
         self.conn
             .execute("DELETE FROM injected_files WHERE session = ?1", params![session])
@@ -2042,7 +2054,7 @@ impl Store {
         let found: Option<i64> = self
             .conn
             .query_row(
-                "SELECT 1 FROM injected WHERE session = ?1 AND event_id = ?2",
+                "SELECT 1 FROM injected WHERE session = ?1 AND event_id = ?2 AND active = 1",
                 params![session, event_id],
                 |row| row.get(0),
             )
@@ -2093,7 +2105,13 @@ impl Store {
         for id in ids {
             self.conn
                 .execute(
-                    "INSERT OR IGNORE INTO injected (session, event_id) VALUES (?1, ?2)",
+                    // Re-arms a row a compaction deactivated: after a reset the
+                    // guard reports the pointer as unseen, this pushes it
+                    // again, and OR IGNORE would leave `active` at 0 - so the
+                    // same pointer would then be re-pushed at every
+                    // opportunity for the rest of the session.
+                    "INSERT INTO injected (session, event_id) VALUES (?1, ?2)
+                     ON CONFLICT(session, event_id) DO UPDATE SET active = 1",
                     params![session, id],
                 )
                 .context("record injected id")?;
@@ -2494,5 +2512,28 @@ mod tests {
         store.clear().unwrap();
         assert_eq!(store.count().unwrap(), 0);
         assert!(store.search(&project.to_string(), "gone", None, 10, Recall::Fused).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_compaction_reset_does_not_erase_the_uptake_history() {
+        let store = Store::open_memory().unwrap();
+        let session = "sess-1";
+
+        // A pointer was pushed, and the agent went on to read it in full.
+        store.record_injected(session, &["01AAA".to_string()], 100).unwrap();
+        store.record_recalled(session, std::iter::once("01AAA")).unwrap();
+        assert_eq!(store.injection_uptake().unwrap(), (1, 1));
+
+        // The context is wiped by a compaction. The de-dup guard must forget,
+        // but the measurement must not: the pull already happened.
+        store.reset_injection_state(session).unwrap();
+        assert!(!store.already_injected(session, "01AAA").unwrap());
+        assert_eq!(store.injection_uptake().unwrap(), (1, 1));
+
+        // Re-injecting the same pointer after the reset re-arms the guard
+        // without double-counting the push.
+        store.record_injected(session, &["01AAA".to_string()], 100).unwrap();
+        assert!(store.already_injected(session, "01AAA").unwrap());
+        assert_eq!(store.injection_uptake().unwrap(), (1, 1));
     }
 }
