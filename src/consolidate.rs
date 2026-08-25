@@ -117,6 +117,15 @@ pub fn run(session: Option<&str>, all_projects: bool, force: bool) -> Result<Out
         // wording, which is how a memory system teaches people not to
         // correct it.
         outcome.adopted += adopt_hand_edits(&project_dir, &scope, &store)?;
+        // When we looked. A claim keeps two runs from working at once, but it
+        // says nothing about a run that finished and released just before we
+        // arrived - and that run's work is invisible in the backlog we already
+        // listed. Comparing its watermark against this instant separates the
+        // two cases exactly: a run that finished AFTER we looked did the work
+        // we were about to do, while one that finished before we looked is
+        // simply the previous state of the world, which we may well be here to
+        // improve on.
+        let listed_at = jiff::Timestamp::now();
         for pending in store.sessions_pending(&project)? {
             if let Some(only) = session {
                 if pending.session != only {
@@ -135,39 +144,40 @@ pub fn run(session: Option<&str>, all_projects: bool, force: bool) -> Result<Out
             // both picking up the same backlog. That costs a second model
             // call the user pays for and leaves two copies of one narrative
             // in memory forever.
-            let lock = LockFile::acquire_reporting(&session_lock(&project_dir, &pending.session));
-            let (_lock, waited) = match lock {
-                Ok(held) => held,
-                // Still held after the wait window: this session's work is
-                // being done by someone, which is the outcome we wanted.
-                Err(_) => {
-                    outcome.skipped += 1;
-                    continue;
-                }
-            };
-
-            // Only a run that had to wait can conclude anything from the
-            // watermark. It waited on the process that just wrote it, so a
-            // watermark covering our own backlog means our work is already
-            // done - `--force` means "skip the debounce", never "summarize the
-            // same events twice".
-            //
-            // A run that walked straight in gets no such conclusion, and must
-            // not draw one: a rule-based run records a watermark too, on
-            // purpose, precisely so a later run can produce the real summary
-            // once a model is reachable again.
-            let already_done = waited
-                && store
-                    .session_run(&pending.session)?
-                    .and_then(|run| run.last_event_id)
-                    .is_some_and(|covered| covered == pending.newest_event_id);
-            if already_done {
+            // Someone else is already on this session. That is the work
+            // getting done, not a failure to do it.
+            if !store.claim_session(&pending.session, &project)? {
                 outcome.skipped += 1;
                 continue;
             }
 
+            // Claimed - but somebody may have finished and released between our
+            // listing and our claim. If their run covers the same backlog and
+            // landed after we looked, we would only be paying for the same
+            // narrative twice.
+            //
+            // A rule-based run records a watermark too, deliberately, so a
+            // later run can produce the real summary once a model is reachable.
+            // That later run listed the backlog after the rule-based one
+            // finished, so this test lets it through and only stops the
+            // duplicate.
+            let superseded = store.session_run(&pending.session)?.is_some_and(|run| {
+                run.last_event_id.as_deref() == Some(pending.newest_event_id.as_str())
+                    && run
+                        .last_run_at
+                        .as_deref()
+                        .and_then(|at| at.parse::<jiff::Timestamp>().ok())
+                        .is_some_and(|at| at > listed_at)
+            });
+            if superseded {
+                store.release_session(&pending.session)?;
+                outcome.skipped += 1;
+                continue;
+            }
             let tier =
-                consolidate_session(&paths, &store, &ladder, &scope, &project_dir, &pending)?;
+                consolidate_session(&paths, &store, &ladder, &scope, &project_dir, &pending);
+            store.release_session(&pending.session)?;
+            let tier = tier?;
             outcome.sessions += 1;
             outcome.events += usize::try_from(pending.pending).unwrap_or(0);
             outcome.tiers.push(match tier {
@@ -1320,22 +1330,10 @@ impl LockFile {
     const STALE: std::time::Duration = std::time::Duration::from_secs(120);
 
     fn acquire(path: &Path) -> Result<Self> {
-        Self::acquire_reporting(path).map(|(lock, _)| lock)
-    }
-
-    /// Acquire, and say whether anyone else was holding it.
-    ///
-    /// Contention is the one signal that separates two runs of the same wave
-    /// from a genuinely later one. A caller that had to wait knows another
-    /// process just finished this exact work; a caller that walked straight in
-    /// knows nothing of the sort, however recently the work was done.
-    fn acquire_reporting(path: &Path) -> Result<(Self, bool)> {
-        let mut waited = false;
         for _ in 0..100 {
             match std::fs::OpenOptions::new().create_new(true).write(true).open(path) {
-                Ok(_) => return Ok((Self { path: path.to_path_buf() }, waited)),
+                Ok(_) => return Ok(Self { path: path.to_path_buf() }),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    waited = true;
                     if is_stale(path) {
                         let _ = std::fs::remove_file(path);
                         continue;
@@ -1349,15 +1347,6 @@ impl LockFile {
         }
         anyhow::bail!("could not acquire {} within 5s", path.display())
     }
-}
-
-/// Where one session's consolidation lock lives.
-///
-/// Per session rather than per project: two sessions consolidating at once is
-/// work happening in parallel, which is fine and worth keeping. It is two runs
-/// on the SAME session that duplicate.
-fn session_lock(project_dir: &Path, session: &str) -> PathBuf {
-    project_dir.join(format!(".brain-session-{session}.lock"))
 }
 
 fn is_stale(path: &Path) -> bool {

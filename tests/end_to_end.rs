@@ -3143,3 +3143,58 @@ fn two_consolidations_racing_in_one_project_do_not_corrupt_or_double_up() {
         );
     }
 }
+
+/// A hook has to finish in the time the user is not noticing.
+///
+/// This is the number the whole "no resident process" commitment rests on. The
+/// comparable tools run a daemon because their per-invocation floor is already
+/// too high to do the work inline — measured on the author's machine, a bare
+/// `node -e "0"` costs about 24ms and the login-shell PATH probe their hooks
+/// run first costs about 9ms more, before a line of their code executes. Doing
+/// the whole job here — parse, scrub, append and fsync the log, index, query
+/// the injection — measures around 13ms, which is why there is nothing to
+/// supervise, respawn, or lose events to.
+///
+/// So this test is not about speed for its own sake. If capture ever grows past
+/// the budget, the honest answer stops being "do it inline" and the argument
+/// for a worker becomes real. Better to find that out here than from a user
+/// noticing their tools got slower.
+#[test]
+fn a_hook_stays_well_inside_its_budget() {
+    // Generous against a loaded CI box; the observed figure is ~13ms. This
+    // catches a regression of the kind that changes the architecture argument,
+    // not ordinary jitter.
+    const BUDGET_MS: u128 = 120;
+    const ROUNDS: u32 = 10;
+
+    let fixture = Fixture::new("budget");
+    // Something to actually search and rank against, so this measures the real
+    // path rather than an empty database.
+    fixture.seed_session(30);
+
+    let payload = serde_json::json!({
+        "session_id": "0199a1f2-3c4d-7e8f-9012-3456789abc42",
+        "cwd": fixture.project,
+        "tool_name": "Edit",
+        "tool_input": {"file_path": fixture.project.join("src/file7.rs")}
+    })
+    .to_string();
+
+    // One warm-up: the first run pays for page cache and schema migration,
+    // which a session pays once and not per event.
+    fixture.hook("claude-code", "PostToolUse", &payload);
+
+    let started = std::time::Instant::now();
+    for _ in 0..ROUNDS {
+        let out = fixture.hook("claude-code", "PostToolUse", &payload);
+        assert!(out.status.success(), "hook failed under timing: {out:?}");
+    }
+    let each = started.elapsed().as_millis() / u128::from(ROUNDS);
+
+    assert!(
+        each <= BUDGET_MS,
+        "capture costs {each}ms per event, over the {BUDGET_MS}ms budget - at this cost \
+         the case for doing the work inside the hook no longer holds, and the \
+         no-resident-process commitment needs re-arguing rather than re-asserting"
+    );
+}

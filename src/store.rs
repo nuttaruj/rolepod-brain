@@ -47,6 +47,12 @@ pub struct Store {
 }
 
 impl Store {
+    /// How long before a consolidation claim is treated as abandoned.
+    ///
+    /// Long enough that a slow model call is not mistaken for a crash, short
+    /// enough that a crash does not cost a session its summary for an hour.
+    const CLAIM_STALE_SECS: i64 = 300;
+
     /// Open (creating if needed) the index and apply the schema.
     ///
     /// # Errors
@@ -242,7 +248,10 @@ impl Store {
                     project       TEXT NOT NULL,
                     last_run_at   TEXT,
                     last_event_id TEXT,
-                    last_tier     TEXT
+                    last_tier     TEXT,
+                    -- Who is consolidating this session right now. Taken by
+                    -- `claim_session`, cleared when that run finishes.
+                    claimed_at    TEXT
                 );
                 ",
             )
@@ -267,6 +276,7 @@ impl Store {
                 ("events", "read_count", "INTEGER NOT NULL DEFAULT 0"),
                 ("events", "confidence", "INTEGER NOT NULL DEFAULT 0"),
                 ("summarizer_health", "last_failed_at", "TEXT"),
+                ("session_state", "claimed_at", "TEXT"),
             ]
         {
             if self.has_column(table, column)? {
@@ -1228,6 +1238,60 @@ impl Store {
                 params![session, project, jiff::Timestamp::now().to_string(), newest_event_id, tier],
             )
             .context("record session run")?;
+        Ok(())
+    }
+
+    /// Take exclusive rights to consolidate one session.
+    ///
+    /// Returns whether we got them. This is the whole of our mutual exclusion:
+    /// two consolidations overlapping on one session is ordinary - a session
+    /// ending starts a run for itself while another session opening starts the
+    /// catch-up for everything pending - and without this both summarize the
+    /// same backlog, which is a second model call the user pays for and two
+    /// copies of one narrative in memory.
+    ///
+    /// One statement, because it has to be atomic and SQLite is already the one
+    /// thing every process here agrees on. The comparable systems all reach for
+    /// a single writer instead - a resident server or worker that owns the
+    /// database - which this project does not have and will not add. A lock
+    /// file works too, and did, but it can only report that SOMEONE holds the
+    /// lock, never whether our own work is still outstanding; closing that gap
+    /// took a second check and a third piece of state to make the second check
+    /// safe. A claim answers the actual question in one round trip.
+    ///
+    /// A claim older than [`Self::CLAIM_STALE_SECS`] is taken over: a crashed
+    /// run must not wedge a session's memory forever.
+    ///
+    /// # Errors
+    /// Returns an error when the write fails.
+    pub fn claim_session(&self, session: &str, project: &str) -> Result<bool> {
+        let now = jiff::Timestamp::now();
+        let stale = (now - jiff::SignedDuration::from_secs(Self::CLAIM_STALE_SECS)).to_string();
+        let changed = self
+            .conn
+            .execute(
+                "INSERT INTO session_state (session, project, claimed_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(session) DO UPDATE SET claimed_at = ?3
+                 WHERE session_state.claimed_at IS NULL
+                    OR session_state.claimed_at < ?4",
+                params![session, project, now.to_string(), stale],
+            )
+            .context("claim session")?;
+        Ok(changed == 1)
+    }
+
+    /// Give the claim back, so the next run does not wait out the stale window.
+    ///
+    /// # Errors
+    /// Returns an error when the write fails.
+    pub fn release_session(&self, session: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE session_state SET claimed_at = NULL WHERE session = ?1",
+                params![session],
+            )
+            .context("release session")?;
         Ok(())
     }
 
