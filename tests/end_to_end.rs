@@ -3441,6 +3441,37 @@ fn an_agent_can_orient_and_can_walk_sideways() {
     );
 }
 
+/// `--help` prints the header, and stops there.
+///
+/// It used to print a fixed line range, which went stale the moment the header
+/// grew: the reader got `set -eu` presented as documentation. Printing every
+/// comment in the file instead hands them the script's internal notes. The
+/// block it should print is the contiguous one at the top, and the shape of
+/// that is what this checks — not a line count, which is the thing that rotted.
+#[test]
+fn the_installer_help_stops_at_the_end_of_its_header() {
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap.sh");
+    let help = Command::new("sh").arg(&script).arg("--help").output().expect("run --help");
+    assert!(help.status.success(), "--help failed: {help:?}");
+    let help = String::from_utf8_lossy(&help.stdout);
+
+    assert!(help.contains("--target=all"), "the options are missing: {help}");
+    assert!(help.contains("BRAIN_BIN_DIR"), "the env vars are missing: {help}");
+    for leaked in ["set -eu", "case \"$(uname", "install_binary", "mktemp"] {
+        assert!(!help.contains(leaked), "`{leaked}` leaked out of the script body: {help}");
+    }
+
+    // What it deliberately does not offer, and why, has to survive too:
+    // installing the binary alone wires nothing, so it is explained rather
+    // than listed as a choice.
+    assert!(help.contains("--binary-only"), "the flag should still be explained: {help}");
+    let options = help.split("Working on brain itself").next().unwrap_or(&help);
+    assert!(
+        !options.contains("--binary-only"),
+        "--binary-only is back in the options list, where it reads as a choice: {options}"
+    );
+}
+
 /// The installer's own arguments must survive the rest of the script.
 ///
 /// `--target=<cli>` and the platform triple lived in one variable named

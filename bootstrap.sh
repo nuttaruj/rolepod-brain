@@ -14,16 +14,19 @@
 #   --yes, -y           apply without asking — for CI, or for a pipe with no
 #                       terminal to ask at
 #   --uninstall         remove brain from every CLI it wired
-#   --binary-only       install the binary and stop
 #
 # Working on brain itself? There is no install script to run: `cargo build
 # --release` and then `target/release/brain setup`. This file is the only
 # supported way to INSTALL, so that installing never means keeping a clone.
 #
+# `--binary-only` (also BRAIN_NO_SETUP) is not in the list above because it is
+# not a choice worth making: it installs the binary and wires nothing, which on
+# its own captures nothing and recalls nothing. It exists for the plugin, whose
+# SessionStart hook needs the binary and supplies the wiring itself.
+#
 # Env:
 #   BRAIN_BIN_DIR   where to install (default $HOME/.local/bin)
 #   BRAIN_VERSION   a tag to install (default: the latest release)
-#   BRAIN_NO_SETUP  same as --binary-only
 set -eu
 
 target=""
@@ -39,7 +42,12 @@ for arg in "$@"; do
         --uninstall)  uninstall=1 ;;
         --binary-only) binary_only=1 ;;
         -h|--help)
-            sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+            # The header block: from the second line to the first that is
+            # not a comment. A fixed line range went stale the moment the
+            # header grew and printed `set -eu` at the reader as if it were
+            # documentation; printing every comment in the file instead would
+            # hand them the script's internal notes.
+            awk 'NR > 1 { if (/^#/) print; else exit }' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
