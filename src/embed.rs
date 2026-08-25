@@ -41,7 +41,7 @@
 
 use std::sync::OnceLock;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tokenizers::Tokenizer;
 
 /// Vendored weights. See `assets/potion-retrieval-32M/PROVENANCE.md` for what
@@ -68,6 +68,7 @@ pub type Vector = Vec<u8>;
 /// The view borrows the static weights rather than owning a copy of them, so
 /// this holds no heap at all: every row read here is a read of the binary's
 /// own read-only pages.
+#[derive(Debug)]
 struct Table {
     view: safetensors::tensor::TensorView<'static>,
     dims: usize,
@@ -81,30 +82,70 @@ impl Table {
     }
 }
 
+/// Everything here loads from bytes compiled into the binary, so a failure is
+/// not a runtime condition — it is a defect in what was vendored, and the only
+/// way to reach it is to change `assets/` without changing this file. The
+/// tests below are what stop that shipping; these messages are what someone
+/// reads through `brain doctor` if one ever does.
+///
+/// The error text is kept, not the error: a `OnceLock` has to hand out the
+/// same value to every caller, and an `anyhow::Error` cannot be shared. A
+/// string can, and a string is what the reader wanted anyway.
 fn tokenizer() -> Result<&'static Tokenizer> {
-    static CELL: OnceLock<Option<Tokenizer>> = OnceLock::new();
-    CELL.get_or_init(|| Tokenizer::from_bytes(TOKENIZER).ok())
+    static CELL: OnceLock<Result<Tokenizer, String>> = OnceLock::new();
+    CELL.get_or_init(|| Tokenizer::from_bytes(TOKENIZER).map_err(|error| error.to_string()))
         .as_ref()
-        .context("embedding tokenizer failed to load")
+        .map_err(|error| anyhow::anyhow!("vendored tokenizer is unusable: {error}"))
 }
 
 fn table() -> Result<&'static Table> {
-    static CELL: OnceLock<Option<Table>> = OnceLock::new();
-    CELL.get_or_init(|| {
-        // Parsing a safetensors file is reading its header; the tensor body
-        // stays exactly where it is, which is the point.
-        let file = safetensors::SafeTensors::deserialize(WEIGHTS).ok()?;
-        let view = file.tensor("embeddings").ok()?;
-        let &[_, dims] = view.shape() else { return None };
-        if dims != DIMS || view.dtype() != safetensors::Dtype::I8 {
-            return None;
-        }
-        // `view` borrows WEIGHTS, not the `SafeTensors` wrapper, so it outlives
-        // the wrapper being dropped here.
-        Some(Table { view, dims })
-    })
-    .as_ref()
-    .context("embedding table failed to load")
+    static CELL: OnceLock<Result<Table, String>> = OnceLock::new();
+    CELL.get_or_init(|| load_table(WEIGHTS))
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("vendored embedding table is unusable: {error}"))
+}
+
+/// Read the weights, and say precisely what is wrong when they cannot be.
+///
+/// Separate from [`table`] so the failures can be tested. Three things can be
+/// wrong with a re-vendored file and they need three different answers: one is
+/// a corrupt download, one is a model saved at the wrong precision, and one is
+/// a different model entirely — and a single "failed to load" sends whoever
+/// reads it looking in the wrong place for all three.
+fn load_table(bytes: &'static [u8]) -> Result<Table, String> {
+    // Parsing a safetensors file is reading its header; the tensor body stays
+    // exactly where it is, which is the point.
+    let file = safetensors::SafeTensors::deserialize(bytes)
+        .map_err(|error| format!("not a readable safetensors file: {error}"))?;
+    let view = file
+        .tensor("embeddings")
+        .map_err(|_| {
+            format!("no `embeddings` tensor; found {:?}", file.names())
+        })?;
+    let &[rows, dims] = view.shape() else {
+        return Err(format!("expected a 2-D tensor, got shape {:?}", view.shape()));
+    };
+    if view.dtype() != safetensors::Dtype::I8 {
+        return Err(format!(
+            "expected int8 weights, got {:?} — see assets/potion-retrieval-32M/quantize.py",
+            view.dtype()
+        ));
+    }
+    if dims != DIMS {
+        return Err(format!(
+            "model is {dims}-dimensional but this build stores {DIMS}-byte vectors; \
+             every vector already in the index would score 0.0 against a new one"
+        ));
+    }
+    if rows == 0 || view.data().len() != rows * dims {
+        return Err(format!(
+            "tensor is {} bytes, which is not {rows} rows of {dims}",
+            view.data().len()
+        ));
+    }
+    // `view` borrows the input bytes, not the `SafeTensors` wrapper, so it
+    // outlives the wrapper being dropped here.
+    Ok(Table { view, dims })
 }
 
 /// Encode one text into a stored vector.
@@ -194,6 +235,20 @@ fn quantize(vector: &[f32]) -> Vector {
             scaled as u8
         })
         .collect()
+}
+
+/// Is the vendored model usable, and if not, why not?
+///
+/// Reported by `brain doctor`. The weights are compiled in, so this can only
+/// answer "no" after somebody replaced them — which is exactly when a specific
+/// reason is worth having, and exactly when nobody has one.
+///
+/// # Errors
+/// Returns the reason the model cannot be loaded.
+pub fn readiness() -> Result<()> {
+    tokenizer()?;
+    table()?;
+    Ok(())
 }
 
 /// Cosine similarity between two stored vectors.
@@ -335,6 +390,61 @@ mod tests {
         assert!((similarity(&[], &[]) - 0.0).abs() < f32::EPSILON);
         assert!((similarity(&[1, 2, 3], &[1, 2]) - 0.0).abs() < f32::EPSILON);
         assert!((similarity(&[0, 0], &[1, 1]) - 0.0).abs() < f32::EPSILON);
+    }
+
+    /// Three ways a re-vendored file can be wrong, three different answers.
+    ///
+    /// This is the whole reason the load path returns a message rather than a
+    /// bare failure. Nobody reaches these at runtime — the weights are
+    /// compiled in — but somebody replacing `assets/` will, and "failed to
+    /// load" would send them looking in the wrong place for all three.
+    #[test]
+    fn a_bad_vendored_file_says_which_way_it_is_bad() {
+        use safetensors::tensor::TensorView;
+
+        let leak = |bytes: Vec<u8>| -> &'static [u8] { Vec::leak(bytes) };
+        let built = |dtype, shape: Vec<usize>, data: Vec<u8>| {
+            let view = TensorView::new(dtype, shape, &data).expect("a valid view");
+            safetensors::serialize([("embeddings", view)], None).expect("serialize")
+        };
+
+        let corrupt = load_table(leak(b"this is not a safetensors file".to_vec()));
+        assert!(
+            corrupt.unwrap_err().contains("not a readable safetensors"),
+            "a corrupt file should say so"
+        );
+
+        let misnamed = {
+            let data = vec![0u8; DIMS];
+            let view = TensorView::new(safetensors::Dtype::I8, vec![1, DIMS], &data).unwrap();
+            safetensors::serialize([("weights", view)], None).unwrap()
+        };
+        let misnamed = load_table(leak(misnamed));
+        assert!(
+            misnamed.unwrap_err().contains("no `embeddings` tensor"),
+            "a different model should name what it did contain"
+        );
+
+        let wrong_precision =
+            load_table(leak(built(safetensors::Dtype::F32, vec![1, DIMS], vec![0u8; DIMS * 4])));
+        let wrong_precision = wrong_precision.unwrap_err();
+        assert!(wrong_precision.contains("expected int8"), "{wrong_precision}");
+        assert!(
+            wrong_precision.contains("quantize.py"),
+            "the answer to wrong precision is a script we ship: {wrong_precision}"
+        );
+
+        let wrong_width =
+            load_table(leak(built(safetensors::Dtype::I8, vec![1, 64], vec![0u8; 64])));
+        let wrong_width = wrong_width.unwrap_err();
+        assert!(wrong_width.contains("64-dimensional"), "{wrong_width}");
+        assert!(
+            wrong_width.contains("score 0.0"),
+            "a width change silently voids every stored vector; say so: {wrong_width}"
+        );
+
+        // And the file actually shipped is none of these.
+        assert!(load_table(WEIGHTS).is_ok());
     }
 
     /// A row index past the end of the table must be skipped, not read.

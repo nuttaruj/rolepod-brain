@@ -221,6 +221,12 @@ fn semantic_check(paths: &Paths) -> Check {
     let Ok((embedded, total)) = store.vector_coverage() else {
         return Check::fail("semantic", "coverage query failed");
     };
+    // Ask the model to load before reporting on an index it produced. A
+    // coverage number is a fact about the past; whether anything can still be
+    // embedded or searched is a fact about this binary.
+    if let Err(error) = crate::embed::readiness() {
+        return Check::fail("semantic", format!("{error} — {embedded} of {total} embedded"));
+    }
     let dims = crate::embed::DIMS;
     if total == 0 {
         return Check::pass("semantic", format!("nothing captured yet ({dims} dims ready)"));
