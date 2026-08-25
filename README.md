@@ -110,6 +110,18 @@ A name it does not recognise is refused rather than quietly wiring nothing.
 curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh -s -- --target=codex
 ```
 
+### Update
+
+The same command that installs. It fetches whatever the latest release is,
+verifies the checksum, and replaces the binary in place — your memory and the
+wiring are untouched, so there is nothing else to re-run. `brain --version`
+says what you have; the [Releases](https://github.com/nuttaruj/rolepod-brain/releases)
+page says what is current.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh -s -- --yes
+```
+
 ### Uninstall
 
 Unwires every CLI it wired. The binary and your memory are left alone — `brain
@@ -139,10 +151,20 @@ codex plugin add rolepod-brain@rolepod-brain
 Updating:
 
 ```sh
+# Claude Code
 claude plugin marketplace update rolepod-brain
 claude plugin update rolepod-brain@rolepod-brain
+
+# Codex
+codex plugin marketplace upgrade rolepod-brain
+codex plugin add rolepod-brain@rolepod-brain
+
 brain setup --apply     # only needed the first time the plugin takes over the hooks
 ```
+
+The plugin carries the hooks and tools; the binary updates itself separately —
+the one-liner under [Update](#update) at any time, and the plugin's own first
+session fetches it when it is missing entirely.
 
 That last line matters exactly once. Before the plugin carried hooks, `setup`
 had written its own into `settings.json`; with both in place every event would
