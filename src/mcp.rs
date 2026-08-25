@@ -238,6 +238,37 @@ fn tool_definitions() -> Value {
             },
         },
         {
+            "name": "brain_related",
+            "description": "What sits beside a memory you are already holding. \
+                            Given an id, returns other memories whose sessions \
+                            named the same files, symbols, or subjects, most \
+                            overlap first. Use it when a search result is close \
+                            but not the whole story — it answers \"what else \
+                            touched this\", which a query for words cannot.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Event id from a brain_search, brain_recent, or brain_get."},
+                    "k": {"type": "integer", "description": "How many (default 10, max 50)."},
+                },
+                "required": ["id"],
+            },
+        },
+        {
+            "name": "brain_outline",
+            "description": "What this project is, before you know what to ask. \
+                            Returns durable knowledge, the subjects that recur \
+                            across sessions, and how much has been captured. \
+                            Call it first in an unfamiliar project: searching \
+                            requires already suspecting what you are looking for.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "k": {"type": "integer", "description": "How many subjects to name (default 10, max 50)."},
+                },
+            },
+        },
+        {
             "name": "brain_recent",
             "description": "Most recent observations in this project, newest first. \
                             Use it to re-orient at the start of a session or after a \
@@ -320,6 +351,19 @@ fn call_tool(paths: &Paths, project: &str, session: &str, params: &Value) -> Res
             events.retain(|event| store.event_exists(&event.id).unwrap_or(false));
             store.record_recalled(session, events.iter().map(|event| event.id.as_str()))?;
             json!({ "events": events, "count": events.len() })
+        }
+        "brain_related" => {
+            let id = arguments
+                .get("id")
+                .and_then(Value::as_str)
+                .context("brain_related requires an `id`")?;
+            let hits = store.related(project, id, limit_from(&arguments))?;
+            store.record_recalled(session, hits.iter().map(|hit| hit.id.as_str()))?;
+            json!({ "hits": hits, "count": hits.len() })
+        }
+        "brain_outline" => {
+            let outline = store.outline(project, limit_from(&arguments))?;
+            json!(outline)
         }
         "brain_recent" => {
             let hits = store.recent(project, limit_from(&arguments))?;
@@ -472,7 +516,7 @@ mod tests {
     fn every_tool_declares_a_usable_schema() {
         let tools = tool_definitions();
         let tools = tools.as_array().unwrap();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 10);
         for tool in tools {
             assert!(tool.get("name").and_then(Value::as_str).is_some());
             let description = tool.get("description").and_then(Value::as_str).unwrap();

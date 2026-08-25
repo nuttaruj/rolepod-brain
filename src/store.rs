@@ -53,6 +53,26 @@ pub enum Recall {
     Lexical,
 }
 
+/// A subject that more than one session has touched.
+#[derive(Debug, serde::Serialize)]
+pub struct Subject {
+    pub name: String,
+    /// How many distinct sessions named it. Recurrence is the signal: once is
+    /// an incident, repeatedly is what the project is about.
+    pub sessions: i64,
+}
+
+/// What a project looks like from outside any one question.
+#[derive(Debug, serde::Serialize)]
+pub struct Outline {
+    pub sessions: i64,
+    pub observations: i64,
+    /// Durable knowledge titles - what survived several sessions.
+    pub knowledge: Vec<String>,
+    pub summaries: i64,
+    pub subjects: Vec<Subject>,
+}
+
 /// One search hit.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Hit {
@@ -616,6 +636,127 @@ impl Store {
             }
         }
         Ok(found)
+    }
+
+    /// What sits beside one memory.
+    ///
+    /// Two memories are neighbours when their sessions named the same entity —
+    /// the same file, symbol, or subject. That is a different question from
+    /// "what matches these words", and it is the one an agent has when it is
+    /// already holding a memory: not "find me X" but "what else touched this".
+    ///
+    /// Ordered by how many entities the two share, because one shared file is
+    /// a coincidence and four is a subject. The event itself is excluded — a
+    /// memory is not related to itself, and returning it wastes the budget the
+    /// caller is spending to look outward.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn related(&self, project: &str, id: &str, limit: usize) -> Result<Vec<Hit>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "WITH subject AS (
+                     SELECT n.name FROM entities n
+                     JOIN events e ON e.session = n.session AND e.project = n.project
+                     WHERE e.id = ?1 AND n.project = ?2
+                 )
+                 SELECT e.id, e.ts, e.cli, e.kind, e.title,
+                        substr(COALESCE(e.body, ''), 1, 160), e.session,
+                        COUNT(DISTINCT n.name) AS shared
+                 FROM events e
+                 JOIN entities n ON n.session = e.session AND n.project = e.project
+                 WHERE n.name IN (SELECT name FROM subject)
+                       AND e.project = ?2 AND e.id != ?1
+                       AND e.forgotten = 0 AND e.kind != 'tombstone'
+                       AND e.hook != 'correct'
+                 GROUP BY e.id
+                 ORDER BY shared DESC,
+                          CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END,
+                          CASE e.kind
+                              WHEN 'knowledge' THEN 0
+                              WHEN 'session_summary' THEN 1
+                              ELSE 2
+                          END,
+                          e.id DESC
+                 LIMIT ?3",
+            )
+            .context("prepare related")?;
+        let rows = stmt
+            .query_map(params![id, project, limit as i64], |row| {
+                Ok(Hit {
+                    id: row.get(0)?,
+                    ts: row.get(1)?,
+                    cli: row.get(2)?,
+                    kind: row.get(3)?,
+                    title: row.get(4)?,
+                    snippet: row.get(5)?,
+                    session: row.get(6)?,
+                })
+            })
+            .context("run related")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("read related")
+    }
+
+    /// What this project is, before anyone knows what to ask about it.
+    ///
+    /// An agent opening a session can search only for what it already suspects.
+    /// This is the other half: the durable knowledge, the subjects that recur,
+    /// and enough shape to form a question with. Counts come from the same
+    /// filtered view search uses, so an outline never describes memory that
+    /// recall would refuse to return.
+    ///
+    /// # Errors
+    /// Returns an error when a query fails.
+    pub fn outline(&self, project: &str, limit: usize) -> Result<Outline> {
+        let live = "forgotten = 0 AND kind != 'tombstone' AND hook != 'correct'";
+        let count = |extra: &str| -> Result<i64> {
+            self.conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM events WHERE project = ?1 AND {live} {extra}"),
+                    params![project],
+                    |row| row.get(0),
+                )
+                .context("count outline")
+        };
+        let sessions: i64 = self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(DISTINCT session) FROM events WHERE project = ?1 AND {live}"
+                ),
+                params![project],
+                |row| row.get(0),
+            )
+            .context("count sessions")?;
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT n.name, COUNT(DISTINCT n.session) AS sessions
+                 FROM entities n
+                 WHERE n.project = ?1
+                 GROUP BY n.name
+                 HAVING sessions > 1
+                 ORDER BY sessions DESC, n.name
+                 LIMIT ?2",
+            )
+            .context("prepare outline subjects")?;
+        let subjects = stmt
+            .query_map(params![project, limit as i64], |row| {
+                Ok(Subject { name: row.get(0)?, sessions: row.get(1)? })
+            })
+            .context("run outline subjects")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("read outline subjects")?;
+
+        Ok(Outline {
+            sessions,
+            observations: count("")?,
+            knowledge: self.knowledge_titles(project)?,
+            summaries: count("AND kind = 'session_summary'")?,
+            subjects,
+        })
     }
 
     /// Hits for ids the keyword pass never saw.

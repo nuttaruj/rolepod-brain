@@ -3341,3 +3341,76 @@ fn forgetting_by_name_never_reaches_a_memory_that_does_not_say_it() {
     let real = String::from_utf8_lossy(&real.stdout);
     assert!(real.contains("coffee machine"), "the real match was lost too: {real}");
 }
+
+/// Two ways into memory that searching cannot give an agent.
+///
+/// `brain_search` answers a question the agent already knows how to ask. The
+/// two failures that leaves are an agent that does not yet know what this
+/// project IS — so it cannot form the question — and an agent holding one
+/// memory with no way to reach what sits beside it. Both are the moments where
+/// an agent gives up on memory and re-derives from source instead, which is
+/// the whole cost this project exists to avoid.
+#[test]
+fn an_agent_can_orient_and_can_walk_sideways() {
+    let fixture = Fixture::new("mcpwalk");
+
+    // Separate sessions that touched the same file, which is what makes two
+    // memories neighbours: a shared subject, not shared words.
+    for (index, (file, prompt)) in [
+        ("src/scheduler.rs", "the scheduler double-books when two runs overlap"),
+        ("src/scheduler.rs", "fixed the scheduler overlap by claiming the row first"),
+        ("Cargo.toml", "bumped the release version"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let payload = serde_json::json!({
+            "session_id": format!("0199aaaa-5555-7000-8000-00000000000{index}"),
+            "cwd": fixture.project,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": fixture.project.join(file)},
+            "prompt": prompt
+        })
+        .to_string();
+        fixture.hook("claude-code", "PostToolUse", &payload);
+    }
+    fixture.brain_with_path(&["consolidate", "--force"], None);
+
+    let listed = fixture.mcp(&[
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
+    ]);
+    let tools = listed[0]["result"]["tools"].as_array().unwrap();
+    let names: Vec<&str> = tools.iter().map(|tool| tool["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"brain_outline"), "no way to orient: {names:?}");
+    assert!(names.contains(&"brain_related"), "no way to walk sideways: {names:?}");
+
+    // Orienting: what is this project, without having to guess a query first.
+    let outline = fixture.mcp(&[
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"brain_outline","arguments":{}}}"#,
+    ]);
+    let outline = &outline[0]["result"]["structuredContent"];
+    assert!(
+        outline["sessions"].as_i64().unwrap_or(0) >= 3,
+        "the outline does not describe the project: {outline}"
+    );
+
+    // Walking sideways: from one memory to what sits beside it.
+    let found = fixture.mcp(&[
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"brain_search","arguments":{"query":"scheduler"}}}"#,
+    ]);
+    let id = found[0]["result"]["structuredContent"]["hits"][0]["id"]
+        .as_str()
+        .expect("a hit to walk from")
+        .to_string();
+
+    let related = fixture.mcp(&[&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"brain_related","arguments":{{"id":"{id}"}}}}}}"#
+    )]);
+    let related = &related[0]["result"]["structuredContent"];
+    let hits = related["hits"].as_array().expect("related returns hits");
+    assert!(!hits.is_empty(), "nothing beside a memory that shares a subject: {related}");
+    assert!(
+        hits.iter().all(|hit| hit["id"].as_str() != Some(id.as_str())),
+        "a memory is not related to itself: {related}"
+    );
+}

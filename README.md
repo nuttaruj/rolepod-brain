@@ -152,8 +152,15 @@ brain search "auth"     # full-text search this project's memory
 brain where             # which project am I in, and where does it live
 ```
 
-Your agent gets five MCP tools: `brain_search`, `brain_get`, `brain_recent`,
-`brain_timeline`, and `brain_note`. On Codex the plugin also ships two skills:
+Your agent gets ten MCP tools. Four to read — `brain_search` by words and
+meaning, `brain_get` for a full body, `brain_recent` to re-orient, and
+`brain_timeline` for a stretch of history. Two to move around memory rather
+than query it: `brain_outline`, for what a project IS before you know what to
+ask about it, and `brain_related`, for what sits beside a memory you are
+already holding. Four to write back — `brain_note`, `brain_correct`,
+`brain_feedback`, and `brain_forget`.
+
+On Codex the plugin also ships two skills:
 `using-brain`, describing when to reach for those tools — MCP tools that
 nothing tells the model about tend not to get called — and `brain-report`, for
 turning the memory into something a person reads.
