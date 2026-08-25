@@ -49,6 +49,24 @@ pub fn is_worker_child() -> bool {
     std::env::var_os(WORKER_ENV).is_some_and(|value| !value.is_empty())
 }
 
+/// Take what the host is sending, and throw it away.
+///
+/// Capturing nothing is not the same as reading nothing. A hook that returns
+/// before draining its stdin closes the pipe under a host that is still
+/// writing, and the host reports a failed hook — so the run that promised to
+/// leave no trace leaves an error in someone's log. Anything past a pipe
+/// buffer is enough to hit it, which is why a small payload never showed it.
+///
+/// Failures are ignored on purpose: there is nothing to do about them, and
+/// this path exists to be silent.
+fn drain_stdin(should: bool) {
+    if !should {
+        return;
+    }
+    let mut sink = String::new();
+    let _ = std::io::stdin().read_to_string(&mut sink);
+}
+
 /// Read a payload from stdin and capture it.
 ///
 /// Returns the JSON the host CLI should see on stdout.
@@ -59,12 +77,14 @@ pub fn is_worker_child() -> bool {
 pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Result<String> {
     // Our own subprocess: acknowledge the host and capture nothing.
     if is_worker_child() {
+        drain_stdin(stdin_payload.is_none());
         return Ok("{}".to_string());
     }
 
     // An orchestrator has asked for a clean room: no capture, no injection,
     // no trace. This is a documented public contract, not an internal switch.
     if invocation::silenced() {
+        drain_stdin(stdin_payload.is_none());
         return Ok("{}".to_string());
     }
 

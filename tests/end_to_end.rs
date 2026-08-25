@@ -2024,10 +2024,15 @@ fn a_silenced_run_leaves_no_trace_at_all() {
     fixture.seed_session(3);
     let before = fixture.log_text().lines().count();
 
+    // Larger than a pipe buffer on purpose. A silenced run captures nothing,
+    // but it is still a process the host is writing to: if it exits without
+    // reading, the write fails with EPIPE and the host logs a hook failure —
+    // which is the opposite of the clean room this switch promises. A small
+    // payload fits in the buffer and hides that; this one does not.
     let payload = serde_json::json!({
         "session_id": "0199a1f2-3c4d-7e8f-9012-3456789abcde",
         "cwd": fixture.project,
-        "prompt": "this must not be remembered"
+        "prompt": format!("this must not be remembered {}", "x".repeat(256 * 1024))
     })
     .to_string();
 
@@ -2040,7 +2045,12 @@ fn a_silenced_run_leaves_no_trace_at_all() {
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn hook");
-    child.stdin.as_mut().unwrap().write_all(payload.as_bytes()).unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .expect("a silenced hook must still accept what the host sends it");
     let output = child.wait_with_output().expect("hook output");
 
     // The host still gets a clean acknowledgement.
