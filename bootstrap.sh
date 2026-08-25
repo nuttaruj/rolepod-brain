@@ -7,11 +7,43 @@
 # resident process. If no prebuilt binary matches your platform this falls
 # back to building from source, which needs Rust.
 #
+# Options:
+#   --target=all        wire every supported CLI found here (the default)
+#   --target=<cli>      wire one: claude-code, codex, cursor, gemini-cli,
+#                       antigravity, opencode
+#   --yes, -y           apply without asking — for CI, or for a pipe with no
+#                       terminal to ask at
+#   --uninstall         remove brain from every CLI it wired
+#   --binary-only       install the binary and stop
+#
 # Env:
 #   BRAIN_BIN_DIR   where to install (default $HOME/.local/bin)
 #   BRAIN_VERSION   a tag to install (default: the latest release)
-#   BRAIN_NO_SETUP  set to skip hook registration; install the binary only
+#   BRAIN_NO_SETUP  same as --binary-only
 set -eu
+
+target=""
+assume_yes=""
+uninstall=""
+binary_only="${BRAIN_NO_SETUP:-}"
+
+for arg in "$@"; do
+    case "$arg" in
+        --target=all) target="" ;;
+        --target=*)   target="${arg#--target=}" ;;
+        --yes|-y)     assume_yes=1 ;;
+        --uninstall)  uninstall=1 ;;
+        --binary-only) binary_only=1 ;;
+        -h|--help)
+            sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *)
+            printf 'error: unknown option %s (try --help)\n' "$arg" >&2
+            exit 2
+            ;;
+    esac
+done
 
 REPO="nuttaruj/rolepod-brain"
 BIN_DIR="${BRAIN_BIN_DIR:-$HOME/.local/bin}"
@@ -122,20 +154,37 @@ case ":$PATH:" in
         ;;
 esac
 
-if [ -n "${BRAIN_NO_SETUP:-}" ]; then
+if [ -n "$uninstall" ]; then
+    say ""
+    "$BIN" uninstall --apply
+    say ""
+    say "Removed from every CLI. The binary and your memory are untouched:"
+    say "  rm $BIN        # the binary"
+    say "  $BIN where     # where the memory lives, if you want it gone too"
+    exit 0
+fi
+
+if [ -n "$binary_only" ]; then
     say ""
     say "Skipped hook registration. Run '$BIN setup' to see what it would change."
     exit 0
 fi
 
+# No `--cli` means every supported CLI found here, which is what `--target=all`
+# asks for and what someone piping this into a shell almost always wants.
+set -- setup
+[ -n "$target" ] && set -- "$@" --cli "$target"
+
 say ""
 say "Planned changes:"
 say ""
-"$BIN" setup
+"$BIN" "$@"
 
 # Piped into a shell, stdin is the script — so a prompt has to read the
 # terminal directly, and where there is no terminal there is nobody to ask.
-if [ -r /dev/tty ]; then
+if [ -n "$assume_yes" ]; then
+    reply="y"
+elif [ -r /dev/tty ]; then
     say ""
     printf 'Apply these changes? [y/N] '
     read -r reply < /dev/tty || reply=""
@@ -145,7 +194,7 @@ fi
 
 case "$reply" in
     [yY]*)
-        "$BIN" setup --apply
+        "$BIN" "$@" --apply
         say ""
         "$BIN" doctor || true
         say ""

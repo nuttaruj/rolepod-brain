@@ -1,0 +1,109 @@
+{
+  "_comment": [
+    "Claude Code hooks, auto-discovered from hooks/hooks.json (plugins reference:",
+    "'Location: hooks/hooks.json in plugin root, or inline in plugin.json').",
+    "Event names are PascalCase here; Cursor's are camelCase (postToolUse,",
+    "beforeSubmitPrompt), so this file cannot be picked up by the wrong host.",
+    "Codex declares its own file explicitly in .codex-plugin/plugin.json.",
+    "",
+    "PreToolUse is scoped to Read and injects only - it is never captured, or it",
+    "would duplicate PostToolUse. PostCompact is absent on purpose: Claude Code",
+    "rejects injected context under that event. Both reasons are in src/setup.rs.",
+    "",
+    "Only SessionStart checks that the binary exists. It fires once a session,",
+    "where PostToolUse fires thousands of times and is the path a person waits on.",
+    "The `Setup` event is NOT an install hook - it fires on --init/--maintenance -",
+    "so it cannot be the thing that puts the binary in place."
+  ],
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "export PATH=\"$HOME/.local/bin:$PATH\"; command -v brain >/dev/null 2>&1 || { echo 'rolepod-brain: the brain binary is not installed yet. Fetching it (checksum-verified) from github.com/nuttaruj/rolepod-brain — this happens once.' >&2; curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh -s -- --binary-only >&2 || echo 'rolepod-brain: could not fetch the binary. Install it yourself: curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh' >&2; }; command -v brain >/dev/null 2>&1 && brain hook --cli claude-code --event SessionStart || echo '{}'",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PATH=\"$HOME/.local/bin:$PATH\" brain hook --cli claude-code --event UserPromptSubmit",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PATH=\"$HOME/.local/bin:$PATH\" brain hook --cli claude-code --event PreToolUse",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PATH=\"$HOME/.local/bin:$PATH\" brain hook --cli claude-code --event PostToolUse",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PATH=\"$HOME/.local/bin:$PATH\" brain hook --cli claude-code --event Stop",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PATH=\"$HOME/.local/bin:$PATH\" brain hook --cli claude-code --event SubagentStop",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PATH=\"$HOME/.local/bin:$PATH\" brain hook --cli claude-code --event PreCompact",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PATH=\"$HOME/.local/bin:$PATH\" brain hook --cli claude-code --event SessionEnd",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

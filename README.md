@@ -286,7 +286,19 @@ codex plugin marketplace add nuttaruj/rolepod-brain
 codex plugin add rolepod-brain@rolepod-brain
 ```
 
-**The plugin is not a replacement for `brain setup`, except on Codex.** What it
+On Claude Code and Codex the plugin is now the whole install: it carries the
+hooks as well as the MCP tools and skills, and its `SessionStart` hook fetches
+the binary — announced, checksum-verified, once — if `brain` is not already on
+your PATH. `brain setup` then stands down for that CLI rather than writing a
+second set of hooks beside the plugin's, which would capture every event twice.
+
+Cursor takes neither file: its hook events have their own names and shape, so
+`setup` still owns Cursor's wiring.
+
+The paragraph below describes what the plugin carried before it carried hooks,
+and still describes Cursor:
+
+**The plugin is not a replacement for `brain setup` on Cursor.** What it
 carries is the MCP recall tools and the skills — the part a CLI can serve from
 a manifest. Capture is still wired by `brain setup --apply`, because a hook has
 to name the absolute path of your binary and tag each event with the CLI it

@@ -764,6 +764,15 @@ fn defer_to_plugin_flow(target: &Target, apply: bool) -> Result<Vec<Change>> {
 }
 
 fn wire_hooks(target: &Target, exe: &Path, apply: bool) -> Result<Vec<Change>> {
+    // The plugin carries a full set of hooks for the CLIs that can load them.
+    // Writing our own alongside would capture every event twice: double
+    // storage, double consolidation prompt, and a duplicate of every memory a
+    // session produces. The same reasoning already governs MCP registration,
+    // and for the same reason — the plugin is the more specific installation,
+    // so it wins and we withdraw.
+    if plugin_installed(&target.kind) && plugin_carries_hooks(&target.kind) {
+        return Ok(sweep_ours(target, apply));
+    }
     let mut root = read_json(&target.hooks_file)?;
     if !root.is_object() {
         root = json!({});
@@ -1021,6 +1030,86 @@ fn register_mcp_file(target: &Target, path: &Path, apply: bool) -> Vec<Change> {
 /// already supplies the MCP server and the skills, so anything `setup` writes
 /// on top of it is a second copy.
 #[must_use]
+/// Does the INSTALLED plugin ship hooks this CLI will actually load?
+///
+/// Looked for on disk, not assumed from the version we happen to be. A machine
+/// can be running a plugin from before the plugin carried hooks at all — and
+/// standing down for that one would leave the CLI with no capture from either
+/// source, silently. The question `setup` needs answered is not "does a plugin
+/// exist" but "is something else already doing this job".
+///
+/// Claude Code auto-discovers `hooks/hooks.json`; Codex is told about its own
+/// file explicitly. Cursor takes neither — its hook events are camelCase and
+/// its own shape — so `setup` keeps Cursor's wiring whatever is installed.
+fn plugin_carries_hooks(kind: &AgentKind) -> bool {
+    let Some(home) = dirs::home_dir() else { return false };
+    let (cache, file) = match kind.as_str() {
+        "claude-code" => (home.join(".claude/plugins/cache"), "hooks/hooks.json"),
+        "codex" => (home.join(".codex/plugins/cache"), "hooks/codex-hooks.json"),
+        _ => return false,
+    };
+    // <cache>/<marketplace>/<plugin>/<version>/hooks/…, and the version
+    // directory is named differently by each CLI, so it is walked rather than
+    // predicted.
+    read_dirs(&cache)
+        .into_iter()
+        .filter(|marketplace| marketplace.file_name().is_some())
+        .flat_map(|marketplace| read_dirs(&marketplace.join(PLUGIN_NAME)))
+        .any(|version| version.join(file).is_file())
+}
+
+/// Immediate subdirectories, or nothing if the path is not a directory.
+fn read_dirs(path: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect()
+}
+
+/// Take our hooks back out of a config the plugin now owns.
+///
+/// A CLI that was wired by `setup` before the plugin arrived still has our
+/// entries. Leaving them is the double-capture this avoids, so they go.
+fn sweep_ours(target: &Target, apply: bool) -> Vec<Change> {
+    let Ok(mut root) = read_json(&target.hooks_file) else {
+        return vec![Change {
+            target: target.kind.as_str().to_string(),
+            detail: "plugin supplies the hooks".to_string(),
+        }];
+    };
+    let mut removed = 0usize;
+    if let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) {
+        for groups in hooks.values_mut() {
+            if let Some(groups) = groups.as_array_mut() {
+                let before = groups.len();
+                groups.retain(|group| !is_ours(group));
+                removed += before - groups.len();
+            }
+        }
+    }
+    if removed == 0 {
+        return vec![Change {
+            target: target.kind.as_str().to_string(),
+            detail: "plugin supplies the hooks".to_string(),
+        }];
+    }
+    if apply {
+        let _ = backup(&target.hooks_file);
+        let _ = write_json(&target.hooks_file, &root);
+    }
+    vec![Change {
+        target: target.kind.as_str().to_string(),
+        detail: format!(
+            "plugin supplies the hooks; {} {removed} of ours from {}",
+            if apply { "removed" } else { "would remove" },
+            target.hooks_file.display()
+        ),
+    }]
+}
+
 pub fn plugin_installed(kind: &AgentKind) -> bool {
     let Some(home) = dirs::home_dir() else { return false };
     match kind.as_str() {
@@ -1195,6 +1284,20 @@ fn shell_quote(input: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Puts `HOME` back however the test ends, including on a panic — a test
+    /// that leaves it pointing at its own fixture decides the next test's
+    /// answers.
+    struct RestoreHome(Option<String>);
+
+    impl Drop for RestoreHome {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
     #[test]
     fn recognizes_only_our_own_entries() {
         let ours = json!({"hooks": [{"type": "command", "command": "/usr/bin/brain hook --cli codex --event Stop"}]});
@@ -1367,15 +1470,39 @@ mod tests {
             assert!(resolved.exists(), "{key} points at {path}, which does not exist");
         }
 
-        // Claude Code and Cursor auto-discover `hooks/hooks.json` at the
-        // plugin root. Ours speaks Codex's event names and tags every capture
-        // `--cli codex`, so a file under that name would make those CLIs
-        // record their sessions as Codex's - on top of the hooks `setup`
-        // already wrote for them.
+        // `hooks/hooks.json` is the name Claude Code auto-discovers, so that
+        // is Claude Code's file and nobody else's. Codex is told about its own
+        // explicitly. Each tags its captures with its own `--cli`, and a file
+        // carrying the wrong one would record a whole CLI's sessions under
+        // another CLI's name - which is what the rename that produced
+        // `codex-hooks.json` was for.
+        let claude = std::fs::read_to_string(root.join("hooks/hooks.json"))
+            .expect("hooks/hooks.json — Claude Code's own file");
+        assert!(claude.contains("--cli claude-code"), "Claude Code's hooks tag the wrong CLI");
+        assert!(!claude.contains("--cli codex"), "Codex's wiring leaked into Claude Code's file");
+
+        let codex_hooks = std::fs::read_to_string(root.join("hooks/codex-hooks.json"))
+            .expect("hooks/codex-hooks.json");
+        assert!(codex_hooks.contains("--cli codex"), "Codex's hooks tag the wrong CLI");
         assert!(
-            !root.join("hooks/hooks.json").exists(),
-            "hooks/hooks.json is the name Claude Code and Cursor claim; Codex's must not use it"
+            !codex_hooks.contains("--cli claude-code"),
+            "Claude Code's wiring leaked into Codex's file"
         );
+
+        // Whatever `setup` would have written for Claude Code, the plugin has
+        // to cover — otherwise installing the plugin silently captures less
+        // than installing the binary does, and nothing would say so.
+        let wired = targets(Path::new("/usr/local/bin/brain"))
+            .unwrap()
+            .into_iter()
+            .find(|target| target.kind == AgentKind::ClaudeCode)
+            .expect("Claude Code is a wired target");
+        for event in wired.events {
+            assert!(
+                claude.contains(&format!("--event {event}")),
+                "the plugin does not carry {event}, which setup wires"
+            );
+        }
     }
 
     #[test]
@@ -1425,6 +1552,78 @@ mod tests {
         }
     }
 
+    /// The plugin and `setup` must never both wire the same CLI.
+    ///
+    /// Installing the plugin gives Claude Code a full set of hooks. If `setup`
+    /// then wrote its own into settings.json, every event would be captured
+    /// twice — double storage, double consolidation prompt, and a duplicate of
+    /// every memory. This is the same bug the duplicate MCP registration was,
+    /// and it is caught the same way: the plugin is asked about first.
+    #[test]
+    fn setup_does_not_wire_a_cli_whose_plugin_already_did() {
+        let home = std::env::temp_dir().join(format!("brain-plugin-hooks-{}", ulid::Ulid::new()));
+        let _ = std::fs::remove_dir_all(&home);
+        let _guard =
+            crate::invocation::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+
+        let plan = |label: &str| -> String {
+            targets(Path::new("/usr/local/bin/brain"))
+                .unwrap()
+                .into_iter()
+                .find(|target| target.kind.as_str() == label)
+                .map(|target| {
+                    wire_hooks(&target, Path::new("/usr/local/bin/brain"), false)
+                        .map(|changes| {
+                            changes.iter().map(|c| c.detail.clone()).collect::<Vec<_>>().join(" ")
+                        })
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default()
+        };
+
+        // No plugin: setup owns the wiring.
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        assert!(plan("claude-code").contains("hook(s)"), "setup should wire an unplugged CLI");
+
+        // Registered but from a version that carries no hooks — the state a
+        // machine is in mid-upgrade. Standing down here would leave the CLI
+        // with capture from neither source, so setup keeps wiring.
+        std::fs::create_dir_all(home.join(".claude/plugins")).unwrap();
+        std::fs::write(
+            home.join(".claude/plugins/installed_plugins.json"),
+            format!(r#"{{"version":2,"plugins":{{"{PLUGIN_NAME}@{PLUGIN_NAME}":[{{"scope":"user"}}]}}}}"#),
+        )
+        .unwrap();
+        let old_version = home.join(".claude/plugins/cache").join(PLUGIN_NAME).join(PLUGIN_NAME).join("0.10.2");
+        std::fs::create_dir_all(&old_version).unwrap();
+        assert!(
+            plan("claude-code").contains("hook(s)"),
+            "setup stood down for a plugin that carries no hooks"
+        );
+
+        // A version that does carry them: setup stands down.
+        let current = old_version.parent().unwrap().join("9.9.9/hooks");
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::write(current.join("hooks.json"), "{}").unwrap();
+        let planned = plan("claude-code");
+        assert!(
+            planned.contains("plugin"),
+            "setup competed with the plugin instead of standing down: {planned}"
+        );
+        assert!(
+            !planned.contains("would write 8 hook(s)"),
+            "both would wire the same CLI: {planned}"
+        );
+
+        match previous {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn a_before_tool_event_may_inject_but_never_capture() {
         // Measured duplication: the before-event repeats the after-event's
@@ -1466,6 +1665,14 @@ mod tests {
 
     #[test]
     fn wiring_preserves_foreign_hooks_and_replaces_our_own() {
+        // `wire_hooks` asks whether the plugin is installed, which reads HOME.
+        // Any test that calls it therefore has to own HOME for the duration,
+        // or a neighbouring test's fixture decides its answer.
+        let _guard =
+            crate::invocation::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", std::env::temp_dir().join(format!("brain-nohome-{}", ulid::Ulid::new())));
+        let _restore = RestoreHome(previous_home);
         let dir = std::env::temp_dir().join(format!("brain-setup-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hooks.json");
@@ -1512,6 +1719,14 @@ mod tests {
 
     #[test]
     fn dropping_an_event_from_the_table_sweeps_its_stale_hook() {
+        // `wire_hooks` asks whether the plugin is installed, which reads HOME.
+        // Any test that calls it therefore has to own HOME for the duration,
+        // or a neighbouring test's fixture decides its answer.
+        let _guard =
+            crate::invocation::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", std::env::temp_dir().join(format!("brain-nohome-{}", ulid::Ulid::new())));
+        let _restore = RestoreHome(previous_home);
         let dir = std::env::temp_dir().join(format!("brain-setup-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hooks.json");
@@ -1707,6 +1922,14 @@ mod tests {
 
     #[test]
     fn dry_run_writes_nothing() {
+        // `wire_hooks` asks whether the plugin is installed, which reads HOME.
+        // Any test that calls it therefore has to own HOME for the duration,
+        // or a neighbouring test's fixture decides its answer.
+        let _guard =
+            crate::invocation::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", std::env::temp_dir().join(format!("brain-nohome-{}", ulid::Ulid::new())));
+        let _restore = RestoreHome(previous_home);
         let dir = std::env::temp_dir().join(format!("brain-setup-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hooks.json");

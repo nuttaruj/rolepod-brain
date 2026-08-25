@@ -5,8 +5,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "brain hook --cli codex --event SessionStart",
-            "timeout": 5
+            "command": "export PATH=\"$HOME/.local/bin:$PATH\"; command -v brain >/dev/null 2>&1 || { echo 'rolepod-brain: the brain binary is not installed yet. Fetching it (checksum-verified) from github.com/nuttaruj/rolepod-brain \u2014 this happens once.' >&2; curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh -s -- --binary-only >&2 || echo 'rolepod-brain: could not fetch the binary. Install it yourself: curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh' >&2; }; command -v brain >/dev/null 2>&1 && brain hook --cli codex --event SessionStart || echo '{}'",
+            "timeout": 120
           }
         ]
       }
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "brain hook --cli codex --event UserPromptSubmit",
+            "command": "PATH=\"$HOME/.local/bin:$PATH\" brain hook --cli codex --event UserPromptSubmit",
             "timeout": 5
           }
         ]
@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "brain hook --cli codex --event PostToolUse",
+            "command": "PATH=\"$HOME/.local/bin:$PATH\" brain hook --cli codex --event PostToolUse",
             "timeout": 5
           }
         ]
@@ -38,7 +38,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "brain hook --cli codex --event Stop",
+            "command": "PATH=\"$HOME/.local/bin:$PATH\" brain hook --cli codex --event Stop",
             "timeout": 5
           }
         ]
@@ -49,7 +49,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "brain hook --cli codex --event SubagentStop",
+            "command": "PATH=\"$HOME/.local/bin:$PATH\" brain hook --cli codex --event SubagentStop",
             "timeout": 5
           }
         ]
@@ -60,7 +60,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "brain hook --cli codex --event PreCompact",
+            "command": "PATH=\"$HOME/.local/bin:$PATH\" brain hook --cli codex --event PreCompact",
             "timeout": 5
           }
         ]
@@ -71,7 +71,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "brain hook --cli codex --event SessionEnd",
+            "command": "PATH=\"$HOME/.local/bin:$PATH\" brain hook --cli codex --event SessionEnd",
             "timeout": 3
           }
         ]

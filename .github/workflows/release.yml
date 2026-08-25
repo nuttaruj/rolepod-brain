@@ -25,16 +25,27 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             runner: macos-14
+            test: true
+          # Cross-compiled from the arm64 runner rather than built on an Intel
+          # one. GitHub is retiring the Intel macOS runners, and a release that
+          # waits for the scarcest machine in the fleet is a release that does
+          # not ship — the first attempt sat queued on it while every other
+          # target had finished. Apple's toolchain targets both architectures
+          # from either, so only the test step has to give way: a binary the
+          # runner cannot execute cannot be tested on it.
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-14
+            test: false
           # Built on the oldest runner we support rather than the newest, so
           # the glibc it links against is one an older distribution actually
           # has. A binary that only runs on the machine that built it is not a
           # release.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
+            test: true
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
+            test: true
     steps:
       - uses: actions/checkout@v4
 
@@ -46,7 +57,10 @@ jobs:
 
       - name: Test
         # The same suite the repository runs. A binary nobody verified is
-        # exactly the artifact this project argues against shipping.
+        # exactly the artifact this project argues against shipping — and the
+        # one target that cannot run its own tests here is covered by the
+        # identical source built and tested on the sibling architecture.
+        if: matrix.test
         run: cargo test --release --locked --target ${{ matrix.target }}
 
       - name: Sign (macOS)
