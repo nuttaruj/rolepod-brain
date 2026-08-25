@@ -91,30 +91,33 @@ read before you run it. If you would rather not pipe a script to a shell, take
 the binary from [Releases](https://github.com/nuttaruj/rolepod-brain/releases)
 yourself and run `brain setup`.
 
-### Choosing what gets wired
+### Every CLI on the machine
 
-By default it wires every supported CLI it finds on the machine. To narrow it,
-or to skip the question entirely:
+The default, and what the command above already does. `--yes` skips the
+confirmation, for a scripted or headless install.
 
 ```sh
-# every CLI found here — the same as passing nothing
 curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh -s -- --target=all
-
-# one CLI: claude-code, codex, cursor, gemini-cli, antigravity, opencode
-curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh -s -- --target=codex
-
-# no prompt, for a scripted or headless install
 curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh -s -- --target=all --yes
-
-# the binary only, wire nothing yet
-curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh -s -- --binary-only
-
-# undo it: removes brain from every CLI it wired
-curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh -s -- --uninstall
 ```
 
-Uninstalling leaves the binary and your memory alone; it only unwires. `brain
+### One CLI
+
+`claude-code`, `codex`, `cursor`, `gemini-cli`, `antigravity`, or `opencode`.
+A name it does not recognise is refused rather than quietly wiring nothing.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh -s -- --target=codex
+```
+
+### Uninstall
+
+Unwires every CLI it wired. The binary and your memory are left alone — `brain
 where` prints where the memory lives if you want that gone too.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh -s -- --uninstall
+```
 
 ### Or install it as a plugin
 
