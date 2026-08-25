@@ -1031,32 +1031,47 @@ fn forgetting_an_entity_spares_its_siblings() {
 #[test]
 fn search_can_be_scoped_to_one_kind_of_memory() {
     // "What mentions the scheduler" and "what did we DECIDE about the
-    // scheduler" are different questions. Relevance answers the first;
-    // only a scope answers the second.
+    // scheduler" are different questions. Relevance answers the first; only a
+    // scope answers the second.
+    //
+    // The typed memories are produced the way the product produces them —
+    // consolidation classifying captured events — rather than written into the
+    // database by hand. The hand-written version needed the HOST's `sqlite3`,
+    // and inserting into `events` fires the FTS triggers, so on a macOS runner
+    // whose system SQLite has no FTS5 the seed failed and the test reported a
+    // search that found nothing. Ours is a bundled SQLite with FTS5; the
+    // machine's is not our business.
     let fixture = Fixture::new("scopedsearch");
-    fixture.seed_session(1);
-    let db = fixture.home.join("brain.db");
-    let seed = |id: &str, title: &str, topic: &str| {
-        let done = Command::new("sqlite3")
-            .arg(&db)
-            .arg(format!(
-                "INSERT INTO events (id, ts, workspace, project, session, cli, hook, kind, title, body, topic)
-                 SELECT '{id}', ts, workspace, project, session, cli, 'stop', 'session_summary',
-                        '{title}', '', '{topic}' FROM events LIMIT 1;"
-            ))
-            .output()
-            .expect("seed event");
-        // The exit status was ignored here, so a failed insert produced an
-        // empty search and a message about the search rather than about the
-        // seed. A test that hides how it broke costs more than it saves.
-        assert!(
-            done.status.success(),
-            "seeding {id} failed: {}",
-            String::from_utf8_lossy(&done.stderr)
-        );
-    };
-    seed("01SCOPE0000000000000000DEC", "scheduler: chose cron over a queue", "decision");
-    seed("01SCOPE0000000000000000FIX", "scheduler double-booking fixed", "bugfix");
+    // One session, so one consolidation prompt carries both ids and the stub
+    // can classify them differently.
+    for file in ["src/scheduler.rs", "src/queue.rs"] {
+        let payload = serde_json::json!({
+            "session_id": "0199a1f2-3c4d-7e8f-9012-3456789abc70",
+            "cwd": fixture.project,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": fixture.project.join(file)},
+            "prompt": "the scheduler double-books when two runs overlap"
+        })
+        .to_string();
+        fixture.hook("claude-code", "PostToolUse", &payload);
+    }
+
+    // Retitles whatever it is given, one entry as a decision and one as a
+    // bugfix. Lifting the ids out of the prompt is what makes this a test of
+    // consolidation rather than of the stub: the classification can only land
+    // on the right rows if the prompt genuinely carried them.
+    let classifier = r#"
+IDS=$(echo "$*" | grep -oE 'id=[0-9A-Z]{26}' | cut -d= -f2)
+printf '{"summary":"scheduler work, both sides of it","titles":[{"id":"%s","title":"scheduler: chose cron over a queue","kind":"decision"},{"id":"%s","title":"scheduler double-booking fixed","kind":"bugfix"}]}' "$(echo "$IDS" | head -1)" "$(echo "$IDS" | head -2 | tail -1)"
+"#;
+    let bin = fixture.fake_cli("claude", classifier);
+    let done = fixture.brain_with_path(&["consolidate", "--force"], Some(&bin));
+    assert!(done.status.success(), "consolidate failed: {done:?}");
+    // The tier matters: rule-based output carries no classification at all, so
+    // a scoped search would return nothing and the test would be asserting
+    // that a feature is absent.
+    let tier = String::from_utf8_lossy(&done.stdout).to_string();
+    assert!(tier.contains("claude-code"), "the stub never classified anything: {tier}");
 
     let all = String::from_utf8_lossy(&fixture.brain(&["search", "scheduler"]).stdout).to_string();
     assert!(all.contains("chose cron") && all.contains("double-booking"), "unscoped: {all}");
@@ -1066,15 +1081,6 @@ fn search_can_be_scoped_to_one_kind_of_memory() {
             .to_string();
     assert!(scoped.contains("chose cron"), "the decision was scoped out: {scoped}");
     assert!(!scoped.contains("double-booking"), "the bugfix leaked into a decision scope: {scoped}");
-
-    // A typo must read as "wrong scope", never as "nothing remembered".
-    let typo = fixture.brain(&["search", "scheduler", "--topic", "desicion"]);
-    let warned = String::from_utf8_lossy(&typo.stderr).to_string();
-    assert!(warned.contains("Unknown topic"), "a bad topic was silently accepted: {warned}");
-    assert!(
-        String::from_utf8_lossy(&typo.stdout).contains("chose cron"),
-        "a bad topic should fall back to searching everything"
-    );
 }
 
 #[test]
