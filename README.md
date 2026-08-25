@@ -120,7 +120,8 @@ where` prints where the memory lives if you want that gone too.
 
 On Claude Code and Codex the plugin is a complete install on its own — it
 carries the hooks, the MCP tools and the skills, and fetches the binary on your
-first session if it is not already on your PATH.
+first session if it is not already on your PATH. Every other CLI is wired by
+the one-liner above.
 
 ```sh
 # Claude Code
@@ -130,10 +131,6 @@ claude plugin install rolepod-brain@rolepod-brain
 # Codex
 codex plugin marketplace add nuttaruj/rolepod-brain
 codex plugin add rolepod-brain@rolepod-brain
-
-# Cursor — carries the MCP tools and skills; run `brain setup --apply` for capture
-cursor-agent plugin marketplace add nuttaruj/rolepod-brain
-cursor-agent plugin install rolepod-brain@rolepod-brain
 ```
 
 Updating:
@@ -326,29 +323,20 @@ searches keep returning the right entry in the wrong place.
 
 ## How the plugin fits
 
-Claude Code, Cursor and Codex all read plugins from a marketplace repository,
-and this one is a marketplace. The commands are under
-[Install](#or-install-it-as-a-plugin); what follows is what each CLI actually
-gets, and why they differ.
+This repository is a plugin marketplace, and on Claude Code and Codex a plugin
+is enough on its own. The commands are under
+[Install](#or-install-it-as-a-plugin); this is what makes them sufficient.
 
-On Claude Code and Codex the plugin is the whole install: it carries the
-hooks as well as the MCP tools and skills, and its `SessionStart` hook fetches
-the binary — announced, checksum-verified, once — if `brain` is not already on
-your PATH. `brain setup` then stands down for that CLI rather than writing a
-second set of hooks beside the plugin's, which would capture every event twice.
+The plugin carries the hooks as well as the MCP tools and the skills, and its
+`SessionStart` hook fetches the binary — announced, checksum-verified, once —
+if `brain` is not already on your PATH. `brain setup` then stands down for that
+CLI rather than writing a second set of hooks beside the plugin's, which would
+capture every event twice; `brain doctor` reports capture as coming "via the
+plugin".
 
-Cursor takes neither file: its hook events have their own names and shape, so
-`setup` still owns Cursor's wiring.
-
-**On Cursor the plugin is not a replacement for `brain setup`.** What it
-carries there is the MCP recall tools and the skills — the part a CLI can serve
-from a manifest — and capture is still wired by `brain setup --apply`. When the
-plugin is installed, `setup` notices and withdraws its own MCP registration
-rather than adding a second entry for the same server.
-
-Either way the plugin needs `brain` on your `PATH`. On Claude Code and Codex it
-fetches the binary itself the first time a session starts, if it is not already
-there; it lands in `~/.local/bin`.
+That only works where the host loads a hooks file from a plugin. Every other
+CLI is wired by the one-liner, which is why the plugin route is documented for
+these two and nothing else.
 
 ### Codex is the exception
 
