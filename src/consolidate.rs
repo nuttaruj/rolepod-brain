@@ -25,6 +25,12 @@ use crate::summarizer::{Ladder, Tier, PROMPT_MAX_BYTES};
 
 /// Below this many pending events, a `Stop`-triggered run waits for more.
 const MIN_PENDING: i64 = 3;
+/// How many events one run will embed.
+///
+/// Encoding is 27µs; the cost being bounded here is the write transaction and
+/// the memory a batch holds, not the model.
+const EMBED_PER_RUN: usize = 2_000;
+
 /// Minimum gap between runs for one session, unless forced.
 const DEBOUNCE_SECS: i64 = 5 * 60;
 /// Ceiling on one event's body inside a prompt.
@@ -80,6 +86,8 @@ pub struct Outcome {
     pub tiers: Vec<String>,
     /// Hand edits read back out of the vault into the log.
     pub adopted: usize,
+    /// Events given a semantic vector this run.
+    pub embedded: usize,
 }
 
 /// Consolidate pending work.
@@ -109,9 +117,15 @@ pub fn run(session: Option<&str>, all_projects: bool, force: bool) -> Result<Out
         vec![(scope, dir)]
     };
 
+    // Semantic vectors, before anything else this run does. Consolidation is
+    // where they belong: the model costs ~83ms to construct and this process is
+    // detached and already slow, where the capture hook is neither - it answers
+    // in ~13ms and a person is waiting on it. Coverage is the same either way,
+    // because everything captured passes through here.
     let mut outcome = Outcome::default();
     for (scope, project_dir) in projects {
         let project = scope.project_id.to_string();
+        outcome.embedded += embed_backlog(&store, &project);
         // Before writing anything, take back what a human wrote by hand.
         // Skipping this would overwrite their correction with our own older
         // wording, which is how a memory system teaches people not to
@@ -193,6 +207,41 @@ pub fn run(session: Option<&str>, all_projects: bool, force: bool) -> Result<Out
 ///
 /// Codex has no session-end event, so its `Stop` hook fires every turn. Without
 /// this, a working burst would trigger a consolidation per turn.
+/// Give vectors to whatever does not have them yet.
+///
+/// Bounded per run rather than exhaustive: a first run against an existing
+/// database has thousands to do, and taking them a slice at a time keeps a
+/// detached process from holding a write lock for a minute. The next run
+/// continues where this one stopped, and the backstop guarantees there is a
+/// next run.
+fn embed_backlog(store: &Store, project: &str) -> usize {
+    // Best-effort throughout, deliberately. This runs first, ahead of hand-edit
+    // adoption and every session's summary, and none of that should be lost
+    // because a vector could not be written - a missing vector is a worse
+    // search, where a failed run is no consolidation at all.
+    let Ok(pending) = store.events_missing_vectors(project, EMBED_PER_RUN) else {
+        return 0;
+    };
+    if pending.is_empty() {
+        return 0;
+    }
+    let texts: Vec<String> = pending.iter().map(|(_, text)| text.clone()).collect();
+    // One call, so the model is built once for the whole batch, not once a row.
+    let Ok(vectors) = crate::embed::encode_all(&texts) else {
+        return 0;
+    };
+    let rows: Vec<(String, Vec<u8>)> = pending
+        .into_iter()
+        .map(|(id, _)| id)
+        .zip(vectors)
+        .collect();
+    let count = rows.len();
+    if store.set_vectors(&rows).is_err() {
+        return 0;
+    }
+    count
+}
+
 fn should_wait(store: &Store, pending: &PendingSession) -> Result<bool> {
     let Some(last) = store.session_run(&pending.session)? else {
         // Never consolidated: only the volume rule applies.

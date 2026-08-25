@@ -11,6 +11,7 @@
 mod config;
 mod consolidate;
 mod doctor;
+mod embed;
 mod event;
 mod history;
 mod hook;
@@ -207,6 +208,9 @@ fn run(command: Commands) -> Result<()> {
         Commands::Mcp => mcp::serve(),
         Commands::Consolidate { session, all, force } => {
             let outcome = consolidate::run(session.as_deref(), all, force)?;
+            if outcome.embedded > 0 {
+                println!("Embedded {} event(s) for semantic search.", outcome.embedded);
+            }
             if outcome.adopted > 0 {
                 println!(
                     "Adopted {} hand-edited page(s) into memory.",
@@ -394,7 +398,7 @@ fn search(query: &str, limit: usize, topic: Option<&str>) -> Result<()> {
             event::TOPICS.join(", ")
         );
     }
-    let hits = store.search(&scope.project_id.to_string(), query, scoped, limit)?;
+    let hits = store.search(&scope.project_id.to_string(), query, scoped, limit, store::Recall::Fused)?;
 
     if hits.is_empty() {
         let where_ = scoped.map_or(String::new(), |topic| format!(" under topic `{topic}`"));

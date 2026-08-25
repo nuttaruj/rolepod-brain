@@ -37,6 +37,26 @@ against a hard byte budget. Full content is never pushed into your context;
 the agent calls `brain_search` / `brain_get` when the task actually needs a
 body. `brain doctor` reports the real bytes spent, not the configured limit.
 
+**Found by meaning, not only by words.** A session that recorded `login token
+expiry` is one someone later searching `auth` needs, and no keyword index will
+ever connect those two. So every memory also carries a semantic vector, and
+search fuses the two rankings — the keyword hit that is *also* about the right
+thing goes first.
+
+The model is compiled into the binary: 32 MB of static embeddings, no download,
+no Python, no second process, no API key, and nothing to be unavailable. Rows
+are read straight out of the binary's read-only pages, so a search costs ~35 MB
+resident rather than the 199 MB an expanded copy of the table would — the
+operating system maps those pages once and every process shares them.
+
+It is never loaded during capture, which is why hooks still answer in ~13ms;
+vectors are written by consolidation, and `brain doctor` reports how much of
+the corpus has one yet.
+
+Anything that DELETES on what it finds — `forget --entity` — searches by words
+only. A semantic ranking always has a closest answer, and a bulk withdrawal
+must never be handed a ranking that always returns something.
+
 **A file's memory arrives before the file does.** Open a file and what we
 already know about it lands ahead of its contents, while that can still change
 what the turn does — not after the agent has read it and already has an answer.

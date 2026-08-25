@@ -24,6 +24,35 @@ const BUSY_TIMEOUT_MS: u32 = 5_000;
 /// the pool by itself, shallow enough that the query stays one index scan.
 const SEARCH_POOL_FACTOR: usize = 4;
 
+/// How close a memory has to be before it counts as an answer.
+///
+/// Cosine on this model's unit vectors: unrelated English text pairs measure
+/// around 0.03, plainly related ones around 0.30. A floor here is what lets
+/// "nothing is close enough" be an outcome rather than "here is the corpus,
+/// sorted".
+///
+/// Deliberately low. This ranking never stands alone — RRF fuses it with the
+/// keyword list, so its job is recall, and a threshold tuned for precision
+/// would throw away the loose association that was the entire reason for
+/// adding it.
+const NEAREST_FLOOR: f32 = 0.10;
+
+/// How much of the recall stack a caller wants.
+///
+/// Not a tuning knob — a safety boundary. Semantic ranking answers "closest to
+/// this", which on any query has an answer, and a caller that DELETES what it
+/// is handed must never be given a ranking that always returns something.
+/// `forget --entity` is that caller, and its own preview promises the reach is
+/// lexical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recall {
+    /// Keyword and meaning, fused. What a person or an agent asking a question
+    /// wants.
+    Fused,
+    /// Words only, exactly as typed. What anything destructive gets.
+    Lexical,
+}
+
 /// One search hit.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Hit {
@@ -243,6 +272,16 @@ impl Store {
 
                 -- What consolidation has already done for a session, so a
                 -- debounced trigger and the catch-up backstop do not redo work.
+                -- One semantic vector per event. Separate from `events`
+                -- because it is derived, regenerable, and four orders of
+                -- magnitude larger than the row it belongs to; keeping it out
+                -- means every query that does NOT rank semantically still
+                -- reads narrow rows.
+                CREATE TABLE IF NOT EXISTS event_vec (
+                    event_id TEXT PRIMARY KEY,
+                    vec      BLOB NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS session_state (
                     session       TEXT PRIMARY KEY,
                     project       TEXT NOT NULL,
@@ -407,6 +446,7 @@ impl Store {
         query: &str,
         topic: Option<&str>,
         limit: usize,
+        recall: Recall,
     ) -> Result<Vec<Hit>> {
         let mut stmt = self
             .conn
@@ -468,14 +508,293 @@ impl Store {
         // as is anything with an unbalanced quote. Falling back to the same
         // text as a quoted phrase turns a failed search into a literal one,
         // which is what someone typing a path meant anyway.
-        let hits = match read(query) {
+        let keyword = match read(query) {
             Ok(hits) => hits,
             Err(_) => {
                 let phrase = format!("\"{}\"", query.replace('"', " "));
                 read(&phrase).context("read search results")?
             }
         };
-        Ok(spread_across_sessions(hits, limit))
+        drop(stmt);
+
+        if recall == Recall::Lexical {
+            return Ok(spread_across_sessions(keyword, limit));
+        }
+
+        // Meaning, alongside words. Failure here degrades to the keyword
+        // results rather than failing the search: a model that will not load
+        // is a worse search, not a broken one.
+        let semantic = crate::embed::encode(query)
+            .and_then(|vector| self.nearest(project, &vector, topic, pool))
+            .unwrap_or_default();
+
+        Ok(spread_across_sessions(self.fuse(keyword, &semantic, pool)?, limit))
+    }
+
+    /// Combine the keyword ranking and the semantic one.
+    ///
+    /// Reciprocal rank fusion, which needs only each list's ORDER — and that
+    /// is the point. An FTS5 `rank` and a cosine similarity are not on the
+    /// same scale and never will be; any attempt to weight one against the
+    /// other directly is a constant someone tuned once against one corpus.
+    /// Position is the only thing both lists agree on the meaning of.
+    ///
+    /// An entry both rankings found outranks one that only appears in either,
+    /// which is exactly the behaviour wanted: the keyword hit that is also
+    /// about the right thing goes first.
+    fn fuse(&self, keyword: Vec<Hit>, semantic: &[(String, f32)], limit: usize) -> Result<Vec<Hit>> {
+        if semantic.is_empty() {
+            return Ok(keyword);
+        }
+        // The conventional damping constant. Large enough that the top of
+        // either list does not dominate outright, so agreement between the two
+        // rankings can still outweigh a single strong opinion.
+        const K: f32 = 60.0;
+
+        let mut score: std::collections::HashMap<&str, f32> = std::collections::HashMap::new();
+        for (rank, hit) in keyword.iter().enumerate() {
+            #[allow(clippy::cast_precision_loss)]
+            let contribution = 1.0 / (K + rank as f32 + 1.0);
+            *score.entry(hit.id.as_str()).or_default() += contribution;
+        }
+        for (rank, (id, _)) in semantic.iter().enumerate() {
+            #[allow(clippy::cast_precision_loss)]
+            let contribution = 1.0 / (K + rank as f32 + 1.0);
+            *score.entry(id.as_str()).or_default() += contribution;
+        }
+
+        // Fusion keeps only each list's ORDER, which silently discards the one
+        // thing both lists encoded outside their order: that a human flagged an
+        // entry stale. Both rankings put demoted entries last on purpose -
+        // "flagging has to change what the user SEES" - so the flag is carried
+        // across the fusion rather than re-derived from a position it no longer
+        // occupies.
+        let demoted = self.demoted_among(score.keys().copied())?;
+        let mut ranked: Vec<(&str, f32)> = score.into_iter().collect();
+        ranked.sort_by(|a, b| {
+            demoted
+                .contains(a.0)
+                .cmp(&demoted.contains(b.0))
+                .then_with(|| b.1.total_cmp(&a.1))
+                .then_with(|| b.0.cmp(a.0))
+        });
+        ranked.truncate(limit);
+
+        let known: std::collections::HashMap<&str, &Hit> =
+            keyword.iter().map(|hit| (hit.id.as_str(), hit)).collect();
+        let missing: Vec<String> = ranked
+            .iter()
+            .filter(|(id, _)| !known.contains_key(id))
+            .map(|(id, _)| (*id).to_string())
+            .collect();
+        // Only the semantic-only hits need fetching, and they have no FTS
+        // snippet to inherit - the query never appeared in them, which is why
+        // the other ranking had to find them.
+        let fetched = self.hits_by_id(&missing)?;
+        let fetched: std::collections::HashMap<&str, &Hit> =
+            fetched.iter().map(|hit| (hit.id.as_str(), hit)).collect();
+
+        Ok(ranked
+            .into_iter()
+            .filter_map(|(id, _)| known.get(id).or_else(|| fetched.get(id)).map(|hit| (*hit).clone()))
+            .collect())
+    }
+
+    /// Which of these ids a human has flagged stale.
+    fn demoted_among<'a>(
+        &self,
+        ids: impl Iterator<Item = &'a str>,
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT 1 FROM events WHERE id = ?1 AND confidence < 0")
+            .context("prepare demoted")?;
+        let mut found = std::collections::HashSet::new();
+        for id in ids {
+            if stmt.exists(params![id]).unwrap_or(false) {
+                found.insert(id.to_string());
+            }
+        }
+        Ok(found)
+    }
+
+    /// Hits for ids the keyword pass never saw.
+    fn hits_by_id(&self, ids: &[String]) -> Result<Vec<Hit>> {
+        let mut out = Vec::with_capacity(ids.len());
+        let mut stmt = self
+            .conn
+            .prepare(
+                // The same recall floor, repeated rather than assumed. Today
+                // every id reaching here came through `nearest`, which already
+                // enforces it - but that is a property of one caller, not of
+                // this function, and a withdrawal that depends on the call
+                // graph staying the shape it is today is not a withdrawal.
+                "SELECT id, ts, cli, kind, title, substr(COALESCE(body, ''), 1, 160), session
+                 FROM events
+                 WHERE id = ?1 AND forgotten = 0 AND kind != 'tombstone'
+                       AND hook != 'correct'",
+            )
+            .context("prepare hits by id")?;
+        for id in ids {
+            if let Ok(hit) = stmt.query_row(params![id], |row| {
+                Ok(Hit {
+                    id: row.get(0)?,
+                    ts: row.get(1)?,
+                    cli: row.get(2)?,
+                    kind: row.get(3)?,
+                    title: row.get(4)?,
+                    snippet: row.get(5)?,
+                    session: row.get(6)?,
+                })
+            }) {
+                out.push(hit);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Store one event's semantic vector.
+    ///
+    /// # Errors
+    /// Returns an error when the write fails.
+    pub fn set_vectors(&self, rows: &[(String, Vec<u8>)]) -> Result<()> {
+        // One transaction, not one per row. A two-thousand-row backlog as
+        // two thousand autocommits is two thousand write-lock acquisitions,
+        // and one `SQLITE_BUSY` past the timeout used to take the whole
+        // consolidation run down with it.
+        let transaction = self.conn.unchecked_transaction().context("begin vectors")?;
+        {
+            let mut stmt = transaction
+                .prepare(
+                    "INSERT INTO event_vec (event_id, vec) VALUES (?1, ?2)
+                     ON CONFLICT(event_id) DO UPDATE SET vec = excluded.vec",
+                )
+                .context("prepare store vector")?;
+            for (id, vector) in rows {
+                // A vector of all zeros means nothing tokenized - text made
+                // entirely of words this vocabulary has never seen. Storing it
+                // would put a row in the ranking whose score against every
+                // query is exactly 0.0, which outranks every genuinely
+                // negative cosine. It is absence, so it is stored as absence.
+                if vector.iter().all(|byte| *byte == 0) {
+                    continue;
+                }
+                stmt.execute(params![id, vector]).context("store vector")?;
+            }
+        }
+        transaction.commit().context("commit vectors")?;
+        Ok(())
+    }
+
+    /// Events that still have no vector, newest first, with the text to encode.
+    ///
+    /// Newest first because a backlog is worked through in batches and the
+    /// recent end is what anyone is about to search for.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn events_missing_vectors(&self, project: &str, limit: usize) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                // Scoped to the project being consolidated. Globally ordered,
+                // a busy project spends every run's budget on its own newest
+                // rows and a quiet one never gets embedded at all.
+                "SELECT e.id, e.title || ' ' || COALESCE(e.body, '')
+                 FROM events e
+                 LEFT JOIN event_vec v ON v.event_id = e.id
+                 WHERE v.event_id IS NULL AND e.kind != 'tombstone' AND e.project = ?1
+                 ORDER BY e.id DESC
+                 LIMIT ?2",
+            )
+            .context("prepare missing vectors")?;
+        let rows = stmt
+            .query_map(params![project, limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))
+            .context("run missing vectors")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("read missing vectors")
+    }
+
+    /// How many events have a vector, and how many are still waiting.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn vector_coverage(&self) -> Result<(i64, i64)> {
+        let embedded: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM event_vec", [], |row| row.get(0))
+            .context("count vectors")?;
+        let total: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM events WHERE kind != 'tombstone'", [], |row| {
+                row.get(0)
+            })
+            .context("count events")?;
+        Ok((embedded, total))
+    }
+
+    /// Rank a project's events by meaning rather than by words.
+    ///
+    /// Brute force on purpose. At 512 bytes a vector, a project with a hundred
+    /// thousand events is 51 MB of sequential read and a few million integer
+    /// multiplies — comfortably inside the time a search is allowed to take,
+    /// and it costs no index to maintain, no extension to load, and no second
+    /// database to keep consistent with this one. An approximate index earns
+    /// its complexity somewhere past this scale, not at it.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn nearest(
+        &self,
+        project: &str,
+        query: &[u8],
+        topic: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, f32)>> {
+        if query.iter().all(|byte| *byte == 0) {
+            // Nothing tokenized: an empty query, or text made entirely of
+            // words this vocabulary has never seen. A zero vector is not a
+            // question, and answering it with the corpus is worse than
+            // answering it with nothing.
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                // The same recall floor every other read enforces. A memory
+                // withdrawn from search has to be withdrawn from this one too,
+                // or the withdrawal was cosmetic.
+                "SELECT v.event_id, v.vec, e.confidence
+                 FROM event_vec v
+                 JOIN events e ON e.id = v.event_id
+                 WHERE e.project = ?1 AND e.forgotten = 0 AND e.kind != 'tombstone'
+                       AND e.hook != 'correct'
+                       AND (?2 IS NULL OR e.topic = ?2)",
+            )
+            .context("prepare nearest")?;
+        let mut scored: Vec<(String, f32, bool)> = stmt
+            .query_map(params![project, topic], |row| {
+                let id: String = row.get(0)?;
+                let vec: Vec<u8> = row.get(1)?;
+                let confidence: i64 = row.get(2)?;
+                let score = crate::embed::similarity(query, &vec);
+                Ok((id, score, confidence < 0))
+            })
+            .context("run nearest")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("read nearest")?;
+
+        // A cosine ranking always has a best answer, which is not the same as
+        // having a relevant one. Without a floor every query returns the whole
+        // project in some order - including the empty query, whose vector is
+        // all zeros and scores 0.0 against everything, a flat tie that still
+        // sorts. "Nothing is close enough" has to be an answer this can give.
+        scored.retain(|(_, score, _)| *score >= NEAREST_FLOOR);
+        // Demotion is applied AFTER the floor, not as part of the score: a
+        // human flagging an entry stale should push it down the list, never
+        // push it off the end of a query it genuinely matches.
+        scored.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| b.1.total_cmp(&a.1)));
+        scored.truncate(limit);
+        Ok(scored.into_iter().map(|(id, score, _)| (id, score)).collect())
     }
 
     /// Fetch full events by id, in the order requested.
@@ -1938,7 +2257,7 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let project = Uuid::new_v4();
         store.index(&event("Fixed the auth middleware", "token expiry used <", project)).unwrap();
-        let hits = store.search(&project.to_string(), "auth", None, 10).unwrap();
+        let hits = store.search(&project.to_string(), "auth", None, 10, Recall::Fused).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].title.contains("auth"));
     }
@@ -1956,12 +2275,12 @@ mod tests {
 
         for query in ["src/billing.rs", "period \"end", "a - b"] {
             let hits = store
-                .search(&project.to_string(), query, None, 10)
+                .search(&project.to_string(), query, None, 10, Recall::Fused)
                 .unwrap_or_else(|error| panic!("query {query:?} errored: {error}"));
             let _ = hits;
         }
         assert_eq!(
-            store.search(&project.to_string(), "src/billing.rs", None, 10).unwrap().len(),
+            store.search(&project.to_string(), "src/billing.rs", None, 10, Recall::Fused).unwrap().len(),
             1,
             "a path query should find the work on that path"
         );
@@ -1974,7 +2293,7 @@ mod tests {
         let theirs = Uuid::new_v4();
         store.index(&event("shared word here", "body", mine)).unwrap();
         store.index(&event("shared word here", "body", theirs)).unwrap();
-        assert_eq!(store.search(&mine.to_string(), "shared", None, 10).unwrap().len(), 1);
+        assert_eq!(store.search(&mine.to_string(), "shared", None, 10, Recall::Fused).unwrap().len(), 1);
     }
 
     #[test]
@@ -1985,7 +2304,7 @@ mod tests {
         store.index(&event).unwrap();
         store.index(&event).unwrap();
         assert_eq!(store.count().unwrap(), 1);
-        assert_eq!(store.search(&project.to_string(), "once", None, 10).unwrap().len(), 1);
+        assert_eq!(store.search(&project.to_string(), "once", None, 10, Recall::Fused).unwrap().len(), 1);
     }
 
     #[test]
@@ -2033,6 +2352,6 @@ mod tests {
         store.index(&event("gone soon", "body", project)).unwrap();
         store.clear().unwrap();
         assert_eq!(store.count().unwrap(), 0);
-        assert!(store.search(&project.to_string(), "gone", None, 10).unwrap().is_empty());
+        assert!(store.search(&project.to_string(), "gone", None, 10, Recall::Fused).unwrap().is_empty());
     }
 }

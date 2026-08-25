@@ -86,6 +86,7 @@ pub fn run() -> Result<Vec<Check>> {
     checks.push(injection_check(&paths));
     checks.push(taxonomy_check(&paths));
     checks.extend(summarizer_checks(&paths));
+    checks.push(semantic_check(&paths));
     checks.extend(hook_checks());
     checks.extend(trigger_checks());
     checks.push(timer_check());
@@ -206,6 +207,35 @@ fn failure_age(at: Option<&str>) -> Option<String> {
 /// Model ids rot when a CLI upgrades, and a wrong id fails exactly like an
 /// outage. This lists the table so a rotted entry is visible rather than
 /// silently degrading every session to rule-based output.
+/// How much of the corpus can be searched by meaning rather than by words.
+///
+/// Worth reporting because it is the one part of recall that lags capture on
+/// purpose: vectors are written by consolidation, so a database that has just
+/// been imported, reindexed, or upgraded is briefly keyword-only. Someone
+/// wondering why a search feels shallow should be able to see that here rather
+/// than guess at it.
+fn semantic_check(paths: &Paths) -> Check {
+    let Ok(store) = Store::open(&paths.db()) else {
+        return Check::fail("semantic", "index unreadable");
+    };
+    let Ok((embedded, total)) = store.vector_coverage() else {
+        return Check::fail("semantic", "coverage query failed");
+    };
+    let dims = crate::embed::DIMS;
+    if total == 0 {
+        return Check::pass("semantic", format!("nothing captured yet ({dims} dims ready)"));
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let percent = embedded as f64 / total as f64 * 100.0;
+    let detail = format!("{embedded} of {total} event(s) embedded ({percent:.0}%, {dims} dims)");
+    if embedded == 0 {
+        // Not a failure: keyword search still works, and the next
+        // consolidation fills this in without anyone doing anything.
+        return Check::pass("semantic", format!("{detail} — pending first consolidation"));
+    }
+    Check::pass("semantic", detail)
+}
+
 fn summarizer_checks(paths: &Paths) -> Vec<Check> {
     let mut checks = Vec::new();
     // Effective models, overrides applied: a report that shows the spec's

@@ -90,7 +90,18 @@ pub fn forget_entity(name: &str, apply: bool) -> Result<Vec<Outcome>> {
     anyhow::ensure!(!name.trim().is_empty(), "name something to forget");
     let (paths, store, scope) = context()?;
     let project = scope.project_id.to_string();
-    let targets = store.search(&project, name, None, ENTITY_FORGET_MAX)?;
+    // Lexical, never fused. This function DELETES what it is handed, and a
+    // semantic ranking always has a closest answer - so fusion here turns a
+    // name that appears nowhere into a withdrawal of the whole project. The
+    // preview this prints promises the reach is lexical; that promise is kept
+    // by the argument on this line.
+    let targets = store.search(
+        &project,
+        name,
+        None,
+        ENTITY_FORGET_MAX,
+        crate::store::Recall::Lexical,
+    )?;
 
     if !apply {
         return Ok(targets

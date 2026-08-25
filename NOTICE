@@ -2,3 +2,46 @@ rolepod-brain
 Copyright (c) 2026 Nuttaruj
 
 This software is released under the MIT License; see LICENSE.
+
+------------------------------------------------------------------------------
+Bundled model weights
+------------------------------------------------------------------------------
+
+assets/potion-retrieval-32M/ contains a static embedding model:
+
+    potion-retrieval-32M
+    Copyright (c) MinishLab
+    MIT License
+    https://huggingface.co/minishlab/potion-retrieval-32M
+
+`tokenizer.json` and `config.json` are that model's files, unmodified. Its
+tokenizer derives from BAAI/bge-base-en-v1.5 (MIT).
+
+`model-int8.safetensors` is the model's `embeddings` tensor quantized from f32
+to int8. The quantization, its arithmetic, and the measured cost of it are
+documented in assets/potion-retrieval-32M/PROVENANCE.md.
+
+------------------------------------------------------------------------------
+Third-party Rust crates under Apache License 2.0
+------------------------------------------------------------------------------
+
+Semantic search links the following crates, which are Apache-2.0 only (the rest
+of this binary's dependency tree is MIT or MIT/Apache dual-licensed):
+
+    tokenizers        Copyright (c) Hugging Face
+    safetensors       Copyright (c) Hugging Face
+    spm_precompiled   Copyright (c) Hugging Face
+    esaxx-rs          Copyright (c) Nicolas Patry
+
+Licensed under the Apache License, Version 2.0. You may obtain a copy at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed
+under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+CONDITIONS OF ANY KIND, either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+
+model2vec-rs (MIT, Copyright (c) MinishLab) is a development dependency only.
+It is not linked into the shipped binary; it is used by the test that holds
+this project's embedding code to the reference implementation's output.

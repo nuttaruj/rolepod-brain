@@ -280,7 +280,7 @@ fn call_tool(paths: &Paths, project: &str, session: &str, params: &Value) -> Res
                 .get("topic")
                 .and_then(Value::as_str)
                 .and_then(crate::event::normalize_topic);
-            let mut hits = store.search(project, query, topic, pool)?;
+            let mut hits = store.search(project, query, topic, pool, crate::store::Recall::Fused)?;
 
             // Second retrieval stream: a query that names a file or a service
             // finds the work about it even when no title contains the word.

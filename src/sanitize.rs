@@ -273,14 +273,20 @@ fn next_tag(haystack: &str, from: usize) -> Option<(usize, bool)> {
     let mut index = from;
     while index < bytes.len() {
         if bytes[index] == b'<' {
-            let rest = &haystack[index..];
+            // Compared as bytes, never as a string slice. Both tags are pure
+            // ASCII, so a byte comparison answers the same question - but
+            // taking the first ten BYTES of a `str` lands inside a character
+            // the moment the text is not ASCII, and slicing there aborts the
+            // process rather than returning an error. One arrow in a commit
+            // message was enough.
+            let rest = &bytes[index..];
             if rest.len() >= PRIVATE_CLOSE.len()
-                && rest[..PRIVATE_CLOSE.len()].eq_ignore_ascii_case(PRIVATE_CLOSE)
+                && rest[..PRIVATE_CLOSE.len()].eq_ignore_ascii_case(PRIVATE_CLOSE.as_bytes())
             {
                 return Some((index, true));
             }
             if rest.len() >= PRIVATE_OPEN.len()
-                && rest[..PRIVATE_OPEN.len()].eq_ignore_ascii_case(PRIVATE_OPEN)
+                && rest[..PRIVATE_OPEN.len()].eq_ignore_ascii_case(PRIVATE_OPEN.as_bytes())
             {
                 return Some((index, false));
             }
@@ -363,6 +369,21 @@ pub fn truncate_head_tail(input: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A `<` followed by multi-byte text used to abort the process.
+    ///
+    /// The tag scan compared a fixed number of BYTES against `<private>`, and
+    /// took that many bytes as a string slice. Ten bytes into `<x←←←←` is the
+    /// middle of an arrow, and slicing a `str` there is a panic, not an error
+    /// — so one arrow in a commit message could take down the consolidation
+    /// that was reading it. Found in real captured data, not by inspection.
+    #[test]
+    fn a_multibyte_character_after_a_bracket_is_not_a_crash() {
+        for haystack in ["<x←←←←", "← <← →→→→→", "<←", "a <private>x←←←←</private> b"] {
+            let scrubbed = super::Sanitizer::default().scrub_body(haystack);
+            assert!(!scrubbed.is_empty() || haystack.is_empty());
+        }
+    }
+
     use super::*;
 
     #[test]

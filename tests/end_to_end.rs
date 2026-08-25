@@ -3198,3 +3198,146 @@ fn a_hook_stays_well_inside_its_budget() {
          no-resident-process commitment needs re-arguing rather than re-asserting"
     );
 }
+
+/// The search that keyword matching cannot answer.
+///
+/// A session records `login sessions expire far too early`. Someone later asks
+/// about `authentication`. Not one word overlaps, so FTS5 scores the pair at
+/// nothing and the memory may as well not exist — which is the most common way
+/// a memory system fails while looking like it works.
+///
+/// This is what the vendored embedding model is for, and this test is the
+/// reason it earns 32MB of binary.
+#[test]
+fn a_memory_is_found_by_meaning_when_no_word_matches() {
+    let fixture = Fixture::new("semantic");
+
+    let record = |session: &str, prompt: &str| {
+        let payload = serde_json::json!({
+            "session_id": session,
+            "cwd": fixture.project,
+            "prompt": prompt
+        })
+        .to_string();
+        fixture.hook("claude-code", "UserPromptSubmit", &payload);
+    };
+    record("0199aaaa-2222-7000-8000-000000000001", "login sessions expire far too early");
+    record("0199aaaa-2222-7000-8000-000000000002", "the office coffee machine broke again");
+    record("0199aaaa-2222-7000-8000-000000000003", "bumped the release version number");
+
+    // Keyword-only, before any vector exists: the word is simply absent.
+    let cold = fixture.brain(&["search", "authentication"]);
+    let cold = String::from_utf8_lossy(&cold.stdout);
+    assert!(
+        !cold.contains("expire far too early"),
+        "keyword search already found it, so this test proves nothing: {cold}"
+    );
+
+    // Consolidation is where vectors are written - never the capture hook,
+    // which has a person waiting on it.
+    let embedded = fixture.brain_with_path(&["consolidate", "--force"], None);
+    assert!(embedded.status.success(), "consolidate failed: {embedded:?}");
+
+    let warm = fixture.brain(&["search", "authentication"]);
+    let warm = String::from_utf8_lossy(&warm.stdout);
+    assert!(
+        warm.contains("expire far too early"),
+        "the memory is about authentication and was still not found: {warm}"
+    );
+
+    // And it is ranked as the answer, not merely present: the coffee machine
+    // has as little to do with the question as anything in the corpus.
+    let login = warm.find("expire far too early");
+    let coffee = warm.find("coffee machine");
+    assert!(
+        login < coffee || coffee.is_none(),
+        "an unrelated memory outranked the relevant one: {warm}"
+    );
+}
+
+/// Semantic ranking has to obey the same withdrawal as everything else.
+///
+/// A memory removed from search that a vector can still surface has not been
+/// removed. This is the failure mode where a forget looks like it worked.
+#[test]
+fn a_forgotten_memory_stays_gone_from_semantic_results_too() {
+    let fixture = Fixture::new("semanticforget");
+    let payload = serde_json::json!({
+        "session_id": "0199aaaa-3333-7000-8000-000000000001",
+        "cwd": fixture.project,
+        "prompt": "login sessions expire far too early"
+    })
+    .to_string();
+    fixture.hook("claude-code", "UserPromptSubmit", &payload);
+    fixture.brain_with_path(&["consolidate", "--force"], None);
+
+    let found = fixture.brain(&["search", "authentication"]);
+    let found = String::from_utf8_lossy(&found.stdout);
+    assert!(found.contains("expire far too early"), "nothing to forget: {found}");
+
+    // The id is the first token of the first result line.
+    let id = found
+        .lines()
+        .find(|line| line.contains("expire far too early"))
+        .and_then(|line| line.split_whitespace().next())
+        .expect("a result line carrying an id")
+        .to_string();
+    let forgotten = fixture.brain(&["forget", &id, "--apply"]);
+    assert!(forgotten.status.success(), "forget failed: {forgotten:?}");
+
+    let after = fixture.brain(&["search", "authentication"]);
+    let after = String::from_utf8_lossy(&after.stdout);
+    assert!(
+        !after.contains("expire far too early"),
+        "a forgotten memory came back through the semantic ranking: {after}"
+    );
+}
+
+/// A bulk withdrawal must never reach past the words it was given.
+///
+/// `forget --entity` is destructive and its own preview promises the reach is
+/// lexical: "Matching is by text, so a mention under another name is not
+/// listed." When semantic ranking was added underneath `Store::search`, that
+/// promise silently became false — a name appearing in no memory at all
+/// matched every embedded event in the project, because a cosine ranking with
+/// no floor returns the whole corpus in order. Typing `--apply` on that
+/// preview destroys a project's memory.
+///
+/// The existing forget test covers `forget <id>`, which is why the suite
+/// stayed green through it.
+#[test]
+fn forgetting_by_name_never_reaches_a_memory_that_does_not_say_it() {
+    let fixture = Fixture::new("entityreach");
+
+    for (index, prompt) in [
+        "login sessions expire far too early",
+        "the CSS grid gap is wrong on mobile",
+        "bumped the release version number",
+        "the office coffee machine broke again",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let payload = serde_json::json!({
+            "session_id": format!("0199aaaa-4444-7000-8000-00000000000{index}"),
+            "cwd": fixture.project,
+            "prompt": prompt
+        })
+        .to_string();
+        fixture.hook("claude-code", "UserPromptSubmit", &payload);
+    }
+    // Everything embedded: the failure only appears once vectors exist.
+    fixture.brain_with_path(&["consolidate", "--force"], None);
+
+    let preview = fixture.brain(&["forget", "--entity", "zzzqqqwww"]);
+    let preview = String::from_utf8_lossy(&preview.stdout);
+    assert!(
+        !preview.contains("coffee machine") && !preview.contains("CSS grid"),
+        "a name in no memory listed unrelated memories for withdrawal: {preview}"
+    );
+
+    // And the reach that IS lexical still works, or the fix was a removal.
+    let real = fixture.brain(&["forget", "--entity", "coffee"]);
+    let real = String::from_utf8_lossy(&real.stdout);
+    assert!(real.contains("coffee machine"), "the real match was lost too: {real}");
+}
