@@ -75,16 +75,28 @@ combine without conflicts.
 
 ## Install
 
-Requires the Rust toolchain and git.
-
 ```sh
-git clone <this repo> rolepod-brain && cd rolepod-brain
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh
 ```
 
-That builds a release binary, installs it to `~/.local/bin/brain`, and wires
+That fetches the binary for your platform, checks it against the checksum
+published with the release, installs it to `~/.local/bin/brain`, and wires
 every supported CLI it finds. It prints a plan first and asks before touching
-anything.
+anything. No repository is left on your machine, and no Rust toolchain is
+needed — what lands is one binary.
+
+This binary reads what you type into your editor, so it refuses to install a
+download whose checksum does not match, and `bootstrap.sh` is short enough to
+read before you run it. If you would rather not pipe a script to a shell, take
+the binary from [Releases](https://github.com/nuttaruj/rolepod-brain/releases)
+yourself and run `brain setup`.
+
+Building from source instead needs Rust and git:
+
+```sh
+git clone https://github.com/nuttaruj/rolepod-brain && cd rolepod-brain
+./install.sh
+```
 
 To see what it would do without doing it:
 

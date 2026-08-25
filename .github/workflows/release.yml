@@ -1,0 +1,108 @@
+name: release
+
+# Prebuilt binaries, so installing does not mean cloning a repository and
+# owning a Rust toolchain. Every other memory tool in this space ships a
+# package rather than a working tree; this is that.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and publish"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-apple-darwin
+            runner: macos-13
+          # Built on the oldest runner we support rather than the newest, so
+          # the glibc it links against is one an older distribution actually
+          # has. A binary that only runs on the machine that built it is not a
+          # release.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Test
+        # The same suite the repository runs. A binary nobody verified is
+        # exactly the artifact this project argues against shipping.
+        run: cargo test --release --locked --target ${{ matrix.target }}
+
+      - name: Sign (macOS)
+        if: runner.os == 'macOS'
+        # Ad-hoc, which is all an unnotarized binary can have — but it must be
+        # signed by something: copying an unsigned binary into place on macOS
+        # produces a process the kernel kills on exec, with no output, which
+        # looks exactly like a broken build.
+        run: codesign -s - -f target/${{ matrix.target }}/release/brain
+
+      - name: Package
+        run: |
+          set -eu
+          name="brain-${{ matrix.target }}"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/brain" "dist/$name"
+          cd dist
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "$name" > "$name.sha256"
+          else
+            sha256sum "$name" > "$name.sha256"
+          fi
+          cat "$name.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: brain-${{ matrix.target }}
+          path: dist/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect
+        run: |
+          set -eu
+          mkdir -p dist
+          find artifacts -type f -exec cp {} dist/ \;
+          cd dist
+          # One file the installer can fetch to check any binary against,
+          # rather than one request per platform.
+          cat ./*.sha256 > SHA256SUMS
+          rm -f ./*.sha256
+          ls -l
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          gh release create "$TAG" --title "$TAG" --generate-notes || true
+          gh release upload "$TAG" dist/* --clobber

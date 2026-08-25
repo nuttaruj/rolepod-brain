@@ -1,5 +1,12 @@
 #!/bin/sh
-# Build and install rolepod-brain, then wire the CLIs on this machine.
+# Build rolepod-brain FROM SOURCE and wire the CLIs on this machine.
+#
+# This is the contributor path: it expects you to be standing in a clone.
+# Installing does not require one — `bootstrap.sh` fetches a prebuilt binary,
+# checks it against the release's published checksum, and leaves no working
+# tree behind:
+#
+#   curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh
 #
 # Safe to re-run: setup backs up each config before writing and only replaces
 # entries it created itself.

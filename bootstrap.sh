@@ -1,0 +1,158 @@
+#!/bin/sh
+# rolepod-brain bootstrap — fetch the binary, wire the CLIs, leave nothing else.
+#
+#   curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh
+#
+# What lands on your machine is one binary. No repository, no toolchain, no
+# resident process. If no prebuilt binary matches your platform this falls
+# back to building from source, which needs Rust.
+#
+# Env:
+#   BRAIN_BIN_DIR   where to install (default $HOME/.local/bin)
+#   BRAIN_VERSION   a tag to install (default: the latest release)
+#   BRAIN_NO_SETUP  set to skip hook registration; install the binary only
+set -eu
+
+REPO="nuttaruj/rolepod-brain"
+BIN_DIR="${BRAIN_BIN_DIR:-$HOME/.local/bin}"
+BIN="$BIN_DIR/brain"
+
+say() { printf '%s\n' "$*"; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required"; }
+need curl
+
+case "$(uname -s)" in
+    Darwin) os="apple-darwin" ;;
+    Linux)  os="unknown-linux-gnu" ;;
+    *)      os="" ;;
+esac
+case "$(uname -m)" in
+    arm64|aarch64) arch="aarch64" ;;
+    x86_64|amd64)  arch="x86_64" ;;
+    *)             arch="" ;;
+esac
+target=""
+[ -n "$os" ] && [ -n "$arch" ] && target="$arch-$os"
+
+version="${BRAIN_VERSION:-}"
+if [ -z "$version" ] && [ -n "$target" ]; then
+    version=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
+        | sed -n 's/.*"tag_name" *: *"\([^"]*\)".*/\1/p' | head -n 1) || true
+fi
+
+from_source() {
+    say "Building from source (this needs Rust and git)."
+    command -v cargo >/dev/null 2>&1 || die "cargo not found. Install Rust: https://rustup.rs"
+    command -v git >/dev/null 2>&1 || die "git not found."
+    # A working tree the user did not ask for is not left behind: this is
+    # cloned into a temporary directory and removed on the way out.
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' EXIT INT TERM
+    git clone --depth 1 "https://github.com/$REPO.git" "$work/src" >/dev/null 2>&1 \
+        || die "could not clone https://github.com/$REPO"
+    ( cd "$work/src" && cargo build --release --quiet ) || die "build failed"
+    install_binary "$work/src/target/release/brain"
+}
+
+install_binary() {
+    src="$1"
+    mkdir -p "$BIN_DIR"
+    # Replaced, never written over in place. On macOS, writing over a running
+    # binary invalidates its code signature and the kernel then kills it on
+    # exec — which looks exactly like a broken install, with no output to say
+    # so. A fresh inode plus a re-sign keeps it launchable.
+    rm -f "$BIN"
+    cp "$src" "$BIN"
+    chmod +x "$BIN"
+    if [ "$(uname -s)" = "Darwin" ] && command -v codesign >/dev/null 2>&1; then
+        codesign -s - -f "$BIN" >/dev/null 2>&1 || true
+    fi
+}
+
+verify() {
+    file="$1"
+    name="$2"
+    sums="$3"
+    want=$(grep " $name\$" "$sums" 2>/dev/null | awk '{print $1}' | head -n 1)
+    [ -n "$want" ] || die "no checksum published for $name — refusing to install"
+    if command -v shasum >/dev/null 2>&1; then
+        got=$(shasum -a 256 "$file" | awk '{print $1}')
+    elif command -v sha256sum >/dev/null 2>&1; then
+        got=$(sha256sum "$file" | awk '{print $1}')
+    else
+        die "no sha256 tool available — refusing to install unverified"
+    fi
+    # This binary reads what you type into your editor. It is not installed
+    # without matching what the release says it should be.
+    [ "$want" = "$got" ] || die "checksum mismatch for $name (expected $want, got $got)"
+}
+
+if [ -n "$target" ] && [ -n "$version" ]; then
+    name="brain-$target"
+    base="https://github.com/$REPO/releases/download/$version"
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' EXIT INT TERM
+    say "Fetching $name $version..."
+    # Failure here is expected and handled - a platform with no published
+    # binary, or no network - so curl's own diagnostics are noise in front of
+    # the message that actually tells the reader what happens next.
+    if curl -fsSL -o "$work/$name" "$base/$name" 2>/dev/null \
+        && curl -fsSL -o "$work/SHA256SUMS" "$base/SHA256SUMS" 2>/dev/null; then
+        verify "$work/$name" "$name" "$work/SHA256SUMS"
+        install_binary "$work/$name"
+    else
+        say "No prebuilt binary for $target at $version."
+        from_source
+    fi
+else
+    say "Unrecognised platform ($(uname -s) $(uname -m)) or no published release."
+    from_source
+fi
+
+say "Installed $("$BIN" --version) to $BIN"
+
+case ":$PATH:" in
+    *":$BIN_DIR:"*) ;;
+    *)
+        say ""
+        say "NOTE: $BIN_DIR is not on your PATH. Add it to your shell profile:"
+        say "  export PATH=\"$BIN_DIR:\$PATH\""
+        ;;
+esac
+
+if [ -n "${BRAIN_NO_SETUP:-}" ]; then
+    say ""
+    say "Skipped hook registration. Run '$BIN setup' to see what it would change."
+    exit 0
+fi
+
+say ""
+say "Planned changes:"
+say ""
+"$BIN" setup
+
+# Piped into a shell, stdin is the script — so a prompt has to read the
+# terminal directly, and where there is no terminal there is nobody to ask.
+if [ -r /dev/tty ]; then
+    say ""
+    printf 'Apply these changes? [y/N] '
+    read -r reply < /dev/tty || reply=""
+else
+    reply=""
+fi
+
+case "$reply" in
+    [yY]*)
+        "$BIN" setup --apply
+        say ""
+        "$BIN" doctor || true
+        say ""
+        say "Done. Start a session in any wired CLI; nothing else to run."
+        ;;
+    *)
+        say ""
+        say "Nothing changed. Run '$BIN setup --apply' when you are ready."
+        ;;
+esac
