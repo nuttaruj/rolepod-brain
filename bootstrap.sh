@@ -69,11 +69,16 @@ case "$(uname -m)" in
     x86_64|amd64)  arch="x86_64" ;;
     *)             arch="" ;;
 esac
-target=""
-[ -n "$os" ] && [ -n "$arch" ] && target="$arch-$os"
+# Named apart from `$target` on purpose. They were one variable once: the
+# option parser stored the user's CLI choice in it and this line overwrote it
+# with the platform triple, so `--target=codex` — and the bare one-liner the
+# README leads with — asked `brain setup` to wire a CLI named
+# `aarch64-apple-darwin`.
+platform=""
+[ -n "$os" ] && [ -n "$arch" ] && platform="$arch-$os"
 
 version="${BRAIN_VERSION:-}"
-if [ -z "$version" ] && [ -n "$target" ]; then
+if [ -z "$version" ] && [ -n "$platform" ]; then
     version=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
         | sed -n 's/.*"tag_name" *: *"\([^"]*\)".*/\1/p' | head -n 1) || true
 fi
@@ -125,8 +130,8 @@ verify() {
     [ "$want" = "$got" ] || die "checksum mismatch for $name (expected $want, got $got)"
 }
 
-if [ -n "$target" ] && [ -n "$version" ]; then
-    name="brain-$target"
+if [ -n "$platform" ] && [ -n "$version" ]; then
+    name="brain-$platform"
     base="https://github.com/$REPO/releases/download/$version"
     work=$(mktemp -d)
     trap 'rm -rf "$work"' EXIT INT TERM
@@ -139,7 +144,7 @@ if [ -n "$target" ] && [ -n "$version" ]; then
         verify "$work/$name" "$name" "$work/SHA256SUMS"
         install_binary "$work/$name"
     else
-        say "No prebuilt binary for $target at $version."
+        say "No prebuilt binary for $platform at $version."
         from_source
     fi
 else

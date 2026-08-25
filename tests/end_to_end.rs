@@ -3440,3 +3440,44 @@ fn an_agent_can_orient_and_can_walk_sideways() {
         "a memory is not related to itself: {related}"
     );
 }
+
+/// The installer's own arguments must survive the rest of the script.
+///
+/// `--target=<cli>` and the platform triple lived in one variable named
+/// `target`: the option parser wrote the user's choice into it and the platform
+/// detection twenty lines later overwrote it. So `--target=codex` — and the
+/// bare one-liner the README leads with — asked `brain setup` to wire a CLI
+/// called `aarch64-apple-darwin`. Nothing was wired, and until `setup` learned
+/// to refuse a name it does not know, nothing said so either.
+///
+/// This is a shell script, so there is no compiler to notice. The invariant it
+/// broke is small enough to state: after the option loop, nothing reassigns the
+/// variables the option loop owns.
+#[test]
+fn the_installer_does_not_overwrite_its_own_options() {
+    let script = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap.sh"),
+    )
+    .expect("bootstrap.sh");
+
+    let (parser, rest) = script.split_once("done\n").expect("the option loop ends with `done`");
+    for option in ["target", "assume_yes", "uninstall", "binary_only"] {
+        assert!(
+            parser.contains(&format!("{option}=")),
+            "{option} is never set by the option parser — has it been renamed?"
+        );
+        // Anywhere on the line, not just at the start of it. The assignment
+        // that caused this sat at the tail of a compound command —
+        // `[ -n "$os" ] && ... && target="$arch-$os"` — and a check anchored to
+        // the line start walked straight past it, which is a guard that passes
+        // on the bug it was written for.
+        for (number, line) in rest.lines().enumerate() {
+            let code = line.split('#').next().unwrap_or(line);
+            assert!(
+                !code.contains(&format!("{option}=")),
+                "line {} reassigns `{option}`, which the option parser owns: {line}",
+                number + 1
+            );
+        }
+    }
+}
