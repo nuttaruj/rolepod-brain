@@ -272,13 +272,49 @@ fn tool_definitions() -> Value {
             "name": "brain_recent",
             "description": "Most recent observations in this project, newest first. \
                             Use it to re-orient at the start of a session or after a \
-                            context compaction.",
+                            context compaction. Pass `cli` to see what ANOTHER \
+                            agent did: this brain is shared by every CLI on the \
+                            machine, so work done in codex or cursor is here even \
+                            though you never saw it. Agents run several sessions \
+                            at once, so pass `kind` too or the list interleaves \
+                            unrelated work: `session_summary` is one line per \
+                            session (what it has been doing), `raw` is what a \
+                            session is doing right now, before it was summarized. \
+                            To answer \"find the session where codex did X\": \
+                            brain_search for X, take `session` off the hit, then \
+                            call again with that `session` to read that one piece \
+                            of work whole.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "k": {
                         "type": "integer",
                         "description": "How many (default 10, max 50).",
+                    },
+                    "cli": {
+                        "type": "string",
+                        "description": "Only this CLI's observations — \
+                                        `claude-code`, `codex`, `cursor`, \
+                                        `gemini-cli`, `antigravity`, `opencode`. \
+                                        Omit for every CLI.",
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": "`session_summary` — one finished session \
+                                        per line. `raw` — live work not yet \
+                                        summarized. Also `knowledge`, `note`, \
+                                        `page_update`. Omit for all of them mixed, \
+                                        which is only readable one session at a \
+                                        time: every entry carries `session`.",
+                    },
+                    "session": {
+                        "type": "string",
+                        "description": "One session's work and nothing else. Take \
+                                        the id from the `session` field of any hit \
+                                        — brain_search, brain_recent, brain_related. \
+                                        Combine with `kind` to read that session's \
+                                        summary, or its live capture when it has \
+                                        not been summarized yet.",
                     },
                 },
             },
@@ -366,7 +402,13 @@ fn call_tool(paths: &Paths, project: &str, session: &str, params: &Value) -> Res
             json!(outline)
         }
         "brain_recent" => {
-            let hits = store.recent(project, limit_from(&arguments))?;
+            let cli = arguments.get("cli").and_then(Value::as_str);
+            let kind = arguments.get("kind").and_then(Value::as_str).map(normalize_kind).transpose()?;
+            // Not `session`: that name is taken by THIS conversation's id, and
+            // the two mean opposite things - one is who is asking, the other is
+            // whose work is being asked about.
+            let of_session = arguments.get("session").and_then(Value::as_str);
+            let hits = store.recent(project, cli, kind, of_session, limit_from(&arguments))?;
             store.record_recalled(session, hits.iter().map(|hit| hit.id.as_str()))?;
             json!({ "events": hits, "count": hits.len() })
         }
@@ -486,6 +528,31 @@ fn write_note(paths: &Paths, text: &str, files: &[String]) -> Result<String> {
     let store = Store::open(&paths.db())?;
     store.index(&event)?;
     Ok(event.id)
+}
+
+/// Kinds a caller may ask for, and the one alias that has to work.
+///
+/// `raw` is not a kind - it is what the primer PRINTS for an untyped
+/// observation, and the primer is the only place most agents ever learn this
+/// vocabulary. Refusing the word they were shown, in favour of the word the
+/// column happens to hold, would be a private schema detail sold as a
+/// contract.
+///
+/// An unknown kind is an error rather than an empty list, for the same reason
+/// a typo'd topic is loud in `brain search`: silence reads as "nothing
+/// remembered", and an agent believes it.
+fn normalize_kind(asked: &str) -> Result<&'static str> {
+    match asked {
+        "raw" | "observation" => Ok("observation"),
+        "session_summary" => Ok("session_summary"),
+        "knowledge" => Ok("knowledge"),
+        "note" => Ok("note"),
+        "page_update" => Ok("page_update"),
+        other => anyhow::bail!(
+            "unknown kind `{other}`; known: raw (an untyped observation), \
+             session_summary, knowledge, note, page_update"
+        ),
+    }
 }
 
 fn limit_from(arguments: &Value) -> usize {

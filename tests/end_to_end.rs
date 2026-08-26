@@ -1166,6 +1166,135 @@ fn mcp_recall_returns_what_was_captured() {
     assert_eq!(fetched[0]["result"]["structuredContent"]["count"], 1);
 }
 
+/// One brain holds every CLI's work, and until now nothing could ask it which
+/// CLI did what. The column was always there; the question was unaskable, so
+/// the answer came from raw SQL against an index the project itself calls
+/// disposable.
+#[test]
+fn one_agent_can_read_what_another_agent_did() {
+    let fixture = Fixture::new("crosscli");
+    fixture.hook("claude-code", "PostToolUse", &claude_payload(&fixture.project));
+    fixture.hook("codex", "UserPromptSubmit", &codex_payload(&fixture.project));
+
+    let responses = fixture.mcp(&[
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"brain_recent","arguments":{}}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"brain_recent","arguments":{"cli":"codex"}}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"brain_recent","arguments":{"cli":"gemini-cli"}}}"#,
+    ]);
+
+    let clis = |index: usize| -> Vec<String> {
+        responses[index]["result"]["structuredContent"]["events"]
+            .as_array()
+            .expect("recent returns events")
+            .iter()
+            .map(|event| event["cli"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // Unfiltered is unchanged: both CLIs, one list.
+    let every = clis(0);
+    assert!(every.contains(&"claude-code".to_string()), "claude missing: {every:?}");
+    assert!(every.contains(&"codex".to_string()), "codex missing: {every:?}");
+
+    // The skill tells agents to group the unfiltered list by session, which is
+    // only advice they can follow if the field reaches them at all.
+    for event in responses[0]["result"]["structuredContent"]["events"].as_array().unwrap() {
+        let session = event["session"].as_str().unwrap_or_default();
+        assert!(!session.is_empty(), "an entry with no session cannot be grouped: {event}");
+    }
+
+    // Filtered is one agent's work on its own - the question this exists for.
+    let only_codex = clis(1);
+    assert!(!only_codex.is_empty(), "codex has observations to return");
+    assert!(only_codex.iter().all(|cli| cli == "codex"), "leaked another CLI: {only_codex:?}");
+
+    // A CLI that never ran here is empty, not an error: "nothing" has to be an
+    // answer, or an agent reads a failure as a reason to stop asking.
+    assert_eq!(responses[2]["result"]["structuredContent"]["count"], 0);
+    assert!(responses[2].get("error").is_none(), "absence is not a failure: {:?}", responses[2]);
+}
+
+/// Several sessions of one agent run at once, so the flat list interleaves
+/// work that has nothing to do with each other. `kind` is what makes it
+/// readable, and `raw` has to be spelled the way the primer spells it.
+#[test]
+fn one_agents_parallel_sessions_can_be_read_apart() {
+    let fixture = Fixture::new("crosskind");
+    fixture.hook("codex", "UserPromptSubmit", &codex_payload(&fixture.project));
+    fixture.brain_with_path(&["consolidate", "--force"], None);
+    // Live work, arriving after the summary was written - the state an agent
+    // is in whenever it asks what another agent is doing right now.
+    fixture.hook("codex", "UserPromptSubmit", &codex_payload(&fixture.project));
+
+    let responses = fixture.mcp(&[
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"brain_recent","arguments":{"cli":"codex","kind":"session_summary"}}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"brain_recent","arguments":{"cli":"codex","kind":"raw"}}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"brain_recent","arguments":{"kind":"sesson_sumary"}}}"#,
+    ]);
+
+    let kinds = |index: usize| -> Vec<String> {
+        responses[index]["result"]["structuredContent"]["events"]
+            .as_array()
+            .expect("recent returns events")
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let summaries = kinds(0);
+    assert!(!summaries.is_empty(), "consolidation wrote a summary: {responses:?}");
+    assert!(summaries.iter().all(|kind| kind == "session_summary"), "not summaries: {summaries:?}");
+
+    // `raw` is the primer's word for an untyped observation. An agent only
+    // ever saw that word, so that word has to work.
+    let live = kinds(1);
+    assert!(!live.is_empty(), "the unsummarized capture is reachable: {responses:?}");
+    assert!(live.iter().all(|kind| kind == "observation"), "raw is not observation: {live:?}");
+
+    // A typo must not read as "nothing remembered".
+    let typo = &responses[2]["result"];
+    assert_eq!(typo["isError"], true, "unknown kind must be loud: {typo:?}");
+    let text = typo["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("session_summary"), "the error names what is valid: {text}");
+}
+
+/// The question the tools exist to answer, end to end: "find the session where
+/// the other agent did X, and tell me what came of it." Search finds it by
+/// meaning, the hit carries the session, and the session reads whole. Each
+/// piece works on its own; this pins that they connect.
+#[test]
+fn a_session_found_by_meaning_can_then_be_read_whole() {
+    let fixture = Fixture::new("chain");
+    // Two agents, two sessions, so isolating one has to actually exclude the
+    // other rather than being trivially satisfied.
+    fixture.hook("claude-code", "PostToolUse", &claude_payload(&fixture.project));
+    fixture.hook("codex", "UserPromptSubmit", &codex_payload(&fixture.project));
+
+    let found = fixture.mcp(&[
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"brain_search","arguments":{"query":"auth"}}}"#,
+    ]);
+    let hits = found[0]["result"]["structuredContent"]["hits"].as_array().unwrap();
+    let codex_hit = hits
+        .iter()
+        .find(|hit| hit["cli"] == "codex")
+        .unwrap_or_else(|| panic!("codex work is findable by meaning: {hits:?}"));
+
+    // Step 2 of the documented chain: the id comes off the hit, so nothing has
+    // to be carried between calls.
+    let session = codex_hit["session"].as_str().expect("a hit names its session");
+    assert!(!session.is_empty());
+
+    let read = fixture.mcp(&[&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"brain_recent","arguments":{{"session":"{session}"}}}}}}"#
+    )]);
+    let events = read[0]["result"]["structuredContent"]["events"].as_array().unwrap();
+    assert!(!events.is_empty(), "the named session reads back: {read:?}");
+    for event in events {
+        assert_eq!(event["session"], session, "another session leaked in: {event}");
+        assert_eq!(event["cli"], "codex", "another agent leaked in: {event}");
+    }
+}
+
 #[test]
 fn the_index_is_disposable_and_rebuilds_from_the_log() {
     let fixture = Fixture::new("reindex");

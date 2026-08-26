@@ -9,6 +9,11 @@ Memory of this project persists across sessions and across CLIs. You did not
 see those sessions, so treat it as a colleague's notebook: worth checking
 before you re-derive something.
 
+Across CLIs is literal: one brain per machine, written by every agent that
+runs here. A benchmark codex ran an hour ago, a file cursor edited yesterday —
+those are in the same memory you are reading, and nothing else will tell you
+they happened.
+
 ## When to search before working
 
 Search first when any of these is true:
@@ -32,8 +37,38 @@ software works.
   here.
 - `brain_get(ids)` — full text of specific entries. Search returns one-line
   titles with ids; call this on the ones worth reading.
-- `brain_recent(k)` — what happened most recently. Good for re-orienting at
-  the start of a session or after a context compaction.
+- `brain_recent(k, cli, kind, session)` — what happened most recently. Good for
+  re-orienting at the start of a session or after a context compaction. Pass
+  `cli` to read one agent's work on its own: `brain_recent(cli="codex")` is
+  what codex did here, whether or not you were running.
+
+  Pass `kind` with it, because agents run several sessions at once and the
+  unfiltered list interleaves them:
+
+  - `kind="session_summary"` — one line per finished session. This is the one
+    to reach for first: "what has codex been doing" is a question about
+    sessions, not about events.
+  - `kind="raw"` — what a session is doing *right now*. A session that is still
+    running has not been summarized yet, so this is the only way to see it.
+
+  Every entry carries `session`, and `session` narrows to that one piece of
+  work. When you do read an unfiltered list, group by it before drawing any
+  conclusion — two adjacent lines are often two different pieces of work.
+
+## Answering "what did the other agent do about X"
+
+The user asks about work another CLI did — "find where codex analyzed this
+project", "what did cursor change yesterday". Three calls:
+
+1. `brain_search("<what they asked about>")` — find it by meaning. Hits from
+   every CLI are in the same index.
+2. Take `session` off the hit that matches.
+3. `brain_recent(session=..., kind="session_summary")` for the conclusion, and
+   `brain_recent(session=..., kind="raw")` for what it actually did.
+
+A session that is still running has no summary yet; `raw` is then the whole
+answer, and worth saying so rather than reporting the work as absent. Report
+what the session concluded, not a list of its tool calls.
 - `brain_timeline(since, k)` — chronological slice. Use when the question is
   about *ordering* or about when something changed, rather than about a topic.
 - `brain_note(text, files)` — record something worth remembering that no tool

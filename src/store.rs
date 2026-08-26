@@ -136,10 +136,15 @@ pub struct Hit {
     pub title: String,
     /// FTS5-generated excerpt with matches marked.
     pub snippet: String,
-    /// Which session produced it. Carried for spreading results across
-    /// sessions, not for the caller - an agent has no use for a session
-    /// uuid, so it never leaves this process.
-    #[serde(skip)]
+    /// Which session produced it.
+    ///
+    /// This was hidden from callers on the grounds that a session uuid means
+    /// nothing to an agent. That held while a list was read top to bottom.
+    /// It stopped holding once one agent could read another's work: agents run
+    /// sessions in parallel, so a newest-first list interleaves several of
+    /// them, and the only thing that says which line belongs with which is
+    /// this. It is opaque, and it does not need to be anything else - grouping
+    /// asks for equality, not for meaning.
     pub session: String,
 }
 
@@ -1423,20 +1428,50 @@ impl Store {
 
     /// Most recent events in a project, newest first.
     ///
+    /// One brain holds every CLI's work, so `cli` answers the question a
+    /// shared brain exists to answer: what did the OTHER agent just do. It is
+    /// the whole reason the column is stored per event rather than per brain -
+    /// without a way to ask by it, cross-CLI handoff is a property of the data
+    /// that nothing can read.
+    ///
+    /// `kind` is what makes that answer readable. Agents run in parallel: on
+    /// the brain this was written against, seven codex sessions opened within
+    /// two seconds of each other, so a flat newest-first list interleaves
+    /// several pieces of unrelated work line by line and none of them can be
+    /// followed. `session_summary` collapses that to one line per session -
+    /// the granularity "what has it been doing" actually asks for - and
+    /// `observation` is the other half: what a session is doing right now,
+    /// before consolidation has written its summary.
+    ///
+    /// `session` closes the loop the other two open. Naming a session is how a
+    /// list of sessions becomes one piece of work read whole: search or the
+    /// summary list says which one, this reads it. Every hit already carries
+    /// the id, so nothing has to be remembered between the two calls.
+    ///
     /// # Errors
     /// Returns an error when the query fails.
-    pub fn recent(&self, project: &str, limit: usize) -> Result<Vec<Hit>> {
+    pub fn recent(
+        &self,
+        project: &str,
+        cli: Option<&str>,
+        kind: Option<&str>,
+        session: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Hit>> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT id, ts, cli, kind, title, session
                  FROM events WHERE project = ?1 AND forgotten = 0 AND kind != 'tombstone'
                        AND hook != 'correct'
+                       AND (?3 IS NULL OR cli = ?3)
+                       AND (?4 IS NULL OR kind = ?4)
+                       AND (?5 IS NULL OR session = ?5)
                  ORDER BY id DESC LIMIT ?2",
             )
             .context("prepare recent")?;
         let rows = stmt
-            .query_map(params![project, limit as i64], |row| {
+            .query_map(params![project, limit as i64, cli, kind, session], |row| {
                 Ok(Hit {
                     id: row.get(0)?,
                     ts: row.get(1)?,
