@@ -268,7 +268,7 @@ fn inject_for(
     if injection.is_empty() {
         return "{}".to_string();
     }
-    let _ = store.record_injected(session, &injection.ids, injection.text.len());
+    let _ = store.record_injected(session, &injection.ids, injection.in_flight, injection.text.len());
     inject::as_hook_output(event_name, &injection)
 }
 

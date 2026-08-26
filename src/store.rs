@@ -484,6 +484,7 @@ impl Store {
                 ("summarizer_health", "last_failed_at", "TEXT"),
                 ("session_state", "claimed_at", "TEXT"),
                 ("injected", "active", "INTEGER NOT NULL DEFAULT 1"),
+                ("injected", "in_flight", "INTEGER NOT NULL DEFAULT 0"),
             ]
         {
             if self.has_column(table, column)? {
@@ -1994,6 +1995,30 @@ impl Store {
             .context("read injection uptake")
     }
 
+    /// The same measurement, for still-unsummarized work alone.
+    ///
+    /// Separate because the two failures are different. A summary nobody
+    /// pulls means the primer is describing the wrong things. A half-finished
+    /// task nobody pulls means the reserve holding it is either too small to
+    /// say anything useful or too large to be believed - and the number of
+    /// lines it reserves cannot be argued about without this.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn in_flight_uptake(&self) -> Result<(i64, i64)> {
+        self.conn
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM injected WHERE in_flight = 1),
+                   (SELECT COUNT(*) FROM injected i
+                      WHERE i.in_flight = 1
+                        AND EXISTS (SELECT 1 FROM recalled r WHERE r.event_id = i.event_id))",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .context("read in-flight uptake")
+    }
+
     /// Total recall calls that returned something.
     ///
     /// # Errors
@@ -2392,6 +2417,62 @@ impl Store {
         rows.collect::<rusqlite::Result<Vec<_>>>().context("read primer pointers")
     }
 
+    /// The newest captures nothing has summarized yet.
+    ///
+    /// Deliberately not part of [`Self::primer_pointers`]'s ranking, which
+    /// puts kind before recency and is right to: a consolidated summary
+    /// really is worth more than a raw capture, nearly always. The exception
+    /// is the one this answers - a session killed mid-task leaves captures
+    /// that no summary covers, and they lose to every summary ever written.
+    ///
+    /// Worse than merely missing: the newest captures are often ABOUT
+    /// something already summarized. The summary says the subject was
+    /// handled, and the capture saying it is half-finished is the part left
+    /// out - so the next session reads "done" and redoes the rest.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn unconsolidated_pointers(&self, project: &str, limit: usize) -> Result<Vec<Pointer>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                // The same test `inject::worth_injecting` applies, pushed into
+                // the query so the limit counts lines that will survive it.
+                // Taking the newest five rows instead spends the reserve on
+                // whatever ran last - a session_start, a stop - and the
+                // caller drops all five, leaving the seats empty and the
+                // in-flight work still invisible. Which is what shipped
+                // first, and what a real event store showed within minutes.
+                "SELECT id, ts, kind, title, topic, files, hook FROM events
+                 WHERE project = ?1 AND consolidated = 0 AND forgotten = 0
+                       AND kind != 'tombstone' AND hook != 'correct'
+                       AND (topic IS NOT NULL
+                            OR kind != 'observation'
+                            OR files != '[]'
+                            OR hook = 'user_prompt_submit')
+                 ORDER BY id DESC
+                 LIMIT ?2",
+            )
+            .context("prepare unconsolidated pointers")?;
+        let rows = stmt
+            .query_map(params![project, limit as i64], |row| {
+                Ok(Pointer {
+                    id: row.get(0)?,
+                    ts: row.get(1)?,
+                    kind: row.get(2)?,
+                    title: row.get(3)?,
+                    topic: row.get(4)?,
+                    has_files: row
+                        .get::<_, String>(5)
+                        .map(|files| files.len() > 2)
+                        .unwrap_or(false),
+                    hook: row.get(6)?,
+                })
+            })
+            .context("run unconsolidated pointers")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("read unconsolidated pointers")
+    }
+
     /// Pointers for events that touched one file, best first.
     ///
     /// # Errors
@@ -2516,8 +2597,14 @@ impl Store {
     ///
     /// # Errors
     /// Returns an error when the write fails.
-    pub fn record_injected(&self, session: &str, ids: &[String], bytes: usize) -> Result<()> {
-        for id in ids {
+    pub fn record_injected(
+        &self,
+        session: &str,
+        ids: &[String],
+        in_flight: usize,
+        bytes: usize,
+    ) -> Result<()> {
+        for (at, id) in ids.iter().enumerate() {
             self.conn
                 .execute(
                     // Re-arms a row a compaction deactivated: after a reset the
@@ -2525,9 +2612,17 @@ impl Store {
                     // again, and OR IGNORE would leave `active` at 0 - so the
                     // same pointer would then be re-pushed at every
                     // opportunity for the rest of the session.
-                    "INSERT INTO injected (session, event_id) VALUES (?1, ?2)
-                     ON CONFLICT(session, event_id) DO UPDATE SET active = 1",
-                    params![session, id],
+                    // `in_flight` is sticky: a pointer first shown as
+                    // unsummarized work stays counted as that, even if a
+                    // later injection of the same id comes from the ranked
+                    // list once a summary exists. The question the column
+                    // answers is what the agent was handed, not what the
+                    // event became.
+                    "INSERT INTO injected (session, event_id, in_flight) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(session, event_id) DO UPDATE SET
+                         active = 1,
+                         in_flight = MAX(injected.in_flight, ?3)",
+                    params![session, id, i64::from(at < in_flight)],
                 )
                 .context("record injected id")?;
         }
@@ -3173,12 +3268,39 @@ mod tests {
     }
 
     #[test]
+    fn work_in_flight_is_counted_apart_from_what_a_summary_said() {
+        // Two pointers land in one session: one was still-unsummarized work,
+        // one came from the ranked list. The agent pulls only the second.
+        // Overall uptake reads 1 of 2 and says nothing useful; split, it says
+        // the reserve was ignored - which is the number that decides how many
+        // lines the reserve should hold.
+        let store = Store::open_memory().unwrap();
+        store
+            .record_injected("s1", &["01FLIGHT".into(), "01SUMMARY".into()], 1, 40)
+            .unwrap();
+        store.record_recalled("s1", ["01SUMMARY"].into_iter()).unwrap();
+
+        assert_eq!(store.injection_uptake().unwrap(), (2, 1));
+        assert_eq!(
+            store.in_flight_uptake().unwrap(),
+            (1, 0),
+            "the in-flight pointer was not counted apart"
+        );
+
+        // Pulled later, it moves - and re-injecting it from the ranked list
+        // must not quietly reclassify what the agent was originally handed.
+        store.record_recalled("s1", ["01FLIGHT"].into_iter()).unwrap();
+        store.record_injected("s1", &["01FLIGHT".into()], 0, 20).unwrap();
+        assert_eq!(store.in_flight_uptake().unwrap(), (1, 1));
+    }
+
+    #[test]
     fn a_compaction_reset_does_not_erase_the_uptake_history() {
         let store = Store::open_memory().unwrap();
         let session = "sess-1";
 
         // A pointer was pushed, and the agent went on to read it in full.
-        store.record_injected(session, &["01AAA".to_string()], 100).unwrap();
+        store.record_injected(session, &["01AAA".to_string()], 0, 100).unwrap();
         store.record_recalled(session, std::iter::once("01AAA")).unwrap();
         assert_eq!(store.injection_uptake().unwrap(), (1, 1));
 
@@ -3190,7 +3312,7 @@ mod tests {
 
         // Re-injecting the same pointer after the reset re-arms the guard
         // without double-counting the push.
-        store.record_injected(session, &["01AAA".to_string()], 100).unwrap();
+        store.record_injected(session, &["01AAA".to_string()], 0, 100).unwrap();
         assert!(store.already_injected(session, "01AAA").unwrap());
         assert_eq!(store.injection_uptake().unwrap(), (1, 1));
     }

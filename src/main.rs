@@ -516,6 +516,17 @@ fn stats() -> Result<()> {
         println!("  (counting started when this brain was upgraded, not at first capture)");
     } else {
         println!("  {pulled} of {pushed} injected pointer(s) were later read in full");
+        // Split out because the two carry different verdicts. Summaries
+        // nobody pulls means the primer describes the wrong things; work in
+        // flight nobody pulls means the lines reserved for it are the wrong
+        // number - and the reserve cannot be argued about without this.
+        let (flight_pushed, flight_pulled) = store.in_flight_uptake().unwrap_or((0, 0));
+        if flight_pushed > 0 {
+            println!(
+                "    of those, {flight_pulled} of {flight_pushed} were work still \
+                 unsummarized when it was handed over"
+            );
+        }
         println!("  {recalls} recall result(s) handed to agents");
     }
 

@@ -33,6 +33,15 @@ const MICRO_MAX_POINTERS: usize = 3;
 pub struct Injection {
     pub text: String,
     pub ids: Vec<String>,
+    /// How many of the LEADING ids were still-unsummarized work.
+    ///
+    /// A count rather than a set, and correct because the reserve is
+    /// prepended: every in-flight pointer is considered before every ranked
+    /// one, so whichever of them survive the budget are exactly the front of
+    /// `ids`. Recorded so uptake can be read separately for the two - a
+    /// summary nobody pulls and a half-finished task nobody pulls are
+    /// different problems with different answers.
+    pub in_flight: usize,
 }
 
 impl Injection {
@@ -47,7 +56,25 @@ impl Injection {
 /// # Errors
 /// Returns an error when the index cannot be queried.
 pub fn primer(store: &Store, project: &str, session: &str, config: &InjectionConfig) -> Result<Injection> {
-    let pointers = store.primer_pointers(project, 200)?;
+    // Work still in flight comes first, and only a few lines of it. A session
+    // killed mid-task is the one thing the ranking below cannot surface -
+    // kind beats recency there, so every summary ever written outranks the
+    // capture from ten minutes ago that says the job is half done.
+    //
+    // A reserve rather than a re-ranking: raw captures are usually the least
+    // useful thing in the store, and letting them compete on recency would
+    // hand the budget to whatever ran last. Bounded, they cost nothing when
+    // nothing is in flight and answer the one case that matters when
+    // something is.
+    let mut pointers = store.unconsolidated_pointers(project, IN_FLIGHT_POINTERS)?;
+    let in_flight: std::collections::HashSet<String> =
+        pointers.iter().map(|pointer| pointer.id.clone()).collect();
+    pointers.extend(
+        store
+            .primer_pointers(project, 200)?
+            .into_iter()
+            .filter(|pointer| !in_flight.contains(&pointer.id)),
+    );
     if pointers.is_empty() {
         return Ok(Injection::default());
     }
@@ -88,6 +115,7 @@ pub fn primer(store: &Store, project: &str, session: &str, config: &InjectionCon
     let mut text = String::with_capacity(budget);
     text.push_str(header);
     let mut ids = Vec::new();
+    let mut in_flight_shown = 0usize;
 
     for pointer in &pointers {
         if !worth_injecting(pointer) {
@@ -105,6 +133,9 @@ pub fn primer(store: &Store, project: &str, session: &str, config: &InjectionCon
         if text.len() + line.len() > budget {
             break;
         }
+        if in_flight.contains(&pointer.id) {
+            in_flight_shown += 1;
+        }
         text.push_str(&line);
         ids.push(pointer.id.clone());
     }
@@ -112,7 +143,7 @@ pub fn primer(store: &Store, project: &str, session: &str, config: &InjectionCon
     if ids.is_empty() {
         return Ok(Injection::default());
     }
-    Ok(Injection { text, ids })
+    Ok(Injection { text, ids, in_flight: in_flight_shown })
 }
 
 /// Build a file-keyed injection for a file just read or edited.
@@ -184,7 +215,7 @@ pub fn for_file(
     if ids.is_empty() {
         return Ok(Injection::default());
     }
-    Ok(Injection { text, ids })
+    Ok(Injection { text, ids, in_flight: 0 })
 }
 
 /// One pointer line: `id  time  TAG  title`.
@@ -252,6 +283,14 @@ fn worth_injecting(pointer: &Pointer) -> bool {
         || pointer.has_files
         || pointer.hook == "user_prompt_submit"
 }
+
+/// How many lines of still-unsummarized work the primer reserves.
+///
+/// Small on purpose. This is the newest thing in the store, not the most
+/// considered, and the budget it takes comes out of summaries that were
+/// worth writing. Enough to say what was in flight; not enough to describe
+/// it.
+const IN_FLIGHT_POINTERS: usize = 5;
 
 /// Wrap an injection in the JSON a Claude Code hook must print.
 ///
@@ -337,6 +376,59 @@ mod tests {
     }
 
     #[test]
+    fn work_still_in_flight_reaches_the_primer_ahead_of_older_summaries() {
+        // The case the ranking was not built for. A session is killed
+        // mid-task; its captures are in the log but nothing has summarized
+        // them yet. The next session - in any CLI - is the one that needs
+        // them most, and they lose to every summary ever written, because
+        // rank puts kind before recency.
+        //
+        // What makes it worse than merely missing: the newest captures are
+        // often ABOUT something already summarized. The summary says the
+        // subject is handled; the capture that says it is half-finished is
+        // the part left out. The agent then redoes work it cannot see.
+        let project = Uuid::new_v4();
+        let store = Store::open_memory().unwrap();
+
+        // Enough consolidated summaries to fill any budget on their own.
+        for index in 0..60 {
+            let mut event = Event::new(
+                Uuid::nil(),
+                project,
+                Uuid::nil(),
+                Source { cli: "claude-code".into(), hook: "consolidate".into() },
+                EventKind::SessionSummary,
+                format!("Older session {index} summarized long ago, at length"),
+                "body".into(),
+            );
+            event.id = format!("01OLD{index:021}");
+            event.consolidated = true;
+            store.index(&event).unwrap();
+        }
+
+        // And the session that just died, still unconsolidated.
+        let mut inflight = Event::new(
+            Uuid::nil(),
+            project,
+            Uuid::nil(),
+            Source { cli: "claude-code".into(), hook: "user_prompt_submit".into() },
+            EventKind::Observation,
+            "Asked: finish the migration we started on src/store.rs".into(),
+            "body".into(),
+        );
+        inflight.id = "01ZZZZINFLIGHT00000000000".to_string();
+        store.index(&inflight).unwrap();
+
+        let config = InjectionConfig { primer_budget: 1024, session_budget: 8192 };
+        let injection = primer(&store, &project.to_string(), "next", &config).unwrap();
+        assert!(
+            injection.text.contains(&inflight.id),
+            "the work still in flight did not survive the budget:\n{}",
+            injection.text
+        );
+    }
+
+    #[test]
     fn the_primer_respects_its_byte_budget_exactly() {
         let project = Uuid::new_v4();
         let store = store_with(project, 200);
@@ -399,7 +491,7 @@ mod tests {
             for_file(&store, &project.to_string(), session, "src/auth.rs", "", &config).unwrap();
         assert!(!first.is_empty());
         assert!(first.ids.len() <= MICRO_MAX_POINTERS);
-        store.record_injected(session, &first.ids, first.text.len()).unwrap();
+        store.record_injected(session, &first.ids, first.in_flight, first.text.len()).unwrap();
         store.record_injected_file(session, "src/auth.rs").unwrap();
 
         // Same file again in the same session: silence.
@@ -415,7 +507,7 @@ mod tests {
         let config = InjectionConfig::default();
 
         let first = for_file(&store, &project.to_string(), "s1", "src/auth.rs", "", &config).unwrap();
-        store.record_injected("s1", &first.ids, first.text.len()).unwrap();
+        store.record_injected("s1", &first.ids, first.in_flight, first.text.len()).unwrap();
 
         // A different file path that happens to share the same events.
         let again = for_file(&store, &project.to_string(), "s1", "src/auth.rs", "", &config).unwrap();
@@ -453,12 +545,12 @@ mod tests {
 
         let first = primer(&store, &project.to_string(), session, &config).unwrap();
         assert!(!first.is_empty());
-        store.record_injected(session, &first.ids, first.text.len()).unwrap();
+        store.record_injected(session, &first.ids, first.in_flight, first.text.len()).unwrap();
 
         // SessionStart fires again with source="resume": same session id, no
         // context wipe, so nothing resets injected_bytes.
         let second = primer(&store, &project.to_string(), session, &config).unwrap();
-        store.record_injected(session, &second.ids, second.text.len()).unwrap();
+        store.record_injected(session, &second.ids, second.in_flight, second.text.len()).unwrap();
 
         let third = primer(&store, &project.to_string(), session, &config).unwrap();
 
@@ -492,7 +584,7 @@ mod tests {
         let project = Uuid::new_v4();
         let store = store_with(project, 20);
         let config = InjectionConfig { primer_budget: 4096, session_budget: 100 };
-        store.record_injected("s1", &[], 100).unwrap();
+        store.record_injected("s1", &[], 0, 100).unwrap();
         let injection =
             for_file(&store, &project.to_string(), "s1", "src/auth.rs", "", &config).unwrap();
         assert!(injection.is_empty(), "the primer keeps the spend, not layer 3");
@@ -533,7 +625,7 @@ mod tests {
 
     #[test]
     fn hook_output_uses_the_field_claude_code_actually_reads() {
-        let injection = Injection { text: "hello".into(), ids: vec!["01A".into()] };
+        let injection = Injection { text: "hello".into(), ids: vec!["01A".into()], in_flight: 0 };
         let output = as_hook_output("SessionStart", &injection);
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "SessionStart");
