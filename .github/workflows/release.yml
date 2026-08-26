@@ -194,12 +194,18 @@ jobs:
           UP=https://huggingface.co/EmbeddedLLM/bge-reranker-v2-m3-onnx-o3-cpu/resolve/main
           [ -s "$R/tokenizer.json" ] || curl -fsSL -o "$R/tokenizer.json" "$UP/tokenizer.json"
           if [ ! -s "$R/model.onnx" ]; then
-              curl -fsSL -o fp32.onnx "$UP/model.onnx"
-              curl -fsSL -o fp32.onnx.data "$UP/model.onnx.data"
+              # Both files keep their published names in a directory of their
+              # own. The graph names its external data `model.onnx.data`
+              # internally, so renaming the download breaks a reference that
+              # is inside the file: "should be stored in model.onnx.data, but
+              # it is not regular file".
+              mkdir -p fp32
+              curl -fsSL -o fp32/model.onnx "$UP/model.onnx"
+              curl -fsSL -o fp32/model.onnx.data "$UP/model.onnx.data"
               python3 -m pip install --quiet --break-system-packages onnx onnxruntime sympy \
                   || python3 -m pip install --quiet onnx onnxruntime sympy
-              python3 "$R/quantize.py" fp32.onnx "$R/model.onnx"
-              rm -f fp32.onnx fp32.onnx.data
+              python3 "$R/quantize.py" fp32/model.onnx "$R/model.onnx"
+              rm -rf fp32
           fi
           ls -l "$R"
 

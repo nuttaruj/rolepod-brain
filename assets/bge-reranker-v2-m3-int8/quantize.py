@@ -19,6 +19,11 @@ graph succeeds and produces a model that will not load: `DequantizeLinear`
 rejects a float16 scale, and the failure arrives at load time rather than at
 quantisation time.
 
+**Keep the published file names.** The graph names its external data
+`model.onnx.data` from inside itself, so a download renamed to anything else
+fails at load with "should be stored in model.onnx.data, but it is not regular
+file". Put the pair in a directory of its own rather than renaming either.
+
 **Declare the default tensor type.** The published graph has been through
 onnxruntime's o3 fusion, so shape inference cannot type every intermediate and
 gives up on the first MatMul output. `DefaultTensorType` tells it what it could

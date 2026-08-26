@@ -104,7 +104,14 @@ from_source() {
     trap 'rm -rf "$work"' EXIT INT TERM
     git clone --depth 1 "https://github.com/$REPO.git" "$work/src" >/dev/null 2>&1 \
         || die "could not clone https://github.com/$REPO"
-    ( cd "$work/src" && cargo build --release --quiet ) || die "build failed"
+    # Try with the local reranker, fall back without it. Whether `ort` can
+    # link here depends on this machine's toolchain, not on the project: the
+    # published Linux binaries go without because they are built on a 2022
+    # runner for a 2022 glibc, but a machine building for itself has whatever
+    # it has, and if that is new enough it should get the faster path.
+    ( cd "$work/src" && cargo build --release --quiet --features local-rerank ) \
+        || ( cd "$work/src" && cargo build --release --quiet ) \
+        || die "build failed"
     install_binary "$work/src/target/release/brain"
 }
 
