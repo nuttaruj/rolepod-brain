@@ -65,6 +65,55 @@ fn writes_without_spaces(text: &str) -> bool {
 /// question a person types; a pasted stack trace stops being a query here.
 const ENTITY_TOKENS_MAX: usize = 8;
 
+/// What each stream's opinion is worth, in the order `search` fuses them:
+/// keyword, semantic, entity, substring, graph.
+///
+/// Not equal, because they do not answer the same question. Keyword,
+/// semantic and substring rank EVENTS against the query. Entity and graph
+/// rank SESSIONS - entities are recorded per session, so both nominate every
+/// event of any session that touched a matching name, and a session that
+/// touched a thousand names is nominated by nearly every query.
+///
+/// Equal weight let that arithmetic win. RRF pays 1/(K+rank), so at K=60 an
+/// entry sitting tenth in three lists (3 x 1/70 = 0.043) beats one sitting
+/// FIRST in a single list (1/61 = 0.016) - and the streams that agree most
+/// readily are the two that nominate whole sessions. Measured on a 22k-event
+/// brain: entries a reranker judged correct sat at a median rank of 4 in
+/// their best stream and rank 10 after fusion; 20 of 28 were pushed DOWN by
+/// being fused. One entry took #1 for 6 of 17 queries.
+///
+/// At half weight, those two streams still widen recall - fewer correct
+/// entries fall out of the pool than before, not more - without deciding the
+/// order. The same 17 queries then returned 17 different first results, and
+/// the worst repeat was 1.
+const STREAM_WEIGHTS: [f32; 5] = [1.0, 1.0, 0.5, 1.0, 0.5];
+
+/// Length past which an entry starts paying for being long, in bytes of
+/// title plus body. The corpus median, measured: 212 on a 22k-event brain.
+const LENGTH_PIVOT: f32 = 200.0;
+
+/// How steeply an over-long entry is discounted.
+///
+/// A long entry is not a worse answer for being long - it is a worse answer
+/// because of what length does to every stream that ranks it. An embedding
+/// of a thousand words is the centroid of everything it covers, which sits
+/// near any query and answers none of them; BM25 sees more terms and scores
+/// more matches. Both effects reward breadth over aboutness.
+///
+/// Measured on the same brain: entries a reranker judged correct had a
+/// median length of 82 bytes, while the entries occupying the top five that
+/// it did NOT pick ran to 815. The distilled `knowledge` note that answers
+/// the question was losing to the session summary that mentions it in
+/// passing.
+///
+/// `score / (1 + 0.6 * ln(len / 200))`, floored so nothing shorter than the
+/// pivot is touched. Logarithmic because the difference between 200 and 2000
+/// bytes matters and the difference between 20k and 22k does not. Mean rank
+/// of a reranker's picks fell from 11.67 to 7.40 with no entry lost from the
+/// pool; 0.3 and 1.0 both land near 7.9, so the exact value is not load
+/// bearing.
+const LENGTH_PENALTY: f32 = 0.6;
+
 /// Events that represent one session in the entity stream. Two: the most
 /// canonical page and one runner-up. The stream nominates sessions, not
 /// events, and a busy session must not fill the pool through it.
@@ -151,6 +200,16 @@ pub struct Hit {
 /// The derived index.
 pub struct Store {
     conn: Connection,
+}
+
+/// How an entry reached a session: offered by a search, or opened on purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// A search or listing returned it. Says nothing about whether it helped.
+    Offered,
+    /// The agent asked for its full body, having seen the title. The closest
+    /// thing to a relevance judgement this project can observe.
+    Opened,
 }
 
 impl Store {
@@ -391,6 +450,9 @@ impl Store {
                 CREATE TABLE IF NOT EXISTS recalled (
                     session  TEXT NOT NULL,
                     event_id TEXT NOT NULL,
+                    -- 0: a search offered it. 1: the agent asked to read it
+                    -- in full. See Store::record_recalled.
+                    opened   INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (session, event_id)
                 );
 
@@ -490,6 +552,7 @@ impl Store {
                 ("session_state", "claimed_at", "TEXT"),
                 ("injected", "active", "INTEGER NOT NULL DEFAULT 1"),
                 ("injected", "in_flight", "INTEGER NOT NULL DEFAULT 0"),
+                ("recalled", "opened", "INTEGER NOT NULL DEFAULT 0"),
             ]
         {
             if self.has_column(table, column)? {
@@ -756,10 +819,11 @@ impl Store {
         const K: f32 = 60.0;
 
         let mut score: std::collections::HashMap<&str, f32> = std::collections::HashMap::new();
-        for list in lists {
+        for (index, list) in lists.iter().enumerate() {
+            let weight = STREAM_WEIGHTS.get(index).copied().unwrap_or(1.0);
             for (rank, hit) in list.iter().enumerate() {
                 #[allow(clippy::cast_precision_loss)]
-                let contribution = 1.0 / (K + rank as f32 + 1.0);
+                let contribution = weight / (K + rank as f32 + 1.0);
                 *score.entry(hit.id.as_str()).or_default() += contribution;
             }
         }
@@ -770,6 +834,14 @@ impl Store {
         // "flagging has to change what the user SEES" - so the flag is carried
         // across the fusion rather than re-derived from a position it no longer
         // occupies.
+        for (id, length) in self.lengths_of(score.keys().copied())? {
+            if let Some(value) = score.get_mut(id.as_str()) {
+                #[allow(clippy::cast_precision_loss)]
+                let over = (length as f32 / LENGTH_PIVOT).ln().max(0.0);
+                *value /= 1.0 + LENGTH_PENALTY * over;
+            }
+        }
+
         let demoted = self.demoted_among(score.keys().copied())?;
         let mut ranked: Vec<(&str, f32)> = score.into_iter().collect();
         ranked.sort_by(|a, b| {
@@ -798,6 +870,29 @@ impl Store {
     }
 
     /// Which of these ids a human has flagged stale.
+    /// Title-plus-body byte length of each id, in one statement.
+    fn lengths_of<'a>(
+        &self,
+        ids: impl Iterator<Item = &'a str>,
+    ) -> Result<Vec<(String, i64)>> {
+        let ids: Vec<String> = ids.map(str::to_string).collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let holes = (0..ids.len()).map(|i| format!("?{}", i + 1)).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, length(COALESCE(title, '')) + length(COALESCE(body, '')) \
+             FROM events WHERE id IN ({holes})"
+        );
+        let mut stmt = self.conn.prepare(&sql).context("prepare lengths")?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .context("run lengths")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("read lengths")
+    }
+
     fn demoted_among<'a>(
         &self,
         ids: impl Iterator<Item = &'a str>,
@@ -1722,23 +1817,79 @@ impl Store {
         session: &str,
         ids: impl Iterator<Item = &'a str>,
     ) -> Result<()> {
+        self.record_recall(session, ids, Reach::Offered)
+    }
+
+    /// The same, for ids the agent asked to read in full.
+    ///
+    /// # Errors
+    /// Returns an error when the write fails.
+    pub fn record_opened<'a>(
+        &self,
+        session: &str,
+        ids: impl Iterator<Item = &'a str>,
+    ) -> Result<()> {
+        self.record_recall(session, ids, Reach::Opened)
+    }
+
+    /// Write one recall, remembering whether it was merely offered by a
+    /// search or actually opened.
+    ///
+    /// The distinction is the only honest relevance signal this project can
+    /// collect. A search returns thirty entries and says nothing about which
+    /// of them answered anything; an agent calling `brain_get` on one of
+    /// them has judged it worth the tokens. Ranking work so far has had to
+    /// score itself against a model's opinion of a list of titles, which is
+    /// a proxy that shares the ranking's own blind spots. This is the
+    /// beginning of a record that does not.
+    ///
+    /// `opened` only ever goes up: a search that offers an entry already
+    /// opened must not erase that it was opened.
+    fn record_recall<'a>(
+        &self,
+        session: &str,
+        ids: impl Iterator<Item = &'a str>,
+        how: Reach,
+    ) -> Result<()> {
         for id in ids {
-            let inserted = self
+            let seen: Option<i64> = self
                 .conn
-                .execute(
-                    "INSERT OR IGNORE INTO recalled (session, event_id) VALUES (?1, ?2)",
+                .query_row(
+                    "SELECT opened FROM recalled WHERE session = ?1 AND event_id = ?2",
                     params![session, id],
+                    |row| row.get(0),
                 )
-                .context("record recalled id")?;
-            // Count a session's first read only. Re-reading the same entry in
-            // one conversation says nothing extra about its worth.
-            if inserted > 0 {
-                self.conn
-                    .execute(
-                        "UPDATE events SET read_count = read_count + 1 WHERE id = ?1",
-                        params![id],
-                    )
-                    .context("count read")?;
+                .optional()
+                .context("read recalled row")?;
+            match seen {
+                None => {
+                    self.conn
+                        .execute(
+                            "INSERT INTO recalled (session, event_id, opened) VALUES (?1, ?2, ?3)",
+                            params![session, id, i64::from(how == Reach::Opened)],
+                        )
+                        .context("record recalled id")?;
+                    // Count a session's first read only. Re-reading the same
+                    // entry in one conversation says nothing extra about its
+                    // worth.
+                    self.conn
+                        .execute(
+                            "UPDATE events SET read_count = read_count + 1 WHERE id = ?1",
+                            params![id],
+                        )
+                        .context("count read")?;
+                }
+                Some(0) if how == Reach::Opened => {
+                    // Offered earlier in this session, opened now. The upgrade
+                    // is the signal; the read was already counted.
+                    self.conn
+                        .execute(
+                            "UPDATE recalled SET opened = 1 WHERE session = ?1 AND event_id = ?2",
+                            params![session, id],
+                        )
+                        .context("mark opened")?;
+                }
+                Some(_) => {}
             }
         }
         Ok(())
@@ -2056,6 +2207,32 @@ impl Store {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .context("read injection uptake")
+    }
+
+    /// Of the entries recall has offered, how many were opened.
+    ///
+    /// Returns `(offered, opened)`. This is the project's only unproxied
+    /// relevance signal: a search returns thirty entries and asserts nothing
+    /// about which of them answered anything, while an agent that asks for a
+    /// body has decided, for its own reasons, that a title was worth the
+    /// tokens. Ranking changes have so far been scored against a model's
+    /// opinion of a list of titles - a proxy that shares the ranking's blind
+    /// spots. Given enough sessions, this does not.
+    ///
+    /// Counting begins when a brain is upgraded, not at first capture:
+    /// everything recalled before then reads as offered-and-never-opened,
+    /// because that is all the old rows can say.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn recall_precision(&self) -> Result<(i64, i64)> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(opened), 0) FROM recalled",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .context("read recall precision")
     }
 
     /// The same measurement, for still-unsummarized work alone.
@@ -3238,6 +3415,154 @@ mod tests {
     /// own session is already in the results; returning the rest of it is not
     /// a second opinion, it is the same opinion counted again - and a long
     /// session gets to count it more times than anyone else.
+    /// What a search offered, and what an agent actually opened.
+    ///
+    /// Every ranking change in this project has had to score itself against
+    /// a model's opinion of a list of titles - a proxy that shares the
+    /// ranking's own blind spots. An agent calling `brain_get` on an entry it
+    /// saw only the title of is a judgement made for its own reasons. This
+    /// records the difference so that, given enough sessions, the next
+    /// ranking change can be measured against something real.
+    #[test]
+    fn opening_an_entry_is_recorded_apart_from_merely_being_offered() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let session = Uuid::new_v4().to_string();
+        let offered = event_in_session("Offered only", "", project, Uuid::new_v4());
+        let opened = event_in_session("Opened on purpose", "", project, Uuid::new_v4());
+        store.index(&offered).unwrap();
+        store.index(&opened).unwrap();
+
+        // A search offers both.
+        store
+            .record_recalled(&session, [offered.id.as_str(), opened.id.as_str()].into_iter())
+            .unwrap();
+        // The agent reads one of them in full.
+        store.record_opened(&session, [opened.id.as_str()].into_iter()).unwrap();
+
+        let flag = |id: &str| -> i64 {
+            store
+                .conn
+                .query_row(
+                    "SELECT opened FROM recalled WHERE session = ?1 AND event_id = ?2",
+                    params![&session, id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(flag(&offered.id), 0, "an entry only listed was marked as opened");
+        assert_eq!(flag(&opened.id), 1, "opening after an offer was not recorded");
+
+        // The offer must not erase it afterwards.
+        store
+            .record_recalled(&session, [opened.id.as_str()].into_iter())
+            .unwrap();
+        assert_eq!(flag(&opened.id), 1, "a later search offer erased that it was opened");
+
+        // And a read is still counted once per session, not once per call.
+        let reads: i64 = store
+            .conn
+            .query_row("SELECT read_count FROM events WHERE id = ?1", params![&opened.id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(reads, 1, "the same entry was counted as read more than once");
+    }
+
+    /// A distilled note beats the long summary that merely mentions it.
+    ///
+    /// Length is not a fault in itself, but it flatters every stream that
+    /// ranks: an embedding of a long entry sits near any query because it is
+    /// the centroid of everything it covers, and BM25 finds more terms to
+    /// match. Measured on a real brain, the entries a reranker judged
+    /// correct had a median length of 82 bytes and the top-five entries it
+    /// rejected ran to 815 - the answer was losing to the retrospective that
+    /// mentions it in passing.
+    #[test]
+    fn a_short_answer_outranks_the_long_entry_that_only_mentions_it() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let session = Uuid::new_v4();
+
+        // The answer: distilled, one subject, the word used once.
+        store
+            .index(&event_in_session("Notes on the month", "vermilion expiry is off by one", project, session))
+            .unwrap();
+        // A retrospective that covers eighty subjects and happens to say the
+        // word more often than the answer does - so every stream that counts
+        // terms or averages meaning prefers it.
+        let sprawl = (0..80)
+            .map(|n| {
+                if n % 10 == 0 { format!("vermilion came up in topic {n}") } else { format!("unrelated topic {n} we also covered") }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        store.index(&event_in_session("Notes on the month", &sprawl, project, session)).unwrap();
+
+        let hits = store.search(&project.to_string(), "vermilion", None, 10, Recall::Fused).unwrap();
+        // Same title on both, so only length can separate them.
+        assert_eq!(
+            hits.first().map(|hit| hit.snippet.contains("off by one")),
+            Some(true),
+            "the sprawling entry outranked the answer: {:?}",
+            hits.iter().map(|h| h.snippet.as_str()).collect::<Vec<_>>()
+        );
+        assert_eq!(hits.len(), 2, "the long entry must still be found, only ranked lower");
+    }
+
+    /// A first-place opinion outranks two vague agreements.
+    ///
+    /// RRF pays 1/(K+rank), so three lists nodding at rank ten used to beat
+    /// one list certain at rank one. The two lists that nod most easily are
+    /// entity and graph, and both nominate whole SESSIONS: a session that
+    /// touched many names is nominated by nearly every query, and its events
+    /// then arrive with two votes each while the entry that actually answers
+    /// arrives with one.
+    #[test]
+    fn a_single_confident_stream_outranks_two_that_merely_agree() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let answer_session = Uuid::new_v4();
+        let busy = Uuid::new_v4();
+
+        // The entry the words point at, alone in its session.
+        store
+            .index(&event_in_session("Vermilion expiry check", "the answer", project, answer_session))
+            .unwrap();
+        // A session that touched the same file over and over, about
+        // something else entirely.
+        for n in 0..6 {
+            store
+                .index(&event_in_session(
+                    &format!("Unrelated chore {n}"),
+                    "another thing that touched the same file",
+                    project,
+                    busy,
+                ))
+                .unwrap();
+        }
+        for session in [answer_session, busy] {
+            store
+                .record_entities(&session.to_string(), &project.to_string(), &["src/gate.rs".to_string()])
+                .unwrap();
+        }
+
+        let hits = store.search(&project.to_string(), "vermilion", None, 10, Recall::Fused).unwrap();
+        assert_eq!(
+            hits.first().map(|hit| hit.title.as_str()),
+            Some("Vermilion expiry check"),
+            "the session-nominating streams outvoted the entry the query names: {:?}",
+            hits.iter().map(|h| h.title.as_str()).collect::<Vec<_>>()
+        );
+        // Still widening recall, not silenced: the busy session is present,
+        // it just does not lead.
+        assert!(
+            hits.iter().any(|hit| hit.title.starts_with("Unrelated chore")),
+            "halving a stream's weight must not remove what it finds: {:?}",
+            hits.iter().map(|h| h.title.as_str()).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn a_seeds_own_session_does_not_crowd_out_real_neighbours() {
         let store = Store::open_memory().unwrap();

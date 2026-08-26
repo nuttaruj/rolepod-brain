@@ -515,7 +515,18 @@ fn stats() -> Result<()> {
         println!("  uptake not measurable yet: no recall has been recorded");
         println!("  (counting started when this brain was upgraded, not at first capture)");
     } else {
-        println!("  {pulled} of {pushed} injected pointer(s) were later read in full");
+        // "recalled", not "read": until 0.28.5 this counted any way an id
+        // came back - a search hit counted the same as a body actually
+        // fetched - and the line claimed the stronger of the two. The
+        // opened-in-full number below is the one that means what it says.
+        println!("  {pulled} of {pushed} injected pointer(s) came back through recall");
+        // What search offered against what an agent chose to open. The only
+        // relevance signal here that no model supplied.
+        if let Ok((offered, opened)) = store.recall_precision() {
+            if offered > 0 {
+                println!("  {opened} of {offered} recalled entr(ies) were opened in full");
+            }
+        }
         // Split out because the two carry different verdicts. Summaries
         // nobody pulls means the primer describes the wrong things; work in
         // flight nobody pulls means the lines reserved for it are the wrong

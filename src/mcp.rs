@@ -405,7 +405,10 @@ fn call_tool(paths: &Paths, project: &str, session: &str, params: &Value) -> Res
             // forgotten events pending forever.
             let mut events = store.get(&ids)?;
             events.retain(|event| store.event_exists(&event.id).unwrap_or(false));
-            store.record_recalled(session, events.iter().map(|event| event.id.as_str()))?;
+            // Not `record_recalled`: asking for a body, having seen only the
+            // title, is the one moment an agent says an entry was worth the
+            // tokens. Everything else in this file merely offered it.
+            store.record_opened(session, events.iter().map(|event| event.id.as_str()))?;
             json!({ "events": events, "count": events.len() })
         }
         "brain_related" => {

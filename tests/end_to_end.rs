@@ -580,6 +580,68 @@ fn reranking_reorders_a_search_and_a_failed_one_changes_nothing() {
     );
 }
 
+/// What a search offered, against what an agent chose to open.
+///
+/// Every ranking change in this project has been scored against a model's
+/// opinion of a list of titles, which is a proxy that shares the ranking's
+/// own blind spots. An agent calling `brain_get` on an entry it has seen
+/// only the title of is a judgement made for its own reasons. Recording the
+/// two apart is what makes the next ranking change measurable against
+/// something real, once enough sessions have passed.
+#[test]
+fn what_an_agent_opens_is_recorded_apart_from_what_it_was_offered() {
+    let fixture = Fixture::new("opened");
+    for name in ["auth.rs", "auth/login.rs", "auth/token.rs"] {
+        let payload = serde_json::json!({
+            "session_id": "0199a1f2-3c4d-7e8f-9012-3456789abcde",
+            "cwd": fixture.project,
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": fixture.project.join(format!("src/{name}")),
+                "new_string": "fn check() {}"
+            },
+            "tool_response": {"success": true}
+        })
+        .to_string();
+        fixture.hook("claude-code", "PostToolUse", &payload);
+    }
+
+    let search = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"brain_search","arguments":{"query":"auth"}}}"#;
+    let responses = fixture.mcp(&[search]);
+    let text = responses.last().expect("a response")["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content")
+        .to_string();
+    let parsed: serde_json::Value = serde_json::from_str(&text).expect("hits JSON");
+    let ids: Vec<String> = parsed["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["id"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(ids.len() >= 2, "need several hits: {ids:?}");
+
+    let count = |opened: i64| -> i64 {
+        let out = Command::new("sqlite3")
+            .arg(fixture.home.join("brain.db"))
+            .arg(format!("SELECT COUNT(*) FROM recalled WHERE opened = {opened};"))
+            .output()
+            .expect("query recalled");
+        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(-1)
+    };
+    assert!(count(1) == 0, "a search alone marked something as opened");
+    let offered_before = count(0);
+    assert!(offered_before > 0, "the search recorded nothing");
+
+    // Now read one of them in full, in the same session.
+    let get = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"brain_get","arguments":{{"ids":["{}"]}}}}}}"#,
+        ids[0]
+    );
+    fixture.mcp(&[&get]);
+    assert_eq!(count(1), 1, "reading a body in full was not recorded as opened");
+}
+
 /// Reranking is the caller's call, one question at a time.
 ///
 /// A config flag says what someone preferred once; an argument says this
