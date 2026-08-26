@@ -447,6 +447,38 @@ fn consolidate_session(
     Ok(tier)
 }
 
+/// How close two durable claims must be before the second is the first again.
+///
+/// Chosen against the real store rather than picked: 124 knowledge entries
+/// there hold 4 pairs above 0.98 and 9 above 0.95 - rewordings of one fact,
+/// the closest of them differing by a hyphen - while the 0.92 band already
+/// contains genuinely different claims ("cash-only fully-paid bookings" and
+/// "cash-only same-tier bookings"). The conservative side is the correct one:
+/// a duplicate wastes one of the primer's knowledge slots, a false merge
+/// loses a memory nothing will bring back.
+const KNOWLEDGE_SAME_FACT: f32 = 0.95;
+
+/// Has this claim already been learned, however it was worded?
+///
+/// Exact titles first, because that is free. Then meaning, because exact
+/// titles catch almost nothing: on the real store the two closest entries
+/// were identical apart from a hyphen, and `normalize_entity` kept both.
+/// Comparing what they mean also makes the language they are written in stop
+/// mattering, which is otherwise a second way to store one fact twice.
+///
+/// Without a model this falls back to exact titles alone - a duplicate then,
+/// not a lost claim.
+fn already_learned(known: &[(String, crate::embed::Vector)], title: &str) -> bool {
+    let normalized = normalize_entity(title);
+    if known.iter().any(|(seen, _)| *seen == normalized) {
+        return true;
+    }
+    let Ok(candidate) = crate::embed::encode(title) else { return false };
+    known.iter().any(|(_, vector)| {
+        !vector.is_empty() && crate::embed::similarity(&candidate, vector) >= KNOWLEDGE_SAME_FACT
+    })
+}
+
 /// Split events into prompt-sized groups.
 fn chunk(events: &[Event]) -> Vec<Vec<Event>> {
     // Measure the fixed part instead of reserving a guessed number for it. A
@@ -1693,10 +1725,15 @@ fn synthesize_knowledge(
     let Some(entries) = parse_knowledge(&answer) else { return Ok(Vec::new()) };
 
     // What is already known does not need learning twice.
-    let known: Vec<String> = store
+    // Encoded here rather than read out of the index: a claim learned in the
+    // same run has no stored vector yet, and the run that would have written
+    // one is this one.
+    let known: Vec<(String, crate::embed::Vector)> = store
         .knowledge_titles(&project)?
         .iter()
-        .map(|title| normalize_entity(title))
+        .map(|title| {
+            (normalize_entity(title), crate::embed::encode(title).unwrap_or_default())
+        })
         .collect();
 
     let log = EventLog::open(project_dir)?;
@@ -1708,7 +1745,7 @@ fn synthesize_knowledge(
         let Some(kind) = normalize_knowledge_kind(&entry.kind) else { continue };
         let title = sanitizer.scrub(entry.title.trim());
         let body = sanitizer.scrub_body(entry.body.trim());
-        if title.is_empty() || body.is_empty() || known.contains(&normalize_entity(&title)) {
+        if title.is_empty() || body.is_empty() || already_learned(&known, &title) {
             continue;
         }
 
@@ -2053,6 +2090,36 @@ mod tests {
         assert!(parse_answer(r#"{"titles":[]}"#).is_none());
         assert!(parse_answer("I could not do that.").is_none());
         assert!(parse_answer("").is_none());
+    }
+
+    #[test]
+    fn one_fact_worded_twice_is_learned_once() {
+        // Exact titles caught almost nothing. On the real store the two
+        // closest knowledge entries were identical apart from a hyphen and
+        // both were kept - and knowledge now has a fixed share of the primer,
+        // so a duplicate does not merely sit there, it takes a slot from
+        // something else.
+        crate::embed::tests::use_checkout_model();
+        let known = vec![(
+            normalize_entity("Use gatedDb harness for deterministic race condition testing"),
+            crate::embed::encode("Use gatedDb harness for deterministic race condition testing")
+                .unwrap(),
+        )];
+
+        assert!(
+            already_learned(&known, "Use gatedDb harness for deterministic race-condition testing"),
+            "a hyphen was enough to store the same fact twice"
+        );
+        assert!(
+            already_learned(&known, "Use gatedDb harness for deterministic race condition testing"),
+            "the identical title was not recognised"
+        );
+        // And the same claim in another language, which is the way this
+        // breaks that no amount of string comparison would ever catch.
+        assert!(
+            !already_learned(&known, "Coach substitution is limited to cash-only bookings"),
+            "a different claim was swallowed as a duplicate"
+        );
     }
 
     #[test]

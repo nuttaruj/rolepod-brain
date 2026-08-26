@@ -2385,6 +2385,34 @@ impl Store {
     /// # Errors
     /// Returns an error when the query fails.
     pub fn primer_pointers(&self, project: &str, limit: usize) -> Result<Vec<Pointer>> {
+        self.ranked_pointers(project, None, limit)
+    }
+
+    /// The same ranking, restricted to one kind.
+    ///
+    /// What makes a quota possible. Ranked together, knowledge takes every
+    /// line the primer has as soon as there is enough of it - measured at 124
+    /// entries: 21 knowledge, 5 in flight, no session summaries at all. It
+    /// outranks a summary by kind and it never stops accumulating, so the
+    /// question is not whether it crowds everything else out but when.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn pointers_of_kind(
+        &self,
+        project: &str,
+        kind: &str,
+        limit: usize,
+    ) -> Result<Vec<Pointer>> {
+        self.ranked_pointers(project, Some(kind), limit)
+    }
+
+    fn ranked_pointers(
+        &self,
+        project: &str,
+        kind: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Pointer>> {
         let sql = format!(
             // The same floor every other read enforces. Injection is recall
             // too - and the costlier half, because it spends bytes in every
@@ -2393,13 +2421,14 @@ impl Store {
             "SELECT id, ts, kind, title, topic, files, hook FROM events
              WHERE project = ?1 AND forgotten = 0 AND kind != 'tombstone'
                    AND hook != 'correct'
+                   AND (?3 IS NULL OR kind = ?3)
              ORDER BY {}, id DESC
              LIMIT ?2",
             Self::rank("")
         );
         let mut stmt = self.conn.prepare(&sql).context("prepare primer pointers")?;
         let rows = stmt
-            .query_map(params![project, limit as i64], |row| {
+            .query_map(params![project, limit as i64, kind], |row| {
                 Ok(Pointer {
                     id: row.get(0)?,
                     ts: row.get(1)?,
@@ -2449,7 +2478,8 @@ impl Store {
                        AND (topic IS NOT NULL
                             OR kind != 'observation'
                             OR files != '[]'
-                            OR hook = 'user_prompt_submit')
+                            OR hook = 'user_prompt_submit'
+                            OR (hook = 'stop' AND title != 'Turn finished'))
                  ORDER BY id DESC
                  LIMIT ?2",
             )

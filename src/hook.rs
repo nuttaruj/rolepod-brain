@@ -125,8 +125,38 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
             .unwrap_or("unknown-session"),
     );
 
+    // The one thing a lifecycle hook cannot see and the next session most
+    // needs: what the model actually answered. Without it a handoff carries
+    // the question and the file that changed, and the answer already given is
+    // the part that goes missing - so the next session asks it again.
+    //
+    // Only the last answer, only at `stop`, bounded and sanitized. The rest of
+    // the transcript stays unread and unstored, as it always has: the user's
+    // turns are captured verbatim already, and the history is what
+    // consolidation reads when it needs it.
+    let answer = (hook == "stop")
+        .then(|| {
+            first_string(&payload, &["transcript_path", "transcriptPath"])
+                .filter(|path| is_transcript_of(agent.as_str(), path))
+                .and_then(|path| {
+                    crate::transcript::last_answer(
+                        std::path::Path::new(path),
+                        agent.as_str(),
+                        &sanitizer,
+                    )
+                })
+        })
+        .flatten();
+
     let title = truncate(&sanitizer.scrub(&title_for(&hook, &payload)), TITLE_MAX_BYTES);
-    let body = sanitizer.scrub_body(&body_for(&payload));
+    let mut body = sanitizer.scrub_body(&body_for(&payload));
+    let mut title = title;
+    if let Some(answer) = answer {
+        // The title carries the answer's opening so the pointer line itself
+        // says something; the body carries the rest for whoever pulls it.
+        title = truncate(&first_line(&answer), TITLE_MAX_BYTES);
+        body = answer;
+    }
 
     // Classified once per session and remembered: working it out costs a
     // process spawn, and the hook budget does not allow one per event.

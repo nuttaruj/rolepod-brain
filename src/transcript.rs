@@ -6,9 +6,15 @@
 //!
 //! The transcript already exists on disk, written by the host CLI for its own
 //! purposes. So we read it when we consolidate, feed it to the summarizer
-//! beside the captured events, and **persist only the summary**. Nothing here
-//! is ever copied into our storage: the log records that a transcript was read
-//! and how much, never a line of it.
+//! beside the captured events, and persist only the summary.
+//!
+//! One exception, added deliberately: [`last_answer`] keeps the model's most
+//! recent reply, bounded at [`ANSWER_MAX_BYTES`] and scrubbed. A session that
+//! ends mid-task leaves its tool calls and the user's questions in the log,
+//! and what is missing is what the model already said - which is what makes
+//! the next session ask the same question again. Nothing else here is stored:
+//! not the user's turns, which capture already has verbatim, and not the
+//! history, which consolidation reads when it needs it.
 //!
 //! Everything read is sanitized before it reaches the summarizer, because a
 //! transcript contains whatever the user typed — including the secrets our
@@ -24,6 +30,82 @@ use crate::sanitize::Sanitizer;
 /// the prompt budget is a fraction of that. We take the tail, because the tail
 /// is what has not been consolidated yet.
 pub const SPAN_MAX_BYTES: usize = 12 * 1024;
+
+/// How much of a transcript's end to read when looking for the last answer.
+///
+/// One turn's worth, generously: an assistant message is a few KB and the
+/// tool-call lines around it a few more. A turn whose answer does not fit is
+/// one this declines to store rather than one it reads a whole file for -
+/// the hook it runs in is measured in milliseconds.
+const TAIL_BYTES: u64 = 256 * 1024;
+
+/// Read the last `bytes` of a file as UTF-8, dropping the line the window cut.
+///
+/// Only when it cut one. A file shorter than the window was read whole and
+/// its first line is a whole line - dropping it there loses the only content
+/// a short transcript has, which is what a test caught.
+fn read_tail(path: &Path, bytes: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let from = len.saturating_sub(bytes);
+    file.seek(SeekFrom::Start(from)).ok()?;
+    let mut raw = Vec::with_capacity(usize::try_from(len - from).unwrap_or(0));
+    file.read_to_end(&mut raw).ok()?;
+    // A window into the middle of a file lands mid-character as easily as
+    // mid-line; both are the same repair.
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    if from == 0 {
+        return Some(text);
+    }
+    text.find('\n').map(|at| text[at + 1..].to_string())
+}
+
+/// Most of the model's last answer to keep as a memory.
+///
+/// Small on purpose, and a different budget from [`SPAN_MAX_BYTES`]: that one
+/// feeds a summarizer once and is thrown away, this one is stored and spends
+/// primer bytes in every session that follows. Enough to recognise an answer
+/// already given; not enough to re-read the conversation.
+pub const ANSWER_MAX_BYTES: usize = 600;
+
+/// The model's most recent answer, sanitized and bounded.
+///
+/// The one part of a transcript worth keeping rather than reading once. A
+/// session that ends mid-task leaves its tool calls and the user's questions
+/// in the log, and the thing that is missing is what the model already said -
+/// which is exactly what makes the next session ask again.
+///
+/// Everything else in the transcript stays unread and unstored: not the
+/// user's turns, which capture already has verbatim, and not the history,
+/// which consolidation reads when it needs it.
+///
+/// Returns `None` when there is no transcript, no assistant prose in it, or
+/// nothing left after sanitizing.
+#[must_use]
+pub fn last_answer(path: &Path, cli: &str, sanitizer: &Sanitizer) -> Option<String> {
+    // The tail, not the file. `stop` fires once a turn and is a path someone
+    // waits on, and a transcript grows all session: this one reached 43 MB in
+    // a day, and reading it whole to find its last line cost 80ms where the
+    // rest of the hook costs 10. The tail is a fixed read no matter how long
+    // the session runs.
+    let raw = read_tail(path, TAIL_BYTES)?;
+    let mut lines: Vec<Line> = Vec::new();
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        match cli {
+            "codex" => extract_codex(&value, &mut lines),
+            _ => extract_claude(&value, &mut lines),
+        }
+    }
+    let answer = lines.iter().rev().find(|line| line.speaker == "assistant")?;
+    let text = sanitizer.scrub(answer.text.trim());
+    let text = crate::sanitize::truncate(text.trim(), ANSWER_MAX_BYTES);
+    (!text.is_empty()).then_some(text)
+}
 
 /// One line of extracted prose.
 struct Line {
@@ -251,6 +333,62 @@ mod tests {
         assert!(!span.contains("ghp_abcdefghijklmnopqrstuvwxyz0123"));
         assert!(!span.contains("Acme Holdings"));
         assert!(span.contains("[REDACTED]") && span.contains("[PRIVATE]"));
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn the_last_answer_is_the_models_own_and_nothing_else() {
+        let sanitizer = Sanitizer::builtin();
+        let path = write(
+            "turns.jsonl",
+            concat!(
+                r#"{"type":"user","message":{"content":[{"type":"text","text":"why is it slow"}]}}"#, "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"An older answer."}]}}"#, "\n",
+                r#"{"type":"user","message":{"content":[{"type":"text","text":"and the index?"}]}}"#, "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"The index is unused: the query filters on a column it does not cover."}]}}"#, "\n",
+            ),
+        );
+        let answer = last_answer(&path, "claude-code", &sanitizer).expect("an answer");
+        assert!(answer.contains("index is unused"), "took the wrong turn: {answer}");
+        assert!(!answer.contains("An older answer"), "took more than the last: {answer}");
+        assert!(!answer.contains("and the index?"), "took the user's turn too: {answer}");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_stored_answer_is_bounded_and_scrubbed() {
+        // It is stored, unlike everything else read here, so the two things
+        // that make storing text dangerous have to be handled at the door:
+        // an unbounded transcript, and a secret the user typed into one.
+        let sanitizer = Sanitizer::builtin();
+        let long = "x".repeat(ANSWER_MAX_BYTES * 3);
+        let path = write(
+            "big.jsonl",
+            &format!(
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{long} sk-ant-api03-SECRETVALUE"}}]}}}}"#
+            ),
+        );
+        let answer = last_answer(&path, "claude-code", &sanitizer).expect("an answer");
+        assert!(answer.len() <= ANSWER_MAX_BYTES, "stored {} bytes", answer.len());
+        assert!(!answer.contains("SECRETVALUE"), "a secret survived into storage");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_transcript_shorter_than_the_tail_window_is_read_whole() {
+        // The window drops the line it cut in half. A file it did not cut has
+        // no half line, and dropping the first one there threw away the only
+        // turn a short transcript has.
+        let sanitizer = Sanitizer::builtin();
+        let path = write(
+            "short.jsonl",
+            concat!(
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"The only answer here."}]}}"#,
+                "\n"
+            ),
+        );
+        let answer = last_answer(&path, "claude-code", &sanitizer);
+        assert_eq!(answer.as_deref(), Some("The only answer here."));
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 

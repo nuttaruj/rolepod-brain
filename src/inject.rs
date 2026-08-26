@@ -66,16 +66,41 @@ pub fn primer(store: &Store, project: &str, session: &str, config: &InjectionCon
     // hand the budget to whatever ran last. Bounded, they cost nothing when
     // nothing is in flight and answer the one case that matters when
     // something is.
-    let mut pointers = store.unconsolidated_pointers(project, IN_FLIGHT_POINTERS)?;
+    let flight = store.unconsolidated_pointers(project, LAYER_CANDIDATES)?;
     let in_flight: std::collections::HashSet<String> =
-        pointers.iter().map(|pointer| pointer.id.clone()).collect();
-    pointers.extend(
-        store
-            .primer_pointers(project, 200)?
-            .into_iter()
-            .filter(|pointer| !in_flight.contains(&pointer.id)),
-    );
-    if pointers.is_empty() {
+        flight.iter().map(|pointer| pointer.id.clone()).collect();
+
+    // Then a quota per layer, rather than one ranking for all of them.
+    //
+    // Ranked together, kind decides everything and knowledge wins every time
+    // - and knowledge never stops accumulating. Measured at 124 entries the
+    // primer was 21 knowledge and nothing else: a session was told what this
+    // project knows in general and nothing about what had just happened in
+    // it. That is not a threshold that was crossed carelessly, it is one that
+    // any project crosses by working long enough.
+    //
+    // Separate quotas make the layers stop competing. Each fills from its own
+    // ranking, so `read_count` and a human's staleness flag decide which
+    // knowledge earns its slots rather than which layer gets any.
+    let mut seen = in_flight.clone();
+    let summaries: Vec<Pointer> = store
+        .pointers_of_kind(project, "session_summary", LAYER_CANDIDATES)?
+        .into_iter()
+        .filter(|pointer| seen.insert(pointer.id.clone()))
+        .collect();
+    let knowledge: Vec<Pointer> = store
+        .pointers_of_kind(project, "knowledge", LAYER_CANDIDATES)?
+        .into_iter()
+        .filter(|pointer| seen.insert(pointer.id.clone()))
+        .collect();
+    // Whatever the shares do not spend goes to the ranking as it always was,
+    // so a project with no knowledge yet still gets a full primer.
+    let rest: Vec<Pointer> = store
+        .primer_pointers(project, 200)?
+        .into_iter()
+        .filter(|pointer| seen.insert(pointer.id.clone()))
+        .collect();
+    if flight.is_empty() && summaries.is_empty() && knowledge.is_empty() && rest.is_empty() {
         return Ok(Injection::default());
     }
 
@@ -117,27 +142,66 @@ pub fn primer(store: &Store, project: &str, session: &str, config: &InjectionCon
     let mut ids = Vec::new();
     let mut in_flight_shown = 0usize;
 
-    for pointer in &pointers {
-        if !worth_injecting(pointer) {
-            continue;
+    // Each layer spends a share of the budget, then the rest is open to
+    // whatever the ranking puts next.
+    //
+    // A share of the BYTES, not a count of lines. The budget is bytes and
+    // always was; counting lines instead only agreed with it while every line
+    // was the same width, and they are not - a Thai title costs about 1.8
+    // times an English one for the same content, so eight summaries could
+    // quietly take the room thirteen were promised. Shares also survive
+    // someone configuring a different `primer_budget`, where a line count
+    // would hand a larger budget exactly the same primer.
+    let spent_by = |text: &mut String,
+                        ids: &mut Vec<String>,
+                        in_flight_shown: &mut usize,
+                        candidates: &[Pointer],
+                        share: usize|
+     -> Result<()> {
+        let allowance = text.len() + budget.saturating_sub(header.len()) * share / 100;
+        let mut taken = 0usize;
+        for pointer in candidates {
+            if !worth_injecting(pointer) {
+                continue;
+            }
+            // A pointer this session has already been shown is not worth
+            // spending budget on again - the same guard `for_file` applies to
+            // every id it injects. Without it, a resume's primer is a verbatim
+            // repeat of the first one rather than what changed since.
+            if store.already_injected(session, &pointer.id)? {
+                continue;
+            }
+            let line = render_line(pointer);
+            // Whole lines only: a clipped line costs the id that made it
+            // useful. Two ceilings: this layer's share, and the budget - a
+            // layer never borrows from another, and none of them outspends
+            // the whole.
+            //
+            // The first line of a layer ignores the share. A percentage of a
+            // small budget rounds to less than one line - at 1024 bytes the
+            // in-flight share is 53, and a line is about 110 - and a reserve
+            // that reserves nothing is not one. The budget still binds.
+            let ceiling = if taken == 0 { budget } else { allowance.min(budget) };
+            if text.len() + line.len() > ceiling {
+                break;
+            }
+            taken += 1;
+            if in_flight.contains(&pointer.id) {
+                *in_flight_shown += 1;
+            }
+            text.push_str(&line);
+            ids.push(pointer.id.clone());
         }
-        // A pointer this session has already been shown is not worth
-        // spending budget on again - the same guard `for_file` applies to
-        // every id it injects. Without it, a resume's primer is a verbatim
-        // repeat of the first one rather than what changed since.
-        if store.already_injected(session, &pointer.id)? {
-            continue;
-        }
-        let line = render_line(pointer);
-        // Whole lines only: a clipped line costs the id that made it useful.
-        if text.len() + line.len() > budget {
-            break;
-        }
-        if in_flight.contains(&pointer.id) {
-            in_flight_shown += 1;
-        }
-        text.push_str(&line);
-        ids.push(pointer.id.clone());
+        Ok(())
+    };
+
+    for (candidates, share) in [
+        (&flight, IN_FLIGHT_SHARE),
+        (&summaries, SUMMARY_SHARE),
+        (&knowledge, KNOWLEDGE_SHARE),
+        (&rest, 100),
+    ] {
+        spent_by(&mut text, &mut ids, &mut in_flight_shown, candidates, share)?;
     }
 
     if ids.is_empty() {
@@ -218,9 +282,26 @@ pub fn for_file(
     Ok(Injection { text, ids, in_flight: 0 })
 }
 
-/// One pointer line: `id  time  TAG  title`.
+/// One pointer line: `id  time  TAG  title`, or `id  KNW  title`.
+///
+/// Durable knowledge carries no time. Everything else here is placed by when
+/// it happened - a summary is about a session, a raw capture about a minute -
+/// but a claim that survived several sessions is not about any of them, and
+/// the date it was first written down says nothing a reader can use. It cost
+/// eighteen bytes a line to say so, out of a budget where thirteen knowledge
+/// lines were already a third of everything.
 fn render_line(pointer: &Pointer) -> String {
     let mut line = String::with_capacity(96);
+    if pointer.kind == "knowledge" {
+        let _ = writeln!(
+            line,
+            "{}  {}  {}",
+            pointer.id,
+            tag(pointer),
+            pointer.title.replace('\n', " ")
+        );
+        return line;
+    }
     let _ = writeln!(
         line,
         "{}  {}  {}  {}",
@@ -282,15 +363,42 @@ fn worth_injecting(pointer: &Pointer) -> bool {
         || pointer.kind != "observation"
         || pointer.has_files
         || pointer.hook == "user_prompt_submit"
+        // A turn that ended with the model saying something. `stop` used to
+        // be a bare "Turn finished" marker and was padding; it now carries
+        // the answer's opening, and an answer already given is the one thing
+        // that stops the next session asking the same question again. A
+        // `stop` with no answer behind it still reads as "Turn finished" and
+        // is still padding, which is what this title test keeps out.
+        || (pointer.hook == "stop" && pointer.title != "Turn finished")
 }
 
-/// How many lines of still-unsummarized work the primer reserves.
+/// Share of the primer each layer may spend, as a percentage of its budget.
 ///
-/// Small on purpose. This is the newest thing in the store, not the most
-/// considered, and the budget it takes comes out of summaries that were
-/// worth writing. Enough to say what was in flight; not enough to describe
-/// it.
-const IN_FLIGHT_POINTERS: usize = 5;
+/// Bytes, not lines: the budget is bytes, and a line's width depends on the
+/// language it is written in - a Thai title costs about 1.8 times an English
+/// one for the same content. They need not sum to 100; whatever is left, plus
+/// whatever a layer with too little to say does not spend, goes to the
+/// ranking as it always did.
+///
+/// Work still in flight gets the smallest share. It is the newest thing in
+/// the store, not the most considered, and the room it takes comes out of
+/// summaries that were worth writing.
+const IN_FLIGHT_SHARE: usize = 15;
+
+/// What happened recently: the layer knowledge displaces first, and the one a
+/// returning session has no other way to see.
+const SUMMARY_SHARE: usize = 40;
+
+/// Durable knowledge: the most valuable thing here per byte, and the only
+/// layer that grows without bound - so the only one that needs telling when
+/// to stop.
+const KNOWLEDGE_SHARE: usize = 35;
+
+/// How many pointers to fetch per layer before the share decides how many fit.
+///
+/// Deep enough that a share is never short of candidates, shallow enough that
+/// the query stays one index scan.
+const LAYER_CANDIDATES: usize = 40;
 
 /// Wrap an injection in the JSON a Claude Code hook must print.
 ///
@@ -373,6 +481,85 @@ mod tests {
             store.index(&event).unwrap();
         }
         store
+    }
+
+    #[test]
+    fn a_share_too_small_for_one_line_still_gets_one() {
+        // A percentage of a small budget rounds to less than a line: at 1024
+        // bytes, with a header of about 660, the in-flight share is 53 and a
+        // line is about 110. A reserve that reserves nothing is not one, and
+        // the layer this silently emptied is the one carrying the work that
+        // was still unfinished.
+        let project = Uuid::new_v4();
+        let store = Store::open_memory().unwrap();
+        let mut inflight = Event::new(
+            Uuid::nil(),
+            project,
+            Uuid::nil(),
+            Source { cli: "claude-code".into(), hook: "user_prompt_submit".into() },
+            EventKind::Observation,
+            "Asked: finish the migration on src/store.rs".into(),
+            "body".into(),
+        );
+        inflight.id = "01ZZZZSMALLBUDGET00000000".to_string();
+        store.index(&inflight).unwrap();
+
+        let config = InjectionConfig { primer_budget: 1024, session_budget: 8192 };
+        let injection = primer(&store, &project.to_string(), "s", &config).unwrap();
+        assert!(
+            injection.text.contains(&inflight.id),
+            "a share smaller than a line emptied the layer:\n{}",
+            injection.text
+        );
+        assert!(injection.text.len() <= config.primer_budget, "the budget still binds");
+    }
+
+    #[test]
+    fn knowledge_cannot_take_every_line_the_primer_has() {
+        // Measured on a real store before this existed: 21 knowledge, 5 in
+        // flight, and not one session summary. Knowledge grows without bound
+        // and outranks a summary by kind, so past some size it takes the
+        // whole primer and the next session is told what this project knows
+        // in general and nothing about what just happened in it.
+        let project = Uuid::new_v4();
+        let store = Store::open_memory().unwrap();
+        for index in 0..200 {
+            let mut event = Event::new(
+                Uuid::nil(),
+                project,
+                Uuid::nil(),
+                Source { cli: "claude-code".into(), hook: "consolidate".into() },
+                EventKind::Knowledge,
+                format!("Durable knowledge {index} that survived several sessions"),
+                "body".into(),
+            );
+            event.id = format!("01KNW{index:021}");
+            event.consolidated = true;
+            store.index(&event).unwrap();
+        }
+        for index in 0..20 {
+            let mut event = Event::new(
+                Uuid::nil(),
+                project,
+                Uuid::nil(),
+                Source { cli: "claude-code".into(), hook: "consolidate".into() },
+                EventKind::SessionSummary,
+                format!("Session {index} did something worth knowing about"),
+                "body".into(),
+            );
+            event.id = format!("01SUM{index:021}");
+            event.consolidated = true;
+            store.index(&event).unwrap();
+        }
+
+        let config = InjectionConfig { primer_budget: 4096, session_budget: 8192 };
+        let injection = primer(&store, &project.to_string(), "s", &config).unwrap();
+        let summaries = injection.text.matches("01SUM").count();
+        assert!(
+            summaries >= 4,
+            "knowledge took the primer; only {summaries} summaries survived:\n{}",
+            injection.text
+        );
     }
 
     #[test]
