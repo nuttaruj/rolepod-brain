@@ -52,6 +52,39 @@ jobs:
       - name: Install Rust
         run: rustup target add ${{ matrix.target }}
 
+      # The tests read the embedding model out of the checkout, and the
+      # checkout does not carry it - 122 MB is past what a repository file may
+      # be. Rebuilding it from upstream here is also what checks the claim in
+      # PROVENANCE.md: the vendored weights are what quantize.py produces from
+      # a pinned revision, and nothing but running it says so.
+      - name: Cache the embedding model
+        uses: actions/cache@v4
+        with:
+          path: assets/potion-multilingual-128M/model-int8.safetensors
+          key: model-73908c3438cf03b6a01bcb9611d62b23d0726f08-v2
+      - name: Cache the tokenizer
+        uses: actions/cache@v4
+        with:
+          path: assets/potion-multilingual-128M/tokenizer.json
+          key: tokenizer-73908c3438cf03b6a01bcb9611d62b23d0726f08
+      - name: Build the embedding model
+        shell: bash
+        run: |
+          set -eu
+          MODEL=assets/potion-multilingual-128M
+          UP=https://huggingface.co/minishlab/potion-multilingual-128M/resolve/73908c3438cf03b6a01bcb9611d62b23d0726f08
+          [ -s "$MODEL/tokenizer.json" ] || curl -fsSL -o "$MODEL/tokenizer.json" "$UP/tokenizer.json"
+          if [ ! -s "$MODEL/model-int8.safetensors" ]; then
+              curl -fsSL -o upstream.safetensors "$UP/model.safetensors"
+              python3 -m pip install --quiet --break-system-packages numpy safetensors \
+                  || python3 -m pip install --quiet numpy safetensors
+              python3 "$MODEL/quantize.py" upstream.safetensors "$MODEL/model-int8.safetensors"
+              rm -f upstream.safetensors
+          fi
+          want=$(grep -A4 'vendored here' "$MODEL/PROVENANCE.md" | grep model-int8 | awk '{print $1}')
+          got=$(shasum -a 256 "$MODEL/model-int8.safetensors" | awk '{print $1}')
+          [ "$want" = "$got" ] || { echo "model checksum $got does not match PROVENANCE $want"; exit 1; }
+
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
@@ -100,27 +133,19 @@ jobs:
         with:
           path: artifacts
 
-      # The embedding model is not in the repository - 122 MB is past what a
-      # repository file may be - so the release is where it comes from, and
-      # every release carries it: an installer fetching the model for version
-      # N must find it under version N's tag.
-      - name: Fetch the embedding model
-        run: |
-          set -eu
-          MODEL=assets/potion-multilingual-128M
-          mkdir -p "$MODEL"
-          UP=https://huggingface.co/minishlab/potion-multilingual-128M/resolve/73908c3438cf03b6a01bcb9611d62b23d0726f08
-          curl -fsSL -o "$MODEL/tokenizer.json" "$UP/tokenizer.json"
-          curl -fsSL -o upstream.safetensors "$UP/model.safetensors"
-          # The vendored weights are not the upstream file: quantize.py is the
-          # whole transformation, and PROVENANCE.md carries the checksum of
-          # what it produces. Reproducing it here rather than storing it is
-          # what keeps that claim checkable.
-          python3 -m pip install --quiet numpy safetensors
-          python3 "$MODEL/quantize.py" upstream.safetensors "$MODEL/model-int8.safetensors"
-          rm -f upstream.safetensors
-          grep -A4 'vendored here' "$MODEL/PROVENANCE.md" | grep model-int8 | awk '{print $1"  '"$MODEL"'/model-int8.safetensors"}' > model.expected
-          sha256sum -c model.expected
+      # Every release carries the model: an installer fetching it for version
+      # N must find it under version N's tag. The build jobs already produced
+      # and checked it, so this is the same cache rather than a second recipe.
+      - name: Cache the embedding model
+        uses: actions/cache@v4
+        with:
+          path: assets/potion-multilingual-128M/model-int8.safetensors
+          key: model-73908c3438cf03b6a01bcb9611d62b23d0726f08-v2
+      - name: Cache the tokenizer
+        uses: actions/cache@v4
+        with:
+          path: assets/potion-multilingual-128M/tokenizer.json
+          key: tokenizer-73908c3438cf03b6a01bcb9611d62b23d0726f08
 
       - name: Collect
         run: |
