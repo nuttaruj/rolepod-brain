@@ -22,12 +22,31 @@ use std::time::Duration;
 use crate::store::Hit;
 use crate::summarizer::{Ladder, Tier};
 
-/// Hits offered to the model. Beyond this the prompt stops being cheap and
-/// the tail is unlikely to deserve promotion anyway.
-pub const POOL: usize = 30;
+/// Hits offered to the model.
+///
+/// Fifteen, measured rather than guessed. Thirty took a median of 21.8s
+/// through a host CLI and six took 8.8s, but six only ever sees the top of
+/// the list - and the entries a reranker earns its keep by promoting sat at
+/// a mean rank of 13. Six would have thrown away more than half of what
+/// there is to find. Fifteen keeps most of that reach at roughly half the
+/// wait.
+pub const POOL: usize = 15;
 
 /// How long someone waiting on a search result will tolerate.
-const TIMEOUT: Duration = Duration::from_secs(6);
+///
+/// Twenty, and the number is the whole feature. At six this never once
+/// answered: measured against a host CLI on a 22k-event brain, fifteen
+/// titles take a median of 12.2s to come back (10.3s fastest, 28.3s worst of
+/// fifteen queries), and an empty prompt still costs 5s of process start.
+/// Six seconds bought a guaranteed timeout - the search paid for a model
+/// call it could never receive, every single time, and reranking was a
+/// setting that did nothing but cost.
+///
+/// Twenty covers fourteen of those fifteen. The fifteenth returns the
+/// index's own order, which is the documented worst case and a real answer.
+/// Thirty would have covered all of them at the price of making everyone
+/// wait for the slowest.
+const TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Reorder `hits` by what a cheap model thinks answers `query`.
 ///

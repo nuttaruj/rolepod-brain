@@ -129,6 +129,18 @@ fn tool_definitions() -> Value {
                                         did we decide\" without wading through every \
                                         mention.",
                     },
+                    "rerank": {
+                        "type": "boolean",
+                        "description": "Let a cheap model reorder the results by what \
+                                        the question was actually asking. Costs about \
+                                        12 seconds of real waiting, 20 at the ceiling, \
+                                        so ask for it when the \
+                                        answer is worth that and not otherwise: a \
+                                        question whose words the entry probably does \
+                                        not use (\"why did we stop doing X\"), or a \
+                                        first search that came back plausible but not \
+                                        right. Omit it for ordinary lookups.",
+                    },
                 },
                 "required": ["query"],
             },
@@ -336,10 +348,18 @@ fn call_tool(paths: &Paths, project: &str, session: &str, params: &Value) -> Res
                 .context("brain_search requires a non-empty `query`")?;
             let limit = limit_from(&arguments);
             let config = crate::config::Config::load(&paths.config_file())?;
+            // Per request first, config second. The config value is a standing
+            // preference; the argument is this caller, on this question,
+            // deciding the answer is worth waiting for. Only the caller knows
+            // that, and it is not the same for two questions in a row.
+            let rerank = arguments
+                .get("rerank")
+                .and_then(Value::as_bool)
+                .unwrap_or(config.search.rerank);
             // With a reranker to sort them, it is worth pulling more than the
             // caller asked for: the entry that answers the question is often
             // just past the cut.
-            let pool = if config.search.rerank { crate::rerank::POOL.max(limit) } else { limit };
+            let pool = if rerank { crate::rerank::POOL.max(limit) } else { limit };
             // An unknown topic would silently return nothing, which reads to
             // an agent as "no memory" rather than "wrong scope" - so a value
             // outside the taxonomy is ignored and the search runs unscoped.
@@ -360,7 +380,7 @@ fn call_tool(paths: &Paths, project: &str, session: &str, params: &Value) -> Res
             hits.extend(by_entity.into_iter().filter(|hit| !seen.contains(&hit.id)).take(pool));
             hits.truncate(pool);
 
-            if config.search.rerank {
+            if rerank {
                 let ladder = crate::summarizer::Ladder::new(&store, &config.summarizer);
                 // Borrow the cheap tier of whichever CLI works here.
                 let cli = store.project_cli(project)?.unwrap_or_default();

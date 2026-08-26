@@ -580,6 +580,71 @@ fn reranking_reorders_a_search_and_a_failed_one_changes_nothing() {
     );
 }
 
+/// Reranking is the caller's call, one question at a time.
+///
+/// A config flag says what someone preferred once; an argument says this
+/// caller, on this question, judged the answer worth ten to twenty-five
+/// seconds of real waiting. Measured through a host CLI, that is what it
+/// costs — so a standing "always" is a standing tax on every lookup, and a
+/// standing "never" hides the one search that needed it.
+#[test]
+fn reranking_can_be_asked_for_one_search_at_a_time() {
+    let fixture = Fixture::new("rerank-per-request");
+    // No config file at all: the standing preference is off.
+    for name in ["auth.rs", "auth/login.rs", "auth/token.rs", "auth/session.rs"] {
+        let payload = serde_json::json!({
+            "session_id": "0199a1f2-3c4d-7e8f-9012-3456789abcde",
+            "cwd": fixture.project,
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": fixture.project.join(format!("src/{name}")),
+                "new_string": "fn check() {}"
+            },
+            "tool_response": {"success": true}
+        })
+        .to_string();
+        fixture.hook("claude-code", "PostToolUse", &payload);
+    }
+
+    let ids = |responses: &[serde_json::Value]| -> Vec<String> {
+        let text = responses.last().expect("a response")["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content")
+            .to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("hits JSON");
+        parsed["hits"]
+            .as_array()
+            .expect("hits array")
+            .iter()
+            .map(|hit| hit["id"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    let plain_req = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"brain_search","arguments":{"query":"auth"}}}"#;
+    let asked_req = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"brain_search","arguments":{"query":"auth","rerank":true}}}"#;
+
+    // A stub that promotes whatever search ranked last. It is on PATH for
+    // both calls, so the only difference is the argument.
+    let bin = fixture.fake_cli("claude", "echo \"$*\" | grep -oE '[0-9A-Z]{26}' | tail -1");
+
+    let plain = ids(&fixture.mcp_with_path(&[plain_req], Some(&bin)));
+    assert!(plain.len() >= 3, "need several hits: {plain:?}");
+
+    let asked = ids(&fixture.mcp_with_path(&[asked_req], Some(&bin)));
+    assert_eq!(
+        asked[0],
+        plain[plain.len() - 1],
+        "asking for a rerank on one search did nothing: {asked:?}"
+    );
+
+    // And the search that did not ask is untouched, in the same process
+    // lifetime and against the same model.
+    assert_eq!(
+        ids(&fixture.mcp_with_path(&[plain_req], Some(&bin))),
+        plain,
+        "a search that did not ask for reranking paid for one anyway"
+    );
+}
+
 /// A rerank is a favour, and a favour must not cost the machine anything.
 ///
 /// Two ways it used to. A model replying NONE - the word the prompt asks for
