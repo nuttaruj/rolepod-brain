@@ -580,6 +580,93 @@ fn reranking_reorders_a_search_and_a_failed_one_changes_nothing() {
     );
 }
 
+/// A rerank is a favour, and a favour must not cost the machine anything.
+///
+/// Two ways it used to. A model replying NONE - the word the prompt asks for
+/// when nothing fits - was read as a dead rung, so the ladder paid a second
+/// CLI to answer the same question, and filed a failure against the first.
+/// Three of those and that CLI was out of consolidation for thirty minutes,
+/// having done nothing wrong at a leash five times shorter than the one
+/// consolidation runs on.
+#[test]
+fn a_rerank_that_finds_nothing_costs_one_call_and_no_breaker() {
+    let fixture = Fixture::new("rerank-none");
+    // `auto` so a second rung genuinely exists to be wrongly taken.
+    std::fs::write(fixture.home.join("config.toml"), "[search]\nrerank = true\n").unwrap();
+    for name in ["auth.rs", "auth/login.rs", "auth/token.rs", "auth/session.rs"] {
+        let payload = serde_json::json!({
+            "session_id": "0199a1f2-3c4d-7e8f-9012-3456789abcde",
+            "cwd": fixture.project,
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": fixture.project.join(format!("src/{name}")),
+                "new_string": "fn check() {}"
+            },
+            "tool_response": {"success": true}
+        })
+        .to_string();
+        fixture.hook("claude-code", "PostToolUse", &payload);
+    }
+
+    let search = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"brain_search","arguments":{"query":"auth"}}}"#;
+    let ids = |responses: &[serde_json::Value]| -> Vec<String> {
+        let text = responses.last().expect("a response")["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content")
+            .to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("hits JSON");
+        parsed["hits"]
+            .as_array()
+            .expect("hits array")
+            .iter()
+            .map(|hit| hit["id"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+
+    let plain = ids(&fixture.mcp(&[search]));
+    assert!(plain.len() >= 3, "need several hits to reorder: {plain:?}");
+
+    // The preferred rung answers NONE. A second rung stands behind it, ready
+    // to promote the last hit - so if the ladder cascades, the order moves and
+    // this test sees it. `gemini`, not `codex`: codex reads its answer from a
+    // file rather than stdout, so a stdout stub there would look like a rung
+    // that failed and prove nothing about cascading.
+    fixture.fake_cli("claude", "echo NONE");
+    let bin = fixture.fake_cli("gemini", "echo \"$*\" | grep -oE '[0-9A-Z]{26}' | tail -1");
+
+    for _ in 0..4 {
+        assert_eq!(
+            ids(&fixture.mcp_with_path(&[search], Some(&bin))),
+            plain,
+            "NONE means the index order stands, and no other CLI is asked"
+        );
+    }
+
+    // And the case that started this: the preferred rung really does fail.
+    // The second CLI is still standing there, and must still not be asked -
+    // a search does not double its wait to improve an ordering it already
+    // had. Nor does the six-second leash get to say a CLI is down.
+    fixture.fake_cli("claude", "echo 'rate limit exceeded' >&2; exit 1");
+    for _ in 0..4 {
+        assert_eq!(
+            ids(&fixture.mcp_with_path(&[search], Some(&bin))),
+            plain,
+            "a failed rerank cascaded to a second CLI instead of standing down"
+        );
+    }
+
+    let health = Command::new("sqlite3")
+        .arg(fixture.home.join("brain.db"))
+        .arg("SELECT cli, failures FROM summarizer_health;")
+        .output()
+        .expect("query health");
+    assert!(
+        String::from_utf8_lossy(&health.stdout).trim().is_empty(),
+        "an advisory call marked the health table: {}",
+        String::from_utf8_lossy(&health.stdout)
+    );
+}
+
 #[test]
 fn an_over_budget_injection_is_reported_with_its_age() {
     // injected_bytes has no timestamp of its own - a session's spend is

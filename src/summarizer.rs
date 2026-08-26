@@ -123,6 +123,9 @@ pub struct Ladder<'a> {
     /// spec's cheap default.
     models: std::collections::HashMap<String, String>,
     timeout: Duration,
+    /// Someone is waiting on this call and its result is a bonus, not the
+    /// answer. See [`Ladder::while_waiting`] for what that changes.
+    advisory: bool,
 }
 
 impl<'a> Ladder<'a> {
@@ -133,21 +136,53 @@ impl<'a> Ladder<'a> {
             mode: config.mode.clone(),
             models: config.models.clone(),
             timeout: CALL_TIMEOUT,
+            advisory: false,
         }
     }
 
-    /// The same ladder on a shorter leash.
+    /// The same ladder, for a call someone is sitting and waiting on.
     ///
-    /// Consolidation runs detached and can afford three minutes. A call made
-    /// while someone waits for a search result cannot: past a few seconds the
-    /// unranked answer they already had is the better one.
+    /// Three things change, all of them consequences of one fact: this call is
+    /// advisory. Consolidation runs detached, can afford three minutes, is
+    /// worth a second CLI when the first will not answer, and its failures are
+    /// real evidence about a CLI. A call holding up a search result is none of
+    /// those, so it gets:
+    ///
+    /// - `limit` instead of three minutes, because past a few seconds the
+    ///   answer the caller already had is the better one;
+    /// - one rung, because a second CLI doubles the wait to improve an
+    ///   ordering that was already good enough to return;
+    /// - no marks on the health table, in either direction. A CLI that
+    ///   overran a six-second leash has not been shown to be down - and
+    ///   charging it would bench it for thirty minutes of consolidation,
+    ///   which had three full minutes to spend and never got to try. The
+    ///   breaker is still *read*: a CLI already known to be down is not worth
+    ///   the wait.
     #[must_use]
-    pub fn clone_with_timeout(&self, limit: Duration) -> Ladder<'a> {
+    pub fn while_waiting(&self, limit: Duration) -> Ladder<'a> {
         Ladder {
             store: self.store,
             mode: self.mode.clone(),
             models: self.models.clone(),
             timeout: limit,
+            advisory: true,
+        }
+    }
+
+    /// Rungs this call may try.
+    fn rungs(&self) -> usize {
+        if self.advisory { 1 } else { MAX_RUNGS_PER_CALL }
+    }
+
+    /// Record an outcome against a CLI, unless the call was one it cannot
+    /// fairly be judged on.
+    fn record(&self, cli: &str, outcome: Result<(), &str>) -> Result<()> {
+        if self.advisory {
+            return Ok(());
+        }
+        match outcome {
+            Ok(()) => self.store.record_summarizer_success(cli),
+            Err(detail) => self.store.record_summarizer_failure(cli, detail),
         }
     }
 
@@ -175,7 +210,7 @@ impl<'a> Ladder<'a> {
 
         let mut attempts = 0usize;
         for spec in self.order(preferred_cli) {
-            if attempts >= MAX_RUNGS_PER_CALL {
+            if attempts >= self.rungs() {
                 break;
             }
             if !self.available(spec)? {
@@ -185,7 +220,7 @@ impl<'a> Ladder<'a> {
 
             match invoke(spec, self.model_for(spec), prompt, self.timeout) {
                 Ok(text) if usable(&text) => {
-                    self.store.record_summarizer_success(spec.cli)?;
+                    self.record(spec.cli, Ok(()))?;
                     return Ok((Tier::Cli(spec.cli.to_string()), text));
                 }
                 Ok(text) => {
@@ -196,11 +231,10 @@ impl<'a> Ladder<'a> {
                     // "no model available" was the bug - it meant a
                     // rate-limited Claude never fell through to Codex.
                     let detail = unusable_reason(&text);
-                    self.store.record_summarizer_failure(spec.cli, &detail)?;
+                    self.record(spec.cli, Err(&detail))?;
                 }
                 Err(error) => {
-                    self.store
-                        .record_summarizer_failure(spec.cli, &format!("{error:#}"))?;
+                    self.record(spec.cli, Err(&format!("{error:#}")))?;
                 }
             }
         }
@@ -627,6 +661,52 @@ mod tests {
         // A prompt no CLI can use should not cost one call per installed CLI.
         assert_eq!(MAX_RUNGS_PER_CALL, 2);
         assert!(MAX_RUNGS_PER_CALL < SPECS.len(), "the bound must actually bind");
+    }
+
+    /// A second CLI is worth waiting for when the work is detached. It is not
+    /// worth doubling a search's wait to improve an ordering that was already
+    /// good enough to return.
+    #[test]
+    fn a_call_someone_is_waiting_on_asks_one_cli_only() {
+        let store = Store::open_memory().unwrap();
+        let ladder = Ladder::new(&store, &config("auto"));
+        assert_eq!(ladder.rungs(), MAX_RUNGS_PER_CALL);
+        assert_eq!(ladder.while_waiting(Duration::from_secs(6)).rungs(), 1);
+    }
+
+    /// The bug this exists to prevent: a six-second leash is not evidence
+    /// about a CLI that consolidation gives three minutes. Charging one for
+    /// the other benched a working CLI for half an hour.
+    #[test]
+    fn an_advisory_call_leaves_no_mark_on_the_breaker() {
+        let store = Store::open_memory().unwrap();
+        let ladder = Ladder::new(&store, &config("auto"));
+        let waiting = ladder.while_waiting(Duration::from_secs(6));
+
+        for _ in 0..failure_threshold() + 2 {
+            waiting.record("codex", Err("timed out after 6s")).unwrap();
+        }
+        assert!(
+            !store.summarizer_in_cooldown("codex").unwrap(),
+            "an advisory timeout took a CLI out of consolidation"
+        );
+
+        // Nor in the other direction: a fast rerank is not a clean bill of
+        // health for a CLI consolidation has been failing against.
+        for _ in 0..failure_threshold() {
+            store.record_summarizer_failure("claude-code", "rate limited").unwrap();
+        }
+        waiting.record("claude-code", Ok(())).unwrap();
+        assert!(
+            store.summarizer_in_cooldown("claude-code").unwrap(),
+            "an advisory success cleared a breaker it never earned"
+        );
+
+        // The same ladder, doing the work it is judged on, still counts.
+        for _ in 0..failure_threshold() {
+            ladder.record("gemini-cli", Err("rate limited")).unwrap();
+        }
+        assert!(store.summarizer_in_cooldown("gemini-cli").unwrap());
     }
 
     #[test]

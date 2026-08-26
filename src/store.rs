@@ -1040,6 +1040,16 @@ impl Store {
     /// entities is context the query's words never asked for. Needs no
     /// model - the other zero-LLM ranking.
     ///
+    /// A seed's own session is excluded, not merely its own event. Entities
+    /// are recorded per session, so a seed drags in every name its session
+    /// ever declared - which means that session shares 100% of `subject` with
+    /// itself and wins the stream outright, no matter how the count is
+    /// normalised. Measured on a 22k-event brain: one session's summary took
+    /// #1 in 21 of 23 queries, one of them nonsense words absent from the
+    /// database. The stream is for what the query's words could NOT reach; a
+    /// seed's own session was already reached, and returning the rest of it
+    /// is the same opinion counted again, once per event it happens to hold.
+    ///
     /// The shared-name count is taken once per SESSION, before events are
     /// touched at all. Entities are recorded per session, so every event in a
     /// session shares the same set - counting them per event asks the same
@@ -1065,15 +1075,20 @@ impl Store {
                 .join(", ")
         };
         let sql = format!(
-            "WITH subject AS (
+            "WITH seed_sessions AS (
+                 SELECT DISTINCT session FROM events
+                 WHERE id IN ({seed_holes}) AND project = ?1
+             ),
+             subject AS (
                  SELECT DISTINCT n.name FROM entities n
-                 JOIN events e ON e.session = n.session AND e.project = n.project
-                 WHERE e.id IN ({seed_holes}) AND n.project = ?1
+                 WHERE n.session IN (SELECT session FROM seed_sessions)
+                       AND n.project = ?1
              ),
              shared AS (
                  SELECT n.session, COUNT(DISTINCT n.name) AS shared
                  FROM entities n
                  WHERE n.project = ?1 AND n.name IN (SELECT name FROM subject)
+                       AND n.session NOT IN (SELECT session FROM seed_sessions)
                  GROUP BY n.session
              )
              SELECT e.id, e.ts, e.cli, e.kind, e.title,
@@ -1081,7 +1096,7 @@ impl Store {
                     s.shared
              FROM events e
              JOIN shared s ON s.session = e.session
-             WHERE e.project = ?1 AND e.id NOT IN ({seed_holes})
+             WHERE e.project = ?1
                    AND e.forgotten = 0 AND e.kind != 'tombstone'
                    AND e.hook != 'correct'
                    AND (?2 IS NULL OR e.topic = ?2)
@@ -3206,6 +3221,64 @@ mod tests {
         assert!(
             titles.iter().any(|t| t.contains("Connection pool")),
             "the neighbour through the shared entity never surfaced: {titles:?}"
+        );
+    }
+
+    /// A seed's own session is not its neighbour.
+    ///
+    /// Measured on a real 22k-event brain: one session's summary took #1 for
+    /// 21 of 23 queries, including one whose words appear nowhere in the
+    /// database. Every seed came from that session, so `subject` absorbed all
+    /// 1098 of its entity names and the session shared 100% of them with
+    /// itself - unbeatable under any normalisation, because the number was
+    /// never about relevance. The graph stream then filled with that
+    /// session's other events, and fusion handed them the top of the search.
+    ///
+    /// The stream exists to reach what the query's words could not. A seed's
+    /// own session is already in the results; returning the rest of it is not
+    /// a second opinion, it is the same opinion counted again - and a long
+    /// session gets to count it more times than anyone else.
+    #[test]
+    fn a_seeds_own_session_does_not_crowd_out_real_neighbours() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let busy = Uuid::new_v4();
+        let neighbour = Uuid::new_v4();
+
+        // The seed the query will actually match, plus a pile of unrelated
+        // work that happened in the same long session.
+        store
+            .index(&event_in_session("Fixed the vermilion middleware", "expiry check", project, busy))
+            .unwrap();
+        for n in 0..8 {
+            store
+                .index(&event_in_session(
+                    &format!("Unrelated chore number {n}"),
+                    "nothing to do with the query",
+                    project,
+                    busy,
+                ))
+                .unwrap();
+        }
+        store
+            .index(&event_in_session("Connection pool tuning", "idle timeout raised", project, neighbour))
+            .unwrap();
+        for session in [busy, neighbour] {
+            store
+                .record_entities(&session.to_string(), &project.to_string(), &["src/gate.rs".to_string()])
+                .unwrap();
+        }
+
+        let hits = store.search(&project.to_string(), "vermilion", None, 10, Recall::Fused).unwrap();
+        let titles: Vec<&str> = hits.iter().map(|hit| hit.title.as_str()).collect();
+        assert!(titles.iter().any(|t| t.contains("vermilion")), "keyword hit lost: {titles:?}");
+        assert!(
+            titles.iter().any(|t| t.contains("Connection pool")),
+            "the real neighbour never surfaced: {titles:?}"
+        );
+        assert!(
+            !titles.iter().any(|t| t.contains("Unrelated chore")),
+            "the seed's own session filled the graph stream: {titles:?}"
         );
     }
 

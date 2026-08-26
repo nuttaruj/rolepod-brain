@@ -9,6 +9,13 @@
 //! So it is bounded on every axis: off unless asked for, one call, titles
 //! only, a few seconds of patience, and any failure at all leaves the
 //! original order untouched. The worst case is the search you already had.
+//!
+//! That last sentence is a claim about the whole system, not just about what
+//! this function returns, and it was false for a while: a rerank that timed
+//! out or answered NONE was filed against the CLI's breaker, and three of
+//! them benched that CLI for thirty minutes of consolidation - which runs
+//! detached, with three minutes to spend, and was never the thing in a
+//! hurry. Advisory calls now leave no mark; see [`Ladder::while_waiting`].
 
 use std::time::Duration;
 
@@ -33,12 +40,33 @@ pub fn rerank(ladder: &Ladder<'_>, cli: &str, query: &str, hits: Vec<Hit>) -> Ve
         return hits;
     }
     let prompt = prompt_for(query, &hits);
-    let ladder = ladder.clone_with_timeout(TIMEOUT);
-    let Ok((Tier::Cli(_), answer)) = ladder.run(&prompt, cli, |text| !order_in(text).is_empty())
-    else {
+    let ladder = ladder.while_waiting(TIMEOUT);
+    let Ok((Tier::Cli(_), answer)) = ladder.run(&prompt, cli, usable) else {
         return hits;
     };
     apply(order_in(&answer), hits)
+}
+
+/// Did the model answer the question it was asked?
+///
+/// Naming ids is an answer. So is NONE: the prompt asks for exactly that word
+/// when nothing fits, and a model obeying its own instruction must not be
+/// filed as a broken rung. Reading it as one sent the ladder to a second CLI
+/// with the same question and charged the first one's breaker for being
+/// right - which, three honest NONEs later, took that CLI out of
+/// consolidation for half an hour.
+///
+/// Everything else - a quota banner, a refusal, empty output - is a rung that
+/// did not answer, which is what this predicate exists to catch.
+fn usable(text: &str) -> bool {
+    !order_in(text).is_empty() || said_none(text)
+}
+
+/// Deliberately narrow: the whole answer is the word, give or take the
+/// punctuation a model adds. A banner that happens to contain "none" is not
+/// an answer, and matching it as one would hide a rung that really did fail.
+fn said_none(text: &str) -> bool {
+    text.trim().trim_end_matches(['.', '!']).eq_ignore_ascii_case("none")
 }
 
 /// Put the ids the model named first, in its order, and keep everything else
@@ -173,6 +201,26 @@ mod tests {
         assert_eq!(ranked.len(), 3, "reranking is a permutation, never a filter");
         assert_eq!(ranked[0].title, "third");
         assert_eq!(ranked[2].title, "first");
+    }
+
+    /// The prompt asks for NONE when nothing fits. A model that complies has
+    /// answered, and treating that as a dead rung cost the CLI a breaker mark
+    /// for doing exactly what it was told.
+    #[test]
+    fn saying_none_is_an_answer_not_a_dead_rung() {
+        for reply in ["NONE", "none", "None.", "  NONE\n"] {
+            assert!(usable(reply), "a compliant NONE was read as a failure: {reply:?}");
+        }
+        assert!(usable("01HZZK9V8N0000000000000003"), "an id is an answer");
+    }
+
+    #[test]
+    fn a_rung_that_did_not_answer_is_still_a_failure() {
+        // The predicate exists to catch these; NONE must not widen it.
+        assert!(!usable(""));
+        assert!(!usable("   "));
+        assert!(!usable("Claude usage limit reached. Resets at 3pm."));
+        assert!(!usable("None of these look relevant, but here is some prose"));
     }
 
     #[test]
