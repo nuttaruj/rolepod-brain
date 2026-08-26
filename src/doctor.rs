@@ -220,9 +220,12 @@ fn reranker_check(paths: &Paths) -> Check {
     let dir = paths.model_dir_for(crate::rerank::LOCAL_MODEL);
     let weights = dir.join("model.onnx");
     if !cfg!(feature = "local-rerank") {
+        // Not a fault and not a missing install: `ort` publishes no prebuilt
+        // onnxruntime this binary's target can link against. Reranking still
+        // works, through the CLI, at the price it has always cost.
         return Check::pass(
             "reranker",
-            "not in this build - reranking uses the host CLI (~12s)",
+            "not built for this platform - reranking uses the host CLI (~12s)",
         );
     }
     if weights.is_file() {

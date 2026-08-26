@@ -51,11 +51,21 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
             test: true
-            features: local-rerank
+            # No local reranker on Linux, for the same reason this job runs on
+            # the oldest supported runner in the first place. `ort` ships
+            # prebuilt onnxruntime built against a newer toolchain than
+            # 22.04 has: x86_64 wants glibc's `__isoc23_strtoll`, arm64 wants
+            # libstdc++'s `__cxa_call_terminate`, and neither exists here.
+            # Building on a newer runner would fix the link and break the
+            # binary for every distribution older than that runner, which is
+            # the trade this matrix was arranged to avoid. Reranking on Linux
+            # goes through the host CLI until `ort` publishes a build that
+            # links against something a 2022 distribution has.
+            features: ""
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
             test: true
-            features: local-rerank
+            features: ""
     steps:
       - uses: actions/checkout@v4
 
