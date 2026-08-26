@@ -21,6 +21,8 @@ mod invocation;
 mod mcp;
 mod portable;
 mod rerank;
+#[cfg(feature = "local-rerank")]
+mod xencoder;
 mod revise;
 mod sanitize;
 mod setup;
@@ -164,6 +166,12 @@ enum Commands {
         /// where the model goes.
         #[arg(long)]
         models: bool,
+        /// Print only where the reranker belongs, and nothing else.
+        ///
+        /// Same reason as `--models`: the installer asks rather than
+        /// rebuilding the path, so the two can never disagree.
+        #[arg(long)]
+        reranker: bool,
     },
 }
 
@@ -334,7 +342,7 @@ fn run(command: Commands) -> Result<()> {
             Ok(())
         }
         Commands::Sync => sync::run(),
-        Commands::Where { models } => where_am_i(models),
+        Commands::Where { models, reranker } => where_am_i(models, reranker),
     }
 }
 
@@ -545,8 +553,12 @@ fn stats() -> Result<()> {
     Ok(())
 }
 
-fn where_am_i(models_only: bool) -> Result<()> {
+fn where_am_i(models_only: bool, reranker_only: bool) -> Result<()> {
     let paths = Paths::resolve()?;
+    if reranker_only {
+        println!("{}", paths.model_dir_for(rerank::LOCAL_MODEL).display());
+        return Ok(());
+    }
     if models_only {
         println!("{}", paths.model_dir().display());
         return Ok(());
@@ -558,5 +570,6 @@ fn where_am_i(models_only: bool) -> Result<()> {
     println!("memory     {}", paths.project_dir(&scope).display());
     println!("index      {}", paths.db().display());
     println!("model      {}", paths.model_dir().display());
+    println!("reranker   {}", paths.model_dir_for(rerank::LOCAL_MODEL).display());
     Ok(())
 }

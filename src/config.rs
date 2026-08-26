@@ -161,6 +161,14 @@ impl Paths {
         self.data_dir.join("models").join(crate::embed::MODEL)
     }
 
+    /// Where a named model's files live, under the same versioned scheme
+    /// `model_dir` uses: a build expecting different weights finds nothing
+    /// rather than reading the wrong ones.
+    #[must_use]
+    pub fn model_dir_for(&self, model: &str) -> PathBuf {
+        self.data_dir.join("models").join(model)
+    }
+
     #[must_use]
     pub fn config_file(&self) -> PathBuf {
         self.data_dir.join("config.toml")

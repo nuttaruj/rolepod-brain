@@ -87,6 +87,7 @@ pub fn run() -> Result<Vec<Check>> {
     checks.push(taxonomy_check(&paths));
     checks.extend(summarizer_checks(&paths));
     checks.push(semantic_check(&paths));
+    checks.push(reranker_check(&paths));
     checks.extend(hook_checks());
     checks.extend(trigger_checks());
     checks.push(timer_check());
@@ -207,6 +208,35 @@ fn failure_age(at: Option<&str>) -> Option<String> {
 /// Model ids rot when a CLI upgrades, and a wrong id fails exactly like an
 /// outage. This lists the table so a rotted entry is visible rather than
 /// silently degrading every session to rule-based output.
+/// Whether a local reranker is present, and what its absence costs.
+///
+/// Absence is the ordinary state and never a failure: reranking is off by
+/// default, the weights are fetched only when someone first asks for one, and
+/// a build for a target `ort` publishes no binaries for cannot use them at
+/// all. What this reports is which of those a machine is in — because the
+/// difference between "reranking takes 1.5 seconds" and "reranking takes
+/// twelve" is otherwise invisible until someone waits through it.
+fn reranker_check(paths: &Paths) -> Check {
+    let dir = paths.model_dir_for(crate::rerank::LOCAL_MODEL);
+    let weights = dir.join("model.onnx");
+    if !cfg!(feature = "local-rerank") {
+        return Check::pass(
+            "reranker",
+            "not in this build - reranking uses the host CLI (~12s)",
+        );
+    }
+    if weights.is_file() {
+        return Check::pass("reranker", format!("local, ready ({})", dir.display()));
+    }
+    if dir.with_extension("fetching").exists() {
+        return Check::pass("reranker", "downloading - the CLI answers until it lands");
+    }
+    Check::pass(
+        "reranker",
+        "not fetched yet - the first rerank asks the CLI and starts the download",
+    )
+}
+
 /// How much of the corpus can be searched by meaning rather than by words.
 ///
 /// Worth reporting because it is the one part of recall that lags capture on

@@ -1,0 +1,155 @@
+//! Reranking without leaving the process.
+//!
+//! A cross-encoder is not a language model. It reads one (question, entry)
+//! pair and returns one number: how well the second answers the first. It
+//! generates nothing, so there is no prompt to write, no answer to parse, and
+//! no vocabulary an agent has to be taught. Thirty pairs take under two
+//! seconds on a laptop CPU.
+//!
+//! That is the whole reason this exists. Reranking through a host CLI is
+//! measured at a median of 12.2s on a real brain — worth waiting for once,
+//! not worth waiting for often. The same work here costs 1.6s, needs no
+//! subscription, no credential, and no process to spawn.
+//!
+//! Bounded the same way everything else here is bounded: absent until asked
+//! for, and absent again the moment anything goes wrong. A missing model, a
+//! corrupt file, a runtime that will not load - each returns `None` and the
+//! caller falls through to the CLI it would have used anyway.
+
+use std::path::Path;
+use std::sync::{Mutex, OnceLock};
+
+use anyhow::{Context, Result};
+use ort::session::Session;
+use ort::value::Value;
+use tokenizers::Tokenizer;
+
+pub const WEIGHTS_FILE: &str = "model.onnx";
+/// The tokenizer inside [`MODEL`]'s directory.
+pub const TOKENIZER_FILE: &str = "tokenizer.json";
+
+/// Tokens kept from one (query, entry) pair.
+///
+/// The model would take 512. Entries here are a title and the first 160 bytes
+/// of a body, so 320 covers them with room for a long query, and every token
+/// past what the text actually holds is padding that costs time to multiply
+/// by zero.
+const MAX_TOKENS: usize = 320;
+
+/// Loaded once per process, kept for the life of it.
+///
+/// The MCP server lives exactly as long as one session, which is what makes a
+/// local model affordable without a daemon: the first search of a session pays
+/// the one-second load, every search after it pays nothing. A short-lived hook
+/// process never reaches this code at all.
+///
+/// The error is kept as text rather than as an error, because a `OnceLock` has
+/// to hand out the same value to every later caller and most error types are
+/// not `Clone`.
+static CELL: OnceLock<Result<Reranker, String>> = OnceLock::new();
+
+struct Reranker {
+    /// `Session::run` needs `&mut`, and this lives in a `OnceLock` that hands
+    /// out shared references. One lock per search, uncontended in practice:
+    /// the MCP server answers one call at a time.
+    session: Mutex<Session>,
+    tokenizer: Tokenizer,
+}
+
+/// Score `entries` against `query`, best first, or `None` if this build has no
+/// reranker to hand.
+///
+/// `None` is not a failure to report. It is the ordinary state of a machine
+/// whose model has not downloaded yet, or whose target `ort` publishes no
+/// binaries for. The caller treats it as "not available" and uses the path it
+/// would have used anyway.
+#[must_use]
+pub fn rerank(model_dir: &Path, query: &str, entries: &[String]) -> Option<Vec<usize>> {
+    if entries.len() < 2 {
+        return None;
+    }
+    let reranker = load(model_dir).as_ref().ok()?;
+    match reranker.score(query, entries) {
+        Ok(scores) => {
+            let mut order: Vec<usize> = (0..scores.len()).collect();
+            // Descending by score, ties broken by the order the caller gave -
+            // which is the index's own ranking, and a better tiebreak than
+            // whatever `sort_by` would otherwise do.
+            order.sort_by(|a, b| {
+                scores[*b].total_cmp(&scores[*a]).then_with(|| a.cmp(b))
+            });
+            Some(order)
+        }
+        Err(_) => None,
+    }
+}
+
+fn load(model_dir: &Path) -> &'static Result<Reranker, String> {
+    CELL.get_or_init(|| open(model_dir).map_err(|error| format!("{error:#}")))
+}
+
+fn open(model_dir: &Path) -> Result<Reranker> {
+    let weights = model_dir.join(WEIGHTS_FILE);
+    let tokenizer = model_dir.join(TOKENIZER_FILE);
+    anyhow::ensure!(weights.is_file(), "no reranker at {}", weights.display());
+    anyhow::ensure!(tokenizer.is_file(), "no tokenizer at {}", tokenizer.display());
+
+    let mut tokenizer = Tokenizer::from_file(&tokenizer)
+        .map_err(|error| anyhow::anyhow!("{error}"))
+        .context("read reranker tokenizer")?;
+    tokenizer
+        .with_truncation(Some(tokenizers::TruncationParams {
+            max_length: MAX_TOKENS,
+            ..Default::default()
+        }))
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    tokenizer.with_padding(Some(tokenizers::PaddingParams::default()));
+
+    let session = Session::builder()
+        .context("build onnx session")?
+        .commit_from_file(&weights)
+        .context("load reranker weights")?;
+    Ok(Reranker { session: Mutex::new(session), tokenizer })
+}
+
+impl Reranker {
+    fn score(&self, query: &str, entries: &[String]) -> Result<Vec<f32>> {
+        let pairs: Vec<(String, String)> =
+            entries.iter().map(|entry| (query.to_string(), entry.clone())).collect();
+        let encoded = self
+            .tokenizer
+            .encode_batch(pairs, true)
+            .map_err(|error| anyhow::anyhow!("{error}"))
+            .context("tokenize pairs")?;
+
+        let rows = encoded.len();
+        let width = encoded.first().map_or(0, |first| first.get_ids().len());
+        anyhow::ensure!(width > 0, "tokenizer produced no tokens");
+
+        let mut ids = Vec::with_capacity(rows * width);
+        let mut mask = Vec::with_capacity(rows * width);
+        for item in &encoded {
+            ids.extend(item.get_ids().iter().map(|id| i64::from(*id)));
+            mask.extend(item.get_attention_mask().iter().map(|bit| i64::from(*bit)));
+        }
+
+        let shape = [rows, width];
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|_| anyhow::anyhow!("reranker lock poisoned"))?;
+        let outputs = session
+            .run(ort::inputs![
+                "input_ids" => Value::from_array((shape, ids))?,
+                "attention_mask" => Value::from_array((shape, mask))?,
+            ])
+            .context("run reranker")?;
+        let (_, scores) = outputs[0].try_extract_tensor::<f32>().context("read scores")?;
+        anyhow::ensure!(
+            scores.len() == rows,
+            "reranker returned {} scores for {rows} entries",
+            scores.len()
+        );
+        Ok(scores.to_vec())
+    }
+}

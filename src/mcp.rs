@@ -359,7 +359,12 @@ fn call_tool(paths: &Paths, project: &str, session: &str, params: &Value) -> Res
             // With a reranker to sort them, it is worth pulling more than the
             // caller asked for: the entry that answers the question is often
             // just past the cut.
-            let pool = if rerank { crate::rerank::POOL.max(limit) } else { limit };
+            // The wide pool whenever reranking is on, whichever engine ends
+            // up doing it. Fetching thirty costs no more than fifteen, the
+            // engine is not known until the hits are in hand, and a wider
+            // candidate set reaches fusion before anything is trimmed - which
+            // helps even the searches that are never reranked.
+            let pool = if rerank { crate::rerank::LOCAL_POOL.max(limit) } else { limit };
             // An unknown topic would silently return nothing, which reads to
             // an agent as "no memory" rather than "wrong scope" - so a value
             // outside the taxonomy is ignored and the search runs unscoped.
@@ -384,7 +389,8 @@ fn call_tool(paths: &Paths, project: &str, session: &str, params: &Value) -> Res
                 let ladder = crate::summarizer::Ladder::new(&store, &config.summarizer);
                 // Borrow the cheap tier of whichever CLI works here.
                 let cli = store.project_cli(project)?.unwrap_or_default();
-                hits = crate::rerank::rerank(&ladder, &cli, query, hits);
+                let model_dir = paths.model_dir_for(crate::rerank::LOCAL_MODEL);
+                hits = crate::rerank::rerank(&ladder, &cli, query, &model_dir, hits);
             }
             hits.truncate(limit);
 

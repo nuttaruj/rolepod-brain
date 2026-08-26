@@ -42,6 +42,7 @@ for arg in "$@"; do
         --uninstall)  uninstall=1 ;;
         --binary-only) binary_only=1 ;;
 --model-only) model_only=1 ;;
+--reranker-only) reranker_only=1 ;;
 --into)       shift; model_into="$1" ;;
         -h|--help)
             # The header block: from the second line to the first that is
@@ -199,6 +200,47 @@ fetch_model() {
     rm -rf "$work"
     say "Semantic search is ready."
 }
+
+fetch_reranker() {
+    # The reranker is 568 MB and reranking is off by default, so this is never
+    # part of an install. `brain` calls it the first time someone actually asks
+    # for a rerank, in the background, and that search falls through to the
+    # host CLI while it runs. The one after it has the model.
+    model_dir="$1"
+    [ -n "$model_dir" ] || model_dir="$($BIN where --reranker 2>/dev/null)"
+    [ -n "$model_dir" ] || return 1
+    if [ -s "$model_dir/model.onnx" ] && [ -s "$model_dir/tokenizer.json" ]; then
+        return 0
+    fi
+    mkdir -p "$model_dir" || return 1
+    work=$(mktemp -d) || return 1
+    say "Fetching the reranker (568 MB, once) ..."
+    if [ -z "$base" ]; then
+        base="https://github.com/$REPO/releases/download/$version"
+    fi
+    curl -fsSL -o "$work/SHA256SUMS" "$base/SHA256SUMS" 2>/dev/null || {
+        rm -rf "$work"
+        return 1
+    }
+    for f in reranker-int8.onnx reranker-tokenizer.json; do
+        curl -fsSL -o "$work/$f" "$base/$f" 2>/dev/null || {
+            rm -rf "$work"
+            return 1
+        }
+        verify "$work/$f" "$f" "$work/SHA256SUMS"
+    done
+    # Named as the loader expects only once both are whole: a half-written
+    # graph that loads is worse than one that is plainly absent.
+    mv "$work/reranker-int8.onnx" "$model_dir/model.onnx" || { rm -rf "$work"; return 1; }
+    mv "$work/reranker-tokenizer.json" "$model_dir/tokenizer.json" || { rm -rf "$work"; return 1; }
+    rm -rf "$work"
+    say "Local reranking is ready."
+}
+
+if [ -n "$reranker_only" ]; then
+    fetch_reranker "" || die "could not fetch the reranker"
+    exit 0
+fi
 
 if [ -n "$model_only" ]; then
     if [ -n "$model_into" ]; then

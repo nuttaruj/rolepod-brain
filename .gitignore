@@ -9,3 +9,7 @@
 # `bootstrap.sh --model-only --into assets` — the checksums are in PROVENANCE.
 assets/*/model-int8.safetensors
 assets/*/tokenizer.json
+# Same rule for the reranker, and more so: 569 MB, fetched only by machines
+# that actually turn reranking on. `bootstrap.sh --reranker-only`.
+assets/*/model.onnx
+assets/*/model.onnx.data

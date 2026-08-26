@@ -23,15 +23,40 @@ use std::time::Duration;
 use crate::store::Hit;
 use crate::summarizer::{Ladder, Tier};
 
-/// Hits offered to the model.
+/// Hits offered to a host CLI.
 ///
-/// Fifteen, measured rather than guessed. Thirty took a median of 21.8s
-/// through a host CLI and six took 8.8s, but six only ever sees the top of
-/// the list - and the entries a reranker earns its keep by promoting sat at
-/// a mean rank of 13. Six would have thrown away more than half of what
-/// there is to find. Fifteen keeps most of that reach at roughly half the
-/// wait.
+/// Fifteen, and it is a ceiling rather than a preference. Measured against a
+/// CLI on a 22k-event brain, thirty titles take a median of 21.8s - past the
+/// leash below - while fifteen take 12.2s and six take 8.8s. Six is faster
+/// still and sees only the top of the list: the entries a reranker earns its
+/// keep by promoting sat at a mean rank of 13, so six discards more than half
+/// of what there is to find.
 pub const POOL: usize = 15;
+
+/// Hits offered to a local cross-encoder.
+///
+/// Twice the CLI's, because the ceiling that set that number does not apply:
+/// thirty pairs take it 1.6s. Fetching thirty costs no more than fetching
+/// fifteen either (0.218s against 0.329s, which is noise) - RRF fuses the
+/// whole pool regardless and truncation only trims the tail.
+///
+/// Not yet established: that thirty ranks BETTER than fifteen here. Only that
+/// it is affordable. `brief/10-cross-encoder-spike.md` has the measurements
+/// and the caveat.
+pub const LOCAL_POOL: usize = 30;
+
+/// Which reranker the local path reads, and the directory its files live in.
+///
+/// `bge-reranker-v2-m3` quantised to int8. Chosen over the smaller
+/// `mmarco-mMiniLMv2-L12` (0.1B, 118 MB) because the small one does not do the
+/// job: measured across fifteen queries it left English rankings slightly
+/// worse than it found them, while this one improves English and Thai alike.
+/// `brief/10-cross-encoder-spike.md` has both sets of numbers.
+///
+/// Named here rather than in `xencoder` so a caller need not know whether this
+/// build has the feature at all. The name is in the path so a build expecting
+/// different weights finds nothing rather than reading the wrong ones.
+pub const LOCAL_MODEL: &str = "bge-reranker-v2-m3-int8";
 
 /// How long someone waiting on a search result will tolerate.
 ///
@@ -55,16 +80,118 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 /// times out, or answers with anything unusable. There is no error case by
 /// design: a failed rerank is a no-op, never a failed search.
 #[must_use]
-pub fn rerank(ladder: &Ladder<'_>, cli: &str, query: &str, hits: Vec<Hit>) -> Vec<Hit> {
+pub fn rerank(
+    ladder: &Ladder<'_>,
+    cli: &str,
+    query: &str,
+    model_dir: &std::path::Path,
+    hits: Vec<Hit>,
+) -> Vec<Hit> {
     if hits.len() < 2 {
         return hits;
     }
-    let prompt = prompt_for(query, &hits);
+    // The local model first, when this build has one and the weights are on
+    // disk: same judgement, 1.6s instead of 12.2s, no subscription spent.
+    if let Some(order) = local_order(model_dir, query, &hits) {
+        return apply_order(&order, hits);
+    }
+    // Not there yet. Start fetching it for next time and answer this search
+    // the way every machine answers it today - through the CLI. The download
+    // is detached and silent: a search is not the place to learn that 568 MB
+    // is moving, and a failed fetch must cost nothing but a retry later.
+    fetch_in_background(model_dir);
+    // The CLI sees the narrower pool: past fifteen it overruns the leash.
+    let offered: Vec<Hit> = hits.iter().take(POOL).cloned().collect();
+    let prompt = prompt_for(query, &offered);
     let ladder = ladder.while_waiting(TIMEOUT);
     let Ok((Tier::Cli(_), answer)) = ladder.run(&prompt, cli, usable) else {
         return hits;
     };
     apply(order_in(&answer), hits)
+}
+
+/// Ask the installer to fetch the reranker, once, without waiting for it.
+///
+/// Only when this build could actually use one - a binary without the feature
+/// would download 568 MB it can never load. Silent by design: nothing is
+/// printed, no error is surfaced, and a second search while the first fetch is
+/// still running does not start another, because the marker file is written
+/// before the download begins.
+#[cfg(feature = "local-rerank")]
+fn fetch_in_background(model_dir: &std::path::Path) {
+    let marker = model_dir.with_extension("fetching");
+    if marker.exists() || model_dir.join(crate::xencoder::WEIGHTS_FILE).exists() {
+        return;
+    }
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if std::fs::write(&marker, "").is_err() {
+        return;
+    }
+    let script = "curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh \
+                  | sh -s -- --reranker-only";
+    let marker_path = marker.to_string_lossy().into_owned();
+    let _ = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("({script}); rm -f '{marker_path}'"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// A build without the feature has nothing to fetch.
+#[cfg(not(feature = "local-rerank"))]
+fn fetch_in_background(_model_dir: &std::path::Path) {}
+
+/// Reorder `hits` by a list of indices into it, keeping anything the list
+/// leaves out in the order it already had.
+fn apply_order(order: &[usize], hits: Vec<Hit>) -> Vec<Hit> {
+    let mut taken = vec![false; hits.len()];
+    let mut hits: Vec<Option<Hit>> = hits.into_iter().map(Some).collect();
+    let mut ranked = Vec::with_capacity(hits.len());
+    for index in order {
+        if let Some(slot) = hits.get_mut(*index) {
+            if let Some(hit) = slot.take() {
+                taken[*index] = true;
+                ranked.push(hit);
+            }
+        }
+    }
+    for (index, slot) in hits.iter_mut().enumerate() {
+        if !taken[index] {
+            if let Some(hit) = slot.take() {
+                ranked.push(hit);
+            }
+        }
+    }
+    ranked
+}
+
+/// What the local cross-encoder makes of these hits, if this build has one.
+///
+/// `None` on every ordinary absence - the feature was not compiled in, the
+/// weights have not been downloaded, the runtime refused them - so the caller
+/// falls through to the CLI it would have used anyway.
+#[cfg(feature = "local-rerank")]
+fn local_order(model_dir: &std::path::Path, query: &str, hits: &[Hit]) -> Option<Vec<usize>> {
+    let offered: Vec<String> = hits
+        .iter()
+        .take(LOCAL_POOL)
+        .map(|hit| {
+            let snippet = hit.snippet.replace(['[', ']'], "");
+            format!("{} {}", hit.title, snippet.trim()).trim().to_string()
+        })
+        .collect();
+    crate::xencoder::rerank(model_dir, query, &offered)
+}
+
+/// The same, for a build without the feature: there is no local model, and
+/// saying so costs nothing.
+#[cfg(not(feature = "local-rerank"))]
+fn local_order(_model_dir: &std::path::Path, _query: &str, _hits: &[Hit]) -> Option<Vec<usize>> {
+    None
 }
 
 /// Did the model answer the question it was asked?
@@ -226,6 +353,62 @@ mod tests {
     /// The prompt asks for NONE when nothing fits. A model that complies has
     /// answered, and treating that as a dead rung cost the CLI a breaker mark
     /// for doing exactly what it was told.
+    /// A local reranker's verdict is applied, and nothing it leaves out is
+    /// dropped.
+    ///
+    /// The scores come from a model, so the test supplies the order directly:
+    /// what is under test is that an order is honoured, that entries the model
+    /// said nothing about keep the place the index gave them, and that no hit
+    /// disappears on the way through.
+    #[test]
+    fn an_order_from_a_local_model_promotes_without_discarding() {
+        let ranked = apply_order(&[2, 0], pool());
+        assert_eq!(
+            ranked.iter().map(|hit| hit.title.as_str()).collect::<Vec<_>>(),
+            vec!["third", "first", "second"],
+            "the unnamed hit must keep its search order behind the named ones"
+        );
+        assert_eq!(ranked.len(), 3, "reranking is a permutation, never a filter");
+    }
+
+    #[test]
+    fn an_order_that_names_nothing_leaves_the_search_alone() {
+        let ranked = apply_order(&[], pool());
+        assert_eq!(
+            ranked.iter().map(|hit| hit.title.as_str()).collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+    }
+
+    #[test]
+    fn an_index_past_the_end_is_ignored_rather_than_trusted() {
+        // A model that returns garbage must not panic a search, and must not
+        // silently shrink one either.
+        let ranked = apply_order(&[99, 1], pool());
+        assert_eq!(
+            ranked.iter().map(|hit| hit.title.as_str()).collect::<Vec<_>>(),
+            vec!["second", "first", "third"]
+        );
+    }
+
+    /// Without the feature compiled in there is no local model, and the code
+    /// says so rather than pretending otherwise - which is what sends the
+    /// caller to the CLI path.
+    #[cfg(not(feature = "local-rerank"))]
+    #[test]
+    fn a_build_without_the_feature_reports_no_local_model() {
+        assert!(local_order(std::path::Path::new("/nowhere"), "q", &pool()).is_none());
+    }
+
+    /// With the feature but without weights on disk, the same answer. This is
+    /// the ordinary state of every machine before the model is fetched.
+    #[cfg(feature = "local-rerank")]
+    #[test]
+    fn a_missing_model_reports_no_local_model() {
+        let empty = std::env::temp_dir().join("rolepod-brain-no-such-reranker");
+        assert!(local_order(&empty, "q", &pool()).is_none());
+    }
+
     #[test]
     fn saying_none_is_an_answer_not_a_dead_rung() {
         for reply in ["NONE", "none", "None.", "  NONE\n"] {

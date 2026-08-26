@@ -26,6 +26,13 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-14
             test: true
+            # Local reranking needs `ort`, which publishes prebuilt
+            # onnxruntime per target. Every target here has one except Intel
+            # macOS, which is built by cross-compiling from this same runner —
+            # so that binary goes without, and reranking there falls through to
+            # the host CLI exactly as it does on any machine that has not
+            # downloaded the weights.
+            features: local-rerank
           # Cross-compiled from the arm64 runner rather than built on an Intel
           # one. GitHub is retiring the Intel macOS runners, and a release that
           # waits for the scarcest machine in the fleet is a release that does
@@ -36,6 +43,7 @@ jobs:
           - target: x86_64-apple-darwin
             runner: macos-14
             test: false
+            features: ""
           # Built on the oldest runner we support rather than the newest, so
           # the glibc it links against is one an older distribution actually
           # has. A binary that only runs on the machine that built it is not a
@@ -43,9 +51,11 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
             test: true
+            features: local-rerank
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
             test: true
+            features: local-rerank
     steps:
       - uses: actions/checkout@v4
 
@@ -86,7 +96,9 @@ jobs:
           [ "$want" = "$got" ] || { echo "model checksum $got does not match PROVENANCE $want"; exit 1; }
 
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} \
+            ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
 
       - name: Test
         # The same suite the repository runs. A binary nobody verified is
@@ -94,7 +106,9 @@ jobs:
         # one target that cannot run its own tests here is covered by the
         # identical source built and tested on the sibling architecture.
         if: matrix.test
-        run: cargo test --release --locked --target ${{ matrix.target }}
+        run: |
+          cargo test --release --locked --target ${{ matrix.target }} \
+            ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
 
       - name: Sign (macOS)
         if: runner.os == 'macOS'
@@ -147,6 +161,38 @@ jobs:
           path: assets/potion-multilingual-128M/tokenizer.json
           key: tokenizer-73908c3438cf03b6a01bcb9611d62b23d0726f08
 
+      # The reranker is 569 MB and nobody downloads it at install — only the
+      # first search that actually asks for one does. It still has to be under
+      # this tag when that happens, so it is built here, from the published
+      # float32 weights, by the script in the repository. Cached because
+      # quantising 2.2 GB on every release is a waste of a runner.
+      - name: Cache the reranker
+        uses: actions/cache@v4
+        with:
+          path: assets/bge-reranker-v2-m3-int8/model.onnx
+          key: reranker-bge-v2-m3-int8-v1
+      - name: Cache the reranker tokenizer
+        uses: actions/cache@v4
+        with:
+          path: assets/bge-reranker-v2-m3-int8/tokenizer.json
+          key: reranker-tokenizer-bge-v2-m3-v1
+      - name: Build the reranker
+        shell: bash
+        run: |
+          set -eu
+          R=assets/bge-reranker-v2-m3-int8
+          UP=https://huggingface.co/EmbeddedLLM/bge-reranker-v2-m3-onnx-o3-cpu/resolve/main
+          [ -s "$R/tokenizer.json" ] || curl -fsSL -o "$R/tokenizer.json" "$UP/tokenizer.json"
+          if [ ! -s "$R/model.onnx" ]; then
+              curl -fsSL -o fp32.onnx "$UP/model.onnx"
+              curl -fsSL -o fp32.onnx.data "$UP/model.onnx.data"
+              python3 -m pip install --quiet --break-system-packages onnx onnxruntime sympy \
+                  || python3 -m pip install --quiet onnx onnxruntime sympy
+              python3 "$R/quantize.py" fp32.onnx "$R/model.onnx"
+              rm -f fp32.onnx fp32.onnx.data
+          fi
+          ls -l "$R"
+
       - name: Collect
         run: |
           set -eu
@@ -154,8 +200,13 @@ jobs:
           find artifacts -type f -exec cp {} dist/ \;
           cp assets/potion-multilingual-128M/model-int8.safetensors dist/
           cp assets/potion-multilingual-128M/tokenizer.json dist/
+          # Named apart from the embedding model's files: both are "a model
+          # and its tokenizer", and one directory of release assets cannot
+          # hold two files called tokenizer.json.
+          cp assets/bge-reranker-v2-m3-int8/model.onnx dist/reranker-int8.onnx
+          cp assets/bge-reranker-v2-m3-int8/tokenizer.json dist/reranker-tokenizer.json
           cd dist
-          for f in model-int8.safetensors tokenizer.json; do
+          for f in model-int8.safetensors tokenizer.json reranker-int8.onnx reranker-tokenizer.json; do
               sha256sum "$f" > "$f.sha256"
           done
           # One file the installer can fetch to check any binary against,
