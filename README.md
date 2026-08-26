@@ -39,15 +39,38 @@ body. `brain doctor` reports the real bytes spent, not the configured limit.
 
 **Found by meaning, not only by words.** A session that recorded `login token
 expiry` is one someone later searching `auth` needs, and no keyword index will
-ever connect those two. So every memory also carries a semantic vector, and
-search fuses the two rankings — the keyword hit that is *also* about the right
-thing goes first.
+ever connect those two. So a search asks five questions at once — which
+memory used these words, which one means this, which session declared it was
+about this, what else touched the same things, and (for scripts written
+without spaces between words) which title contains this run of characters —
+and fuses whatever each one ranked. A memory several of them agree on
+outranks one a single ranking felt strongly about. Each is equal weight: a
+per-stream tuning knob is a number nobody can justify a value for.
 
-The model is compiled into the binary: 32 MB of static embeddings, no download,
-no Python, no second process, no API key, and nothing to be unavailable. Rows
-are read straight out of the binary's read-only pages, so a search costs ~35 MB
-resident rather than the 199 MB an expanded copy of the table would — the
-operating system maps those pages once and every process shares them.
+None of the five needs a model to be reachable, which is what keeps recall
+wide when none is.
+
+**In whatever language you work in.** The question and the memory do not have
+to be in the same one: ask in Thai about work recorded in English and the
+right memory still comes back. The model covers 101 languages, and this is
+measured rather than assumed — 40 pairs of a Thai question and the English
+memory answering it, the right one ranked first 80% of the time and inside the
+top five 97%, measured on the quantized file that actually ships and not on
+the original it was made from. The English-only model this replaced managed
+2.5%, which is one in forty: chance.
+
+The model is 122 MB of static embeddings — no Python, no second process, no
+API key, and no service to be down. It is fetched once when brain is
+installed, checksum-verified, and never touched over the network again; the
+binary itself is under 4 MB. Until it arrives, and if it never does, recall
+runs on its other four rankings and `brain doctor` says so.
+
+It is never loaded into memory either. A search needs about ten rows out of
+half a million, so those rows are read where they sit and the operating
+system's page cache shares them between every brain process. Segmenting the
+query is written out here rather than taken from the usual library for the
+same reason: that library holds this vocabulary as a trie of one hash map per
+byte, which is 710 MB that never goes away.
 
 It is never loaded during capture, which is why hooks still answer in ~13ms;
 vectors are written by consolidation, and `brain doctor` reports how much of
@@ -80,8 +103,8 @@ curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstr
 ```
 
 That fetches the binary for your platform, checks it against the checksum
-published with the release, installs it to `~/.local/bin/brain`, and wires
-every supported CLI it finds. It prints a plan first and asks before touching
+published with the release, installs it to `~/.local/bin/brain`, fetches the
+embedding model once, and wires every supported CLI it finds. It prints a plan first and asks before touching
 anything. No repository is left on your machine, and no Rust toolchain is
 needed — what lands is one binary.
 
@@ -134,9 +157,14 @@ curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstr
 ### Or install it as a plugin
 
 On Claude Code and Codex the plugin is a complete install on its own — it
-carries the hooks, the MCP tools and the skills, and fetches the binary on your
-first session if it is not already on your PATH. Every other CLI is wired by
-the one-liner above.
+carries the hooks, the MCP tools and the skills, and on your first session it
+fetches the binary if it is not already on your PATH and starts the embedding
+model download in the background. Nothing waits on that: the session opens
+immediately and recall gains its fifth ranking when the model lands. Every
+other CLI is wired by the one-liner above.
+
+Codex is installed this way and no other. Its plugin flow is what grants the
+hooks permission to run, and brain does not write its own trust entry.
 
 ```sh
 # Claude Code

@@ -11,13 +11,18 @@
 //! no ONNX runtime, no Python, no second process, no download. It is compiled
 //! into the binary and works on a machine that has never had a network.
 //!
+//! The table covers 101 languages, which is not a feature so much as the
+//! absence of a defect: the English-only model this replaced pooled a Thai
+//! sentence into noise and ranked the memory that answered it at chance.
+//! `assets/potion-multilingual-128M/PROVENANCE.md` has the measurement.
+//!
 //! ## Why the inference is written out here
 //!
 //! The reference implementation loads a model by expanding the whole int8
-//! table into `f32` up front. For this table that is 63,091 × 512 values —
-//! 129 MB of heap, per process, measured at 199 MB RSS — to answer a query
-//! that touches about ten rows. A long-lived MCP server would hold that for a
-//! whole session, and several sessions multiply it.
+//! table into `f32` up front. For this table that is 500,353 × 256 values —
+//! 489 MB of heap, per process — to answer a query that touches about ten
+//! rows. A long-lived MCP server would hold that for a whole session, and
+//! several sessions multiply it.
 //!
 //! A static model's forward pass is a gather and a mean, so it is written here
 //! instead, reading int8 straight out of the binary's read-only pages: the
@@ -26,9 +31,7 @@
 //!
 //! | | reference | here |
 //! |---|---|---|
-//! | construct | 83 ms | 40 ms (the tokenizer, and nothing else) |
-//! | encode | 27 µs | 18 µs |
-//! | resident | 199 MB | a few MB |
+//! | resident | the whole expanded table | only the rows a query touched |
 //!
 //! `an_answer_here_matches_the_reference_implementation` holds the two to the
 //! same output, so this stays a memory optimisation and never becomes a
@@ -42,15 +45,34 @@
 use std::sync::OnceLock;
 
 use anyhow::Result;
-use tokenizers::Tokenizer;
+use crate::tokenize::Unigram;
 
-/// Vendored weights. See `assets/potion-retrieval-32M/PROVENANCE.md` for what
-/// was changed from upstream and the measured cost of changing it.
-const WEIGHTS: &[u8] = include_bytes!("../assets/potion-retrieval-32M/model-int8.safetensors");
-const TOKENIZER: &[u8] = include_bytes!("../assets/potion-retrieval-32M/tokenizer.json");
+/// Which weights this build reads, and the directory they live in.
+///
+/// See `assets/potion-multilingual-128M/PROVENANCE.md` for what was changed
+/// from upstream, why this model and not the English one, and the measured
+/// cost of both. The name is in the path so that a build expecting different
+/// weights finds nothing rather than reading the wrong ones.
+pub const MODEL: &str = "potion-multilingual-128M";
+
+/// The weights file inside [`MODEL`]'s directory.
+pub const WEIGHTS_FILE: &str = "model-int8.safetensors";
+/// The tokenizer file inside [`MODEL`]'s directory.
+pub const TOKENIZER_FILE: &str = "tokenizer.json";
+
+/// Ceiling on the safetensors header, so a corrupt length cannot ask for an
+/// allocation the size of the disk. The real one is a few hundred bytes.
+const MAX_HEADER: u64 = 1 << 20;
+
 
 /// Vector width, fixed by the model.
-pub const DIMS: usize = 512;
+///
+/// Changing this changes the width of every stored vector, and `similarity`
+/// scores mismatched widths at 0.0 - so an existing index does not degrade,
+/// it stops answering. `Store::events_missing_vectors` counts a row of the
+/// wrong width as absent for exactly that reason, which is what turns a model
+/// change into an ordinary backlog instead of a migration.
+pub const DIMS: usize = 256;
 
 /// A unit vector, stored one byte per dimension.
 ///
@@ -59,8 +81,8 @@ pub const DIMS: usize = 512;
 /// same argument the weights themselves are stored under.
 ///
 /// This is not miserliness. Search reads every vector in the project to rank
-/// them, so the row width IS the query cost: 512 bytes a row keeps a hundred
-/// thousand events at 51 MB of sequential reads rather than 205 MB.
+/// them, so the row width IS the query cost: 256 bytes a row keeps a hundred
+/// thousand events at 26 MB of sequential reads rather than 102 MB.
 pub type Vector = Vec<u8>;
 
 /// The embedding table, as it sits in the binary.
@@ -70,15 +92,30 @@ pub type Vector = Vec<u8>;
 /// own read-only pages.
 #[derive(Debug)]
 struct Table {
-    view: safetensors::tensor::TensorView<'static>,
+    file: std::fs::File,
+    /// Where the tensor body starts, past the safetensors header.
+    body: u64,
+    rows: usize,
     dims: usize,
 }
 
 impl Table {
-    fn row(&self, id: u32) -> Option<&[u8]> {
-        let start = (id as usize).checked_mul(self.dims)?;
-        let end = start.checked_add(self.dims)?;
-        self.view.data().get(start..end)
+    /// Read one token's row into `into`, or leave it alone and say no.
+    ///
+    /// A read rather than a mapping, and that is the whole memory story: a
+    /// query touches on the order of ten rows of 256 bytes out of half a
+    /// million, so the table never needs to be in this process at all. The
+    /// operating system's page cache keeps the pages that get used, shares
+    /// them between every brain process, and the heap here stays empty.
+    /// `mmap` would do the same thing and needs `unsafe`; this does not.
+    fn row(&self, id: u32, into: &mut [u8]) -> bool {
+        use std::os::unix::fs::FileExt;
+        let id = id as usize;
+        if id >= self.rows || into.len() != self.dims {
+            return false;
+        }
+        let at = self.body + (id * self.dims) as u64;
+        self.file.read_exact_at(into, at).is_ok()
     }
 }
 
@@ -91,18 +128,32 @@ impl Table {
 /// The error text is kept, not the error: a `OnceLock` has to hand out the
 /// same value to every caller, and an `anyhow::Error` cannot be shared. A
 /// string can, and a string is what the reader wanted anyway.
-fn tokenizer() -> Result<&'static Tokenizer> {
-    static CELL: OnceLock<Result<Tokenizer, String>> = OnceLock::new();
-    CELL.get_or_init(|| Tokenizer::from_bytes(TOKENIZER).map_err(|error| error.to_string()))
-        .as_ref()
-        .map_err(|error| anyhow::anyhow!("vendored tokenizer is unusable: {error}"))
+fn tokenizer() -> Result<&'static Unigram> {
+    static CELL: OnceLock<Result<Unigram, String>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let paths = crate::config::Paths::resolve().map_err(|error| error.to_string())?;
+        let path = paths.model_dir().join(TOKENIZER_FILE);
+        if !path.is_file() {
+            return Err(format!(
+                "{} is not here. The embedding model is fetched once, after \
+                 install; `brain doctor` says how",
+                path.display()
+            ));
+        }
+        Unigram::from_path(&path).map_err(|error| error.to_string())
+    })
+    .as_ref()
+    .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
 fn table() -> Result<&'static Table> {
     static CELL: OnceLock<Result<Table, String>> = OnceLock::new();
-    CELL.get_or_init(|| load_table(WEIGHTS))
+    CELL.get_or_init(|| {
+        let paths = crate::config::Paths::resolve().map_err(|error| error.to_string())?;
+        load_table(&paths.model_dir().join(WEIGHTS_FILE))
+    })
         .as_ref()
-        .map_err(|error| anyhow::anyhow!("vendored embedding table is unusable: {error}"))
+        .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
 /// Read the weights, and say precisely what is wrong when they cannot be.
@@ -112,40 +163,67 @@ fn table() -> Result<&'static Table> {
 /// a corrupt download, one is a model saved at the wrong precision, and one is
 /// a different model entirely — and a single "failed to load" sends whoever
 /// reads it looking in the wrong place for all three.
-fn load_table(bytes: &'static [u8]) -> Result<Table, String> {
-    // Parsing a safetensors file is reading its header; the tensor body stays
-    // exactly where it is, which is the point.
-    let file = safetensors::SafeTensors::deserialize(bytes)
-        .map_err(|error| format!("not a readable safetensors file: {error}"))?;
-    let view = file
-        .tensor("embeddings")
-        .map_err(|_| {
-            format!("no `embeddings` tensor; found {:?}", file.names())
-        })?;
-    let &[rows, dims] = view.shape() else {
-        return Err(format!("expected a 2-D tensor, got shape {:?}", view.shape()));
-    };
-    if view.dtype() != safetensors::Dtype::I8 {
+fn load_table(path: &std::path::Path) -> Result<Table, String> {
+    // A safetensors file is a length, a JSON header, and the tensor bodies -
+    // so the header alone answers where the rows begin, and the 122 MB behind
+    // it is never read into this process.
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("{} is not readable: {error}", path.display()))?;
+    let mut length = [0u8; 8];
+    std::io::Read::read_exact(&mut file, &mut length)
+        .map_err(|error| format!("{} is too short to be safetensors: {error}", path.display()))?;
+    let header_len = u64::from_le_bytes(length);
+    if header_len > MAX_HEADER {
+        // Not a size problem in practice - it is what any file that is not
+        // safetensors looks like when its first eight bytes are read as a
+        // length. Saying "not a readable safetensors file" points at the
+        // actual mistake; saying "header too large" points at nothing.
         return Err(format!(
-            "expected int8 weights, got {:?} — see assets/potion-retrieval-32M/quantize.py",
-            view.dtype()
+            "not a readable safetensors file: {} opens with a {header_len}-byte header length",
+            path.display()
         ));
     }
+    #[allow(clippy::cast_possible_truncation)]
+    let mut header = vec![0u8; header_len as usize];
+    std::io::Read::read_exact(&mut file, &mut header)
+        .map_err(|error| format!("{} has a truncated header: {error}", path.display()))?;
+    let header: serde_json::Value = serde_json::from_slice(&header).map_err(|error| {
+        format!("not a readable safetensors file: {} ({error})", path.display())
+    })?;
+
+    let tensor = header.get("embeddings").ok_or_else(|| {
+        let names: Vec<&String> = header.as_object().map(|m| m.keys().collect()).unwrap_or_default();
+        format!("no `embeddings` tensor; found {names:?}")
+    })?;
+    if tensor["dtype"] != "I8" {
+        return Err(format!(
+            "expected int8 weights, got {} — see assets/{MODEL}/quantize.py",
+            tensor["dtype"]
+        ));
+    }
+    let shape: Vec<usize> = serde_json::from_value(tensor["shape"].clone())
+        .map_err(|error| format!("unreadable tensor shape: {error}"))?;
+    let &[rows, dims] = shape.as_slice() else {
+        return Err(format!("expected a 2-D tensor, got shape {shape:?}"));
+    };
     if dims != DIMS {
         return Err(format!(
             "model is {dims}-dimensional but this build stores {DIMS}-byte vectors; \
              every vector already in the index would score 0.0 against a new one"
         ));
     }
-    if rows == 0 || view.data().len() != rows * dims {
+    let offsets: Vec<u64> = serde_json::from_value(tensor["data_offsets"].clone())
+        .map_err(|error| format!("unreadable tensor offsets: {error}"))?;
+    let &[start, end] = offsets.as_slice() else {
+        return Err(format!("expected two data offsets, got {offsets:?}"));
+    };
+    if rows == 0 || end.saturating_sub(start) != (rows * dims) as u64 {
         return Err(format!(
-            "tensor is {} bytes, which is not {rows} rows of {dims}",
-            view.data().len()
+            "tensor spans {} bytes, which is not {rows} rows of {dims}",
+            end.saturating_sub(start)
         ));
     }
-    // `view` borrows the input bytes, not the `SafeTensors` wrapper, so it
-    // outlives the wrapper being dropped here.
-    Ok(Table { view, dims })
+    Ok(Table { file, body: 8 + header_len + start, rows, dims })
 }
 
 /// Encode one text into a stored vector.
@@ -186,22 +264,23 @@ const MAX_TOKENS: usize = 512;
 ///   cost 0.93 cosine against the reference on Thai text, and nothing at all
 ///   on English, which is exactly how it would have shipped unnoticed.
 /// * Truncation at [`MAX_TOKENS`], applied after the unknowns are gone.
-fn pool(tokenizer: &Tokenizer, table: &Table, text: &str) -> Vec<f32> {
+fn pool(tokenizer: &Unigram, table: &Table, text: &str) -> Vec<f32> {
     let mut sum = vec![0f32; table.dims];
-    let Ok(encoded) = tokenizer.encode(text, false) else {
-        return sum;
-    };
-    let unknown = tokenizer.token_to_id("[UNK]");
+    let encoded = tokenizer.encode(text);
+    let unknown = tokenizer.unk_id();
     let mut counted = 0u32;
-    for id in encoded.get_ids() {
+    let mut row = vec![0u8; table.dims];
+    for id in &encoded {
         if Some(*id) == unknown {
             continue;
         }
         if counted as usize >= MAX_TOKENS {
             break;
         }
-        let Some(row) = table.row(*id) else { continue };
-        for (slot, byte) in sum.iter_mut().zip(row) {
+        if !table.row(*id, &mut row) {
+            continue;
+        }
+        for (slot, byte) in sum.iter_mut().zip(&row) {
             #[allow(clippy::cast_possible_wrap)]
             let value = *byte as i8;
             *slot += f32::from(value);
@@ -278,25 +357,92 @@ pub fn similarity(a: &[u8], b: &[u8]) -> f32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
+    /// The model as it sits in a checkout, which is where tests read it from.
+    ///
+    /// Not the installed copy: a test must not depend on whether the machine
+    /// running it has fetched anything, and must not read a different version
+    /// than the source tree it is checking. `assets/` is git-ignored and
+    /// fetched by `bootstrap.sh --model-only --into assets`.
+    pub(crate) const ASSETS: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/assets/potion-multilingual-128M");
+
+    /// Point this process's data directory at a tree whose model is the one in
+    /// the checkout.
+    ///
+    /// The loaders resolve the model through `Paths`, and a test must not
+    /// depend on whether the machine running it has ever installed anything.
+    /// Called by every test that encodes; the work happens once because the
+    /// loaders themselves cache.
+    pub(crate) fn use_checkout_model() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let home = std::env::temp_dir().join("rolepod-brain-test-home");
+            let models = home.join("models").join(MODEL);
+            std::fs::create_dir_all(&models).expect("test model directory");
+            for file in [WEIGHTS_FILE, TOKENIZER_FILE, "config.json"] {
+                let target = models.join(file);
+                if !target.exists() {
+                    std::fs::copy(std::path::Path::new(ASSETS).join(file), &target)
+                        .expect("stage the checkout model");
+                }
+            }
+            // SAFETY-adjacent: single-threaded here by `Once`, and every
+            // reader of this variable runs after it.
+            std::env::set_var(crate::config::DATA_DIR_ENV, &home);
+        });
+    }
+
     /// The reason this module exists: two memories about one thing, in words
-    /// that never meet. FTS5 scores this pair at nothing.
+    /// that never meet. FTS5 scores every one of these pairs at nothing.
+    ///
+    /// Stated as an ordering rather than a threshold, because the absolute
+    /// cosine scale belongs to whichever model is vendored - a different table
+    /// moves every number here at once without the ranking changing at all,
+    /// and a test that pins the numbers would fail on a model that got better.
+    /// What must hold for any model worth shipping is that each pair about one
+    /// thing outscores the same text against something unrelated.
     #[test]
     fn words_that_never_meet_still_land_near_each_other() {
-        let auth = encode("the auth token expiry comparison is wrong").unwrap();
-        let login = encode("login sessions are expiring far too early").unwrap();
-        let coffee = encode("the office coffee machine is broken again").unwrap();
+        use_checkout_model();
+        let unrelated = encode("the office coffee machine is broken again").unwrap();
+        let pairs = [
+            ("the auth token expiry comparison is wrong", "login sessions are expiring far too early"),
+            ("the nightly job never wrote a backup", "yesterday's database snapshot is missing"),
+            ("every page waits on one slow query", "the site takes eight seconds to open"),
+        ];
+        for (left, right) in pairs {
+            let anchor = encode(left).unwrap();
+            let near = similarity(&anchor, &encode(right).unwrap());
+            let far = similarity(&anchor, &unrelated);
+            assert!(
+                near > far,
+                "no semantic signal: {left:?} scored {near:.3} against its pair \
+                 and {far:.3} against unrelated text"
+            );
+        }
+    }
 
-        let related = similarity(&auth, &login);
-        let unrelated = similarity(&auth, &coffee);
+    /// A question in Thai, and the English memory that answers it. The model
+    /// before this one scored these at chance - not badly, at chance - because
+    /// its vocabulary held thirty Thai characters and no Thai words, so every
+    /// Thai sentence pooled to the same noise.
+    #[test]
+    fn a_question_in_another_language_finds_the_memory_that_answers_it() {
+        use_checkout_model();
+        let answer = encode("Fixed the login page rejecting valid credentials").unwrap();
+        let asked = encode("แก้บั๊กหน้าเข้าสู่ระบบที่ล็อกอินไม่ได้").unwrap();
+        let other = encode("Nightly automated database backup job").unwrap();
+
+        let hit = similarity(&asked, &answer);
+        let miss = similarity(&asked, &other);
         assert!(
-            related > unrelated,
-            "no semantic signal at all: related {related:.3} vs unrelated {unrelated:.3}"
+            hit > miss,
+            "a Thai question ranked the wrong English memory first: \
+             {hit:.3} for the answer, {miss:.3} for unrelated work"
         );
-        assert!(related > 0.15, "related texts scored only {related:.3}");
-        assert!(unrelated < 0.15, "unrelated texts scored {unrelated:.3}");
     }
 
     /// The forward pass is written out here rather than called, to keep 129 MB
@@ -308,10 +454,12 @@ mod tests {
     /// nothing and this comparison cannot quietly stop being made.
     #[test]
     fn an_answer_here_matches_the_reference_implementation() {
+        use_checkout_model();
+        let assets = std::path::Path::new(ASSETS);
         let reference = model2vec_rs::model::StaticModel::from_bytes(
-            TOKENIZER,
-            WEIGHTS,
-            include_bytes!("../assets/potion-retrieval-32M/config.json"),
+            std::fs::read(assets.join(TOKENIZER_FILE)).expect("tokenizer"),
+            std::fs::read(assets.join(WEIGHTS_FILE)).expect("weights"),
+            std::fs::read(assets.join("config.json")).expect("config"),
             None,
         )
         .expect("reference model");
@@ -344,6 +492,7 @@ mod tests {
 
     #[test]
     fn a_vector_is_one_byte_per_dimension() {
+        use_checkout_model();
         assert_eq!(encode("anything at all").unwrap().len(), DIMS);
     }
 
@@ -351,6 +500,7 @@ mod tests {
     /// every row and no stored vector could be trusted to be current.
     #[test]
     fn encoding_is_deterministic() {
+        use_checkout_model();
         let once = encode("consolidation writes per-project hub notes").unwrap();
         let twice = encode("consolidation writes per-project hub notes").unwrap();
         assert_eq!(once, twice);
@@ -358,6 +508,7 @@ mod tests {
 
     #[test]
     fn a_batch_matches_encoding_one_at_a_time() {
+        use_checkout_model();
         let texts = vec!["first observation".to_string(), "a second, unrelated one".to_string()];
         let batched = encode_all(&texts).unwrap();
         for (text, batch) in texts.iter().zip(&batched) {
@@ -370,6 +521,7 @@ mod tests {
     /// single `←` in a commit message already caused once, in `sanitize`.
     #[test]
     fn nothing_a_payload_can_contain_brings_this_down() {
+        use_checkout_model();
         for text in [
             "",
             " ",
@@ -395,20 +547,29 @@ mod tests {
     /// Three ways a re-vendored file can be wrong, three different answers.
     ///
     /// This is the whole reason the load path returns a message rather than a
-    /// bare failure. Nobody reaches these at runtime — the weights are
-    /// compiled in — but somebody replacing `assets/` will, and "failed to
-    /// load" would send them looking in the wrong place for all three.
+    /// bare failure. The weights arrive as a fetched file now, so a truncated
+    /// download, a half-written rename, or a replaced `assets/` all land here
+    /// — and "failed to load" would send the reader looking in the wrong
+    /// place for every one of them.
     #[test]
     fn a_bad_vendored_file_says_which_way_it_is_bad() {
         use safetensors::tensor::TensorView;
 
-        let leak = |bytes: Vec<u8>| -> &'static [u8] { Vec::leak(bytes) };
+        // Each case needs a file, because that is what the loader reads.
+        let leak = |bytes: Vec<u8>| -> std::path::PathBuf {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut hasher);
+            let path = std::env::temp_dir().join(format!("brain-model-{}.bin", hasher.finish()));
+            std::fs::write(&path, bytes).expect("write the case to a file");
+            path
+        };
         let built = |dtype, shape: Vec<usize>, data: Vec<u8>| {
             let view = TensorView::new(dtype, shape, &data).expect("a valid view");
             safetensors::serialize([("embeddings", view)], None).expect("serialize")
         };
 
-        let corrupt = load_table(leak(b"this is not a safetensors file".to_vec()));
+        let corrupt = load_table(&leak(b"this is not a safetensors file".to_vec()));
         assert!(
             corrupt.unwrap_err().contains("not a readable safetensors"),
             "a corrupt file should say so"
@@ -419,14 +580,14 @@ mod tests {
             let view = TensorView::new(safetensors::Dtype::I8, vec![1, DIMS], &data).unwrap();
             safetensors::serialize([("weights", view)], None).unwrap()
         };
-        let misnamed = load_table(leak(misnamed));
+        let misnamed = load_table(&leak(misnamed));
         assert!(
             misnamed.unwrap_err().contains("no `embeddings` tensor"),
             "a different model should name what it did contain"
         );
 
         let wrong_precision =
-            load_table(leak(built(safetensors::Dtype::F32, vec![1, DIMS], vec![0u8; DIMS * 4])));
+            load_table(&leak(built(safetensors::Dtype::F32, vec![1, DIMS], vec![0u8; DIMS * 4])));
         let wrong_precision = wrong_precision.unwrap_err();
         assert!(wrong_precision.contains("expected int8"), "{wrong_precision}");
         assert!(
@@ -435,7 +596,7 @@ mod tests {
         );
 
         let wrong_width =
-            load_table(leak(built(safetensors::Dtype::I8, vec![1, 64], vec![0u8; 64])));
+            load_table(&leak(built(safetensors::Dtype::I8, vec![1, 64], vec![0u8; 64])));
         let wrong_width = wrong_width.unwrap_err();
         assert!(wrong_width.contains("64-dimensional"), "{wrong_width}");
         assert!(
@@ -444,14 +605,15 @@ mod tests {
         );
 
         // And the file actually shipped is none of these.
-        assert!(load_table(WEIGHTS).is_ok());
+        assert!(load_table(&std::path::Path::new(ASSETS).join(WEIGHTS_FILE)).is_ok());
     }
 
     /// A row index past the end of the table must be skipped, not read.
     #[test]
     fn a_token_id_past_the_table_is_ignored() {
-        let table = table().unwrap();
-        assert!(table.row(0).is_some());
-        assert!(table.row(u32::MAX).is_none());
+        let table = load_table(&std::path::Path::new(ASSETS).join(WEIGHTS_FILE)).unwrap();
+        let mut row = vec![0u8; DIMS];
+        assert!(table.row(0, &mut row));
+        assert!(!table.row(u32::MAX, &mut row));
     }
 }

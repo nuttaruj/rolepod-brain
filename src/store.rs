@@ -33,6 +33,34 @@ const NEIGHBOUR_SEEDS: usize = 3;
 /// letters inside every path separator is a match for the whole table.
 const ENTITY_TOKEN_MIN: usize = 3;
 
+/// Shortest query the trigram index can answer, fixed by the tokenizer:
+/// it stores three-character runs and has nothing smaller to look up.
+const TRIGRAM_MIN_CHARS: usize = 3;
+
+/// Does this text use a script that is written without spaces between words?
+///
+/// The question `unicode61` gets wrong. Thai, Lao, Khmer, Myanmar, Tibetan,
+/// Han, kana and Hangul all run words together, so a word-boundary tokenizer
+/// cuts them at whatever mark it happens to consider punctuation. Latin,
+/// Cyrillic, Greek, Arabic and Hebrew all separate words with spaces and are
+/// served correctly by the tokenizer already — including them here would
+/// only add substring noise to a ranking that is already right.
+fn writes_without_spaces(text: &str) -> bool {
+    text.chars().any(|c| {
+        matches!(c,
+            '\u{0E00}'..='\u{0EFF}'   // Thai, Lao
+            | '\u{0F00}'..='\u{0FFF}' // Tibetan
+            | '\u{1000}'..='\u{109F}' // Myanmar
+            | '\u{1780}'..='\u{17FF}' // Khmer
+            | '\u{3040}'..='\u{30FF}' // Hiragana, Katakana
+            | '\u{3400}'..='\u{4DBF}' // CJK extension A
+            | '\u{4E00}'..='\u{9FFF}' // CJK unified
+            | '\u{AC00}'..='\u{D7AF}' // Hangul syllables
+            | '\u{F900}'..='\u{FAFF}' // CJK compatibility
+        )
+    })
+}
+
 /// Tokens per query that the entity scan will consider. Enough for any
 /// question a person types; a pasted stack trace stops being a query here.
 const ENTITY_TOKENS_MAX: usize = 8;
@@ -44,16 +72,23 @@ const ENTITY_EVENTS_PER_SESSION: usize = 2;
 
 /// How close a memory has to be before it counts as an answer.
 ///
-/// Cosine on this model's unit vectors: unrelated English text pairs measure
-/// around 0.03, plainly related ones around 0.30. A floor here is what lets
-/// "nothing is close enough" be an outcome rather than "here is the corpus,
-/// sorted".
+/// A floor here is what lets "nothing is close enough" be an outcome rather
+/// than "here is the corpus, sorted".
+///
+/// Set at the median cosine of UNRELATED pairs, measured on a real event
+/// store rather than on invented sentences: memories from two different
+/// sessions score below it half the time, memories from the same session
+/// score well above it. Each model has its own scale for this and the numbers
+/// do not transfer — the English model this replaced put unrelated pairs at
+/// 0.101 and same-session pairs at 0.238, so its floor was 0.10; this one
+/// puts them at 0.229 and 0.362. A floor carried over unchanged would have
+/// admitted the whole corpus.
 ///
 /// Deliberately low. This ranking never stands alone — RRF fuses it with the
 /// keyword list, so its job is recall, and a threshold tuned for precision
 /// would throw away the loose association that was the entire reason for
 /// adding it.
-const NEAREST_FLOOR: f32 = 0.10;
+const NEAREST_FLOOR: f32 = 0.23;
 
 /// How much of the recall stack a caller wants.
 ///
@@ -216,6 +251,51 @@ impl Store {
                     VALUES (new.rowid, new.title, new.body);
                 END;
 
+                -- The same titles again, indexed by three-character run
+                -- instead of by word.
+                --
+                -- `unicode61` finds word boundaries at spaces, and Thai,
+                -- Khmer, Lao and the CJK scripts do not write any - so a
+                -- sentence in them becomes fragments cut at whatever tone or
+                -- vowel mark happened to fall inside it, and a word plainly
+                -- present in the text is not findable. Measured on this
+                -- corpus before this table existed: `ภาษาหลัก` returned
+                -- nothing while three events contained it.
+                --
+                -- Titles only, and that is a measured choice rather than a
+                -- cautious one: over this event store the title index cost
+                -- nothing on disk (it fit in pages already allocated) while
+                -- adding bodies cost 81 MB, a 65% larger database, to widen
+                -- one stream of five.
+                -- One-time migrations that are not a column and cannot be
+                -- asked about. Filling an index added after the rows it
+                -- covers is the first: the index cannot be asked whether it
+                -- is empty, so the fact that it was filled is recorded here.
+                CREATE TABLE IF NOT EXISTS schema_state (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+
+                CREATE VIRTUAL TABLE IF NOT EXISTS events_tri USING fts5(
+                    title,
+                    content='events',
+                    content_rowid='rowid',
+                    tokenize='trigram'
+                );
+
+                CREATE TRIGGER IF NOT EXISTS events_tri_ai AFTER INSERT ON events BEGIN
+                    INSERT INTO events_tri(rowid, title) VALUES (new.rowid, new.title);
+                END;
+                CREATE TRIGGER IF NOT EXISTS events_tri_ad AFTER DELETE ON events BEGIN
+                    INSERT INTO events_tri(events_tri, rowid, title)
+                    VALUES ('delete', old.rowid, old.title);
+                END;
+                CREATE TRIGGER IF NOT EXISTS events_tri_au AFTER UPDATE ON events BEGIN
+                    INSERT INTO events_tri(events_tri, rowid, title)
+                    VALUES ('delete', old.rowid, old.title);
+                    INSERT INTO events_tri(rowid, title) VALUES (new.rowid, new.title);
+                END;
+
                 -- Which file each event touched. Feeds file-keyed injection.
                 CREATE TABLE IF NOT EXISTS event_files (
                     event_id TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
@@ -340,7 +420,49 @@ impl Store {
                 ",
             )
             .context("apply schema")?;
-        self.add_missing_columns()
+        self.add_missing_columns()?;
+        self.backfill_trigram()
+    }
+
+    /// Fill a full-text index that was added after the events it covers.
+    ///
+    /// `CREATE VIRTUAL TABLE IF NOT EXISTS` leaves an existing database with
+    /// an empty index and triggers that only ever see new rows, so every
+    /// memory captured before the upgrade would be invisible to the stream
+    /// that was added to find it — silently, because an empty index answers
+    /// every query with nothing rather than with an error.
+    ///
+    /// The index cannot be asked whether it holds anything. `COUNT(*)` on an
+    /// external-content FTS5 table is answered by the CONTENT table, so the
+    /// obvious check reads every row of `events` out of an index containing
+    /// nothing and concludes it is full. That is how this shipped the first
+    /// time, and it failed silently on a real event store: twenty thousand
+    /// rows reported, two rows of actual index, every Thai query answered
+    /// with nothing.
+    ///
+    /// So the fact is recorded instead of inferred. Idempotent through the
+    /// marker, which is also what makes a rebuild forceable — drop the row
+    /// and reopen.
+    fn backfill_trigram(&self) -> Result<()> {
+        let built: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_state WHERE key = 'events_tri_built')",
+                [],
+                |row| row.get(0),
+            )
+            .context("check the substring index")?;
+        if built {
+            return Ok(());
+        }
+        self.conn
+            .execute_batch(
+                "INSERT INTO events_tri(events_tri) VALUES('rebuild');
+                 INSERT OR REPLACE INTO schema_state (key, value)
+                 VALUES ('events_tri_built', '1');",
+            )
+            .context("build the substring index")?;
+        Ok(())
     }
 
     /// Add columns introduced after a database was first created.
@@ -582,8 +704,16 @@ impl Store {
         // work whose words never matched; neighbours are what else touched
         // the same things, so a hit pulls in its context.
         let entity = self.entity_matches(project, query, topic, ENTITY_EVENTS_PER_SESSION, pool)?;
+        // Only for the scripts the keyword tokenizer cannot cut into words.
+        // An English query is already served correctly by `keyword`, and
+        // substring matching would only add `author` to a search for `auth`.
+        let substring = if writes_without_spaces(query) {
+            self.substring_matches(project, query, topic, pool)?
+        } else {
+            Vec::new()
+        };
         let mut seeds: Vec<String> = Vec::new();
-        for hit in keyword.iter().chain(semantic.iter()) {
+        for hit in keyword.iter().chain(semantic.iter()).chain(substring.iter()) {
             if seeds.len() >= NEIGHBOUR_SEEDS {
                 break;
             }
@@ -593,7 +723,10 @@ impl Store {
         }
         let graph = self.neighbours_of(project, &seeds, topic, pool)?;
 
-        Ok(spread_across_sessions(self.fuse(&[keyword, semantic, entity, graph], pool)?, limit))
+        Ok(spread_across_sessions(
+            self.fuse(&[keyword, semantic, entity, substring, graph], pool)?,
+            limit,
+        ))
     }
 
     /// Combine several rankings into one.
@@ -734,6 +867,60 @@ impl Store {
             })
             .context("run related")?;
         rows.collect::<rusqlite::Result<Vec<_>>>().context("read related")
+    }
+
+    /// Memories whose titles contain the query as a substring.
+    ///
+    /// The stream that answers for scripts `unicode61` cannot cut into words.
+    /// It is substring matching, not word matching, which is why it is gated
+    /// on the query's script rather than run for everything: for English it
+    /// would rank `author` against `auth`, and English already has both word
+    /// boundaries and a stemmer.
+    ///
+    /// The query goes in as one quoted phrase. FTS5's own grammar would read
+    /// a stray quote or a slash as syntax, and someone typing a sentence in
+    /// Thai means the sentence.
+    fn substring_matches(
+        &self,
+        project: &str,
+        query: &str,
+        topic: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Hit>> {
+        // The tokenizer indexes three-character runs, so nothing shorter can
+        // be looked up at all.
+        if query.chars().count() < TRIGRAM_MIN_CHARS {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT e.id, e.ts, e.cli, e.kind, e.title,
+                        substr(COALESCE(e.body, ''), 1, 160), e.session
+                 FROM events_tri
+                 JOIN events e ON e.rowid = events_tri.rowid
+                 WHERE events_tri MATCH ?1 AND e.project = ?2 AND e.forgotten = 0
+                       AND e.kind != 'tombstone' AND e.hook != 'correct'
+                       AND (?4 IS NULL OR e.topic = ?4)
+                 ORDER BY CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END, rank
+                 LIMIT ?3",
+            )
+            .context("prepare substring matches")?;
+        let phrase = format!("\"{}\"", query.replace('"', " "));
+        let rows = stmt
+            .query_map(params![phrase, project, limit as i64, topic], |row| {
+                Ok(Hit {
+                    id: row.get(0)?,
+                    ts: row.get(1)?,
+                    cli: row.get(2)?,
+                    kind: row.get(3)?,
+                    title: row.get(4)?,
+                    snippet: row.get(5)?,
+                    session: row.get(6)?,
+                })
+            })
+            .context("run substring matches")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("read substring matches")
     }
 
     /// Sessions whose DECLARED subjects match the query's words.
@@ -1058,16 +1245,27 @@ impl Store {
                 // Scoped to the project being consolidated. Globally ordered,
                 // a busy project spends every run's budget on its own newest
                 // rows and a quiet one never gets embedded at all.
+                //
+                // A vector of the wrong width counts as absent, which is how
+                // a model change migrates: `similarity` scores mismatched
+                // widths at 0.0, so a stale row is not a worse answer but a
+                // memory that has left semantic search entirely. Listing it
+                // here lets the ordinary backlog re-embed it a bounded slice
+                // at a time, and `doctor`'s percentage reports the progress -
+                // no migration step, and nothing to run by hand.
                 "SELECT e.id, e.title || ' ' || COALESCE(e.body, '')
                  FROM events e
                  LEFT JOIN event_vec v ON v.event_id = e.id
-                 WHERE v.event_id IS NULL AND e.kind != 'tombstone' AND e.project = ?1
+                 WHERE (v.event_id IS NULL OR length(v.vec) != ?3)
+                       AND e.kind != 'tombstone' AND e.project = ?1
                  ORDER BY e.id DESC
                  LIMIT ?2",
             )
             .context("prepare missing vectors")?;
         let rows = stmt
-            .query_map(params![project, limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map(params![project, limit as i64, crate::embed::DIMS as i64], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
             .context("run missing vectors")?;
         rows.collect::<rusqlite::Result<Vec<_>>>().context("read missing vectors")
     }
@@ -1077,9 +1275,17 @@ impl Store {
     /// # Errors
     /// Returns an error when the query fails.
     pub fn vector_coverage(&self) -> Result<(i64, i64)> {
+        // Width, not presence. A vector left behind by an older model still
+        // has a row and still scores 0.0 against every query, so counting it
+        // would report a full index over an empty search - and hide the
+        // backlog that is quietly putting it right.
         let embedded: i64 = self
             .conn
-            .query_row("SELECT COUNT(*) FROM event_vec", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM event_vec WHERE length(vec) = ?1",
+                params![crate::embed::DIMS as i64],
+                |row| row.get(0),
+            )
             .context("count vectors")?;
         let total: i64 = self
             .conn
@@ -2666,6 +2872,117 @@ mod tests {
         );
         event.files = vec!["src/main.rs".to_string()];
         event
+    }
+
+    #[test]
+    fn an_index_added_after_the_events_it_covers_gets_filled() {
+        // The failure this exists to catch, found on a real event store and
+        // not by any test: `COUNT(*)` on an external-content FTS5 table is
+        // answered by the CONTENT table, not by the index, so an emptiness
+        // check written that way reads 20,120 rows out of a completely empty
+        // index and skips the rebuild. Nothing errors. Every query in the
+        // affected script just returns nothing, forever.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        store.index(&event("Asked: ปรับปรุงประสิทธิภาพการค้นหา", "body", project)).unwrap();
+        assert_eq!(
+            store.search(&project.to_string(), "ประสิทธิภาพ", None, 10, Recall::Fused).unwrap().len(),
+            1
+        );
+
+        // An index that exists but holds nothing - exactly what an upgrade
+        // leaves behind.
+        store.conn.execute_batch("INSERT INTO events_tri(events_tri) VALUES('delete-all');").unwrap();
+        store.conn.execute_batch("DELETE FROM schema_state WHERE key = 'events_tri_built';").unwrap();
+        assert_eq!(
+            store.search(&project.to_string(), "ประสิทธิภาพ", None, 10, Recall::Fused).unwrap().len(),
+            0,
+            "the emptied index still answered - this test is not testing what it claims"
+        );
+
+        store.migrate().unwrap();
+        assert_eq!(
+            store.search(&project.to_string(), "ประสิทธิภาพ", None, 10, Recall::Fused).unwrap().len(),
+            1,
+            "opening the store did not fill an index that was empty"
+        );
+    }
+
+    #[test]
+    fn a_word_inside_a_thai_sentence_is_findable() {
+        // Thai writes without spaces, and `unicode61` splits on tone and
+        // vowel marks rather than on word boundaries - so a sentence becomes
+        // fragments like `กระบบค` and `นหาให`, and searching for a word that
+        // is plainly in the text returns nothing. Whether recall works then
+        // depends on where the marks happened to fall, which is a lottery,
+        // not an index.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        store
+            .index(&event("Asked: แก้บั๊กระบบค้นหาให้รองรับภาษาไทย", "body", project))
+            .unwrap();
+
+        for query in ["ระบบ", "ค้นหา", "ภาษาไทย"] {
+            let hits = store.search(&project.to_string(), query, None, 10, Recall::Fused).unwrap();
+            assert_eq!(hits.len(), 1, "{query:?} did not find the sentence containing it");
+        }
+    }
+
+    #[test]
+    fn an_english_query_is_not_touched_by_the_substring_stream() {
+        // Trigram matching is substring matching: it would rank `author` for
+        // `auth`. English already has word boundaries and a stemmer, so the
+        // stream stays out of the way unless the query is in a script that
+        // needs it.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        store.index(&event("Wrote the authentication guide", "body", project)).unwrap();
+        store.index(&event("Chose an author for the page", "body", project)).unwrap();
+
+        let hits = store.search(&project.to_string(), "authentication", None, 10, Recall::Fused).unwrap();
+        assert_eq!(hits[0].title, "Wrote the authentication guide", "{hits:?}");
+    }
+
+    #[test]
+    fn coverage_counts_what_can_answer_a_query_not_what_has_a_row() {
+        // The number `doctor` prints is the only thing telling anyone a model
+        // change is still being absorbed. Counting rows rather than usable
+        // rows reports 100% while every one of them scores 0.0 against every
+        // query - a full index and an empty search, agreeing with each other.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let stale = event("Chose SQLite over Postgres", "nothing resident", project);
+        let fresh = event("Wrote the installation guide", "one page", project);
+        store.index(&stale).unwrap();
+        store.index(&fresh).unwrap();
+        store.set_vectors(&[(stale.id.clone(), vec![7u8; crate::embed::DIMS / 2])]).unwrap();
+        store.set_vectors(&[(fresh.id.clone(), vec![7u8; crate::embed::DIMS])]).unwrap();
+
+        let (embedded, total) = store.vector_coverage().unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(embedded, 1, "a vector of the wrong width was counted as coverage");
+    }
+
+    #[test]
+    fn a_vector_from_an_older_model_is_treated_as_missing() {
+        // Changing the embedding model changes the width of a vector, and
+        // `similarity` scores mismatched widths at 0.0 - so a stale row is
+        // not a worse answer, it is a memory that has silently left semantic
+        // search. The backlog has to see it as absent, or an upgrade would
+        // quietly hollow out the index of every brain that already existed.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let stale = event("Chose SQLite over Postgres", "nothing resident", project);
+        store.index(&stale).unwrap();
+        store
+            .set_vectors(&[(stale.id.clone(), vec![7u8; crate::embed::DIMS / 2])])
+            .unwrap();
+
+        let pending = store.events_missing_vectors(&project.to_string(), 10).unwrap();
+        assert!(
+            pending.iter().any(|(id, _)| *id == stale.id),
+            "a vector of the wrong width was counted as present: {pending:?}"
+        );
     }
 
     #[test]

@@ -41,6 +41,8 @@ for arg in "$@"; do
         --yes|-y)     assume_yes=1 ;;
         --uninstall)  uninstall=1 ;;
         --binary-only) binary_only=1 ;;
+--model-only) model_only=1 ;;
+--into)       shift; model_into="$1" ;;
         -h|--help)
             # The header block: from the second line to the first that is
             # not a comment. A fixed line range went stale the moment the
@@ -160,7 +162,60 @@ else
     from_source
 fi
 
+fetch_model() {
+    # The embedding table is 122 MB - past what a repository file may be, and
+    # not something to make every install of every version download again. It
+    # is a release asset, fetched once into a directory named for the model, so
+    # a later version that needs different weights finds nothing here rather
+    # than reading the wrong ones.
+    model_dir="$1"
+    [ -n "$model_dir" ] || model_dir="$($BIN where --models 2>/dev/null)"
+    [ -n "$model_dir" ] || return 1
+    if [ -s "$model_dir/model-int8.safetensors" ] && [ -s "$model_dir/tokenizer.json" ]; then
+        return 0
+    fi
+    mkdir -p "$model_dir" || return 1
+    work=$(mktemp -d) || return 1
+    say "Fetching the embedding model (122 MB, once) ..."
+    if [ -z "$base" ]; then
+        base="https://github.com/$REPO/releases/download/$version"
+    fi
+    curl -fsSL -o "$work/SHA256SUMS" "$base/SHA256SUMS" 2>/dev/null || {
+        rm -rf "$work"
+        return 1
+    }
+    for f in model-int8.safetensors tokenizer.json; do
+        curl -fsSL -o "$work/$f" "$base/$f" 2>/dev/null || {
+            rm -rf "$work"
+            return 1
+        }
+        verify "$work/$f" "$f" "$work/SHA256SUMS"
+    done
+    # Renamed into place only once both are whole, so a broken download is
+    # never a half-installed model that loads and answers differently.
+    for f in model-int8.safetensors tokenizer.json; do
+        mv "$work/$f" "$model_dir/$f" || { rm -rf "$work"; return 1; }
+    done
+    rm -rf "$work"
+    say "Semantic search is ready."
+}
+
+if [ -n "$model_only" ]; then
+    if [ -n "$model_into" ]; then
+        into_dir="$model_into/potion-multilingual-128M"
+    else
+        into_dir=""
+    fi
+    fetch_model "$into_dir" || die "could not fetch the embedding model"
+    exit 0
+fi
+
 say "Installed $("$BIN" --version) to $BIN"
+
+# Semantic search needs the model; everything else does not. A failure here
+# is reported and stepped over - capture, keyword, entity and neighbour
+# recall all work without it, and `brain doctor` says what is missing.
+fetch_model "" || say "Could not fetch the embedding model; run 'brain doctor' for what that costs."
 
 case ":$PATH:" in
     *":$BIN_DIR:"*) ;;

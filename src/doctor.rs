@@ -221,6 +221,22 @@ fn semantic_check(paths: &Paths) -> Check {
     let Ok((embedded, total)) = store.vector_coverage() else {
         return Check::fail("semantic", "coverage query failed");
     };
+    // A model that has not arrived yet is not a broken install. Recall keeps
+    // four of its five rankings without it - words, declared entities, shared
+    // neighbours, and substring matching - so this is the one thing `doctor`
+    // reports as missing rather than failed, with the command that fixes it.
+    let model = paths.model_dir();
+    if !model.join(crate::embed::WEIGHTS_FILE).is_file() {
+        return Check::pass(
+            "semantic",
+            format!(
+                "the embedding model is not in {} yet, so search is running on words, \
+                 entities and neighbours but not meaning. Fetch it once: \
+                 curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh -s -- --model-only",
+                model.display()
+            ),
+        );
+    }
     // Ask the model to load before reporting on an index it produced. A
     // coverage number is a fact about the past; whether anything can still be
     // embedded or searched is a fact about this binary.

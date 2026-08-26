@@ -100,12 +100,39 @@ jobs:
         with:
           path: artifacts
 
+      # The embedding model is not in the repository - 122 MB is past what a
+      # repository file may be - so the release is where it comes from, and
+      # every release carries it: an installer fetching the model for version
+      # N must find it under version N's tag.
+      - name: Fetch the embedding model
+        run: |
+          set -eu
+          MODEL=assets/potion-multilingual-128M
+          mkdir -p "$MODEL"
+          UP=https://huggingface.co/minishlab/potion-multilingual-128M/resolve/73908c3438cf03b6a01bcb9611d62b23d0726f08
+          curl -fsSL -o "$MODEL/tokenizer.json" "$UP/tokenizer.json"
+          curl -fsSL -o upstream.safetensors "$UP/model.safetensors"
+          # The vendored weights are not the upstream file: quantize.py is the
+          # whole transformation, and PROVENANCE.md carries the checksum of
+          # what it produces. Reproducing it here rather than storing it is
+          # what keeps that claim checkable.
+          python3 -m pip install --quiet numpy safetensors
+          python3 "$MODEL/quantize.py" upstream.safetensors "$MODEL/model-int8.safetensors"
+          rm -f upstream.safetensors
+          grep -A4 'vendored here' "$MODEL/PROVENANCE.md" | grep model-int8 | awk '{print $1"  '"$MODEL"'/model-int8.safetensors"}' > model.expected
+          sha256sum -c model.expected
+
       - name: Collect
         run: |
           set -eu
           mkdir -p dist
           find artifacts -type f -exec cp {} dist/ \;
+          cp assets/potion-multilingual-128M/model-int8.safetensors dist/
+          cp assets/potion-multilingual-128M/tokenizer.json dist/
           cd dist
+          for f in model-int8.safetensors tokenizer.json; do
+              sha256sum "$f" > "$f.sha256"
+          done
           # One file the installer can fetch to check any binary against,
           # rather than one request per platform.
           cat ./*.sha256 > SHA256SUMS

@@ -145,6 +145,22 @@ impl Paths {
         pretty
     }
 
+    /// Where the embedding model lives once it has been fetched.
+    ///
+    /// Not compiled into the binary, which is a distribution decision and not
+    /// an architectural one: the table is 122 MB, GitHub refuses a file over
+    /// 100 MB, and putting it in the repository would also add that much to
+    /// every clone forever. It is published as a release asset instead and
+    /// fetched once, checksum-verified.
+    ///
+    /// The directory is versioned, so a build that expects different weights
+    /// does not read the old ones and quietly answer differently — it finds
+    /// nothing and fetches what it needs.
+    #[must_use]
+    pub fn model_dir(&self) -> PathBuf {
+        self.data_dir.join("models").join(crate::embed::MODEL)
+    }
+
     #[must_use]
     pub fn config_file(&self) -> PathBuf {
         self.data_dir.join("config.toml")

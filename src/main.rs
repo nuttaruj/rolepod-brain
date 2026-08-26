@@ -25,6 +25,7 @@ mod revise;
 mod sanitize;
 mod setup;
 mod store;
+mod tokenize;
 mod transcript;
 mod sync;
 mod summarizer;
@@ -155,7 +156,15 @@ enum Commands {
     /// Explains why there is no remote sync.
     Sync,
     /// Show where this directory's memory lives.
-    Where,
+    Where {
+        /// Print only where the embedding model belongs, and nothing else.
+        ///
+        /// `bootstrap.sh` asks for this rather than rebuilding the path
+        /// itself, so the installer and the binary can never disagree about
+        /// where the model goes.
+        #[arg(long)]
+        models: bool,
+    },
 }
 
 fn main() {
@@ -325,7 +334,7 @@ fn run(command: Commands) -> Result<()> {
             Ok(())
         }
         Commands::Sync => sync::run(),
-        Commands::Where => where_am_i(),
+        Commands::Where { models } => where_am_i(models),
     }
 }
 
@@ -514,13 +523,18 @@ fn stats() -> Result<()> {
     Ok(())
 }
 
-fn where_am_i() -> Result<()> {
+fn where_am_i(models_only: bool) -> Result<()> {
     let paths = Paths::resolve()?;
+    if models_only {
+        println!("{}", paths.model_dir().display());
+        return Ok(());
+    }
     let scope = ids::resolve_scope(&std::env::current_dir().unwrap_or_default());
     println!("project    {} ({})", scope.project, scope.project_id);
     println!("workspace  {} ({})", scope.workspace, scope.workspace_id);
     println!("root       {}", scope.root.display());
     println!("memory     {}", paths.project_dir(&scope).display());
     println!("index      {}", paths.db().display());
+    println!("model      {}", paths.model_dir().display());
     Ok(())
 }

@@ -35,6 +35,17 @@ impl Fixture {
         // A git root is what makes every worktree of one repo share a brain,
         // so the fixture must be a real repository.
         run_in(&project, "git", &["init", "-q"]);
+        // The embedding model is fetched after install rather than compiled
+        // in, so a fixture has to point at one or every semantic assertion
+        // would be testing its absence. A link, not a copy: it is 122 MB and
+        // every test builds a fixture.
+        let models = home.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let checkout =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/potion-multilingual-128M");
+        if checkout.is_dir() {
+            let _ = std::os::unix::fs::symlink(&checkout, models.join("potion-multilingual-128M"));
+        }
         Self { home, project }
     }
 

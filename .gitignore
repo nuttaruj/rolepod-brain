@@ -3,3 +3,9 @@
 .DS_Store
 .rolepod/
 .claude/agent-memory/
+
+# The embedding model is a release asset, not a repository file: 122 MB is
+# past what GitHub accepts and would sit in every clone forever. Fetch it with
+# `bootstrap.sh --model-only --into assets` — the checksums are in PROVENANCE.
+assets/*/model-int8.safetensors
+assets/*/tokenizer.json

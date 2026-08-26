@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "export PATH=\"$HOME/.local/bin:$PATH\"; command -v brain >/dev/null 2>&1 || { echo 'rolepod-brain: the brain binary is not installed yet. Fetching it (checksum-verified) from github.com/nuttaruj/rolepod-brain \u2014 this happens once.' >&2; curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh -s -- --binary-only >&2 || echo 'rolepod-brain: could not fetch the binary. Install it yourself: curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh' >&2; }; command -v brain >/dev/null 2>&1 && brain hook --cli codex --event SessionStart || echo '{}'",
+            "command": "export PATH=\"$HOME/.local/bin:$PATH\"; command -v brain >/dev/null 2>&1 || { echo 'rolepod-brain: the brain binary is not installed yet. Fetching it (checksum-verified) from github.com/nuttaruj/rolepod-brain — this happens once.' >&2; curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh -s -- --binary-only >&2 || echo 'rolepod-brain: could not fetch the binary. Install it yourself: curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh' >&2; }; command -v brain >/dev/null 2>&1 && [ ! -s \"$(brain where --models 2>/dev/null)/model-int8.safetensors\" ] && { nohup sh -c 'curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh -s -- --model-only' >/dev/null 2>&1 & }; command -v brain >/dev/null 2>&1 && brain hook --cli codex --event SessionStart || echo '{}'",
             "timeout": 120
           }
         ]
