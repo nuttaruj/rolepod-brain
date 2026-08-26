@@ -67,7 +67,7 @@ the real event store, mean ± population standard deviation:
 | | recall@1 | recall@5 | MRR |
 |---|---|---|---|
 | potion-retrieval-32M (512d) | 0.447 ± 0.091 | 0.651 ± 0.095 | 0.552 ± 0.080 |
-| potion-multilingual-128M (256d) | 0.449 ± 0.084 | 0.659 ± 0.074 | 0.548 ± 0.066 |
+| potion-multilingual-128M (256d) | 0.456 ± 0.067 | 0.659 ± 0.074 | 0.557 ± 0.062 |
 
 Every difference is an order of magnitude inside the spread. A single draw of
 that benchmark shows a regression or an improvement depending on the seed,
@@ -76,7 +76,15 @@ which is why it is reported as a mean over resamples and not as one number.
 ## Verifying this
 
 `quantize.py` in this directory is the whole transformation, and the checksums
-below are what it produced. A 122 MB blob nobody can read is worth exactly the
+below are what it produced — on any machine, which took a second attempt to
+be true. The scale was an interpolated percentile at first, and an
+interpolated percentile differs by an ULP between platforms: macOS and Linux
+ran the same script over the same input and produced two different files.
+It is an exact order statistic now, a value that is actually in the array, so
+every platform computes the identical scale and therefore the identical file.
+The release workflow rebuilds it from upstream and checks it against this
+line, which is the only thing that makes the claim checkable rather than
+merely stated. A 122 MB blob nobody can read is worth exactly the
 provenance attached to it.
 
 ```
@@ -84,7 +92,7 @@ sha256, upstream model.safetensors (f32, 489 MB, at the revision above)
   14b5eb39cb4ce5666da8ad1f3dc6be4346e9b2d601c073302fa0a31bf7943397
 
 sha256, vendored here
-  d00b9cd941f639e6178611b6df696cf2e41b359cdda1b923fc07262a014df7d0  model-int8.safetensors
+  41f5e8169c8b280471115f41bb0f2664554fabdf762fc6063dd9c722f4080eb0  model-int8.safetensors
   19f1909063da3cfe3bd83a782381f040dccea475f4816de11116444a73e1b6a1  tokenizer.json
   595e4cab2093732efd5dbe084fd5c1826b5eea693b73b4c1fd971672867d2e54  config.json
 ```

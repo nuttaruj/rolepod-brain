@@ -61,7 +61,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: assets/potion-multilingual-128M/model-int8.safetensors
-          key: model-73908c3438cf03b6a01bcb9611d62b23d0726f08-v2
+          key: model-73908c3438cf03b6a01bcb9611d62b23d0726f08-v3
       - name: Cache the tokenizer
         uses: actions/cache@v4
         with:
@@ -140,7 +140,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: assets/potion-multilingual-128M/model-int8.safetensors
-          key: model-73908c3438cf03b6a01bcb9611d62b23d0726f08-v2
+          key: model-73908c3438cf03b6a01bcb9611d62b23d0726f08-v3
       - name: Cache the tokenizer
         uses: actions/cache@v4
         with:

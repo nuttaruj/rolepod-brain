@@ -30,8 +30,17 @@ source, target = sys.argv[1], sys.argv[2]
 with safe_open(source, "numpy") as handle:
     weights = handle.get_tensor("embeddings")
 
+# An exact order statistic, not an interpolated percentile. `np.percentile`
+# blends the two neighbouring values, and that blend differs by an ULP between
+# platforms - enough to move the scale, enough to flip a `rint` that sat on a
+# half, enough that the same script produced two different files on macOS and
+# Linux. `partition` returns an element that is actually in the array, so
+# every platform computes the identical scale and therefore the identical
+# file, which is what makes the checksum below something anyone can check.
 CLIP_PERCENTILE = 99.9
-scale = np.percentile(np.abs(weights), CLIP_PERCENTILE) / 127.0
+flat = np.abs(weights).ravel()
+index = int(CLIP_PERCENTILE / 100.0 * (flat.size - 1))
+scale = float(np.partition(flat, index)[index]) / 127.0
 save_file(
     {"embeddings": np.clip(np.rint(weights / scale), -127, 127).astype(np.int8)},
     target,
