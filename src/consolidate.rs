@@ -98,6 +98,10 @@ pub struct Outcome {
 /// # Errors
 /// Returns an error when the store or event log cannot be opened.
 pub fn run(session: Option<&str>, all_projects: bool, force: bool) -> Result<Outcome> {
+    // When THIS invocation began, which is the line between "a run we raced"
+    // and "the previous state of the world". See the `superseded` check below
+    // for why the moment we listed is not that line.
+    let began = jiff::Timestamp::now();
     let paths = Paths::resolve()?;
     paths.ensure()?;
     let config = Config::load(&paths.config_file())?;
@@ -131,15 +135,6 @@ pub fn run(session: Option<&str>, all_projects: bool, force: bool) -> Result<Out
         // wording, which is how a memory system teaches people not to
         // correct it.
         outcome.adopted += adopt_hand_edits(&project_dir, &scope, &store)?;
-        // When we looked. A claim keeps two runs from working at once, but it
-        // says nothing about a run that finished and released just before we
-        // arrived - and that run's work is invisible in the backlog we already
-        // listed. Comparing its watermark against this instant separates the
-        // two cases exactly: a run that finished AFTER we looked did the work
-        // we were about to do, while one that finished before we looked is
-        // simply the previous state of the world, which we may well be here to
-        // improve on.
-        let listed_at = jiff::Timestamp::now();
         for pending in store.sessions_pending(&project)? {
             if let Some(only) = session {
                 if pending.session != only {
@@ -165,23 +160,30 @@ pub fn run(session: Option<&str>, all_projects: bool, force: bool) -> Result<Out
                 continue;
             }
 
-            // Claimed - but somebody may have finished and released between our
-            // listing and our claim. If their run covers the same backlog and
-            // landed after we looked, we would only be paying for the same
-            // narrative twice.
+            // Claimed - but somebody may have finished and released before we
+            // got here. If their run covers the same backlog we would be
+            // paying for the same narrative twice.
+            //
+            // The line is when THIS invocation began, not when it listed. Two
+            // runs launched together race through listing and claiming in any
+            // order: ours can list AFTER theirs already recorded and released,
+            // and comparing against our listing then reads their finished work
+            // as old news and redoes it. That is the duplicate this guard
+            // exists to stop, and it is what a slow arm64 runner reproduced
+            // once consolidation got slower.
             //
             // A rule-based run records a watermark too, deliberately, so a
-            // later run can produce the real summary once a model is reachable.
-            // That later run listed the backlog after the rule-based one
-            // finished, so this test lets it through and only stops the
-            // duplicate.
+            // later run can produce the real summary once a model is
+            // reachable. That later run is a later invocation - it began after
+            // the rule-based one finished - so this comparison lets it through
+            // and only stops the duplicate.
             let superseded = store.session_run(&pending.session)?.is_some_and(|run| {
                 run.last_event_id.as_deref() == Some(pending.newest_event_id.as_str())
                     && run
                         .last_run_at
                         .as_deref()
                         .and_then(|at| at.parse::<jiff::Timestamp>().ok())
-                        .is_some_and(|at| at > listed_at)
+                        .is_some_and(|at| at > began)
             });
             if superseded {
                 store.release_session(&pending.session)?;
