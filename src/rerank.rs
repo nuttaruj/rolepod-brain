@@ -6,9 +6,10 @@
 //! seventh. A cheap model reading thirty titles can tell which one answers
 //! the question — but only if asking costs almost nothing.
 //!
-//! So it is bounded on every axis: off unless asked for, one call, titles
-//! only, a few seconds of patience, and any failure at all leaves the
-//! original order untouched. The worst case is the search you already had.
+//! So it is bounded on every axis: off unless asked for, one call to one
+//! CLI - the one whose work is being searched, never a substitute - a few
+//! seconds of patience, and any failure at all leaves the original order
+//! untouched. The worst case is the search you already had.
 //!
 //! That last sentence is a claim about the whole system, not just about what
 //! this function returns, and it was false for a while: a rerank that timed

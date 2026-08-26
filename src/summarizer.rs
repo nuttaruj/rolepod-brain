@@ -150,8 +150,13 @@ impl<'a> Ladder<'a> {
     ///
     /// - `limit` instead of three minutes, because past a few seconds the
     ///   answer the caller already had is the better one;
-    /// - one rung, because a second CLI doubles the wait to improve an
-    ///   ordering that was already good enough to return;
+    /// - one rung, and only ever the CLI whose work this is. Consolidation
+    ///   may fall through to another vendor because the job has to get done
+    ///   and any model that summarises will do; a rerank is a favour asked
+    ///   mid-search against a subscription the caller is already waiting on.
+    ///   If that one cannot answer, the search keeps the order it had and
+    ///   the next search asks again - spending a second vendor's quota to
+    ///   reorder a list the caller already holds is a cost nobody asked for;
     /// - no marks on the health table, in either direction. A CLI that
     ///   overran a six-second leash has not been shown to be down - and
     ///   charging it would bench it for thirty minutes of consolidation,
@@ -243,6 +248,20 @@ impl<'a> Ladder<'a> {
 
     /// Rungs to try, in order.
     fn order(&self, preferred_cli: &str) -> Vec<&'static CliSpec> {
+        // An advisory call goes to the CLI whose work this is, or nowhere.
+        //
+        // Consolidation may fall through to another vendor: the job must get
+        // done, and any model that can summarise will do. A rerank is not
+        // that. It is a favour asked mid-search, against a subscription the
+        // user is already signed into and already waiting on - and if that
+        // one cannot answer right now, spending a second vendor's quota to
+        // reorder a list the caller already has is a cost they did not ask
+        // for. The search returns the order it had, and the next search can
+        // try again.
+        if self.advisory {
+            let preferred = Self::normalize_cli(preferred_cli);
+            return SPECS.iter().filter(|spec| spec.cli == preferred).collect();
+        }
         // A pinned mode means exactly one rung: the user asked for that CLI,
         // and silently using another would spend the wrong subscription.
         if self.mode != "auto" {
@@ -582,6 +601,40 @@ mod tests {
         let order = ladder.order("codex");
         assert_eq!(order[0].cli, "codex");
         assert_eq!(order.len(), SPECS.len(), "every other CLI stays as a fallback");
+    }
+
+    /// A rerank asks the CLI whose work it is, or nobody.
+    ///
+    /// Consolidation is allowed to fall through to another vendor: the job
+    /// has to get done and any model that summarises will do. A rerank is a
+    /// favour asked mid-search. If the CLI the user is already signed into
+    /// and already waiting on cannot answer, spending a second vendor's quota
+    /// to reorder a list the caller already holds is a cost they did not ask
+    /// for. The search keeps the order it had, and the next one tries again.
+    #[test]
+    fn an_advisory_call_never_spends_another_vendors_quota() {
+        let store = Store::open_memory().unwrap();
+        let ladder = Ladder::new(&store, &config("auto"));
+        let waiting = ladder.while_waiting(Duration::from_secs(20));
+
+        assert_eq!(
+            waiting.order("codex").iter().map(|spec| spec.cli).collect::<Vec<_>>(),
+            vec!["codex"],
+            "an advisory call reached past the CLI whose work it is"
+        );
+        // Consolidation keeps its fallbacks.
+        assert_eq!(ladder.order("codex").len(), SPECS.len());
+
+        // And when that CLI is out of rotation, the advisory call has nowhere
+        // to go - which is the point. It must not quietly become a call to
+        // whichever vendor happens to be up.
+        for _ in 0..failure_threshold() {
+            store.record_summarizer_failure("codex", "rate limited").unwrap();
+        }
+        assert!(store.summarizer_in_cooldown("codex").unwrap());
+        let (tier, text) = waiting.run("anything", "codex", |_| true).unwrap();
+        assert_eq!(tier, Tier::RuleBased, "a benched CLI was substituted for another");
+        assert!(text.is_empty());
     }
 
     #[test]
