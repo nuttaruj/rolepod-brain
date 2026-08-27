@@ -238,4 +238,42 @@ jobs:
         run: |
           set -eu
           gh release create "$TAG" --title "$TAG" --generate-notes || true
-          gh release upload "$TAG" dist/* --clobber
+
+          # The reranker is 568MB, and uploads.github.com answers a large POST
+          # with an occasional HTTP 404 *after* the bytes have landed. One
+          # upload call for the whole directory turns that lost response into a
+          # failed release. So: one file at a time, ask the release what it
+          # actually holds before believing an error, and retry what is really
+          # missing.
+          landed() {
+            gh release view "$TAG" --json assets \
+              --jq '.assets[] | select(.state == "uploaded") | .name' \
+              | grep -qx "$1"
+          }
+
+          for file in dist/*; do
+            name=$(basename "$file")
+            for attempt in 1 2 3; do
+              if gh release upload "$TAG" "$file" --clobber; then
+                break
+              fi
+              if landed "$name"; then
+                echo "$name is on the release despite the error - keeping it"
+                break
+              fi
+              if [ "$attempt" = 3 ]; then
+                echo "could not upload $name after 3 attempts" >&2
+                exit 1
+              fi
+              echo "retrying $name in 20s"
+              sleep 20
+            done
+          done
+
+          # Nothing above proves the set is complete, only that each upload
+          # stopped erroring. Say so out loud.
+          for file in dist/*; do
+            name=$(basename "$file")
+            landed "$name" || { echo "missing from release: $name" >&2; exit 1; }
+          done
+          echo "all $(ls dist | wc -l | tr -d ' ') assets are on $TAG"
