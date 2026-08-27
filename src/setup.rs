@@ -1487,7 +1487,11 @@ mod tests {
 
         // Nothing installed anywhere.
         for kind in [&claude, &cursor, &codex] {
-            assert!(!plugin_installed(kind), "{} claimed an absent plugin", kind.as_str());
+            assert!(
+                !plugin_installed_in(&home, kind),
+                "{} claimed an absent plugin",
+                kind.as_str()
+            );
         }
 
         // Claude Code: a JSON registry keyed `<plugin>@<marketplace>`.
@@ -1518,10 +1522,10 @@ mod tests {
             format!("[plugins.\"{PLUGIN_NAME}@{PLUGIN_NAME}\"]\nenabled = true\n"),
         )
         .unwrap();
-        assert!(plugin_installed(&codex));
+        assert!(plugin_installed_in(&home, &codex));
 
         // A CLI with no plugin story must never claim one.
-        assert!(!plugin_installed(&AgentKind::parse("opencode")));
+        assert!(!plugin_installed_in(&home, &AgentKind::parse("opencode")));
 
         let _ = std::fs::remove_dir_all(&home);
     }
