@@ -316,16 +316,44 @@ fn unusable_reason(text: &str) -> String {
     format!("unusable answer: {}", crate::sanitize::truncate(first, 160))
 }
 
+/// The extensions a program name might really wear on this platform.
+///
+/// Empty means the name as given. On Windows the list is the reason the whole
+/// ladder works there at all: `claude`, `codex` and `gemini` are installed by
+/// npm, which writes a `.cmd` shim rather than an executable, and neither
+/// `CreateProcess` nor Rust's own `.exe`-only search will find one. Resolving
+/// the shim ourselves and handing the full path to `Command` is what closes
+/// that - the standard library recognises a `.cmd` and runs it through
+/// `cmd.exe` with the escaping that fix required.
+#[cfg(windows)]
+const PROGRAM_EXTENSIONS: &[&str] = &["", "exe", "cmd", "bat"];
+#[cfg(not(windows))]
+const PROGRAM_EXTENSIONS: &[&str] = &[""];
+
+/// Where `program` really is on `PATH`, if it is anywhere.
+///
+/// Returns the full path rather than the bare name, because on Windows the
+/// difference between the two is whether the program can be started at all.
+#[must_use]
+pub fn resolve(program: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|dir| {
+        let candidate = dir.join(program);
+        PROGRAM_EXTENSIONS.iter().find_map(|extension| {
+            let candidate = if extension.is_empty() {
+                candidate.clone()
+            } else {
+                candidate.with_extension(extension)
+            };
+            candidate.is_file().then_some(candidate)
+        })
+    })
+}
+
 /// Is a program on `PATH`?
 #[must_use]
 pub fn installed(program: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| {
-        let candidate = dir.join(program);
-        candidate.is_file() || candidate.with_extension("exe").is_file()
-    })
+    resolve(program).is_some()
 }
 
 /// Run one CLI once and return its answer.
@@ -358,7 +386,12 @@ fn invoke(spec: &CliSpec, model: &str, prompt: &str, timeout: Duration) -> Resul
         })
         .collect();
 
-    let mut command = Command::new(spec.program);
+    // The resolved path, not the bare name. On Windows these are npm `.cmd`
+    // shims and a bare name reaches nothing; everywhere else this is the same
+    // file `PATH` would have found, just named in full.
+    let program = resolve(spec.program)
+        .with_context(|| format!("{} is not on PATH", spec.program))?;
+    let mut command = Command::new(&program);
     command
         .args(&args)
         .arg(prompt)
@@ -768,6 +801,49 @@ mod tests {
         let error =
             invoke(spec, spec.model, &"x".repeat(PROMPT_MAX_BYTES + 1), CALL_TIMEOUT).unwrap_err();
         assert!(error.to_string().contains("call ceiling"));
+    }
+
+    /// A host CLI installed by npm is found, and can actually be started.
+    ///
+    /// This is the one thing about this platform that is not shared with the
+    /// others, and the end-to-end suite does not run here to cover it. npm
+    /// writes `claude.cmd` rather than `claude.exe`; `CreateProcess` cannot
+    /// start a `.cmd`, and Rust's own search only ever appends `.exe`. Both
+    /// halves are asserted - that `resolve` returns the shim, and that the
+    /// shim spawned through the returned path runs and answers - because
+    /// finding a program you then cannot execute is the failure this guards.
+    #[cfg(windows)]
+    #[test]
+    fn an_npm_shim_is_found_and_can_be_run() {
+        let dir = std::env::temp_dir().join(format!("brain-shim-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).expect("create");
+        let name = "brain-fake-host-cli";
+        std::fs::write(dir.join(format!("{name}.cmd")), "@echo off\r\necho shim-answered\r\n")
+            .expect("write shim");
+
+        let previous = std::env::var_os("PATH");
+        std::env::set_var("PATH", &dir);
+        let found = resolve(name);
+        let installed_says = installed(name);
+        match previous {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+
+        let found = found.unwrap_or_else(|| panic!("{name}.cmd was not found on PATH"));
+        assert_eq!(
+            found.extension().and_then(std::ffi::OsStr::to_str),
+            Some("cmd"),
+            "resolved {} rather than the shim",
+            found.display()
+        );
+        assert!(installed_says, "resolve found it and installed disagreed");
+
+        let output = Command::new(&found).output().expect("spawn the shim");
+        let said = String::from_utf8_lossy(&output.stdout);
+        assert!(said.contains("shim-answered"), "the shim did not run: {said:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

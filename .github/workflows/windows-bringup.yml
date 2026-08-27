@@ -1,0 +1,182 @@
+# Windows, beyond what the release matrix can check.
+#
+# It began as bring-up - a way to get a platform that had never executed this
+# code green without spending public tags on the attempt - and the suite half
+# of that is now in the release matrix, which runs it on the same runner.
+#
+# What is kept is the half the release cannot do: taking the hook `setup`
+# writes and running it, the way the CLI would, to see that it captures. No
+# host CLI is installed on a runner, so this is the furthest the claim can be
+# taken without owning a Windows machine, and it is worth a manual run
+# whenever the wiring or the hook shapes change.
+name: windows
+
+# Triggered by pushing the branch, not by dispatch: a `workflow_dispatch`
+# workflow has to already be on the default branch before GitHub will offer
+# it, and the point of this one is to answer a question before anything
+# reaches the default branch.
+on:
+  push:
+    branches: [windows-bringup]
+  workflow_dispatch:
+
+jobs:
+  bringup:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # The suite reads the embedding model out of the checkout, which does
+      # not carry it. Same recipe as the release, minus the PROVENANCE check
+      # that the release already performs on four other runners.
+      - name: Cache the embedding model
+        uses: actions/cache@v4
+        with:
+          path: assets/potion-multilingual-128M/model-int8.safetensors
+          key: model-73908c3438cf03b6a01bcb9611d62b23d0726f08-v3
+      - name: Cache the tokenizer
+        uses: actions/cache@v4
+        with:
+          path: assets/potion-multilingual-128M/tokenizer.json
+          key: tokenizer-73908c3438cf03b6a01bcb9611d62b23d0726f08
+      - name: Build the embedding model
+        shell: bash
+        run: |
+          set -eu
+          MODEL=assets/potion-multilingual-128M
+          UP=https://huggingface.co/minishlab/potion-multilingual-128M/resolve/73908c3438cf03b6a01bcb9611d62b23d0726f08
+          [ -s "$MODEL/tokenizer.json" ] || curl -fsSL -o "$MODEL/tokenizer.json" "$UP/tokenizer.json"
+          if [ ! -s "$MODEL/model-int8.safetensors" ]; then
+              curl -fsSL -o upstream.safetensors "$UP/model.safetensors"
+              python -m pip install --quiet numpy safetensors
+              python "$MODEL/quantize.py" upstream.safetensors "$MODEL/model-int8.safetensors"
+              rm -f upstream.safetensors
+          fi
+          ls -l "$MODEL"
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc --features local-rerank
+
+      # The whole point. Nobody here owns a Windows machine, so this runner is
+      # the only thing that can say whether the port is real.
+      - name: Test
+        shell: bash
+        run: cargo test --release --locked --target x86_64-pc-windows-msvc --features local-rerank
+
+      # And the one thing the suite cannot cover: that the ONNX Runtime this
+      # platform is handed opens, exports what `ort` looks for, and is not
+      # older than the API floor this build was compiled against.
+      - name: Load the ONNX Runtime
+        shell: bash
+        run: |
+          set -eu
+          curl -fsSL -o rt.zip \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-win-x64-1.28.0.zip
+          unzip -q rt.zip
+          dll="$PWD/onnxruntime-win-x64-1.28.0/lib/onnxruntime.dll"
+          got=$(sha256sum "$dll" | cut -d' ' -f1)
+          want=18370c375f07357fa5874344a9d9ac17e6b6fe1eb18b1dd209d79483b4470257
+          [ "$got" = "$want" ] || { echo "runtime is not the pinned one: $got" >&2; exit 1; }
+          BRAIN_TEST_RUNTIME="$dll" cargo test --release --locked \
+            --target x86_64-pc-windows-msvc --features local-rerank \
+            -- --ignored runtime_loads --nocapture
+
+      - name: What the binary says about itself
+        shell: bash
+        run: |
+          ./target/x86_64-pc-windows-msvc/release/brain.exe --version
+          ./target/x86_64-pc-windows-msvc/release/brain.exe doctor || true
+
+      # The furthest this can be taken without owning a Windows machine.
+      #
+      # No host CLI is installed on this runner, so nothing here proves that
+      # Claude Code fires our hook. What it does prove is the half that is
+      # ours: that `setup` writes a command this platform can actually run,
+      # and that running it captures. The exec form was chosen precisely so
+      # there is no shell in the way - so spawning it the way the CLI would is
+      # a faithful test of everything up to the CLI's own door.
+      - name: Run the hook setup wrote
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $brain = "$PWD\target\x86_64-pc-windows-msvc\release\brain.exe"
+
+          # `setup` skips a CLI that is not installed, and installed means its
+          # configuration directory exists. A bare runner has neither, so make
+          # it look like the machine this is for.
+          New-Item -ItemType Directory -Force -Path (Join-Path $HOME '.claude') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $HOME '.codex') | Out-Null
+
+          & $brain setup --cli claude-code --apply
+          $settings = Join-Path $HOME '.claude\settings.json'
+          if (-not (Test-Path $settings)) { throw "setup wrote no $settings" }
+          $config = Get-Content $settings -Raw | ConvertFrom-Json
+
+          $entry = $config.hooks.SessionStart[0].hooks[0]
+          Write-Host "setup wrote: $($entry | ConvertTo-Json -Compress)"
+          if (-not $entry.args) { throw 'not the exec form: no args' }
+          if ($entry.command -notlike '*brain.exe') { throw "command is $($entry.command)" }
+
+          # Fire it exactly as the exec form says it will be fired: the
+          # executable, then each argument passed as one argument.
+          $payload = @{
+              session_id = '0199b000-0000-7000-8000-000000000000'
+              cwd        = "$PWD"
+              source     = 'startup'
+          } | ConvertTo-Json -Compress
+          $answer = $payload | & $entry.command @($entry.args)
+          if ($LASTEXITCODE -ne 0) { throw "the hook exited $LASTEXITCODE" }
+          $null = $answer | ConvertFrom-Json   # throws if it is not JSON
+          Write-Host "SessionStart answered: $answer"
+
+          # And one that captures, so the claim is "it records", not "it runs".
+          $post = $config.hooks.PostToolUse[0].hooks[0]
+          $edit = @{
+              session_id = '0199b000-0000-7000-8000-000000000000'
+              cwd        = "$PWD"
+              tool_name  = 'Edit'
+              tool_input = @{ file_path = "$PWD\src\main.rs" }
+          } | ConvertTo-Json -Compress
+          $edit | & $post.command @($post.args) | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "the capture hook exited $LASTEXITCODE" }
+
+          & $brain doctor
+          $found = & $brain search 'main.rs' 2>&1 | Out-String
+          Write-Host "search said: $found"
+          if ($found -notmatch 'main\.rs') { throw 'the hook ran and captured nothing' }
+
+          # Leave the runner as it was found, and prove removal recognises the
+          # exec form it wrote - the failure that would otherwise show up as a
+          # doubled memory much later.
+          # Codex takes a string with a documented Windows twin rather than an
+          # exec form, so it is checked for the shape its own docs describe.
+          & $brain setup --cli codex --apply
+          $codexHooks = Join-Path $HOME '.codex\hooks.json'
+          if (Test-Path $codexHooks) {
+              $written = Get-Content $codexHooks -Raw
+              Write-Host "codex config: $written"
+              if ($written -notmatch 'command_windows') {
+                  throw 'codex lost its documented Windows spelling'
+              }
+          } else {
+              Write-Host "note: codex wrote no $codexHooks - checking what setup reported instead"
+              & $brain setup --cli codex
+          }
+
+          & $brain uninstall --apply
+          $after = Get-Content $settings -Raw | ConvertFrom-Json
+          if ($after.hooks.SessionStart) { throw 'uninstall left its own exec-form entry behind' }
+          Write-Host 'setup wrote it, it ran, it captured, and uninstall took it back out.'
+
+      - name: Parse the PowerShell installer
+        shell: pwsh
+        run: |
+          $errors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+              "$PWD\bootstrap.ps1", [ref]$null, [ref]$errors)
+          if ($errors) { $errors | ForEach-Object { $_.Message }; throw 'bootstrap.ps1 does not parse' }
+          Write-Host 'bootstrap.ps1 parses'

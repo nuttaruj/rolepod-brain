@@ -1,3 +1,18 @@
+//! Unix only, deliberately.
+//!
+//! Every fixture here builds a fake host CLI as a `/bin/sh` script, pins
+//! `PATH` to `/usr/bin:/bin` so a test can never see a real CLI installed on
+//! the machine, and links the embedding model rather than copying 122 MB per
+//! test. Porting that to Windows means running each stub through `cmd.exe`
+//! into `bash`, where the prompt crosses two argument parsers - and a failure
+//! there would be as likely to be the harness as the code.
+//!
+//! What Windows verifies instead is the unit suite, plus the one behaviour
+//! this file would have covered that is genuinely platform-specific: that a
+//! host CLI installed as a `.cmd` shim is found and can be run. That test
+//! lives next to the code it tests, in `summarizer`.
+#![cfg(unix)]
+
 //! v0.1 exit test, run against the real binary.
 //!
 //! The claims this file is here to prove:

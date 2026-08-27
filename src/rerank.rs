@@ -133,6 +133,14 @@ fn fetch_in_background(model_dir: &std::path::Path) {
     if std::fs::write(&marker, "").is_err() {
         return;
     }
+    // Windows has no `sh` and no installer script of its own yet, so there is
+    // nothing to spawn there. The marker is removed again rather than left
+    // behind claiming a download is in flight, and `brain doctor` names the
+    // manual step instead of a machine quietly never reranking locally.
+    if cfg!(windows) {
+        let _ = std::fs::remove_file(&marker);
+        return;
+    }
     let script = "curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh \
                   | sh -s -- --reranker-only";
     let marker_path = marker.to_string_lossy().into_owned();

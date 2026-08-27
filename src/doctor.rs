@@ -243,6 +243,15 @@ fn reranker_check(paths: &Paths) -> Check {
             "weights are here but ONNX Runtime is not - the next rerank fetches it",
         );
     }
+    // Windows can load the runtime but has no installer script to go and get
+    // it, so the sentence that is true everywhere else - that asking once
+    // starts the download - would be a promise nothing keeps.
+    if cfg!(windows) {
+        return Check::pass(
+            "reranker",
+            "not fetched yet - reranking uses the host CLI until the model is placed by hand",
+        );
+    }
     Check::pass(
         "reranker",
         "not fetched yet - the first rerank asks the CLI and starts the download",
@@ -269,12 +278,29 @@ fn semantic_check(paths: &Paths) -> Check {
     // reports as missing rather than failed, with the command that fixes it.
     let model = paths.model_dir();
     if !model.join(crate::embed::WEIGHTS_FILE).is_file() {
+        // Windows has no installer script of its own yet, so pointing a
+        // Windows reader at a shell pipeline is worse than saying nothing -
+        // it is a command that cannot work, printed by a tool they are
+        // consulting because something already did not. Name the files and
+        // where they live instead.
+        let how = if cfg!(windows) {
+            format!(
+                "Download model-int8.safetensors and tokenizer.json from the latest \
+                 release at https://github.com/nuttaruj/rolepod-brain/releases and put \
+                 them in {}",
+                model.display()
+            )
+        } else {
+            "Fetch it once: curl -fsSL \
+             https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh \
+             | sh -s -- --model-only"
+                .to_string()
+        };
         return Check::pass(
             "semantic",
             format!(
                 "the embedding model is not in {} yet, so search is running on words, \
-                 entities and neighbours but not meaning. Fetch it once: \
-                 curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh -s -- --model-only",
+                 entities and neighbours but not meaning. {how}",
                 model.display()
             ),
         );
@@ -510,24 +536,12 @@ fn timer_check() -> Check {
 ///
 /// This check runs inside a `brain` process, so it must not count itself.
 fn resident_check() -> Check {
-    let output = std::process::Command::new("ps").args(["-Ao", "pid=,comm="]).output();
-    let Ok(output) = output else {
-        return Check::fail("no resident process", "could not run `ps`");
+    let Some(running) = running_brains() else {
+        return Check::fail("no resident process", "could not list processes");
     };
     let me = std::process::id();
-    let stray: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.trim().splitn(2, char::is_whitespace);
-            let pid: u32 = parts.next()?.parse().ok()?;
-            let command = parts.next()?.trim();
-            if pid == me {
-                return None;
-            }
-            let name = Path::new(command).file_name()?.to_string_lossy();
-            (name == "brain").then(|| format!("pid {pid}"))
-        })
-        .collect();
+    let stray: Vec<String> =
+        running.into_iter().filter(|pid| *pid != me).map(|pid| format!("pid {pid}")).collect();
 
     if stray.is_empty() {
         Check::pass("no resident process", "nothing of ours is running")
@@ -539,6 +553,52 @@ fn resident_check() -> Check {
             format!("{} live: {} (expected only while a session is open)", stray.len(), stray.join(", ")),
         )
     }
+}
+
+/// Every `brain` process on this machine, or `None` if we could not ask.
+///
+/// Two spellings of one question. `ps` reports a command that may be a path,
+/// so the name is taken from its last component; `tasklist` reports an image
+/// name that is already bare and already carries `.exe`. Neither needs a
+/// crate, and both are present on a machine that can run this at all.
+#[cfg(unix)]
+fn running_brains() -> Option<Vec<u32>> {
+    let output = std::process::Command::new("ps").args(["-Ao", "pid=,comm="]).output().ok()?;
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.trim().splitn(2, char::is_whitespace);
+                let pid: u32 = parts.next()?.parse().ok()?;
+                let command = parts.next()?.trim();
+                let name = Path::new(command).file_name()?.to_string_lossy();
+                (name == "brain").then_some(pid)
+            })
+            .collect(),
+    )
+}
+
+#[cfg(windows)]
+fn running_brains() -> Option<Vec<u32>> {
+    // `/NH` drops the header, `/FO CSV` quotes every field, and the two we
+    // want are the first: image name, then pid.
+    let output = std::process::Command::new("tasklist")
+        .args(["/FO", "CSV", "/NH", "/FI", "IMAGENAME eq brain.exe"])
+        .output()
+        .ok()?;
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split("\",\"");
+                let name = fields.next()?.trim_start_matches('"');
+                if !name.eq_ignore_ascii_case("brain.exe") {
+                    return None;
+                }
+                fields.next()?.parse().ok()
+            })
+            .collect(),
+    )
 }
 
 /// Recent capture failures. Hooks never print to the host CLI, so this file is

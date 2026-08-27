@@ -22,6 +22,9 @@ pub const SILENT_ENV: &str = "ROLEPOD_BRAIN_SILENT";
 ///
 /// The CLI is normally our direct parent; a couple of levels of slack covers a
 /// shell wrapper without walking into unrelated ancestors.
+///
+/// Unix only, because only there is there a process tree to walk.
+#[cfg(unix)]
 const MAX_ANCESTORS: usize = 4;
 
 /// What kind of run produced this event.
@@ -114,6 +117,7 @@ fn classify_argv(argv: &str) -> Option<Invocation> {
 /// implementation — one `ps` per ancestor — cost 70 ms on a real hook and blew
 /// the 50 ms budget outright. Process spawns are the expensive thing here, so
 /// there is exactly one.
+#[cfg(unix)]
 fn ancestors() -> Vec<String> {
     let Ok(output) = std::process::Command::new("ps").args(["-Ao", "pid=,ppid=,args="]).output()
     else {
@@ -144,6 +148,22 @@ fn ancestors() -> Vec<String> {
         pid = *parent;
     }
     out
+}
+
+/// Windows has no `ps` and no way to read a parent pid without `unsafe`.
+///
+/// The honest answer there is that we do not know, and the caller is built for
+/// that: an empty ancestry means invocation is classified from the event alone
+/// rather than from who started us. What is lost is telling a headless run
+/// apart from an interactive one by inspecting the process tree - which
+/// affects how a session is labelled, not whether it is captured.
+///
+/// The alternatives were both worse. `Get-CimInstance` costs about a second of
+/// PowerShell startup inside a 50 ms hook budget, and the Win32 tool help API
+/// needs `unsafe`, which this crate forbids.
+#[cfg(windows)]
+fn ancestors() -> Vec<String> {
+    Vec::new()
 }
 
 fn basename(path: &str) -> &str {

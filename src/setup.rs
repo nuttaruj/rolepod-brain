@@ -104,6 +104,16 @@ pub struct Target {
 
 pub fn targets(exe: &Path) -> Result<Vec<Target>> {
     let home = dirs::home_dir().context("cannot determine home directory")?;
+    targets_in(&home, exe)
+}
+
+/// The same table, rooted at a named home.
+///
+/// Split out for the same reason the plugin lookups were: `dirs::home_dir()`
+/// consults no environment variable on Windows, so a test that redirects
+/// `HOME` is still describing the real machine. Every caller outside a test
+/// wants the real one and goes through [`targets`].
+pub fn targets_in(home: &Path, exe: &Path) -> Result<Vec<Target>> {
     let exe = exe.display().to_string();
 
     Ok(vec![
@@ -502,7 +512,10 @@ fn strip_mcp(target: &Target, apply: bool) -> Vec<Change> {
             detail: format!("would run: {program} mcp remove {MCP_SERVER_NAME}"),
         }];
     }
-    match Command::new(program).args(["mcp", "remove", MCP_SERVER_NAME]).output() {
+    // Resolved for the same reason the ladder resolves: on Windows these CLIs
+    // are `.cmd` shims that a bare name cannot start.
+    let Some(program) = crate::summarizer::resolve(program) else { return Vec::new() };
+    match Command::new(&program).args(["mcp", "remove", MCP_SERVER_NAME]).output() {
         Ok(output) if output.status.success() => {
             vec![Change { target: label, detail: "deregistered MCP server".to_string() }]
         }
@@ -778,6 +791,19 @@ fn defer_to_plugin_flow(target: &Target, apply: bool) -> Result<Vec<Change>> {
 }
 
 fn wire_hooks(target: &Target, exe: &Path, apply: bool) -> Result<Vec<Change>> {
+    // Cursor does not document how it runs a hook command on Windows - not
+    // which shell, not whether there is one - and its own examples are bash
+    // scripts. Writing a command there means picking a spelling and hoping,
+    // and a hook that silently never fires is worse than one that was never
+    // written: the CLI looks wired and nothing is captured. So it is left
+    // alone, and `setup` says why rather than reporting a success.
+    if cfg!(windows) && target.kind.as_str() == "cursor" {
+        return Ok(vec![Change {
+            target: target.kind.as_str().to_string(),
+            detail: "not wired - Cursor does not document how it runs hook commands on Windows"
+                .to_string(),
+        }]);
+    }
     // The plugin carries a full set of hooks for the CLIs that can load them.
     // Writing our own alongside would capture every event twice: double
     // storage, double consolidation prompt, and a duplicate of every memory a
@@ -849,11 +875,7 @@ fn wire_hooks(target: &Target, exe: &Path, apply: bool) -> Result<Vec<Change>> {
             .iter()
             .find(|(name, _)| name == event)
             .map_or(target.timeout, |(_, seconds)| *seconds);
-        let handler = json!({
-            "type": "command",
-            "command": command,
-            "timeout": timeout,
-        });
+        let handler = handler_for(target, exe, event, &command, timeout);
         let grouped = target.layout == Layout::Grouped
             || target.grouped_events.contains(event);
         let matcher = target.matchers.iter().find(|(name, _)| name == event).map(|(_, m)| *m);
@@ -1047,10 +1069,13 @@ fn register_mcp_file(target: &Target, path: &Path, apply: bool) -> Vec<Change> {
 /// Returns `None` when no installed plugin supplies hooks for this CLI.
 #[must_use]
 pub fn plugin_hook_events(kind: &AgentKind) -> Option<Vec<String>> {
-    if !plugin_installed(kind) || !plugin_carries_hooks(kind) {
+    plugin_hook_events_in(&dirs::home_dir()?, kind)
+}
+
+fn plugin_hook_events_in(home: &std::path::Path, kind: &AgentKind) -> Option<Vec<String>> {
+    if !plugin_installed_in(home, kind) || !plugin_carries_hooks_in(home, kind) {
         return None;
     }
-    let home = dirs::home_dir()?;
     let (cache, file) = match kind.as_str() {
         "claude-code" => (home.join(".claude/plugins/cache"), "hooks/hooks.json"),
         "codex" => (home.join(".codex/plugins/cache"), "hooks/codex-hooks.json"),
@@ -1082,7 +1107,10 @@ pub fn plugin_hook_events(kind: &AgentKind) -> Option<Vec<String>> {
 /// file explicitly. Cursor takes neither — its hook events are camelCase and
 /// its own shape — so `setup` keeps Cursor's wiring whatever is installed.
 fn plugin_carries_hooks(kind: &AgentKind) -> bool {
-    let Some(home) = dirs::home_dir() else { return false };
+    dirs::home_dir().is_some_and(|home| plugin_carries_hooks_in(&home, kind))
+}
+
+fn plugin_carries_hooks_in(home: &std::path::Path, kind: &AgentKind) -> bool {
     let (cache, file) = match kind.as_str() {
         "claude-code" => (home.join(".claude/plugins/cache"), "hooks/hooks.json"),
         "codex" => (home.join(".codex/plugins/cache"), "hooks/codex-hooks.json"),
@@ -1158,7 +1186,16 @@ fn sweep_ours(target: &Target, apply: bool) -> Vec<Change> {
 /// it is a second copy.
 #[must_use]
 pub fn plugin_installed(kind: &AgentKind) -> bool {
-    let Some(home) = dirs::home_dir() else { return false };
+    dirs::home_dir().is_some_and(|home| plugin_installed_in(&home, kind))
+}
+
+/// The same question, asked of a named home.
+///
+/// Split out so a test can answer it about a fixture. `dirs::home_dir()` reads
+/// no environment variable on Windows - it asks the operating system - so a
+/// test that redirects `HOME` there is still inspecting the real machine, and
+/// three of these were doing exactly that.
+fn plugin_installed_in(home: &std::path::Path, kind: &AgentKind) -> bool {
     match kind.as_str() {
         // A JSON registry keyed `<plugin>@<marketplace>`.
         "claude-code" => std::fs::read_to_string(home.join(".claude/plugins/installed_plugins.json"))
@@ -1177,7 +1214,7 @@ pub fn plugin_installed(kind: &AgentKind) -> bool {
             .any(|marketplace| marketplace.path().join(PLUGIN_NAME).is_dir()),
         // TOML, and the only CLI where installing the plugin is what makes
         // the hooks run at all.
-        "codex" => codex_plugin_installed(&home),
+        "codex" => codex_plugin_installed(home),
         _ => false,
     }
 }
@@ -1262,10 +1299,40 @@ fn withdraw_mcp(target: &Target, apply: bool) -> Vec<Change> {
 /// one shape would mean leaving a stale hook of ours behind on every re-run.
 fn is_ours(entry: &Value) -> bool {
     let carries_marker = |value: &Value| {
-        value
+        // The string forms, including Codex's Windows twin. Either carrying
+        // the marker is enough: an entry with both is still one entry.
+        let in_command = ["command", "command_windows", "commandWindows"].iter().any(|key| {
+            value.get(*key).and_then(Value::as_str).is_some_and(|text| text.contains(MARKER))
+        });
+        if in_command {
+            return true;
+        }
+        // The exec form splits the marker across two fields, so neither half
+        // contains it and the check above sees nothing. Missing this would
+        // leave `uninstall` unable to remove what `setup` wrote, and a second
+        // `setup` adding a duplicate beside the first - on Windows only, which
+        // is exactly the kind of thing that is not noticed until it is a
+        // doubled memory.
+        let is_our_program = value
             .get("command")
             .and_then(Value::as_str)
-            .is_some_and(|command| command.contains(MARKER))
+            .map(|program| {
+                // Both separators, because `Path` only knows the local one and
+                // these files get synced between machines. On unix a Windows
+                // path is a single component and `file_stem` hands back the
+                // whole string, so the entry would read as someone else's and
+                // be left behind by an uninstall run from the other side.
+                program.rsplit(['/', '\\']).next().unwrap_or(program)
+            })
+            .map(|name| name.strip_suffix(".exe").unwrap_or(name))
+            .is_some_and(|stem| stem.eq_ignore_ascii_case("brain"));
+        let asks_for_a_hook = value
+            .get("args")
+            .and_then(Value::as_array)
+            .and_then(|args| args.first())
+            .and_then(Value::as_str)
+            == Some("hook");
+        is_our_program && asks_for_a_hook
     };
     if carries_marker(entry) {
         return true;
@@ -1317,6 +1384,62 @@ fn backup(path: &Path) -> Result<Option<PathBuf>> {
 }
 
 /// Quote a path for `/bin/sh` only when it needs it.
+/// One hook entry, spelled the way this CLI reads it on this platform.
+///
+/// Everywhere but Windows there is one spelling: a command string a shell
+/// runs. Windows has no single shell to write for - Claude Code prefers Git
+/// Bash and falls back to PowerShell, and a path quoted for one is wrong in
+/// the other - so each CLI is written the way its own documentation says to
+/// write it there.
+///
+/// Claude Code takes an exec form: a real executable and an argument list,
+/// distinguished from the string form by the presence of `args`, with each
+/// element passed as one argument and no quoting anywhere. That removes the
+/// question rather than answering it - no shell to guess at, a username with
+/// a space in it handled, and no shell startup inside a 50 ms hook budget.
+///
+/// Codex documents a `command_windows` key beside `command`, and its own
+/// example passes an unquoted Windows path. Both are written, so the file is
+/// right whichever one that CLI reaches for.
+fn handler_for(
+    target: &Target,
+    exe: &Path,
+    event: &str,
+    command: &str,
+    timeout: u32,
+) -> Value {
+    let exe = exe.display().to_string();
+    if cfg!(windows) {
+        match target.kind.as_str() {
+            "claude-code" => {
+                return json!({
+                    "type": "command",
+                    "command": exe,
+                    "args": ["hook", "--cli", target.kind.as_str(), "--event", event],
+                    "timeout": timeout,
+                });
+            }
+            "codex" => {
+                return json!({
+                    "type": "command",
+                    "command": command,
+                    "command_windows": format!(
+                        "{exe} hook --cli {} --event {event}",
+                        target.kind.as_str()
+                    ),
+                    "timeout": timeout,
+                });
+            }
+            _ => {}
+        }
+    }
+    json!({
+        "type": "command",
+        "command": command,
+        "timeout": timeout,
+    })
+}
+
 fn shell_quote(input: &str) -> String {
     if input
         .chars()
@@ -1331,18 +1454,151 @@ fn shell_quote(input: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Puts `HOME` back however the test ends, including on a panic — a test
-    /// that leaves it pointing at its own fixture decides the next test's
+    /// The variables that decide where `dirs::home_dir()` points.
+    ///
+    /// `HOME` everywhere, and `USERPROFILE` as well on Windows, which is the
+    /// one it actually reads there. A test that sets only `HOME` on Windows
+    /// silently keeps looking at the real home - which is how three of these
+    /// found the runner's own `.claude` directory instead of their fixture.
+    #[cfg(windows)]
+    const HOME_VARS: &[&str] = &["HOME", "USERPROFILE"];
+    #[cfg(not(windows))]
+    const HOME_VARS: &[&str] = &["HOME"];
+
+    /// Point every one of them at `home`, returning what was there.
+    fn take_home(home: &std::path::Path) -> RestoreHome {
+        let previous =
+            HOME_VARS.iter().map(|name| (*name, std::env::var(name).ok())).collect::<Vec<_>>();
+        for name in HOME_VARS {
+            std::env::set_var(name, home);
+        }
+        RestoreHome(previous)
+    }
+
+    /// Puts them back however the test ends, including on a panic — a test
+    /// that leaves one pointing at its own fixture decides the next test's
     /// answers.
-    struct RestoreHome(Option<String>);
+    struct RestoreHome(Vec<(&'static str, Option<String>)>);
 
     impl Drop for RestoreHome {
         fn drop(&mut self) {
-            match self.0.take() {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
+            for (name, value) in self.0.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
             }
         }
+    }
+
+    /// The exec form is still ours, and a stranger's exec form still is not.
+    ///
+    /// `setup` writes Claude Code's Windows hook as an executable plus an
+    /// argument list, which splits the marker across two fields so the
+    /// substring check sees nothing in either. If ownership missed that,
+    /// `uninstall` could not remove what `setup` wrote and a second `setup`
+    /// would add a duplicate beside the first - on Windows alone, quietly,
+    /// showing up much later as every memory recorded twice.
+    #[test]
+    fn ownership_survives_the_exec_form() {
+        let ours = json!({
+            "type": "command",
+            "command": "C:\\Users\\x\\.local\\bin\\brain.exe",
+            "args": ["hook", "--cli", "claude-code", "--event", "Stop"],
+        });
+        assert!(is_ours(&ours), "setup could not recognise what it writes on Windows");
+        assert!(is_ours(&json!({"hooks": [ours.clone()]})), "not found inside a group");
+
+        // Codex writes both spellings; either one carrying the marker is us.
+        assert!(is_ours(&json!({
+            "type": "command",
+            "command": "/usr/local/bin/brain hook --cli codex --event Stop",
+            "command_windows": "C:\\bin\\brain.exe hook --cli codex --event Stop",
+        })));
+
+        // And the shapes that are not ours stay not ours. A different program
+        // with our argument list, and our program doing something that is not
+        // a hook, are both somebody else's entry to leave alone.
+        assert!(!is_ours(&json!({
+            "type": "command",
+            "command": "C:\\tools\\other.exe",
+            "args": ["hook", "--cli", "claude-code", "--event", "Stop"],
+        })));
+        assert!(!is_ours(&json!({
+            "type": "command",
+            "command": "C:\\Users\\x\\.local\\bin\\brain.exe",
+            "args": ["doctor"],
+        })));
+    }
+
+    /// What `setup` writes for each CLI on Windows, held to what each one's
+    /// own documentation says to write.
+    #[test]
+    fn windows_gets_the_shape_each_cli_documents() {
+        let exe = Path::new("C:\\Users\\x\\.local\\bin\\brain.exe");
+        let all = targets_in(Path::new("C:\\Users\\x"), exe).expect("targets");
+        let claude = all.iter().find(|t| t.kind.as_str() == "claude-code").expect("claude");
+        let codex = all.iter().find(|t| t.kind.as_str() == "codex").expect("codex");
+
+        let written = handler_for(claude, exe, "Stop", "ignored on windows", 5);
+        if cfg!(windows) {
+            // Exec form: a real executable and an argument list, which is what
+            // removes the shell question rather than answering it.
+            assert_eq!(written["command"], "C:\\Users\\x\\.local\\bin\\brain.exe");
+            assert_eq!(written["args"][0], "hook");
+            assert_eq!(written["args"][4], "Stop");
+            assert!(written.get("args").is_some(), "no args means shell form");
+
+            let codex_written = handler_for(codex, exe, "Stop", "the unix string", 5);
+            assert_eq!(codex_written["command"], "the unix string");
+            assert!(
+                codex_written["command_windows"].as_str().is_some_and(|c| c.contains("brain.exe")),
+                "codex lost its documented Windows spelling"
+            );
+        } else {
+            // Everywhere else there is one shell and one spelling.
+            assert_eq!(written["command"], "ignored on windows");
+            assert!(written.get("args").is_none(), "a shell form must not carry args");
+        }
+    }
+
+    /// Cursor is left alone on Windows, and says so.
+    ///
+    /// It documents neither which shell runs a hook command there nor whether
+    /// one does, and its own examples are bash scripts. Guessing a spelling
+    /// buys a config that looks wired and captures nothing, which is worse
+    /// than not writing it - so this pins that the file is untouched and that
+    /// the reason is reported rather than a success.
+    #[cfg(windows)]
+    #[test]
+    fn cursor_is_not_wired_on_windows_and_setup_says_why() {
+        let dir = std::env::temp_dir().join(format!("brain-cursor-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hooks.json");
+        let before = json!({"version": 1, "hooks": {"stop": [{"command": "other-tool summarize"}]}});
+        std::fs::write(&path, serde_json::to_string(&before).unwrap()).unwrap();
+
+        let target = Target {
+            kind: AgentKind::parse("cursor"),
+            layout: Layout::Flat,
+            grouped_events: &[],
+            hooks_file: path.clone(),
+            events: &["stop"],
+            timeout: HOOK_TIMEOUT_SECS,
+            timeout_overrides: &[],
+            matchers: &[],
+            mcp_file: None,
+            mcp_register: None,
+        };
+        let changes = wire_hooks(&target, Path::new("C:\\bin\\brain.exe"), true).unwrap();
+
+        assert_eq!(read_json(&path).unwrap(), before, "Cursor's config was modified on Windows");
+        assert!(
+            changes.iter().any(|change| change.detail.contains("does not document")),
+            "setup did not say why it stood down: {changes:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1428,8 +1684,7 @@ mod tests {
         let home = std::env::temp_dir().join(format!("brain-plugin-detect-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let _guard = crate::invocation::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &home);
+        let _restore = take_home(&home);
 
         let claude = AgentKind::parse("claude-code");
         let cursor = AgentKind::parse("cursor");
@@ -1437,7 +1692,11 @@ mod tests {
 
         // Nothing installed anywhere.
         for kind in [&claude, &cursor, &codex] {
-            assert!(!plugin_installed(kind), "{} claimed an absent plugin", kind.as_str());
+            assert!(
+                !plugin_installed_in(&home, kind),
+                "{} claimed an absent plugin",
+                kind.as_str()
+            );
         }
 
         // Claude Code: a JSON registry keyed `<plugin>@<marketplace>`.
@@ -1447,13 +1706,13 @@ mod tests {
             format!(r#"{{"version":2,"plugins":{{"{PLUGIN_NAME}@{PLUGIN_NAME}":[{{"scope":"user"}}]}}}}"#),
         )
         .unwrap();
-        assert!(plugin_installed(&claude));
-        assert!(!plugin_installed(&cursor), "one CLI's registry answered for another");
+        assert!(plugin_installed_in(&home, &claude));
+        assert!(!plugin_installed_in(&home, &cursor), "one CLI's registry answered for another");
 
         // Cursor: a directory under the marketplace it came from.
         std::fs::create_dir_all(home.join(".cursor/plugins/cache/somewhere").join(PLUGIN_NAME))
             .unwrap();
-        assert!(plugin_installed(&cursor));
+        assert!(plugin_installed_in(&home, &cursor));
 
         // Codex: a TOML table, and `enabled = false` means not installed.
         std::fs::create_dir_all(home.join(".codex")).unwrap();
@@ -1462,21 +1721,17 @@ mod tests {
             format!("[plugins.\"{PLUGIN_NAME}@{PLUGIN_NAME}\"]\nenabled = false\n"),
         )
         .unwrap();
-        assert!(!plugin_installed(&codex), "a disabled plugin is not an installed one");
+        assert!(!plugin_installed_in(&home, &codex), "a disabled plugin is not an installed one");
         std::fs::write(
             home.join(".codex/config.toml"),
             format!("[plugins.\"{PLUGIN_NAME}@{PLUGIN_NAME}\"]\nenabled = true\n"),
         )
         .unwrap();
-        assert!(plugin_installed(&codex));
+        assert!(plugin_installed_in(&home, &codex));
 
         // A CLI with no plugin story must never claim one.
-        assert!(!plugin_installed(&AgentKind::parse("opencode")));
+        assert!(!plugin_installed_in(&home, &AgentKind::parse("opencode")));
 
-        match previous {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1606,17 +1861,29 @@ mod tests {
     /// twice — double storage, double consolidation prompt, and a duplicate of
     /// every memory. This is the same bug the duplicate MCP registration was,
     /// and it is caught the same way: the plugin is asked about first.
+    /// Unix only, and not because the behaviour is.
+    ///
+    /// This one goes through the planner rather than asking a question
+    /// directly, and the planner consults `dirs::home_dir()` several layers
+    /// down. That reads no environment variable on Windows, so the test would
+    /// describe the runner's real machine instead of its fixture. Threading a
+    /// home through every layer of the planner to satisfy one test is a worse
+    /// trade than saying so: the logic is ordinary Rust with nothing
+    /// platform-specific in it, and four other targets build and run it from
+    /// the same source. The two questions it depends on - is the plugin
+    /// installed, does it carry hooks - are tested directly, on every
+    /// platform, by the tests above.
+    #[cfg(unix)]
     #[test]
     fn setup_does_not_wire_a_cli_whose_plugin_already_did() {
         let home = std::env::temp_dir().join(format!("brain-plugin-hooks-{}", ulid::Ulid::new()));
         let _ = std::fs::remove_dir_all(&home);
         let _guard =
             crate::invocation::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &home);
+        let _restore = take_home(&home);
 
         let plan = |label: &str| -> String {
-            targets(Path::new("/usr/local/bin/brain"))
+            targets_in(&home, Path::new("/usr/local/bin/brain"))
                 .unwrap()
                 .into_iter()
                 .find(|target| target.kind.as_str() == label)
@@ -1664,10 +1931,6 @@ mod tests {
             "both would wire the same CLI: {planned}"
         );
 
-        match previous {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1701,9 +1964,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
         let _guard =
             crate::invocation::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &home);
-        let _restore = RestoreHome(previous);
+        let _restore = take_home(&home);
 
         let claude = AgentKind::ClaudeCode;
         assert!(plugin_hook_events(&claude).is_none(), "no plugin, no events");
@@ -1730,11 +1991,11 @@ mod tests {
             r#"{"hooks":{"SessionStart":[],"PostToolUse":[]}}"#,
         )
         .unwrap();
-        let events = plugin_hook_events(&claude).expect("the plugin wires events");
+        let events = plugin_hook_events_in(&home, &claude).expect("the plugin wires events");
         assert_eq!(events, vec!["PostToolUse".to_string(), "SessionStart".to_string()]);
 
         // Cursor loads neither file, whatever is installed.
-        assert!(plugin_hook_events(&AgentKind::parse("cursor")).is_none());
+        assert!(plugin_hook_events_in(&home, &AgentKind::parse("cursor")).is_none());
 
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -1785,9 +2046,8 @@ mod tests {
         // or a neighbouring test's fixture decides its answer.
         let _guard =
             crate::invocation::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", std::env::temp_dir().join(format!("brain-nohome-{}", ulid::Ulid::new())));
-        let _restore = RestoreHome(previous_home);
+        let _restore =
+            take_home(&std::env::temp_dir().join(format!("brain-nohome-{}", ulid::Ulid::new())));
         let dir = std::env::temp_dir().join(format!("brain-setup-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hooks.json");
@@ -1839,9 +2099,8 @@ mod tests {
         // or a neighbouring test's fixture decides its answer.
         let _guard =
             crate::invocation::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", std::env::temp_dir().join(format!("brain-nohome-{}", ulid::Ulid::new())));
-        let _restore = RestoreHome(previous_home);
+        let _restore =
+            take_home(&std::env::temp_dir().join(format!("brain-nohome-{}", ulid::Ulid::new())));
         let dir = std::env::temp_dir().join(format!("brain-setup-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hooks.json");
@@ -1942,6 +2201,16 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Cursor is not wired on Windows at all, so there is nothing to leave a
+    /// foreign entry beside there.
+    ///
+    /// Unix only for that reason and not because the merge is: Cursor is the
+    /// one CLI with a flat layout, so it is the only vehicle this can be
+    /// tested through, and the behaviour under test - keep the schema version,
+    /// keep what is not ours, write exactly one of ours - is JSON handling
+    /// with nothing platform-specific in it. The Windows behaviour it collides
+    /// with has a test of its own below.
+    #[cfg(unix)]
     #[test]
     fn a_flat_config_keeps_its_schema_version_and_foreign_entries() {
         let dir = std::env::temp_dir().join(format!("brain-setup-{}", ulid::Ulid::new()));
@@ -2042,9 +2311,8 @@ mod tests {
         // or a neighbouring test's fixture decides its answer.
         let _guard =
             crate::invocation::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", std::env::temp_dir().join(format!("brain-nohome-{}", ulid::Ulid::new())));
-        let _restore = RestoreHome(previous_home);
+        let _restore =
+            take_home(&std::env::temp_dir().join(format!("brain-nohome-{}", ulid::Ulid::new())));
         let dir = std::env::temp_dir().join(format!("brain-setup-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hooks.json");
