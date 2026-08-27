@@ -60,6 +60,14 @@ jobs:
             runner: ubuntu-22.04-arm
             test: true
             features: local-rerank
+          # The only Windows machine this project will ever touch, so the
+          # suite runs here rather than being reasoned about. `msvc` and not
+          # `gnu`: it is what a Windows user's toolchain already is, and the
+          # ONNX Runtime Microsoft publishes is built against it.
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            test: true
+            features: local-rerank
     steps:
       - uses: actions/checkout@v4
 
@@ -100,6 +108,7 @@ jobs:
           [ "$want" = "$got" ] || { echo "model checksum $got does not match PROVENANCE $want"; exit 1; }
 
       - name: Build
+        shell: bash
         run: |
           cargo build --release --locked --target ${{ matrix.target }} \
             ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
@@ -110,6 +119,7 @@ jobs:
         # one target that cannot run its own tests here is covered by the
         # identical source built and tested on the sibling architecture.
         if: matrix.test
+        shell: bash
         run: |
           cargo test --release --locked --target ${{ matrix.target }} \
             ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
@@ -123,11 +133,22 @@ jobs:
         run: codesign -s - -f target/${{ matrix.target }}/release/brain
 
       - name: Package
+        # `bash` explicitly: the Windows runner would otherwise use PowerShell,
+        # where none of this is syntax.
+        shell: bash
         run: |
           set -eu
-          name="brain-${{ matrix.target }}"
+          # Windows keeps the extension, because a downloaded file without one
+          # is not something a Windows user can run.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+              built="target/${{ matrix.target }}/release/brain.exe"
+              name="brain-${{ matrix.target }}.exe"
+          else
+              built="target/${{ matrix.target }}/release/brain"
+              name="brain-${{ matrix.target }}"
+          fi
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/brain" "dist/$name"
+          cp "$built" "dist/$name"
           cd dist
           if command -v shasum >/dev/null 2>&1; then
             shasum -a 256 "$name" > "$name.sha256"
@@ -229,14 +250,19 @@ jobs:
           # what makes that a checkable claim rather than a promise: these are
           # the libraries that were measured, and a release asset that upstream
           # replaced under the same name would stop this job rather than ship.
+          # Windows ships a zip where the others ship a tarball, which is the
+          # only reason the archive kind is a parameter rather than assumed.
           fetch() {
-              target="$1"; pack="$2"; version="$3"; inner="$4"; want="$5"
+              target="$1"; pack="$2"; version="$3"; kind="$4"; inner="$5"; want="$6"
               url="https://github.com/microsoft/onnxruntime/releases/download"
-              url="$url/v$version/onnxruntime-$pack-$version.tgz"
+              url="$url/v$version/onnxruntime-$pack-$version.$kind"
               echo "$target <- onnxruntime $version ($pack)"
-              curl -fsSL -o rt.tgz "$url"
-              tar xzf rt.tgz
-              # Copied, not moved: the archive ships the real library beside
+              curl -fsSL -o "rt.$kind" "$url"
+              case "$kind" in
+                  tgz) tar xzf rt.tgz ;;
+                  zip) unzip -q rt.zip ;;
+              esac
+              # Copied, not moved: the tarballs ship the real library beside
               # unversioned symlinks pointing at it, and a release asset that
               # is a dangling symlink is a zero-byte download.
               cp "onnxruntime-$pack-$version/lib/$inner" "runtimes/onnxruntime-$target"
@@ -247,16 +273,18 @@ jobs:
                   echo "  got      $got" >&2
                   exit 1
               fi
-              rm -rf rt.tgz "onnxruntime-$pack-$version"
+              rm -rf "rt.$kind" "onnxruntime-$pack-$version"
           }
-          fetch aarch64-apple-darwin      osx-arm64      1.28.0 "libonnxruntime.1.28.0.dylib" \
+          fetch aarch64-apple-darwin      osx-arm64      1.28.0 tgz "libonnxruntime.1.28.0.dylib" \
               dc19bbcb2f5c9fb3c68b4f9248aa0a35065ff702c5dbeae75eac54a74da97b6d
-          fetch x86_64-apple-darwin       osx-x86_64     1.23.0 "libonnxruntime.1.23.0.dylib" \
+          fetch x86_64-apple-darwin       osx-x86_64     1.23.0 tgz "libonnxruntime.1.23.0.dylib" \
               091d265e49da84ac8eafd6ff76b67688555192a272d784a252d550a858797d6f
-          fetch x86_64-unknown-linux-gnu  linux-x64      1.28.0 "libonnxruntime.so.1.28.0" \
+          fetch x86_64-unknown-linux-gnu  linux-x64      1.28.0 tgz "libonnxruntime.so.1.28.0" \
               1461ef7cc3d9e49982591721683cc3e3a55580aeca9a5254e7aac47b75ee4bab
-          fetch aarch64-unknown-linux-gnu linux-aarch64  1.28.0 "libonnxruntime.so.1.28.0" \
+          fetch aarch64-unknown-linux-gnu linux-aarch64  1.28.0 tgz "libonnxruntime.so.1.28.0" \
               f1ec1a08eb99bd6e5401340f0a2b101381bf4694415480291dc13bcaa30f9ec7
+          fetch x86_64-pc-windows-msvc    win-x64        1.28.0 zip "onnxruntime.dll" \
+              18370c375f07357fa5874344a9d9ac17e6b6fe1eb18b1dd209d79483b4470257
           ls -l runtimes
 
       - name: Collect

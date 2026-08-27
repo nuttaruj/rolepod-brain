@@ -1,0 +1,88 @@
+# Windows bring-up, run by hand.
+#
+# Separate from the release so a platform that has never executed this code
+# can be brought up without spending public tags on the attempt. Delete this
+# file once Windows has shipped green in a release - the release matrix runs
+# the same suite on the same runner, and two places to fix a Windows problem
+# is one too many.
+name: windows
+
+# Triggered by pushing the branch, not by dispatch: a `workflow_dispatch`
+# workflow has to already be on the default branch before GitHub will offer
+# it, and the point of this one is to answer a question before anything
+# reaches the default branch.
+on:
+  push:
+    branches: [windows-bringup]
+  workflow_dispatch:
+
+jobs:
+  bringup:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # The suite reads the embedding model out of the checkout, which does
+      # not carry it. Same recipe as the release, minus the PROVENANCE check
+      # that the release already performs on four other runners.
+      - name: Cache the embedding model
+        uses: actions/cache@v4
+        with:
+          path: assets/potion-multilingual-128M/model-int8.safetensors
+          key: model-73908c3438cf03b6a01bcb9611d62b23d0726f08-v3
+      - name: Cache the tokenizer
+        uses: actions/cache@v4
+        with:
+          path: assets/potion-multilingual-128M/tokenizer.json
+          key: tokenizer-73908c3438cf03b6a01bcb9611d62b23d0726f08
+      - name: Build the embedding model
+        shell: bash
+        run: |
+          set -eu
+          MODEL=assets/potion-multilingual-128M
+          UP=https://huggingface.co/minishlab/potion-multilingual-128M/resolve/73908c3438cf03b6a01bcb9611d62b23d0726f08
+          [ -s "$MODEL/tokenizer.json" ] || curl -fsSL -o "$MODEL/tokenizer.json" "$UP/tokenizer.json"
+          if [ ! -s "$MODEL/model-int8.safetensors" ]; then
+              curl -fsSL -o upstream.safetensors "$UP/model.safetensors"
+              python -m pip install --quiet numpy safetensors
+              python "$MODEL/quantize.py" upstream.safetensors "$MODEL/model-int8.safetensors"
+              rm -f upstream.safetensors
+          fi
+          ls -l "$MODEL"
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc --features local-rerank
+
+      # The whole point. Nobody here owns a Windows machine, so this runner is
+      # the only thing that can say whether the port is real.
+      - name: Test
+        shell: bash
+        run: cargo test --release --locked --target x86_64-pc-windows-msvc --features local-rerank
+
+      # And the one thing the suite cannot cover: that the ONNX Runtime this
+      # platform is handed opens, exports what `ort` looks for, and is not
+      # older than the API floor this build was compiled against.
+      - name: Load the ONNX Runtime
+        shell: bash
+        run: |
+          set -eu
+          curl -fsSL -o rt.zip \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-win-x64-1.28.0.zip
+          unzip -q rt.zip
+          dll="$PWD/onnxruntime-win-x64-1.28.0/lib/onnxruntime.dll"
+          got=$(sha256sum "$dll" | cut -d' ' -f1)
+          want=18370c375f07357fa5874344a9d9ac17e6b6fe1eb18b1dd209d79483b4470257
+          [ "$got" = "$want" ] || { echo "runtime is not the pinned one: $got" >&2; exit 1; }
+          BRAIN_TEST_RUNTIME="$dll" cargo test --release --locked \
+            --target x86_64-pc-windows-msvc --features local-rerank \
+            -- --ignored runtime_loads --nocapture
+
+      - name: What the binary says about itself
+        shell: bash
+        run: |
+          ./target/x86_64-pc-windows-msvc/release/brain.exe --version
+          ./target/x86_64-pc-windows-msvc/release/brain.exe doctor || true

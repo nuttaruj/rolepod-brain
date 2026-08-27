@@ -41,7 +41,9 @@ pub const TOKENIZER_FILE: &str = "tokenizer.json";
 /// loader should not have to know which answer it got.
 #[cfg(target_os = "macos")]
 pub const RUNTIME_FILE: &str = "libonnxruntime.dylib";
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+pub const RUNTIME_FILE: &str = "onnxruntime.dll";
+#[cfg(not(any(target_os = "macos", windows)))]
 pub const RUNTIME_FILE: &str = "libonnxruntime.so";
 
 /// Tokens kept from one (query, entry) pair.
@@ -185,5 +187,39 @@ impl Reranker {
             scores.len()
         );
         Ok(scores.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Does the ONNX Runtime this platform is given actually load?
+    ///
+    /// Ignored by default because it needs a runtime file, which is a download
+    /// rather than part of the checkout. Run it where the answer is not
+    /// already known - a platform whose library nobody here can execute:
+    ///
+    /// ```text
+    /// BRAIN_TEST_RUNTIME=path/to/onnxruntime.dll \
+    ///     cargo test --features local-rerank -- --ignored runtime_loads
+    /// ```
+    ///
+    /// It deliberately stops short of the model. What is in doubt for a new
+    /// platform is the three things `init_from` checks - that the library
+    /// opens, that it exports `OrtGetApiBase`, and that its API is not older
+    /// than this build's floor. A 568 MB download would not tell us more
+    /// about any of them.
+    #[test]
+    #[ignore = "needs a runtime file; set BRAIN_TEST_RUNTIME"]
+    fn runtime_loads() {
+        let path = std::env::var("BRAIN_TEST_RUNTIME")
+            .expect("set BRAIN_TEST_RUNTIME to an onnxruntime library");
+        let path = std::path::Path::new(&path);
+        assert!(path.is_file(), "no runtime at {}", path.display());
+        match ort::init_from(path) {
+            Ok(builder) => {
+                builder.commit();
+            }
+            Err(error) => panic!("{} did not load: {error}", path.display()),
+        }
     }
 }

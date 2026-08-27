@@ -502,7 +502,10 @@ fn strip_mcp(target: &Target, apply: bool) -> Vec<Change> {
             detail: format!("would run: {program} mcp remove {MCP_SERVER_NAME}"),
         }];
     }
-    match Command::new(program).args(["mcp", "remove", MCP_SERVER_NAME]).output() {
+    // Resolved for the same reason the ladder resolves: on Windows these CLIs
+    // are `.cmd` shims that a bare name cannot start.
+    let Some(program) = crate::summarizer::resolve(program) else { return Vec::new() };
+    match Command::new(&program).args(["mcp", "remove", MCP_SERVER_NAME]).output() {
         Ok(output) if output.status.success() => {
             vec![Change { target: label, detail: "deregistered MCP server".to_string() }]
         }

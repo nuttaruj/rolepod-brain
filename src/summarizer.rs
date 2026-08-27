@@ -316,16 +316,44 @@ fn unusable_reason(text: &str) -> String {
     format!("unusable answer: {}", crate::sanitize::truncate(first, 160))
 }
 
+/// The extensions a program name might really wear on this platform.
+///
+/// Empty means the name as given. On Windows the list is the reason the whole
+/// ladder works there at all: `claude`, `codex` and `gemini` are installed by
+/// npm, which writes a `.cmd` shim rather than an executable, and neither
+/// `CreateProcess` nor Rust's own `.exe`-only search will find one. Resolving
+/// the shim ourselves and handing the full path to `Command` is what closes
+/// that - the standard library recognises a `.cmd` and runs it through
+/// `cmd.exe` with the escaping that fix required.
+#[cfg(windows)]
+const PROGRAM_EXTENSIONS: &[&str] = &["", "exe", "cmd", "bat"];
+#[cfg(not(windows))]
+const PROGRAM_EXTENSIONS: &[&str] = &[""];
+
+/// Where `program` really is on `PATH`, if it is anywhere.
+///
+/// Returns the full path rather than the bare name, because on Windows the
+/// difference between the two is whether the program can be started at all.
+#[must_use]
+pub fn resolve(program: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|dir| {
+        let candidate = dir.join(program);
+        PROGRAM_EXTENSIONS.iter().find_map(|extension| {
+            let candidate = if extension.is_empty() {
+                candidate.clone()
+            } else {
+                candidate.with_extension(extension)
+            };
+            candidate.is_file().then_some(candidate)
+        })
+    })
+}
+
 /// Is a program on `PATH`?
 #[must_use]
 pub fn installed(program: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| {
-        let candidate = dir.join(program);
-        candidate.is_file() || candidate.with_extension("exe").is_file()
-    })
+    resolve(program).is_some()
 }
 
 /// Run one CLI once and return its answer.
@@ -358,7 +386,12 @@ fn invoke(spec: &CliSpec, model: &str, prompt: &str, timeout: Duration) -> Resul
         })
         .collect();
 
-    let mut command = Command::new(spec.program);
+    // The resolved path, not the bare name. On Windows these are npm `.cmd`
+    // shims and a bare name reaches nothing; everywhere else this is the same
+    // file `PATH` would have found, just named in full.
+    let program = resolve(spec.program)
+        .with_context(|| format!("{} is not on PATH", spec.program))?;
+    let mut command = Command::new(&program);
     command
         .args(&args)
         .arg(prompt)

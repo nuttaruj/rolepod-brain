@@ -109,14 +109,43 @@ impl Table {
     /// them between every brain process, and the heap here stays empty.
     /// `mmap` would do the same thing and needs `unsafe`; this does not.
     fn row(&self, id: u32, into: &mut [u8]) -> bool {
-        use std::os::unix::fs::FileExt;
         let id = id as usize;
         if id >= self.rows || into.len() != self.dims {
             return false;
         }
         let at = self.body + (id * self.dims) as u64;
-        self.file.read_exact_at(into, at).is_ok()
+        read_exact_at(&self.file, into, at)
     }
+}
+
+/// Fill `into` from `at`, without moving a file cursor anyone else can see.
+///
+/// Positional reads are what let one open file serve every lookup without a
+/// lock and without `mmap`, and the two platforms spell them differently.
+/// `pread` fills the buffer or fails; `seek_read` is allowed to come back
+/// short and has to be driven in a loop, which is the kind of difference that
+/// is invisible until a row reads half-right.
+#[cfg(unix)]
+fn read_exact_at(file: &std::fs::File, into: &mut [u8], at: u64) -> bool {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(into, at).is_ok()
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &std::fs::File, into: &mut [u8], at: u64) -> bool {
+    use std::os::windows::fs::FileExt;
+    let mut filled = 0;
+    while filled < into.len() {
+        match file.seek_read(&mut into[filled..], at + filled as u64) {
+            // Zero means end of file with the buffer unfilled, which for a
+            // fixed-width table is a truncated file rather than a short read.
+            Ok(0) => return false,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 /// Everything here loads from bytes compiled into the binary, so a failure is
