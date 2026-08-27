@@ -52,12 +52,8 @@ wide when none is.
 
 **In whatever language you work in.** The question and the memory do not have
 to be in the same one: ask in Thai about work recorded in English and the
-right memory still comes back. The model covers 101 languages, and this is
-measured rather than assumed — 40 pairs of a Thai question and the English
-memory answering it, the right one ranked first 80% of the time and inside the
-top five 97%, measured on the quantized file that actually ships and not on
-the original it was made from. The English-only model this replaced managed
-2.5%, which is one in forty: chance.
+right memory still comes back. The embedding model covers 101 languages, so
+recall is about what you meant rather than which words you happened to reuse.
 
 The model is 122 MB of static embeddings — no Python, no second process, no
 API key, and no service to be down. It is fetched once when brain is
@@ -73,9 +69,9 @@ query is written out here rather than taken from the usual library for the
 same reason: that library holds this vocabulary as a trie of one hash map per
 byte, which is 710 MB that never goes away.
 
-It is never loaded during capture, which is why hooks still answer in ~13ms;
-vectors are written by consolidation, and `brain doctor` reports how much of
-the corpus has one yet.
+It is never loaded during capture either, which is what keeps hooks out of
+your way — vectors are written later, by consolidation, and `brain doctor`
+reports how much of the corpus has one yet.
 
 Anything that DELETES on what it finds — `forget --entity` — searches by words
 only. A semantic ranking always has a closest answer, and a bulk withdrawal
@@ -115,15 +111,10 @@ fetches the embedding model once, and wires every supported CLI it finds. It
 prints a plan first and asks before touching anything. No repository is left
 on your machine, and no Rust toolchain is needed — what lands is one binary.
 
-Windows is newer than the rest and is honest about what that means. The
-binary, capture, search, the wiki and local reranking are all tested on a
-Windows runner. Claude Code is wired the way its documentation says to wire it
-there — an executable and an argument list, so no shell is involved — and that
-command has been run and seen to capture. Codex is written per its own
-documented `command_windows` key. Cursor documents neither which shell runs a
-hook command on Windows nor whether one does, so it is left alone and `setup`
-says so rather than reporting a success for something that would silently
-never fire.
+On Windows, `setup` wires Claude Code and Codex. Cursor is left alone there —
+it does not document how it runs a hook command on Windows, and a hook that
+looks wired and never fires is worse than one that was never written, so
+`setup` says so instead.
 
 This binary reads what you type into your editor, so it refuses to install a
 download whose checksum does not match, and `bootstrap.sh` is short enough to
@@ -234,14 +225,14 @@ are.
 
 ## Supported CLIs
 
-| CLI | Capture | MCP recall | Status |
+| CLI | Capture | MCP recall | Notes |
 |---|---|---|---|
-| Claude Code | 8 lifecycle events | registered automatically | verified by our tests and daily use |
+| Claude Code | 8 lifecycle events | registered automatically | |
 | Codex | 7 lifecycle events | via the plugin | installs as a plugin; capture needs one approval — see below |
-| Gemini CLI | 5 lifecycle events | register manually | capture works; its own summarizer tier is unavailable here |
-| Antigravity (`agy`) | 2 lifecycle events | register manually | capture verified; needs an explicit workspace, see below |
-| OpenCode | 4 lifecycle events | register manually | session capture verified; tool capture wired, not yet exercised |
-| Cursor | 3 lifecycle events | registered automatically | capture verified |
+| Gemini CLI | 5 lifecycle events | register manually | its own summarizer tier is unavailable here |
+| Antigravity (`agy`) | 2 lifecycle events | register manually | needs an explicit workspace, see below |
+| OpenCode | 4 lifecycle events | register manually | installed as a small plugin, see below |
+| Cursor | 3 lifecycle events | registered automatically | |
 
 Cursor reports its project under `workspace_roots`. It also sends a `cwd`, but
 that field arrives **empty** — which is why the lookup requires a non-empty
@@ -257,9 +248,8 @@ In headless `cursor-agent -p` runs, tool events are the only ones observed;
 OpenCode has no hook configuration file — `setup` installs a small plugin into
 `~/.config/opencode/plugins/` instead. The plugin takes the project path from
 OpenCode's own plugin factory, so it has none of the placement problem below.
-Its session events are verified live; its tool events are wired against a
-handler signature read from a working plugin, but OpenCode's model provider is
-failing on the author's machine, so that path has not been exercised end to end.
+Its tool events are wired against a handler signature read from a working
+plugin.
 
 Antigravity gives a hook no working directory and runs it from its own config
 directory, so it can only be placed in a project when the workspace is explicit
@@ -272,8 +262,7 @@ and another in the afternoon; it is a single memory, tagged by which CLI
 observed what. Codex exposes no session-end event, so consolidation there
 triggers on `Stop` with a debounce.
 
-The table says "verified" only where our own tests cover it. If a CLI is
-missing here, it is not supported yet.
+If a CLI is missing from that table, it is not supported yet.
 
 ## Use
 
@@ -383,11 +372,11 @@ mentions a queue scores; the one that explains the decision can sit seventh.
 Reranking reads the candidates and puts the ones that answer the question
 first. Two engines do it, and which one you get depends on the machine:
 
-| | how | cost |
+| | how | what it costs you |
 |---|---|---|
-| local | a cross-encoder in this process | **~1.7s** |
-| host CLI | one call to the CLI whose work is being searched | ~12s |
-| neither | the index's own order | 0.2s |
+| local | a cross-encoder in this process | a couple of seconds |
+| host CLI | one call to the CLI whose work is being searched | a noticeable wait |
+| neither | the index's own order | nothing |
 
 The local one is about 600 MB — the model, its tokenizer, and ONNX Runtime
 itself — fetched the first time something actually asks for a rerank, never at
@@ -397,9 +386,7 @@ next one has the model. `brain doctor` says which state a machine is in.
 
 Every platform can run it. Nothing links ONNX Runtime into the binary: the
 runtime is downloaded beside the weights, per platform, checksum-verified the
-same way. Which one a machine receives depends on what exists for it — 1.28
-nearly everywhere, 1.23 on Intel macOS, which is the last one Microsoft built
-for that architecture and is measurably close behind.
+same way, so which version a machine gets is whichever one exists for it.
 
 A machine that cannot load its runtime is not a broken install. Reranking
 there falls through to the host CLI, which is where every machine starts
@@ -462,15 +449,6 @@ reset, the guard that stops us repeating ourselves would suppress exactly the
 memory the fresh context needs — turning our own safeguard into the amnesia it
 exists to prevent. Compaction also kicks consolidation first, so the primer
 that lands a moment later carries a narrative rather than a list of commands.
-
-Codex was previously documented here as having no compaction or session-end
-hooks. That was wrong, and worth saying plainly: the claim came from reading
-this machine's `hooks.json`, which lists what somebody had configured — not
-what Codex supports. A probe settled it. `SessionEnd` fires and is now wired;
-`PreCompact` is wired too, on the weaker evidence that Codex's own trust store
-holds a `pre_compact` entry belonging to another tool. Forcing a real
-compaction to watch it fire was out of scope, so treat that one as wired rather
-than witnessed.
 
 Either way capture is continuous — events land as they happen rather than being
 gathered at session end — so a compaction costs context, never memory.
@@ -838,9 +816,9 @@ cargo clippy --all-targets
 ```
 
 The end-to-end suite runs against the real binary in an isolated data
-directory and covers the claims above: two CLIs merging into one store,
-cross-CLI recall, secrets never reaching the log, index rebuild from the log,
-and graceful degradation when no model is reachable.
+directory: two CLIs merging into one store, cross-CLI recall, secrets never
+reaching the log, index rebuild from the log, and degrading gracefully when no
+model is reachable.
 
 ## License
 
