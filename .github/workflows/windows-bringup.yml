@@ -196,7 +196,13 @@ jobs:
           $models = & $brain where --models
           $weights = Join-Path $models 'model-int8.safetensors'
           if (-not (Test-Path $weights)) { throw "no embedding model at $weights" }
+
+          # `doctor` is read for its output, not its verdict. On a bare runner
+          # it correctly reports no host CLI on PATH and nothing wired - which
+          # is a true finding about the machine and not about the install, and
+          # under PowerShell 7 a non-zero native exit ends the step.
           & $brain doctor
+          $global:LASTEXITCODE = 0
           Write-Host 'the installer installed, and what it installed works.'
 
       - name: Refuse a corrupted download
