@@ -337,6 +337,12 @@ fn summarizer_checks(paths: &Paths) -> Vec<Check> {
         .filter(|spec| crate::summarizer::installed(spec.program))
         .map(|spec| {
             let model = overrides.get(spec.cli).map_or(spec.model, String::as_str);
+            // A rung with no model of ours runs on whatever that CLI is
+            // configured for. Printing `opencode=` reads as a broken lookup;
+            // saying so reads as the fact it is.
+            if model.is_empty() {
+                return format!("{}=(its own default)", spec.cli);
+            }
             format!("{}={model}", spec.cli)
         })
         .collect();

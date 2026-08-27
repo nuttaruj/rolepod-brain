@@ -141,7 +141,11 @@ pub fn run(session: Option<&str>, all_projects: bool, force: bool) -> Result<Out
                     continue;
                 }
             }
-            if !force && should_wait(&store, &pending)? {
+            // Asked per session, not once per run: the preferred CLI is the
+            // one that saw THIS session's events, and a cooldown can open
+            // between two sessions of the same run.
+            let retriable = ladder.could_answer(&pending.cli)?;
+            if !force && should_wait(&store, &pending, retriable)? {
                 outcome.skipped += 1;
                 continue;
             }
@@ -244,20 +248,34 @@ fn embed_backlog(store: &Store, project: &str) -> usize {
     count
 }
 
-fn should_wait(store: &Store, pending: &PendingSession) -> Result<bool> {
+/// `retriable` is whether a model is reachable right now - see
+/// [`crate::summarizer::Ladder::could_answer`]. It is the only thing that
+/// makes redoing a degraded run worth the write, and asking it here rather
+/// than inside keeps this function's tests independent of what is on `PATH`.
+fn should_wait(store: &Store, pending: &PendingSession, retriable: bool) -> Result<bool> {
     let Some(last) = store.session_run(&pending.session)? else {
         // Never consolidated: only the volume rule applies.
         return Ok(pending.pending < MIN_PENDING);
     };
 
-    // Nothing new since the last run.
-    if last.last_event_id.as_deref() == Some(pending.newest_event_id.as_str()) {
-        return Ok(true);
-    }
-
     // A rule-based run left the events pending on purpose; retrying it sooner
     // is how a session gets its real summary once a CLI recovers.
     let was_rule_based = last.last_tier.as_deref() == Some("rule-based");
+
+    // Nothing new since the last run.
+    //
+    // For a model-backed run that is the end of it: the work is done and the
+    // events are marked. A rule-based one is not done - it is a floor written
+    // because nothing could be reached, and a session that has ENDED will
+    // never produce the new event this check used to require. That left the
+    // ladder's promise ("degrade quality, never data") true only for sessions
+    // still being typed in; a session that closed during an outage kept its
+    // placeholder forever. So it is retried - but only when a model is
+    // actually reachable, or the backstop would rewrite the same page at every
+    // session start for the rest of the machine's life.
+    if last.last_event_id.as_deref() == Some(pending.newest_event_id.as_str()) {
+        return Ok(!(was_rule_based && retriable));
+    }
 
     if let Some(at) = last.last_run_at.as_deref().and_then(|at| at.parse::<jiff::Timestamp>().ok()) {
         let elapsed = jiff::Timestamp::now().as_second() - at.as_second();
@@ -2189,14 +2207,14 @@ mod tests {
             newest_event_id: "01A".into(),
             cli: "codex".into(),
         };
-        assert!(should_wait(&store, &few).unwrap());
+        assert!(should_wait(&store, &few, true).unwrap());
 
         let many = PendingSession { pending: MIN_PENDING, ..few };
-        assert!(!should_wait(&store, &many).unwrap());
+        assert!(!should_wait(&store, &many, true).unwrap());
     }
 
     #[test]
-    fn nothing_new_since_the_last_run_is_always_skipped() {
+    fn nothing_new_since_a_model_backed_run_is_skipped() {
         let store = Store::open_memory().unwrap();
         store.record_session_run("s1", "p1", "01A", "claude-code").unwrap();
         let pending = PendingSession {
@@ -2205,7 +2223,7 @@ mod tests {
             newest_event_id: "01A".into(),
             cli: "codex".into(),
         };
-        assert!(should_wait(&store, &pending).unwrap());
+        assert!(should_wait(&store, &pending, true).unwrap());
     }
 
     #[test]
@@ -2218,7 +2236,46 @@ mod tests {
             newest_event_id: "01B".into(),
             cli: "codex".into(),
         };
-        assert!(!should_wait(&store, &pending).unwrap(), "a degraded run must be re-attempted");
+        assert!(
+            !should_wait(&store, &pending, true).unwrap(),
+            "a degraded run must be re-attempted"
+        );
+    }
+
+    #[test]
+    fn a_session_that_ended_on_the_floor_is_redone_when_a_model_returns() {
+        // The outage case: every rung was down when this session closed, so it
+        // got a rule-based page and its events stayed pending. No new event
+        // will ever arrive - the session is over - so the watermark matches
+        // forever, and matching used to be the end of the story.
+        let store = Store::open_memory().unwrap();
+        store.record_session_run("s1", "p1", "01A", "rule-based").unwrap();
+        let pending = PendingSession {
+            session: "s1".into(),
+            pending: 5,
+            newest_event_id: "01A".into(),
+            cli: "codex".into(),
+        };
+        assert!(
+            !should_wait(&store, &pending, true).unwrap(),
+            "a closed session kept its placeholder after a model came back"
+        );
+    }
+
+    #[test]
+    fn the_floor_is_not_rewritten_while_no_model_can_be_reached() {
+        // Same session, still nothing to reach: a machine with no summarizing
+        // CLI, or `summarizer = "off"`. Retrying here produces the identical
+        // rule-based page plus a wiki commit, at every session start, forever.
+        let store = Store::open_memory().unwrap();
+        store.record_session_run("s1", "p1", "01A", "rule-based").unwrap();
+        let pending = PendingSession {
+            session: "s1".into(),
+            pending: 5,
+            newest_event_id: "01A".into(),
+            cli: "cursor".into(),
+        };
+        assert!(should_wait(&store, &pending, false).unwrap(), "a retry loop with no model in it");
     }
 
     #[test]
@@ -2231,7 +2288,7 @@ mod tests {
             newest_event_id: "01B".into(),
             cli: "codex".into(),
         };
-        assert!(should_wait(&store, &pending).unwrap());
+        assert!(should_wait(&store, &pending, true).unwrap());
     }
 
     #[test]

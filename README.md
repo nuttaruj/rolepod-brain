@@ -225,14 +225,33 @@ are.
 
 ## Supported CLIs
 
-| CLI | Capture | MCP recall | Notes |
-|---|---|---|---|
-| Claude Code | 8 lifecycle events | registered automatically | |
-| Codex | 7 lifecycle events | via the plugin | installs as a plugin; capture needs one approval — see below |
-| Gemini CLI | 5 lifecycle events | register manually | its own summarizer tier is unavailable here |
-| Antigravity (`agy`) | 2 lifecycle events | register manually | needs an explicit workspace, see below |
-| OpenCode | 4 lifecycle events | register manually | installed as a small plugin, see below |
-| Cursor | 3 lifecycle events | registered automatically | |
+| CLI | Capture | MCP recall | Summarizes | Notes |
+|---|---|---|---|---|
+| Claude Code | 8 lifecycle events | registered automatically | `claude` | |
+| Codex | 7 lifecycle events | via the plugin | `codex` | installs as a plugin; capture needs one approval — see below |
+| Antigravity (`agy`) | 2 lifecycle events | register manually | `agy` | needs an explicit workspace, see below |
+| Cursor | 3 lifecycle events | registered automatically | `cursor-agent` | |
+| Gemini CLI | 5 lifecycle events | register manually | `gemini` | Google closed this CLI to individual accounts on 2026-06-18 — see below |
+| OpenCode | 4 lifecycle events | register manually | `opencode` | installed as a small plugin, see below |
+
+**Summarizes** is whether that CLI can also write the summaries, not just
+capture the events. Consolidation asks the CLI whose session it is first, and
+falls through to whichever others are installed — so the more of these are on
+the machine, the fewer sessions end up with the rule-based floor. Nothing is
+sent anywhere: these are CLIs you are already signed into, invoked locally on
+their cheap tier.
+
+Most of them are pinned to a specific cheap model. Two are not: OpenCode fronts
+whatever providers you authenticated, so it runs on whatever that install is
+already set to — and is asked last for the same reason — and Cursor is left on
+`auto`, which routes the call itself and measured no slower here than naming
+its fast model did. Either can be pinned under `summarizer.models`.
+
+Gemini CLI stays in the table because Google closed it to *individual*
+accounts, not to everyone: enterprise and Code Assist Standard licences were
+left running. On a personal account it exits successfully and prints an
+`IneligibleTierError` pointing at Antigravity, which is why it is asked
+second-to-last and why three of those benches it for half an hour.
 
 Cursor reports its project under `workspace_roots`. It also sends a `cwd`, but
 that field arrives **empty** — which is why the lookup requires a non-empty

@@ -15,7 +15,7 @@
 //!    while. Repeated failures open a circuit breaker and we stay quietly on
 //!    rule-based output until the cooldown expires.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -96,8 +96,73 @@ pub const SPECS: &[CliSpec] = &[
         args: &["exec", "-m", "{model}", "--skip-git-repo-check", "-o", "{out}"],
     },
     CliSpec {
+        // Google's replacement for Gemini CLI, and the reason that entry is
+        // now last. The binary is `agy`; the name here is the one
+        // its hooks write.
+        cli: "antigravity",
+        program: "agy",
+        model: "gemini-3.7-flash-low",
+        output: OutputMode::Stdout,
+        // `-p` takes the prompt as its VALUE, so it must be the last flag:
+        // `agy -p --model X` reads "--model" as the prompt and drops the real
+        // one, which the CLI says out loud rather than guessing. Ordering it
+        // last is also exactly what `invoke` does - it appends the prompt as
+        // the final argument - so the two agree by construction.
+        args: &["--model", "{model}", "-p"],
+    },
+    CliSpec {
+        cli: "cursor",
+        program: "cursor-agent",
+        // The one rung that is not a named cheap tier, because on this CLI
+        // naming one bought nothing. `auto` lets Cursor route the call, and
+        // measured against its own fast model over five and three runs it was
+        // not the slower choice - `composer-2.5` averaged 20.3s and went over
+        // the rerank leash three times in five, `auto` averaged 18.1s and
+        // went over once in three. A pin whose whole argument was
+        // predictability, that is neither cheaper to wait for nor more
+        // reliable, is just a worse model. Anyone who wants one back can name
+        // it under `summarizer.models`.
+        model: "auto",
+        output: OutputMode::Stdout,
+        // Two restrictions, both load-bearing. `-p` on its own, in Cursor's
+        // own words, "has access to all tools, including write and shell" -
+        // and the text we hand it is captured session content, which is data,
+        // not instruction. `--mode ask` is its read-only Q&A mode. `--trust`
+        // then answers the workspace-trust prompt that would otherwise make
+        // every call hang; it applies to the temp directory `invoke` runs in,
+        // never the user's repo. `-f` and `--yolo` do what their names say
+        // and are not here.
+        args: &["-p", "--output-format", "text", "--mode", "ask", "--trust", "--model", "{model}"],
+    },
+    CliSpec {
+        // Second to last. OpenCode is a front end for whatever providers
+        // the user has authenticated, so unlike every other rung there is no
+        // model we can name that is cheap on all machines - or valid on any
+        // given one. It runs on whatever that install is already set to,
+        // which is the only choice that cannot spend money the user did not
+        // agree to; sitting back here means it is reached only when nothing we
+        // can price has answered.
+        cli: "opencode",
+        program: "opencode",
+        // Empty on purpose: no `{model}` to substitute. See
+        // `a_spec_without_a_model_placeholder_names_no_model`.
+        model: "",
+        output: OutputMode::Stdout,
+        // Prints a one-line banner naming the model before the answer. It
+        // carries no brace, so `extract_json_object` steps over it.
+        args: &["run"],
+    },
+    CliSpec {
         // Must match what hooks write as `source.cli`, not what the binary is
         // called: this string is looked up against captured events.
+        //
+        // Last on purpose. Google shut this CLI down for individual
+        // accounts on 2026-06-18 - it exits 0 and prints an `IneligibleTierError`
+        // pointing at Antigravity, which is a rung that looks installed and
+        // answers nothing. Enterprise and Code Assist Standard licences were
+        // not shut down, and npm is still publishing, so the rung stays for
+        // them, at the back, until it is closed to them too - and three
+        // failures bench it for half an hour either way.
         cli: "gemini-cli",
         program: "gemini",
         model: "flash",
@@ -197,6 +262,30 @@ impl<'a> Ladder<'a> {
         self.mode != "off"
     }
 
+    /// Could this ladder answer right now?
+    ///
+    /// Mode, installation and the breaker together - the same three questions
+    /// [`Ladder::run`] asks before it spends anything, asked without spending
+    /// anything. A caller deciding whether to redo degraded work needs to know
+    /// that a model is actually reachable: "no CLI is in a cooldown" is also
+    /// true of a machine where none is installed, and of `mode = "off"`, and
+    /// retrying there is a rewrite that produces the same rule-based page
+    /// forever.
+    ///
+    /// # Errors
+    /// Returns an error when the health table cannot be read.
+    pub fn could_answer(&self, preferred_cli: &str) -> Result<bool> {
+        if !self.enabled() {
+            return Ok(false);
+        }
+        for spec in self.order(preferred_cli) {
+            if self.available(spec)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Run `prompt`, preferring the CLI that produced the observations.
     ///
     /// Returns the model's text and which tier answered, or [`Tier::RuleBased`]
@@ -278,10 +367,14 @@ impl<'a> Ladder<'a> {
     ///
     /// `mode = "gemini"` is what the tool is called; `gemini-cli` is what its
     /// hooks write. Refusing the shorter one would turn a reasonable config
-    /// into a summarizer that silently never runs.
+    /// into a summarizer that silently never runs. The same trap is set twice
+    /// more by CLIs whose binary is not spelled like their product: someone
+    /// pinning `agy` or `cursor-agent` typed the name they invoke.
     fn normalize_cli(raw: &str) -> &str {
         match raw {
             "gemini" => "gemini-cli",
+            "agy" => "antigravity",
+            "cursor-agent" => "cursor",
             other => other,
         }
     }
@@ -356,6 +449,39 @@ pub fn installed(program: &str) -> bool {
     resolve(program).is_some()
 }
 
+/// `PATH` for a child, with the program's own directory on the front.
+///
+/// Returns `None` when there is nothing to add - the caller then leaves the
+/// child's environment alone.
+///
+/// Every CLI in this table except Antigravity's is a Node script installed by
+/// npm, and a script starts by asking the kernel to run its shebang - almost
+/// always `/usr/bin/env node`. `env` searches `PATH`, so the child needs to
+/// find `node`, and OUR `PATH` is whatever the host CLI happened to have.
+/// A GUI-launched editor is handed launchd's minimal one: `resolve` still
+/// finds `codex` (the hook prepends the directory it lives in), the kernel
+/// still reads the shebang, and `env` then fails to find `node` - which
+/// surfaces as ENOENT about a file that demonstrably exists.
+///
+/// The interpreter is installed beside the script that needs it: `node` sits
+/// in the same nvm `bin` as the `codex` npm put there, and in the same
+/// `/opt/homebrew/bin` as a brewed `gemini`. So the program's own directory,
+/// as `PATH` spelled it, is the answer.
+///
+/// Following the symlink first is the plausible-looking version that does not
+/// work. `codex` in an nvm `bin` points at
+/// `lib/node_modules/@openai/codex/bin/`, and Homebrew's `gemini` points into
+/// a `Cellar` - package directories, with no interpreter in either. Measured
+/// on both, rather than reasoned about: the un-followed directory starts the
+/// program and the resolved one does not.
+fn interpreter_path(program: &Path) -> Option<std::ffi::OsString> {
+    let dir = program.parent()?;
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    let mut dirs: Vec<PathBuf> = vec![dir.to_path_buf()];
+    dirs.extend(std::env::split_paths(&current));
+    std::env::join_paths(dirs).ok()
+}
+
 /// Run one CLI once and return its answer.
 fn invoke(spec: &CliSpec, model: &str, prompt: &str, timeout: Duration) -> Result<String> {
     // A prompt that begins with a dash would be read as a flag by whichever
@@ -403,10 +529,22 @@ fn invoke(spec: &CliSpec, model: &str, prompt: &str, timeout: Duration) -> Resul
         // Run somewhere inert: a headless CLI started inside the user's repo
         // may read project instructions we neither need nor want to pay for.
         .current_dir(std::env::temp_dir());
+    if let Some(path) = interpreter_path(&program) {
+        command.env("PATH", path);
+    }
 
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("spawn {}", spec.program))?;
+    let mut child = command.spawn().with_context(|| {
+        // A resolved path that will not start is almost always a script whose
+        // interpreter is missing, not a missing program - the program was
+        // found a line ago. Saying "No such file or directory" about a file
+        // that exists is what made this cost an afternoon.
+        format!(
+            "spawn {} ({}) - if this says no such file, the script's interpreter \
+             is missing from PATH, not the script",
+            spec.program,
+            program.display()
+        )
+    })?;
 
     let result = wait_with_timeout(&mut child, timeout)?;
 
@@ -628,6 +766,61 @@ mod tests {
     }
 
     #[test]
+    fn a_child_can_find_the_interpreter_its_program_needs() {
+        // The failure this closes, reproduced on this machine: with only
+        // `/usr/bin:/bin` on PATH, the full path to an npm-installed `codex`
+        // fails with `env: node: No such file or directory` - about a file
+        // that is demonstrably there. Put its own directory on the front and
+        // the same command prints `codex-cli 0.147.0`, because that is where
+        // npm also put `node`.
+        let dir = std::env::temp_dir().join(format!("brain-interp-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("some-cli");
+        std::fs::write(&program, "#!/bin/sh\necho hi\n").unwrap();
+
+        let path = interpreter_path(&program).expect("a program in a directory has a directory");
+        let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        assert_eq!(dirs.first(), Some(&dir), "the program's own directory is not searched first");
+        assert!(dirs.len() > 1, "the rest of PATH was dropped rather than extended");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_spec_without_a_model_placeholder_names_no_model() {
+        // The trap this closes: a spec whose args never substitute `{model}`
+        // still has a `model` field, and `model_for` still returns whatever a
+        // user puts in `summarizer.models`. Writing a model there - in the
+        // spec or in config - would look like a pinned cheap tier and change
+        // nothing about what runs. An empty default makes the report say so
+        // out loud instead.
+        for spec in SPECS {
+            let substitutes = spec.args.contains(&"{model}");
+            assert_eq!(
+                substitutes,
+                !spec.model.is_empty(),
+                "{}: a model that is never passed, or a placeholder with nothing to put in it",
+                spec.cli
+            );
+        }
+    }
+
+    #[test]
+    fn a_binary_may_be_pinned_by_the_name_it_is_invoked_with() {
+        // Nobody types "antigravity" at a shell; they type `agy`. A mode
+        // pinned to the spelling they know must not silently produce an empty
+        // ladder.
+        let store = Store::open_memory().unwrap();
+        for (typed, spec) in [("agy", "antigravity"), ("cursor-agent", "cursor"), ("gemini", "gemini-cli")]
+        {
+            let ladder = Ladder::new(&store, &config(typed));
+            let order = ladder.order("claude-code");
+            assert_eq!(order.len(), 1, "`{typed}` matched no rung");
+            assert_eq!(order[0].cli, spec);
+        }
+    }
+
+    #[test]
     fn auto_mode_prefers_the_cli_that_saw_the_events() {
         let store = Store::open_memory().unwrap();
         let ladder = Ladder::new(&store, &config("auto"));
@@ -687,6 +880,28 @@ mod tests {
         let (tier, text) = ladder.run("anything", "claude-code", |_| true).unwrap();
         assert_eq!(tier, Tier::RuleBased);
         assert!(text.is_empty());
+    }
+
+    #[test]
+    fn off_mode_could_never_answer() {
+        // The caller that asks this is deciding whether to redo degraded work.
+        // Reading the breaker alone would say yes here - `off` never ran, so
+        // it never failed, so nothing is in a cooldown - and the answer would
+        // still be rule-based every time.
+        let store = Store::open_memory().unwrap();
+        assert!(!Ladder::new(&store, &config("off")).could_answer("claude-code").unwrap());
+    }
+
+    #[test]
+    fn a_mode_that_matches_no_rung_could_not_answer() {
+        // A pinned mode naming a CLI this table does not carry - a typo, or a
+        // rung dropped in a later version while the config that named it
+        // stayed on disk. The order is empty, so nothing can run, and a
+        // caller deciding whether to redo degraded work must be told that
+        // rather than left to retry forever. Pinned rather than `auto` so the
+        // answer does not depend on what is installed on the test machine.
+        let store = Store::open_memory().unwrap();
+        assert!(!Ladder::new(&store, &config("windsurf")).could_answer("codex").unwrap());
     }
 
     #[test]
