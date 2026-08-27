@@ -791,6 +791,19 @@ fn defer_to_plugin_flow(target: &Target, apply: bool) -> Result<Vec<Change>> {
 }
 
 fn wire_hooks(target: &Target, exe: &Path, apply: bool) -> Result<Vec<Change>> {
+    // Cursor does not document how it runs a hook command on Windows - not
+    // which shell, not whether there is one - and its own examples are bash
+    // scripts. Writing a command there means picking a spelling and hoping,
+    // and a hook that silently never fires is worse than one that was never
+    // written: the CLI looks wired and nothing is captured. So it is left
+    // alone, and `setup` says why rather than reporting a success.
+    if cfg!(windows) && target.kind.as_str() == "cursor" {
+        return Ok(vec![Change {
+            target: target.kind.as_str().to_string(),
+            detail: "not wired - Cursor does not document how it runs hook commands on Windows"
+                .to_string(),
+        }]);
+    }
     // The plugin carries a full set of hooks for the CLIs that can load them.
     // Writing our own alongside would capture every event twice: double
     // storage, double consolidation prompt, and a duplicate of every memory a
@@ -862,11 +875,7 @@ fn wire_hooks(target: &Target, exe: &Path, apply: bool) -> Result<Vec<Change>> {
             .iter()
             .find(|(name, _)| name == event)
             .map_or(target.timeout, |(_, seconds)| *seconds);
-        let handler = json!({
-            "type": "command",
-            "command": command,
-            "timeout": timeout,
-        });
+        let handler = handler_for(target, exe, event, &command, timeout);
         let grouped = target.layout == Layout::Grouped
             || target.grouped_events.contains(event);
         let matcher = target.matchers.iter().find(|(name, _)| name == event).map(|(_, m)| *m);
@@ -1290,10 +1299,40 @@ fn withdraw_mcp(target: &Target, apply: bool) -> Vec<Change> {
 /// one shape would mean leaving a stale hook of ours behind on every re-run.
 fn is_ours(entry: &Value) -> bool {
     let carries_marker = |value: &Value| {
-        value
+        // The string forms, including Codex's Windows twin. Either carrying
+        // the marker is enough: an entry with both is still one entry.
+        let in_command = ["command", "command_windows", "commandWindows"].iter().any(|key| {
+            value.get(*key).and_then(Value::as_str).is_some_and(|text| text.contains(MARKER))
+        });
+        if in_command {
+            return true;
+        }
+        // The exec form splits the marker across two fields, so neither half
+        // contains it and the check above sees nothing. Missing this would
+        // leave `uninstall` unable to remove what `setup` wrote, and a second
+        // `setup` adding a duplicate beside the first - on Windows only, which
+        // is exactly the kind of thing that is not noticed until it is a
+        // doubled memory.
+        let is_our_program = value
             .get("command")
             .and_then(Value::as_str)
-            .is_some_and(|command| command.contains(MARKER))
+            .map(|program| {
+                // Both separators, because `Path` only knows the local one and
+                // these files get synced between machines. On unix a Windows
+                // path is a single component and `file_stem` hands back the
+                // whole string, so the entry would read as someone else's and
+                // be left behind by an uninstall run from the other side.
+                program.rsplit(['/', '\\']).next().unwrap_or(program)
+            })
+            .map(|name| name.strip_suffix(".exe").unwrap_or(name))
+            .is_some_and(|stem| stem.eq_ignore_ascii_case("brain"));
+        let asks_for_a_hook = value
+            .get("args")
+            .and_then(Value::as_array)
+            .and_then(|args| args.first())
+            .and_then(Value::as_str)
+            == Some("hook");
+        is_our_program && asks_for_a_hook
     };
     if carries_marker(entry) {
         return true;
@@ -1345,6 +1384,62 @@ fn backup(path: &Path) -> Result<Option<PathBuf>> {
 }
 
 /// Quote a path for `/bin/sh` only when it needs it.
+/// One hook entry, spelled the way this CLI reads it on this platform.
+///
+/// Everywhere but Windows there is one spelling: a command string a shell
+/// runs. Windows has no single shell to write for - Claude Code prefers Git
+/// Bash and falls back to PowerShell, and a path quoted for one is wrong in
+/// the other - so each CLI is written the way its own documentation says to
+/// write it there.
+///
+/// Claude Code takes an exec form: a real executable and an argument list,
+/// distinguished from the string form by the presence of `args`, with each
+/// element passed as one argument and no quoting anywhere. That removes the
+/// question rather than answering it - no shell to guess at, a username with
+/// a space in it handled, and no shell startup inside a 50 ms hook budget.
+///
+/// Codex documents a `command_windows` key beside `command`, and its own
+/// example passes an unquoted Windows path. Both are written, so the file is
+/// right whichever one that CLI reaches for.
+fn handler_for(
+    target: &Target,
+    exe: &Path,
+    event: &str,
+    command: &str,
+    timeout: u32,
+) -> Value {
+    let exe = exe.display().to_string();
+    if cfg!(windows) {
+        match target.kind.as_str() {
+            "claude-code" => {
+                return json!({
+                    "type": "command",
+                    "command": exe,
+                    "args": ["hook", "--cli", target.kind.as_str(), "--event", event],
+                    "timeout": timeout,
+                });
+            }
+            "codex" => {
+                return json!({
+                    "type": "command",
+                    "command": command,
+                    "command_windows": format!(
+                        "{exe} hook --cli {} --event {event}",
+                        target.kind.as_str()
+                    ),
+                    "timeout": timeout,
+                });
+            }
+            _ => {}
+        }
+    }
+    json!({
+        "type": "command",
+        "command": command,
+        "timeout": timeout,
+    })
+}
+
 fn shell_quote(input: &str) -> String {
     if input
         .chars()
@@ -1393,6 +1488,77 @@ mod tests {
                     None => std::env::remove_var(name),
                 }
             }
+        }
+    }
+
+    /// The exec form is still ours, and a stranger's exec form still is not.
+    ///
+    /// `setup` writes Claude Code's Windows hook as an executable plus an
+    /// argument list, which splits the marker across two fields so the
+    /// substring check sees nothing in either. If ownership missed that,
+    /// `uninstall` could not remove what `setup` wrote and a second `setup`
+    /// would add a duplicate beside the first - on Windows alone, quietly,
+    /// showing up much later as every memory recorded twice.
+    #[test]
+    fn ownership_survives_the_exec_form() {
+        let ours = json!({
+            "type": "command",
+            "command": "C:\\Users\\x\\.local\\bin\\brain.exe",
+            "args": ["hook", "--cli", "claude-code", "--event", "Stop"],
+        });
+        assert!(is_ours(&ours), "setup could not recognise what it writes on Windows");
+        assert!(is_ours(&json!({"hooks": [ours.clone()]})), "not found inside a group");
+
+        // Codex writes both spellings; either one carrying the marker is us.
+        assert!(is_ours(&json!({
+            "type": "command",
+            "command": "/usr/local/bin/brain hook --cli codex --event Stop",
+            "command_windows": "C:\\bin\\brain.exe hook --cli codex --event Stop",
+        })));
+
+        // And the shapes that are not ours stay not ours. A different program
+        // with our argument list, and our program doing something that is not
+        // a hook, are both somebody else's entry to leave alone.
+        assert!(!is_ours(&json!({
+            "type": "command",
+            "command": "C:\\tools\\other.exe",
+            "args": ["hook", "--cli", "claude-code", "--event", "Stop"],
+        })));
+        assert!(!is_ours(&json!({
+            "type": "command",
+            "command": "C:\\Users\\x\\.local\\bin\\brain.exe",
+            "args": ["doctor"],
+        })));
+    }
+
+    /// What `setup` writes for each CLI on Windows, held to what each one's
+    /// own documentation says to write.
+    #[test]
+    fn windows_gets_the_shape_each_cli_documents() {
+        let exe = Path::new("C:\\Users\\x\\.local\\bin\\brain.exe");
+        let all = targets_in(Path::new("C:\\Users\\x"), exe).expect("targets");
+        let claude = all.iter().find(|t| t.kind.as_str() == "claude-code").expect("claude");
+        let codex = all.iter().find(|t| t.kind.as_str() == "codex").expect("codex");
+
+        let written = handler_for(claude, exe, "Stop", "ignored on windows", 5);
+        if cfg!(windows) {
+            // Exec form: a real executable and an argument list, which is what
+            // removes the shell question rather than answering it.
+            assert_eq!(written["command"], "C:\\Users\\x\\.local\\bin\\brain.exe");
+            assert_eq!(written["args"][0], "hook");
+            assert_eq!(written["args"][4], "Stop");
+            assert!(written.get("args").is_some(), "no args means shell form");
+
+            let codex_written = handler_for(codex, exe, "Stop", "the unix string", 5);
+            assert_eq!(codex_written["command"], "the unix string");
+            assert!(
+                codex_written["command_windows"].as_str().is_some_and(|c| c.contains("brain.exe")),
+                "codex lost its documented Windows spelling"
+            );
+        } else {
+            // Everywhere else there is one shell and one spelling.
+            assert_eq!(written["command"], "ignored on windows");
+            assert!(written.get("args").is_none(), "a shell form must not carry args");
         }
     }
 

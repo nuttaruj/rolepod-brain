@@ -278,12 +278,29 @@ fn semantic_check(paths: &Paths) -> Check {
     // reports as missing rather than failed, with the command that fixes it.
     let model = paths.model_dir();
     if !model.join(crate::embed::WEIGHTS_FILE).is_file() {
+        // Windows has no installer script of its own yet, so pointing a
+        // Windows reader at a shell pipeline is worse than saying nothing -
+        // it is a command that cannot work, printed by a tool they are
+        // consulting because something already did not. Name the files and
+        // where they live instead.
+        let how = if cfg!(windows) {
+            format!(
+                "Download model-int8.safetensors and tokenizer.json from the latest \
+                 release at https://github.com/nuttaruj/rolepod-brain/releases and put \
+                 them in {}",
+                model.display()
+            )
+        } else {
+            "Fetch it once: curl -fsSL \
+             https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh \
+             | sh -s -- --model-only"
+                .to_string()
+        };
         return Check::pass(
             "semantic",
             format!(
                 "the embedding model is not in {} yet, so search is running on words, \
-                 entities and neighbours but not meaning. Fetch it once: \
-                 curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh -s -- --model-only",
+                 entities and neighbours but not meaning. {how}",
                 model.display()
             ),
         );

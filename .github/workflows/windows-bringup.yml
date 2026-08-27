@@ -86,3 +86,72 @@ jobs:
         run: |
           ./target/x86_64-pc-windows-msvc/release/brain.exe --version
           ./target/x86_64-pc-windows-msvc/release/brain.exe doctor || true
+
+      # The furthest this can be taken without owning a Windows machine.
+      #
+      # No host CLI is installed on this runner, so nothing here proves that
+      # Claude Code fires our hook. What it does prove is the half that is
+      # ours: that `setup` writes a command this platform can actually run,
+      # and that running it captures. The exec form was chosen precisely so
+      # there is no shell in the way - so spawning it the way the CLI would is
+      # a faithful test of everything up to the CLI's own door.
+      - name: Run the hook setup wrote
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $brain = "$PWD\target\x86_64-pc-windows-msvc\release\brain.exe"
+
+          & $brain setup --cli claude-code --apply
+          $settings = Join-Path $HOME '.claude\settings.json'
+          if (-not (Test-Path $settings)) { throw "setup wrote no $settings" }
+          $config = Get-Content $settings -Raw | ConvertFrom-Json
+
+          $entry = $config.hooks.SessionStart[0].hooks[0]
+          Write-Host "setup wrote: $($entry | ConvertTo-Json -Compress)"
+          if (-not $entry.args) { throw 'not the exec form: no args' }
+          if ($entry.command -notlike '*brain.exe') { throw "command is $($entry.command)" }
+
+          # Fire it exactly as the exec form says it will be fired: the
+          # executable, then each argument passed as one argument.
+          $payload = @{
+              session_id = '0199b000-0000-7000-8000-000000000000'
+              cwd        = "$PWD"
+              source     = 'startup'
+          } | ConvertTo-Json -Compress
+          $answer = $payload | & $entry.command @($entry.args)
+          if ($LASTEXITCODE -ne 0) { throw "the hook exited $LASTEXITCODE" }
+          $null = $answer | ConvertFrom-Json   # throws if it is not JSON
+          Write-Host "SessionStart answered: $answer"
+
+          # And one that captures, so the claim is "it records", not "it runs".
+          $post = $config.hooks.PostToolUse[0].hooks[0]
+          $edit = @{
+              session_id = '0199b000-0000-7000-8000-000000000000'
+              cwd        = "$PWD"
+              tool_name  = 'Edit'
+              tool_input = @{ file_path = "$PWD\src\main.rs" }
+          } | ConvertTo-Json -Compress
+          $edit | & $post.command @($post.args) | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "the capture hook exited $LASTEXITCODE" }
+
+          & $brain doctor
+          $found = & $brain search 'main.rs' 2>&1 | Out-String
+          Write-Host "search said: $found"
+          if ($found -notmatch 'main\.rs') { throw 'the hook ran and captured nothing' }
+
+          # Leave the runner as it was found, and prove removal recognises the
+          # exec form it wrote - the failure that would otherwise show up as a
+          # doubled memory much later.
+          & $brain uninstall --apply
+          $after = Get-Content $settings -Raw | ConvertFrom-Json
+          if ($after.hooks.SessionStart) { throw 'uninstall left its own exec-form entry behind' }
+          Write-Host 'setup wrote it, it ran, it captured, and uninstall took it back out.'
+
+      - name: Parse the PowerShell installer
+        shell: pwsh
+        run: |
+          $errors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+              "$PWD\bootstrap.ps1", [ref]$null, [ref]$errors)
+          if ($errors) { $errors | ForEach-Object { $_.Message }; throw 'bootstrap.ps1 does not parse' }
+          Write-Host 'bootstrap.ps1 parses'
