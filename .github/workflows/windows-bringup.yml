@@ -205,28 +205,62 @@ jobs:
           $global:LASTEXITCODE = 0
           Write-Host 'the installer installed, and what it installed works.'
 
+      # Over HTTP, because the point is the checksum and nothing else.
+      #
+      # The first version of this pointed `-Base` at a `file://` URL and went
+      # green on "The 'file' scheme is not supported" - it never reached the
+      # comparison it existed to test. A test that passes for the wrong reason
+      # is worse than one that fails, so this serves the tampered release the
+      # way a real one is served.
       - name: Refuse a corrupted download
         shell: pwsh
         run: |
-          # The refusal is the property worth testing: this binary reads what
-          # someone types into their editor, and an installer that shrugs at a
-          # checksum mismatch is the whole guarantee gone.
           $ErrorActionPreference = 'Stop'
           $fake = Join-Path $env:RUNNER_TEMP 'fakerelease'
           New-Item -ItemType Directory -Force -Path $fake | Out-Null
-          Set-Content -Path (Join-Path $fake 'brain-x86_64-pc-windows-msvc.exe') -Value 'not a binary'
-          Set-Content -Path (Join-Path $fake 'SHA256SUMS') -Value @(
-              "0000000000000000000000000000000000000000000000000000000000000000  brain-x86_64-pc-windows-msvc.exe"
-          )
-          $env:BRAIN_BIN_DIR = Join-Path $env:RUNNER_TEMP 'refused'
-          $failed = $false
-          try {
-              ./bootstrap.ps1 -BinaryOnly -Base "file:///$($fake -replace '\\','/')" -Version 'v0.0.0'
-          } catch {
-              $failed = $true
-              Write-Host "refused, as it should: $($_.Exception.Message)"
+          $asset = 'brain-x86_64-pc-windows-msvc.exe'
+          Set-Content -Path (Join-Path $fake $asset) -Value 'not a binary' -NoNewline
+          Set-Content -Path (Join-Path $fake 'SHA256SUMS') -NoNewline -Value (
+              "0000000000000000000000000000000000000000000000000000000000000000  $asset`n")
+
+          $listener = [System.Net.HttpListener]::new()
+          $listener.Prefixes.Add('http://localhost:8099/')
+          $listener.Start()
+          $serve = Start-ThreadJob -ArgumentList $listener, $fake -ScriptBlock {
+              param($listener, $root)
+              # Two requests: SHA256SUMS, then the asset. Then it is done.
+              for ($i = 0; $i -lt 2; $i++) {
+                  $context = $listener.GetContext()
+                  $name = $context.Request.Url.Segments[-1]
+                  $file = Join-Path $root $name
+                  if (Test-Path $file) {
+                      $bytes = [System.IO.File]::ReadAllBytes($file)
+                      $context.Response.ContentLength64 = $bytes.Length
+                      $context.Response.OutputStream.Write($bytes, 0, $bytes.Length)
+                  } else {
+                      $context.Response.StatusCode = 404
+                  }
+                  $context.Response.Close()
+              }
           }
-          if (-not $failed) { throw 'the installer accepted a file whose checksum did not match' }
+
+          $env:BRAIN_BIN_DIR = Join-Path $env:RUNNER_TEMP 'refused'
+          $message = $null
+          try {
+              ./bootstrap.ps1 -BinaryOnly -Base 'http://localhost:8099' -Version 'v0.0.0'
+          } catch {
+              $message = $_.Exception.Message
+          } finally {
+              $listener.Stop()
+              Receive-Job $serve -ErrorAction SilentlyContinue | Out-Null
+              Remove-Job $serve -Force -ErrorAction SilentlyContinue
+          }
+
+          if (-not $message) { throw 'the installer accepted a file whose checksum did not match' }
+          if ($message -notmatch 'checksum mismatch') {
+              throw "it failed, but not on the checksum: $message"
+          }
           if (Test-Path (Join-Path $env:BRAIN_BIN_DIR 'brain.exe')) {
               throw 'it refused and installed the thing anyway'
           }
+          Write-Host "refused on the checksum, as it must: $message"
