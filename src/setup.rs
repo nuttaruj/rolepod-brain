@@ -1562,6 +1562,45 @@ mod tests {
         }
     }
 
+    /// Cursor is left alone on Windows, and says so.
+    ///
+    /// It documents neither which shell runs a hook command there nor whether
+    /// one does, and its own examples are bash scripts. Guessing a spelling
+    /// buys a config that looks wired and captures nothing, which is worse
+    /// than not writing it - so this pins that the file is untouched and that
+    /// the reason is reported rather than a success.
+    #[cfg(windows)]
+    #[test]
+    fn cursor_is_not_wired_on_windows_and_setup_says_why() {
+        let dir = std::env::temp_dir().join(format!("brain-cursor-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hooks.json");
+        let before = json!({"version": 1, "hooks": {"stop": [{"command": "other-tool summarize"}]}});
+        std::fs::write(&path, serde_json::to_string(&before).unwrap()).unwrap();
+
+        let target = Target {
+            kind: AgentKind::parse("cursor"),
+            layout: Layout::Flat,
+            grouped_events: &[],
+            hooks_file: path.clone(),
+            events: &["stop"],
+            timeout: HOOK_TIMEOUT_SECS,
+            timeout_overrides: &[],
+            matchers: &[],
+            mcp_file: None,
+            mcp_register: None,
+        };
+        let changes = wire_hooks(&target, Path::new("C:\\bin\\brain.exe"), true).unwrap();
+
+        assert_eq!(read_json(&path).unwrap(), before, "Cursor's config was modified on Windows");
+        assert!(
+            changes.iter().any(|change| change.detail.contains("does not document")),
+            "setup did not say why it stood down: {changes:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn recognizes_only_our_own_entries() {
         let ours = json!({"hooks": [{"type": "command", "command": "/usr/bin/brain hook --cli codex --event Stop"}]});
@@ -2162,6 +2201,16 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Cursor is not wired on Windows at all, so there is nothing to leave a
+    /// foreign entry beside there.
+    ///
+    /// Unix only for that reason and not because the merge is: Cursor is the
+    /// one CLI with a flat layout, so it is the only vehicle this can be
+    /// tested through, and the behaviour under test - keep the schema version,
+    /// keep what is not ours, write exactly one of ours - is JSON handling
+    /// with nothing platform-specific in it. The Windows behaviour it collides
+    /// with has a test of its own below.
+    #[cfg(unix)]
     #[test]
     fn a_flat_config_keeps_its_schema_version_and_foreign_entries() {
         let dir = std::env::temp_dir().join(format!("brain-setup-{}", ulid::Ulid::new()));
