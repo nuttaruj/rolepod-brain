@@ -316,7 +316,13 @@ jobs:
           done
           # One file the installer can fetch to check any binary against,
           # rather than one request per platform.
-          cat ./*.sha256 > SHA256SUMS
+          #
+          # Normalised, because the tools do not agree on how to separate a
+          # hash from a name. `sha256sum` on Git Bash writes `<hash> *<name>`
+          # - its binary-mode marker - where every other runner here writes
+          # two spaces, so adding a Windows target made this file internally
+          # inconsistent and broke the installers reading it.
+          cat ./*.sha256 | sed 's/ \*/  /' > SHA256SUMS
           rm -f ./*.sha256
           ls -l
 
