@@ -45,9 +45,29 @@ function Die($message) { Write-Error $message; exit 1 }
 # build to give them, this is where the choice goes.
 $platform = 'x86_64-pc-windows-msvc'
 
+# Which release. The API is the direct answer and the one that runs out:
+# unauthenticated calls are limited per address, and a shared address - an
+# office, a CI runner, a VPN - can be out of them through no fault of yours.
+# So the redirect is the fallback, because `releases/latest` on the web host
+# is a redirect to the tag and nothing rate-limits it.
 if (-not $Version) {
-    $Version = (Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest").tag_name
+    try {
+        $Version = (Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest").tag_name
+    } catch {
+        try {
+            $landed = (Invoke-WebRequest "https://github.com/$Repo/releases/latest" -UseBasicParsing)
+            $uri = if ($landed.BaseResponse.ResponseUri) {
+                $landed.BaseResponse.ResponseUri.AbsoluteUri      # Windows PowerShell 5.1
+            } else {
+                $landed.BaseResponse.RequestMessage.RequestUri.AbsoluteUri   # PowerShell 7
+            }
+            $Version = ($uri -split '/')[-1]
+        } catch {
+            Die "could not find the latest release. Pass -Version, or set BRAIN_VERSION."
+        }
+    }
 }
+if (-not $Version) { Die "could not find the latest release. Pass -Version, or set BRAIN_VERSION." }
 if (-not $Base) { $Base = "https://github.com/$Repo/releases/download/$Version" }
 
 # Nothing is installed without matching what the release says it should be.
