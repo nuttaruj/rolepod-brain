@@ -104,6 +104,16 @@ pub struct Target {
 
 pub fn targets(exe: &Path) -> Result<Vec<Target>> {
     let home = dirs::home_dir().context("cannot determine home directory")?;
+    targets_in(&home, exe)
+}
+
+/// The same table, rooted at a named home.
+///
+/// Split out for the same reason the plugin lookups were: `dirs::home_dir()`
+/// consults no environment variable on Windows, so a test that redirects
+/// `HOME` is still describing the real machine. Every caller outside a test
+/// wants the real one and goes through [`targets`].
+pub fn targets_in(home: &Path, exe: &Path) -> Result<Vec<Target>> {
     let exe = exe.display().to_string();
 
     Ok(vec![
@@ -1050,10 +1060,13 @@ fn register_mcp_file(target: &Target, path: &Path, apply: bool) -> Vec<Change> {
 /// Returns `None` when no installed plugin supplies hooks for this CLI.
 #[must_use]
 pub fn plugin_hook_events(kind: &AgentKind) -> Option<Vec<String>> {
-    if !plugin_installed(kind) || !plugin_carries_hooks(kind) {
+    plugin_hook_events_in(&dirs::home_dir()?, kind)
+}
+
+fn plugin_hook_events_in(home: &std::path::Path, kind: &AgentKind) -> Option<Vec<String>> {
+    if !plugin_installed_in(home, kind) || !plugin_carries_hooks_in(home, kind) {
         return None;
     }
-    let home = dirs::home_dir()?;
     let (cache, file) = match kind.as_str() {
         "claude-code" => (home.join(".claude/plugins/cache"), "hooks/hooks.json"),
         "codex" => (home.join(".codex/plugins/cache"), "hooks/codex-hooks.json"),
@@ -1085,7 +1098,10 @@ pub fn plugin_hook_events(kind: &AgentKind) -> Option<Vec<String>> {
 /// file explicitly. Cursor takes neither — its hook events are camelCase and
 /// its own shape — so `setup` keeps Cursor's wiring whatever is installed.
 fn plugin_carries_hooks(kind: &AgentKind) -> bool {
-    let Some(home) = dirs::home_dir() else { return false };
+    dirs::home_dir().is_some_and(|home| plugin_carries_hooks_in(&home, kind))
+}
+
+fn plugin_carries_hooks_in(home: &std::path::Path, kind: &AgentKind) -> bool {
     let (cache, file) = match kind.as_str() {
         "claude-code" => (home.join(".claude/plugins/cache"), "hooks/hooks.json"),
         "codex" => (home.join(".codex/plugins/cache"), "hooks/codex-hooks.json"),
@@ -1161,7 +1177,16 @@ fn sweep_ours(target: &Target, apply: bool) -> Vec<Change> {
 /// it is a second copy.
 #[must_use]
 pub fn plugin_installed(kind: &AgentKind) -> bool {
-    let Some(home) = dirs::home_dir() else { return false };
+    dirs::home_dir().is_some_and(|home| plugin_installed_in(&home, kind))
+}
+
+/// The same question, asked of a named home.
+///
+/// Split out so a test can answer it about a fixture. `dirs::home_dir()` reads
+/// no environment variable on Windows - it asks the operating system - so a
+/// test that redirects `HOME` there is still inspecting the real machine, and
+/// three of these were doing exactly that.
+fn plugin_installed_in(home: &std::path::Path, kind: &AgentKind) -> bool {
     match kind.as_str() {
         // A JSON registry keyed `<plugin>@<marketplace>`.
         "claude-code" => std::fs::read_to_string(home.join(".claude/plugins/installed_plugins.json"))
@@ -1180,7 +1205,7 @@ pub fn plugin_installed(kind: &AgentKind) -> bool {
             .any(|marketplace| marketplace.path().join(PLUGIN_NAME).is_dir()),
         // TOML, and the only CLI where installing the plugin is what makes
         // the hooks run at all.
-        "codex" => codex_plugin_installed(&home),
+        "codex" => codex_plugin_installed(home),
         _ => false,
     }
 }
@@ -1472,13 +1497,13 @@ mod tests {
             format!(r#"{{"version":2,"plugins":{{"{PLUGIN_NAME}@{PLUGIN_NAME}":[{{"scope":"user"}}]}}}}"#),
         )
         .unwrap();
-        assert!(plugin_installed(&claude));
-        assert!(!plugin_installed(&cursor), "one CLI's registry answered for another");
+        assert!(plugin_installed_in(&home, &claude));
+        assert!(!plugin_installed_in(&home, &cursor), "one CLI's registry answered for another");
 
         // Cursor: a directory under the marketplace it came from.
         std::fs::create_dir_all(home.join(".cursor/plugins/cache/somewhere").join(PLUGIN_NAME))
             .unwrap();
-        assert!(plugin_installed(&cursor));
+        assert!(plugin_installed_in(&home, &cursor));
 
         // Codex: a TOML table, and `enabled = false` means not installed.
         std::fs::create_dir_all(home.join(".codex")).unwrap();
@@ -1487,7 +1512,7 @@ mod tests {
             format!("[plugins.\"{PLUGIN_NAME}@{PLUGIN_NAME}\"]\nenabled = false\n"),
         )
         .unwrap();
-        assert!(!plugin_installed(&codex), "a disabled plugin is not an installed one");
+        assert!(!plugin_installed_in(&home, &codex), "a disabled plugin is not an installed one");
         std::fs::write(
             home.join(".codex/config.toml"),
             format!("[plugins.\"{PLUGIN_NAME}@{PLUGIN_NAME}\"]\nenabled = true\n"),
@@ -1627,6 +1652,19 @@ mod tests {
     /// twice — double storage, double consolidation prompt, and a duplicate of
     /// every memory. This is the same bug the duplicate MCP registration was,
     /// and it is caught the same way: the plugin is asked about first.
+    /// Unix only, and not because the behaviour is.
+    ///
+    /// This one goes through the planner rather than asking a question
+    /// directly, and the planner consults `dirs::home_dir()` several layers
+    /// down. That reads no environment variable on Windows, so the test would
+    /// describe the runner's real machine instead of its fixture. Threading a
+    /// home through every layer of the planner to satisfy one test is a worse
+    /// trade than saying so: the logic is ordinary Rust with nothing
+    /// platform-specific in it, and four other targets build and run it from
+    /// the same source. The two questions it depends on - is the plugin
+    /// installed, does it carry hooks - are tested directly, on every
+    /// platform, by the tests above.
+    #[cfg(unix)]
     #[test]
     fn setup_does_not_wire_a_cli_whose_plugin_already_did() {
         let home = std::env::temp_dir().join(format!("brain-plugin-hooks-{}", ulid::Ulid::new()));
@@ -1636,7 +1674,7 @@ mod tests {
         let _restore = take_home(&home);
 
         let plan = |label: &str| -> String {
-            targets(Path::new("/usr/local/bin/brain"))
+            targets_in(&home, Path::new("/usr/local/bin/brain"))
                 .unwrap()
                 .into_iter()
                 .find(|target| target.kind.as_str() == label)
@@ -1744,11 +1782,11 @@ mod tests {
             r#"{"hooks":{"SessionStart":[],"PostToolUse":[]}}"#,
         )
         .unwrap();
-        let events = plugin_hook_events(&claude).expect("the plugin wires events");
+        let events = plugin_hook_events_in(&home, &claude).expect("the plugin wires events");
         assert_eq!(events, vec!["PostToolUse".to_string(), "SessionStart".to_string()]);
 
         // Cursor loads neither file, whatever is installed.
-        assert!(plugin_hook_events(&AgentKind::parse("cursor")).is_none());
+        assert!(plugin_hook_events_in(&home, &AgentKind::parse("cursor")).is_none());
 
         let _ = std::fs::remove_dir_all(&home);
     }
