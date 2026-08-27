@@ -103,11 +103,27 @@ combine without conflicts.
 curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh
 ```
 
-That fetches the binary for your platform, checks it against the checksum
-published with the release, installs it to `~/.local/bin/brain`, fetches the
-embedding model once, and wires every supported CLI it finds. It prints a plan first and asks before touching
-anything. No repository is left on your machine, and no Rust toolchain is
-needed — what lands is one binary.
+On Windows, in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.ps1 | iex
+```
+
+Either one fetches the binary for your platform, checks it against the
+checksum published with the release, installs it to `~/.local/bin/brain`,
+fetches the embedding model once, and wires every supported CLI it finds. It
+prints a plan first and asks before touching anything. No repository is left
+on your machine, and no Rust toolchain is needed — what lands is one binary.
+
+Windows is newer than the rest and is honest about what that means. The
+binary, capture, search, the wiki and local reranking are all tested on a
+Windows runner. Claude Code is wired the way its documentation says to wire it
+there — an executable and an argument list, so no shell is involved — and that
+command has been run and seen to capture. Codex is written per its own
+documented `command_windows` key. Cursor documents neither which shell runs a
+hook command on Windows nor whether one does, so it is left alone and `setup`
+says so rather than reporting a success for something that would silently
+never fire.
 
 This binary reads what you type into your editor, so it refuses to install a
 download whose checksum does not match, and `bootstrap.sh` is short enough to

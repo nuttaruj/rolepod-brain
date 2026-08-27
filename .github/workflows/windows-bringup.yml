@@ -1,10 +1,14 @@
-# Windows bring-up, run by hand.
+# Windows, beyond what the release matrix can check.
 #
-# Separate from the release so a platform that has never executed this code
-# can be brought up without spending public tags on the attempt. Delete this
-# file once Windows has shipped green in a release - the release matrix runs
-# the same suite on the same runner, and two places to fix a Windows problem
-# is one too many.
+# It began as bring-up - a way to get a platform that had never executed this
+# code green without spending public tags on the attempt - and the suite half
+# of that is now in the release matrix, which runs it on the same runner.
+#
+# What is kept is the half the release cannot do: taking the hook `setup`
+# writes and running it, the way the CLI would, to see that it captures. No
+# host CLI is installed on a runner, so this is the furthest the claim can be
+# taken without owning a Windows machine, and it is worth a manual run
+# whenever the wiring or the hook shapes change.
 name: windows
 
 # Triggered by pushing the branch, not by dispatch: a `workflow_dispatch`
@@ -168,11 +172,55 @@ jobs:
           if ($after.hooks.SessionStart) { throw 'uninstall left its own exec-form entry behind' }
           Write-Host 'setup wrote it, it ran, it captured, and uninstall took it back out.'
 
-      - name: Parse the PowerShell installer
+      # The installer, against a real published release rather than a parse
+      # check. It is the first thing a Windows user runs and the only part of
+      # this that had never been executed - a script that parses and then
+      # fails on its first download is not an installer.
+      #
+      # Into a directory of its own, so a green run says the script placed a
+      # binary rather than that one was already lying around.
+      - name: Install the way a Windows user would
+        shell: pwsh
+        env:
+          BRAIN_BIN_DIR: ${{ runner.temp }}\installed
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./bootstrap.ps1 -BinaryOnly
+          $brain = Join-Path $env:BRAIN_BIN_DIR 'brain.exe'
+          if (-not (Test-Path $brain)) { throw "the installer placed no $brain" }
+          & $brain --version
+          if ($LASTEXITCODE -ne 0) { throw 'what it installed does not run' }
+
+          # And the model fetch, which is the step with a checksum to refuse.
+          ./bootstrap.ps1 -ModelOnly
+          $models = & $brain where --models
+          $weights = Join-Path $models 'model-int8.safetensors'
+          if (-not (Test-Path $weights)) { throw "no embedding model at $weights" }
+          & $brain doctor
+          Write-Host 'the installer installed, and what it installed works.'
+
+      - name: Refuse a corrupted download
         shell: pwsh
         run: |
-          $errors = $null
-          $null = [System.Management.Automation.Language.Parser]::ParseFile(
-              "$PWD\bootstrap.ps1", [ref]$null, [ref]$errors)
-          if ($errors) { $errors | ForEach-Object { $_.Message }; throw 'bootstrap.ps1 does not parse' }
-          Write-Host 'bootstrap.ps1 parses'
+          # The refusal is the property worth testing: this binary reads what
+          # someone types into their editor, and an installer that shrugs at a
+          # checksum mismatch is the whole guarantee gone.
+          $ErrorActionPreference = 'Stop'
+          $fake = Join-Path $env:RUNNER_TEMP 'fakerelease'
+          New-Item -ItemType Directory -Force -Path $fake | Out-Null
+          Set-Content -Path (Join-Path $fake 'brain-x86_64-pc-windows-msvc.exe') -Value 'not a binary'
+          Set-Content -Path (Join-Path $fake 'SHA256SUMS') -Value @(
+              "0000000000000000000000000000000000000000000000000000000000000000  brain-x86_64-pc-windows-msvc.exe"
+          )
+          $env:BRAIN_BIN_DIR = Join-Path $env:RUNNER_TEMP 'refused'
+          $failed = $false
+          try {
+              ./bootstrap.ps1 -BinaryOnly -Base "file:///$($fake -replace '\\','/')" -Version 'v0.0.0'
+          } catch {
+              $failed = $true
+              Write-Host "refused, as it should: $($_.Exception.Message)"
+          }
+          if (-not $failed) { throw 'the installer accepted a file whose checksum did not match' }
+          if (Test-Path (Join-Path $env:BRAIN_BIN_DIR 'brain.exe')) {
+              throw 'it refused and installed the thing anyway'
+          }

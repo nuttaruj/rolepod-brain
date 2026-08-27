@@ -103,8 +103,17 @@ jobs:
               python3 "$MODEL/quantize.py" upstream.safetensors "$MODEL/model-int8.safetensors"
               rm -f upstream.safetensors
           fi
+          # Neither tool is on every runner: Git Bash on Windows ships
+          # `sha256sum` and no `shasum`, and macOS ships the reverse.
+          sha256() {
+              if command -v sha256sum >/dev/null 2>&1; then
+                  sha256sum "$1" | awk '{print $1}'
+              else
+                  shasum -a 256 "$1" | awk '{print $1}'
+              fi
+          }
           want=$(grep -A4 'vendored here' "$MODEL/PROVENANCE.md" | grep model-int8 | awk '{print $1}')
-          got=$(shasum -a 256 "$MODEL/model-int8.safetensors" | awk '{print $1}')
+          got=$(sha256 "$MODEL/model-int8.safetensors")
           [ "$want" = "$got" ] || { echo "model checksum $got does not match PROVENANCE $want"; exit 1; }
 
       - name: Build
