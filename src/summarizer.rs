@@ -803,6 +803,49 @@ mod tests {
         assert!(error.to_string().contains("call ceiling"));
     }
 
+    /// A host CLI installed by npm is found, and can actually be started.
+    ///
+    /// This is the one thing about this platform that is not shared with the
+    /// others, and the end-to-end suite does not run here to cover it. npm
+    /// writes `claude.cmd` rather than `claude.exe`; `CreateProcess` cannot
+    /// start a `.cmd`, and Rust's own search only ever appends `.exe`. Both
+    /// halves are asserted - that `resolve` returns the shim, and that the
+    /// shim spawned through the returned path runs and answers - because
+    /// finding a program you then cannot execute is the failure this guards.
+    #[cfg(windows)]
+    #[test]
+    fn an_npm_shim_is_found_and_can_be_run() {
+        let dir = std::env::temp_dir().join(format!("brain-shim-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).expect("create");
+        let name = "brain-fake-host-cli";
+        std::fs::write(dir.join(format!("{name}.cmd")), "@echo off\r\necho shim-answered\r\n")
+            .expect("write shim");
+
+        let previous = std::env::var_os("PATH");
+        std::env::set_var("PATH", &dir);
+        let found = resolve(name);
+        let installed_says = installed(name);
+        match previous {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+
+        let found = found.unwrap_or_else(|| panic!("{name}.cmd was not found on PATH"));
+        assert_eq!(
+            found.extension().and_then(std::ffi::OsStr::to_str),
+            Some("cmd"),
+            "resolved {} rather than the shim",
+            found.display()
+        );
+        assert!(installed_says, "resolve found it and installed disagreed");
+
+        let output = Command::new(&found).output().expect("spawn the shim");
+        let said = String::from_utf8_lossy(&output.stdout);
+        assert!(said.contains("shim-answered"), "the shim did not run: {said:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_missing_program_is_not_installed() {
         assert!(!installed("definitely-not-a-real-program-xyz"));
