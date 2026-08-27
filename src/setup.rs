@@ -1334,16 +1334,39 @@ fn shell_quote(input: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Puts `HOME` back however the test ends, including on a panic — a test
-    /// that leaves it pointing at its own fixture decides the next test's
+    /// The variables that decide where `dirs::home_dir()` points.
+    ///
+    /// `HOME` everywhere, and `USERPROFILE` as well on Windows, which is the
+    /// one it actually reads there. A test that sets only `HOME` on Windows
+    /// silently keeps looking at the real home - which is how three of these
+    /// found the runner's own `.claude` directory instead of their fixture.
+    #[cfg(windows)]
+    const HOME_VARS: &[&str] = &["HOME", "USERPROFILE"];
+    #[cfg(not(windows))]
+    const HOME_VARS: &[&str] = &["HOME"];
+
+    /// Point every one of them at `home`, returning what was there.
+    fn take_home(home: &std::path::Path) -> RestoreHome {
+        let previous =
+            HOME_VARS.iter().map(|name| (*name, std::env::var(name).ok())).collect::<Vec<_>>();
+        for name in HOME_VARS {
+            std::env::set_var(name, home);
+        }
+        RestoreHome(previous)
+    }
+
+    /// Puts them back however the test ends, including on a panic — a test
+    /// that leaves one pointing at its own fixture decides the next test's
     /// answers.
-    struct RestoreHome(Option<String>);
+    struct RestoreHome(Vec<(&'static str, Option<String>)>);
 
     impl Drop for RestoreHome {
         fn drop(&mut self) {
-            match self.0.take() {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
+            for (name, value) in self.0.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
             }
         }
     }
@@ -1431,8 +1454,7 @@ mod tests {
         let home = std::env::temp_dir().join(format!("brain-plugin-detect-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let _guard = crate::invocation::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &home);
+        let _restore = take_home(&home);
 
         let claude = AgentKind::parse("claude-code");
         let cursor = AgentKind::parse("cursor");
@@ -1476,10 +1498,6 @@ mod tests {
         // A CLI with no plugin story must never claim one.
         assert!(!plugin_installed(&AgentKind::parse("opencode")));
 
-        match previous {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1615,8 +1633,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
         let _guard =
             crate::invocation::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &home);
+        let _restore = take_home(&home);
 
         let plan = |label: &str| -> String {
             targets(Path::new("/usr/local/bin/brain"))
@@ -1667,10 +1684,6 @@ mod tests {
             "both would wire the same CLI: {planned}"
         );
 
-        match previous {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1704,9 +1717,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
         let _guard =
             crate::invocation::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &home);
-        let _restore = RestoreHome(previous);
+        let _restore = take_home(&home);
 
         let claude = AgentKind::ClaudeCode;
         assert!(plugin_hook_events(&claude).is_none(), "no plugin, no events");
@@ -1788,9 +1799,8 @@ mod tests {
         // or a neighbouring test's fixture decides its answer.
         let _guard =
             crate::invocation::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", std::env::temp_dir().join(format!("brain-nohome-{}", ulid::Ulid::new())));
-        let _restore = RestoreHome(previous_home);
+        let _restore =
+            take_home(&std::env::temp_dir().join(format!("brain-nohome-{}", ulid::Ulid::new())));
         let dir = std::env::temp_dir().join(format!("brain-setup-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hooks.json");
@@ -1842,9 +1852,8 @@ mod tests {
         // or a neighbouring test's fixture decides its answer.
         let _guard =
             crate::invocation::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", std::env::temp_dir().join(format!("brain-nohome-{}", ulid::Ulid::new())));
-        let _restore = RestoreHome(previous_home);
+        let _restore =
+            take_home(&std::env::temp_dir().join(format!("brain-nohome-{}", ulid::Ulid::new())));
         let dir = std::env::temp_dir().join(format!("brain-setup-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hooks.json");
@@ -2045,9 +2054,8 @@ mod tests {
         // or a neighbouring test's fixture decides its answer.
         let _guard =
             crate::invocation::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", std::env::temp_dir().join(format!("brain-nohome-{}", ulid::Ulid::new())));
-        let _restore = RestoreHome(previous_home);
+        let _restore =
+            take_home(&std::env::temp_dir().join(format!("brain-nohome-{}", ulid::Ulid::new())));
         let dir = std::env::temp_dir().join(format!("brain-setup-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hooks.json");

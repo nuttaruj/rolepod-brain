@@ -453,11 +453,17 @@ fn working_directory(payload: &Value) -> Option<std::path::PathBuf> {
 fn is_cli_config_dir(path: &std::path::Path) -> bool {
     let Some(home) = dirs::home_dir() else { return false };
     let resolve = |path: &std::path::Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let path = resolve(path);
-    let home = resolve(&home);
+    // Both spellings of both sides, because `canonicalize` is not a pure
+    // normalisation: it fails on a path that does not exist yet - which a
+    // config directory often is - and on Windows it succeeds by returning a
+    // verbatim `\\?\C:\...` form. Comparing a resolved home against an
+    // unresolved path then matches nothing, and every event inside a CLI's own
+    // configuration would be captured as if it were project work. Resolving is
+    // still tried first, because a symlinked home is the case it exists for.
+    let pairs = [(resolve(path), resolve(&home)), (path.to_path_buf(), home.clone())];
     [".gemini", ".cursor", ".codex", ".claude", ".antigravity", ".config/opencode"]
         .iter()
-        .any(|dir| path.starts_with(home.join(dir)))
+        .any(|dir| pairs.iter().any(|(path, home)| path.starts_with(home.join(dir))))
 }
 
 /// First present, non-empty string among several candidate keys.
@@ -680,10 +686,25 @@ fn relativize(path: &str, root: &std::path::Path) -> String {
     let resolved = resolve_symlinks(std::path::Path::new(path));
     for candidate in [resolved.as_path(), std::path::Path::new(path)] {
         if let Ok(relative) = candidate.strip_prefix(root) {
-            return relative.to_string_lossy().into_owned();
+            return portable_separators(&relative.to_string_lossy());
         }
     }
-    path.to_string()
+    portable_separators(path)
+}
+
+/// One spelling of a path, whichever machine recorded it.
+///
+/// These strings are not used to open anything - they key which memories a
+/// file has, they are what a wiki page cites, and they travel between machines
+/// through `brain export`. Windows would write `src\main.rs` where every other
+/// platform writes `src/main.rs`, and the same file in the same repository
+/// would then be two different keys either side of an import. Forward slashes
+/// are the portable spelling, and Windows accepts them as input anyway.
+///
+/// Only separators change. A backslash inside a component on a unix filesystem
+/// is a legal character in a name, so this runs on Windows alone.
+fn portable_separators(path: &str) -> String {
+    if cfg!(windows) { path.replace('\\', "/") } else { path.to_string() }
 }
 
 /// Resolve symlinks in the deepest part of a path that exists.
@@ -971,6 +992,27 @@ mod tests {
         assert_eq!(working_directory(&payload), Some(std::path::PathBuf::from("/repo")));
         assert_eq!(tool_name(&payload), "Shell");
         assert_eq!(title_for("post_tool_use", &payload), "Ran echo");
+    }
+
+    /// A recorded path reads the same whichever machine wrote it.
+    ///
+    /// These strings key which memories a file has and travel between machines
+    /// through `brain export`. Windows writing `src\\main.rs` where everything
+    /// else writes `src/main.rs` makes one file in one repository into two
+    /// different keys either side of an import - a brain that quietly forgets
+    /// half of what it knows about a file the moment it moves.
+    #[test]
+    fn a_recorded_path_is_spelled_the_same_on_every_platform() {
+        let root = std::env::temp_dir().join(format!("brain-sep-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(root.join("src")).expect("create");
+        let file = root.join("src").join("main.rs");
+        std::fs::write(&file, "fn main() {}").expect("write");
+
+        let recorded = relativize(&file.to_string_lossy(), &root);
+        assert_eq!(recorded, "src/main.rs", "a path was recorded in the local dialect");
+        assert!(!recorded.contains('\\'), "a separator survived into a recorded path");
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
