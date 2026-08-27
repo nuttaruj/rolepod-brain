@@ -101,6 +101,12 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $brain = "$PWD\target\x86_64-pc-windows-msvc\release\brain.exe"
 
+          # `setup` skips a CLI that is not installed, and installed means its
+          # configuration directory exists. A bare runner has neither, so make
+          # it look like the machine this is for.
+          New-Item -ItemType Directory -Force -Path (Join-Path $HOME '.claude') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $HOME '.codex') | Out-Null
+
           & $brain setup --cli claude-code --apply
           $settings = Join-Path $HOME '.claude\settings.json'
           if (-not (Test-Path $settings)) { throw "setup wrote no $settings" }
@@ -142,6 +148,21 @@ jobs:
           # Leave the runner as it was found, and prove removal recognises the
           # exec form it wrote - the failure that would otherwise show up as a
           # doubled memory much later.
+          # Codex takes a string with a documented Windows twin rather than an
+          # exec form, so it is checked for the shape its own docs describe.
+          & $brain setup --cli codex --apply
+          $codexHooks = Join-Path $HOME '.codex\hooks.json'
+          if (Test-Path $codexHooks) {
+              $written = Get-Content $codexHooks -Raw
+              Write-Host "codex config: $written"
+              if ($written -notmatch 'command_windows') {
+                  throw 'codex lost its documented Windows spelling'
+              }
+          } else {
+              Write-Host "note: codex wrote no $codexHooks - checking what setup reported instead"
+              & $brain setup --cli codex
+          }
+
           & $brain uninstall --apply
           $after = Get-Content $settings -Raw | ConvertFrom-Json
           if ($after.hooks.SessionStart) { throw 'uninstall left its own exec-form entry behind' }
