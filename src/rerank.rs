@@ -120,7 +120,11 @@ pub fn rerank(
 #[cfg(feature = "local-rerank")]
 fn fetch_in_background(model_dir: &std::path::Path) {
     let marker = model_dir.with_extension("fetching");
-    if marker.exists() || model_dir.join(crate::xencoder::WEIGHTS_FILE).exists() {
+    // Asking for the weights alone was enough when the runtime was linked into
+    // the binary. It is not any more: a machine upgraded from a build that
+    // carried its own onnxruntime already has the weights and none of the
+    // runtime, and would never ask for the rest.
+    if marker.exists() || local_is_ready(model_dir) {
         return;
     }
     if let Some(parent) = marker.parent() {
@@ -192,6 +196,39 @@ fn local_order(model_dir: &std::path::Path, query: &str, hits: &[Hit]) -> Option
 #[cfg(not(feature = "local-rerank"))]
 fn local_order(_model_dir: &std::path::Path, _query: &str, _hits: &[Hit]) -> Option<Vec<usize>> {
     None
+}
+
+/// Would the next rerank be answered here, or through a host CLI?
+///
+/// Two things have to be true and neither is visible from a tool schema: this
+/// build has to carry the feature, and the weights have to be on disk. The
+/// difference between the two answers is 1.6s and 12.2s - far enough apart to
+/// change what an agent is willing to ask for, which is the whole reason
+/// anything reads this.
+///
+/// A file that exists but will not load still reports true. The check is
+/// deliberately cheap - three `stat` calls on a path an agent may list often -
+/// and anything that fails to load falls through to the CLI at the moment it
+/// fails, which is the same place this answer would have sent it.
+#[must_use]
+pub fn local_is_ready(model_dir: &std::path::Path) -> bool {
+    #[cfg(feature = "local-rerank")]
+    {
+        // Three files, not two: ONNX Runtime is downloaded rather than linked,
+        // so the runtime is as absent-until-fetched as the weights are.
+        [
+            crate::xencoder::WEIGHTS_FILE,
+            crate::xencoder::TOKENIZER_FILE,
+            crate::xencoder::RUNTIME_FILE,
+        ]
+        .iter()
+        .all(|file| model_dir.join(file).is_file())
+    }
+    #[cfg(not(feature = "local-rerank"))]
+    {
+        let _ = model_dir;
+        false
+    }
 }
 
 /// Did the model answer the question it was asked?
@@ -278,6 +315,47 @@ fn prompt_for(query: &str, hits: &[Hit]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Weights alone used to mean ready. They do not any more.
+    ///
+    /// This is the check that decides whether an agent is told reranking costs
+    /// two seconds or twelve, and whether a machine that already has the model
+    /// goes looking for the rest. Getting it wrong in the lenient direction
+    /// promises a local rerank that then falls through to a twelve-second CLI;
+    /// in the strict direction it re-downloads 568 MB that is already there.
+    #[cfg(feature = "local-rerank")]
+    #[test]
+    fn readiness_needs_the_runtime_too_not_only_the_weights() {
+        let path = std::env::temp_dir().join(format!("brain-ready-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&path).expect("create");
+        let path = path.as_path();
+        let files = [
+            crate::xencoder::WEIGHTS_FILE,
+            crate::xencoder::TOKENIZER_FILE,
+            crate::xencoder::RUNTIME_FILE,
+        ];
+
+        assert!(!local_is_ready(path), "an empty directory is not a reranker");
+        for (written, file) in files.iter().enumerate() {
+            std::fs::write(path.join(file), b"x").expect("write");
+            let complete = written + 1 == files.len();
+            assert_eq!(
+                local_is_ready(path),
+                complete,
+                "with {} of {} files present",
+                written + 1,
+                files.len()
+            );
+        }
+
+        // And it goes back to not-ready when any one of them leaves - the
+        // upgrade case, where weights outlive the binary that linked its own
+        // runtime.
+        std::fs::remove_file(path.join(crate::xencoder::RUNTIME_FILE)).expect("remove");
+        assert!(!local_is_ready(path), "weights without a runtime are not ready");
+
+        std::fs::remove_dir_all(path).ok();
+    }
 
     fn hit(id: &str, title: &str) -> Hit {
         Hit {

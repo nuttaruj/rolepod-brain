@@ -218,21 +218,30 @@ fn failure_age(at: Option<&str>) -> Option<String> {
 /// twelve" is otherwise invisible until someone waits through it.
 fn reranker_check(paths: &Paths) -> Check {
     let dir = paths.model_dir_for(crate::rerank::LOCAL_MODEL);
-    let weights = dir.join("model.onnx");
     if !cfg!(feature = "local-rerank") {
-        // Not a fault and not a missing install: `ort` publishes no prebuilt
-        // onnxruntime this binary's target can link against. Reranking still
-        // works, through the CLI, at the price it has always cost.
+        // Not a fault and not a missing install - only a build that was asked
+        // to leave the code out. Reranking still works, through the CLI, at
+        // the price it has always cost.
         return Check::pass(
             "reranker",
-            "not built for this platform - reranking uses the host CLI (~12s)",
+            "not built into this binary - reranking uses the host CLI (~12s)",
         );
     }
-    if weights.is_file() {
+    if crate::rerank::local_is_ready(&dir) {
         return Check::pass("reranker", format!("local, ready ({})", dir.display()));
     }
     if dir.with_extension("fetching").exists() {
         return Check::pass("reranker", "downloading - the CLI answers until it lands");
+    }
+    // Naming the missing half is worth the extra line. Weights without a
+    // runtime is what an upgrade from a statically linked build looks like,
+    // and it is otherwise indistinguishable from having downloaded nothing.
+    #[cfg(feature = "local-rerank")]
+    if dir.join(crate::xencoder::WEIGHTS_FILE).is_file() {
+        return Check::pass(
+            "reranker",
+            "weights are here but ONNX Runtime is not - the next rerank fetches it",
+        );
     }
     Check::pass(
         "reranker",

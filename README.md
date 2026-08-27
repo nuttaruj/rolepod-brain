@@ -62,8 +62,8 @@ the original it was made from. The English-only model this replaced managed
 The model is 122 MB of static embeddings — no Python, no second process, no
 API key, and no service to be down. It is fetched once when brain is
 installed, checksum-verified, and never touched over the network again; the
-binary itself is under 4 MB, or 22 MB where it carries the local reranker
-(see `search.rerank`). Until the model arrives, and if it never does, recall
+binary itself is under 4 MB on every platform. Until the model arrives, and
+if it never does, recall
 runs on its other four rankings and `brain doctor` says so.
 
 It is never loaded into memory either. A search needs about ten rows out of
@@ -373,19 +373,21 @@ first. Two engines do it, and which one you get depends on the machine:
 | host CLI | one call to the CLI whose work is being searched | ~12s |
 | neither | the index's own order | 0.2s |
 
-The local one is a 568 MB model, fetched the first time something actually
-asks for a rerank — never at install, because reranking is off by default and
-most installs will never turn it on. That first search falls through to the
-CLI while the download runs; the next one has the model. `brain doctor` says
-which state a machine is in.
+The local one is about 600 MB — the model, its tokenizer, and ONNX Runtime
+itself — fetched the first time something actually asks for a rerank, never at
+install, because reranking is off by default and most installs will never turn
+it on. That first search falls through to the CLI while the download runs; the
+next one has the model. `brain doctor` says which state a machine is in.
 
-It ships on Apple Silicon today. `ort`, the ONNX runtime binding, publishes
-prebuilt libraries per platform and does not have one for Intel macOS, and the
-Linux builds it does publish need a newer glibc than the release binaries are
-built against — deliberately, so they run on distributions older than the
-build machine. Those platforms rerank through the CLI, and a source build
-(`bootstrap.sh` falls back to one) tries the local path first in case the
-machine's own toolchain can link it.
+Every platform can run it. Nothing links ONNX Runtime into the binary: the
+runtime is downloaded beside the weights, per platform, checksum-verified the
+same way. Which one a machine receives depends on what exists for it — 1.28
+nearly everywhere, 1.23 on Intel macOS, which is the last one Microsoft built
+for that architecture and is measurably close behind.
+
+A machine that cannot load its runtime is not a broken install. Reranking
+there falls through to the host CLI, which is where every machine starts
+anyway, and the search still returns.
 
 Ask for it per search — `brain_search(query, rerank: true)` — when a question
 is worth the wait, or set `rerank = true` in config to make it the default for

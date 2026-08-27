@@ -1,6 +1,6 @@
 [package]
 name = "rolepod-brain"
-version = "0.29.3"
+version = "0.30.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -14,23 +14,30 @@ path = "src/main.rs"
 [features]
 # The local reranker, off unless a build asks for it.
 #
-# `ort` ships prebuilt onnxruntime per target and has none for
-# x86_64-apple-darwin, which the release matrix cross-compiles on purpose
-# (GitHub is retiring the Intel macOS fleet, and a release that waits for the
-# scarcest machine does not ship). Rather than lose the target or the
-# cross-compile, that build simply goes without: reranking there falls through
-# to the host CLI, which is the same path every machine takes before the model
-# is downloaded. The degradation already exists; this only widens who sees it.
+# Every target can carry it now. Nothing links ONNX Runtime at build time -
+# the runtime arrives as a downloaded file next to the weights, the same way
+# the weights themselves do - so the feature costs a build nothing but the
+# code, and a machine without the download falls through to the host CLI
+# exactly as it does before the model arrives.
 default = []
-local-rerank = ["dep:ort", "dep:ndarray"]
+local-rerank = ["dep:ort"]
 
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
 jiff = "0.2"
-ndarray = { version = "0.16", optional = true }
-ort = { version = "2.0.0-rc.13", optional = true }
+# `load-dynamic` is the whole reason every platform can have this. The crate's
+# own prebuilt onnxruntime is what demanded glibc 2.38 and what has no Intel
+# macOS build at all; Microsoft's official binaries need glibc 2.27 and are
+# published per platform. Loading one at runtime takes the choice of runtime
+# out of the build and puts it next to the weights.
+#
+# `api-23` is a floor, not a pin: `ort` refuses a runtime OLDER than the API
+# level it was built for and merely logs a note for a newer one. 23 is the
+# last ONNX Runtime that Microsoft still built for Intel macOS, so this is the
+# lowest floor any platform needs - every other platform loads 1.28 over it.
+ort = { version = "2.0.0-rc.13", optional = true, default-features = false, features = ["std", "load-dynamic", "api-23"] }
 regex = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 safetensors = "0.8.0"

@@ -28,6 +28,22 @@ pub const WEIGHTS_FILE: &str = "model.onnx";
 /// The tokenizer inside [`MODEL`]'s directory.
 pub const TOKENIZER_FILE: &str = "tokenizer.json";
 
+/// ONNX Runtime itself, downloaded beside the weights.
+///
+/// Nothing links it at build time, which is what lets every target carry this
+/// feature. The crate's own prebuilt runtime is what demanded glibc 2.38 and
+/// what has no Intel macOS build; Microsoft publishes one per platform that
+/// needs glibc 2.27, and 2.27 is old enough to be everywhere.
+///
+/// The name has no version in it on purpose. Which ONNX Runtime a machine
+/// receives is a question for whatever downloads it - 1.28 where that exists,
+/// 1.23 on Intel macOS, where 1.23 is the last one Microsoft built - and the
+/// loader should not have to know which answer it got.
+#[cfg(target_os = "macos")]
+pub const RUNTIME_FILE: &str = "libonnxruntime.dylib";
+#[cfg(not(target_os = "macos"))]
+pub const RUNTIME_FILE: &str = "libonnxruntime.so";
+
 /// Tokens kept from one (query, entry) pair.
 ///
 /// The model would take 512. Entries here are a title and the first 160 bytes
@@ -91,8 +107,26 @@ fn load(model_dir: &Path) -> &'static Result<Reranker, String> {
 fn open(model_dir: &Path) -> Result<Reranker> {
     let weights = model_dir.join(WEIGHTS_FILE);
     let tokenizer = model_dir.join(TOKENIZER_FILE);
+    let runtime = model_dir.join(RUNTIME_FILE);
     anyhow::ensure!(weights.is_file(), "no reranker at {}", weights.display());
     anyhow::ensure!(tokenizer.is_file(), "no tokenizer at {}", tokenizer.display());
+    anyhow::ensure!(runtime.is_file(), "no onnx runtime at {}", runtime.display());
+
+    // The one call in this file that must not be allowed to panic. Every other
+    // `ort` entry point loads the dylib on first use and aborts the process if
+    // it cannot - wrong architecture, missing symbol, a runtime older than the
+    // API floor - and this binary aborts rather than unwinds. `init_from` is
+    // the fallible door: it performs exactly those checks and hands back an
+    // error, which becomes a `None` upstream and a fall through to the host
+    // CLI, which is where a machine that cannot run this model belongs anyway.
+    //
+    // `commit` returning false means another caller configured the environment
+    // first. Nothing else in this binary touches `ort`, so that can only
+    // happen if this ran twice, and the dylib is already the one we asked for.
+    ort::init_from(&runtime)
+        .map_err(|error| anyhow::anyhow!("{error}"))
+        .with_context(|| format!("load onnx runtime from {}", runtime.display()))?
+        .commit();
 
     let mut tokenizer = Tokenizer::from_file(&tokenizer)
         .map_err(|error| anyhow::anyhow!("{error}"))

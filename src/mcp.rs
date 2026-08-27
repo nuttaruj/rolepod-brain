@@ -69,7 +69,16 @@ pub fn serve() -> Result<()> {
         let response = match method {
             "initialize" => success(id, initialize_result()),
             "ping" => success(id, json!({})),
-            "tools/list" => success(id, json!({ "tools": tool_definitions() })),
+            "tools/list" => {
+                // Listed once per session, so a model that finishes downloading
+                // mid-session is still described as absent until the next one.
+                // That is the honest reading anyway: this session's reranks
+                // were quoted at the CLI price and will be charged it.
+                let ready = crate::rerank::local_is_ready(
+                    &paths.model_dir_for(crate::rerank::LOCAL_MODEL),
+                );
+                success(id, json!({ "tools": tool_definitions(ready) }))
+            }
             "tools/call" => match call_tool(&paths, &project, &session, &params) {
                 Ok(result) => success(id, result),
                 // A failed tool call is reported inside the result, not as a
@@ -100,7 +109,29 @@ fn initialize_result() -> Value {
     })
 }
 
-fn tool_definitions() -> Value {
+/// The tool list, worded for the machine it is being listed on.
+///
+/// `local_rerank` is the one thing here that is not the same everywhere: a
+/// build with the weights on disk answers a rerank in about 1.6s, and every
+/// other build waits on a host CLI for around 12s. Quoting one number on both
+/// leaves an agent either skipping a rerank it could have had for free, or
+/// asking for one that costs a session's worth of patience. So the price on
+/// the label is the price this machine charges.
+fn tool_definitions(local_rerank: bool) -> Value {
+    // Read once here rather than inside the macro: `json!` would otherwise
+    // have to carry the branch, and the two strings are easier to compare
+    // sitting next to each other.
+    let rerank_cost = if local_rerank {
+        "Runs on this machine in under two seconds - no subscription spent, \
+         nothing sent anywhere - so ask for it whenever the first ordering \
+         looks off. It is not free, but it is cheap enough to reach for."
+    } else {
+        "Costs about 12 seconds of real waiting, 20 at the ceiling, because \
+         this machine has no local reranker and the work goes out to a host \
+         CLI. Ask for it when the answer is worth that and not otherwise. The \
+         first such search also starts a one-time 600 MB download in the \
+         background, and the searches after it are the fast kind."
+    };
     json!([
         {
             "name": "brain_search",
@@ -131,15 +162,14 @@ fn tool_definitions() -> Value {
                     },
                     "rerank": {
                         "type": "boolean",
-                        "description": "Let a cheap model reorder the results by what \
-                                        the question was actually asking. Costs about \
-                                        12 seconds of real waiting, 20 at the ceiling, \
-                                        so ask for it when the \
-                                        answer is worth that and not otherwise: a \
-                                        question whose words the entry probably does \
-                                        not use (\"why did we stop doing X\"), or a \
-                                        first search that came back plausible but not \
-                                        right. Omit it for ordinary lookups.",
+                        "description": format!(
+                            "Let a cheap model reorder the results by what the \
+                             question was actually asking. {rerank_cost} It earns \
+                             its keep on a question whose words the entry probably \
+                             does not use (\"why did we stop doing X\"), or on a \
+                             first search that came back plausible but not right. \
+                             Omit it for ordinary lookups."
+                        ),
                     },
                 },
                 "required": ["query"],
@@ -610,15 +640,46 @@ mod tests {
 
     #[test]
     fn every_tool_declares_a_usable_schema() {
-        let tools = tool_definitions();
-        let tools = tools.as_array().unwrap();
-        assert_eq!(tools.len(), 10);
-        for tool in tools {
-            assert!(tool.get("name").and_then(Value::as_str).is_some());
-            let description = tool.get("description").and_then(Value::as_str).unwrap();
-            assert!(description.len() > 40, "description too thin to route on");
-            assert_eq!(tool["inputSchema"]["type"], "object");
+        // Both machines, because the list is worded per machine and a broken
+        // schema on the rarer one is still a broken schema.
+        for local_rerank in [false, true] {
+            let tools = tool_definitions(local_rerank);
+            let tools = tools.as_array().unwrap();
+            assert_eq!(tools.len(), 10);
+            for tool in tools {
+                assert!(tool.get("name").and_then(Value::as_str).is_some());
+                let description = tool.get("description").and_then(Value::as_str).unwrap();
+                assert!(description.len() > 40, "description too thin to route on");
+                assert_eq!(tool["inputSchema"]["type"], "object");
+            }
         }
+    }
+
+    /// The point of wording the list per machine is the number in it.
+    ///
+    /// Asserted on the substance rather than the sentence: a machine with the
+    /// weights must not be quoting twelve seconds at anyone, and a machine
+    /// without them must still say what the first rerank will cost.
+    #[test]
+    fn the_rerank_flag_quotes_this_machine_s_price() {
+        let cost = |local_rerank| {
+            tool_definitions(local_rerank)[0]["inputSchema"]["properties"]["rerank"]
+                ["description"]
+                .as_str()
+                .expect("rerank description")
+                .to_string()
+        };
+
+        let slow = cost(false);
+        assert!(slow.contains("12 seconds"), "the CLI wait is what a bare build charges");
+        assert!(slow.contains("600 MB"), "and the download is part of that price");
+
+        let fast = cost(true);
+        assert!(!fast.contains("12 seconds"), "a local reranker does not wait on a CLI");
+        assert!(!fast.contains("600 MB"), "nor does it download what it already has");
+        assert!(fast.contains("two seconds"), "say what it does cost, not just what it does not");
+
+        assert_ne!(slow, fast, "one string for both machines is the bug this fixes");
     }
 
     #[test]

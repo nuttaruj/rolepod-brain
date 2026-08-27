@@ -104,11 +104,12 @@ from_source() {
     trap 'rm -rf "$work"' EXIT INT TERM
     git clone --depth 1 "https://github.com/$REPO.git" "$work/src" >/dev/null 2>&1 \
         || die "could not clone https://github.com/$REPO"
-    # Try with the local reranker, fall back without it. Whether `ort` can
-    # link here depends on this machine's toolchain, not on the project: the
-    # published Linux binaries go without because they are built on a 2022
-    # runner for a 2022 glibc, but a machine building for itself has whatever
-    # it has, and if that is new enough it should get the faster path.
+    # The reranker goes in. Nothing links ONNX Runtime at build time any more,
+    # so this compiles wherever `brain` itself compiles - the runtime is a file
+    # downloaded later, and a machine that cannot load it falls through to the
+    # host CLI at that point rather than failing here. The bare build is kept
+    # as a second chance only because a build failure at install time should
+    # cost a feature, not the install.
     ( cd "$work/src" && cargo build --release --quiet --features local-rerank ) \
         || ( cd "$work/src" && cargo build --release --quiet ) \
         || die "build failed"
@@ -209,19 +210,30 @@ fetch_model() {
 }
 
 fetch_reranker() {
-    # The reranker is 568 MB and reranking is off by default, so this is never
+    # About 600 MB all told and reranking is off by default, so this is never
     # part of an install. `brain` calls it the first time someone actually asks
     # for a rerank, in the background, and that search falls through to the
     # host CLI while it runs. The one after it has the model.
+    #
+    # Three files, not two. ONNX Runtime is no longer linked into the binary -
+    # that is what let this feature reach Intel macOS and older Linux at all -
+    # so the runtime is downloaded here like the weights, per platform, and
+    # verified the same way.
     model_dir="$1"
     [ -n "$model_dir" ] || model_dir="$($BIN where --reranker 2>/dev/null)"
     [ -n "$model_dir" ] || return 1
-    if [ -s "$model_dir/model.onnx" ] && [ -s "$model_dir/tokenizer.json" ]; then
+    case "$(uname -s)" in
+        Darwin) runtime_name="libonnxruntime.dylib" ;;
+        *)      runtime_name="libonnxruntime.so" ;;
+    esac
+    if [ -s "$model_dir/model.onnx" ] && [ -s "$model_dir/tokenizer.json" ] \
+        && [ -s "$model_dir/$runtime_name" ]; then
         return 0
     fi
+    [ -n "$platform" ] || return 1
     mkdir -p "$model_dir" || return 1
     work=$(mktemp -d) || return 1
-    say "Fetching the reranker (568 MB, once) ..."
+    say "Fetching the reranker (up to 600 MB, once) ..."
     if [ -z "$base" ]; then
         base="https://github.com/$REPO/releases/download/$version"
     fi
@@ -229,17 +241,33 @@ fetch_reranker() {
         rm -rf "$work"
         return 1
     }
-    for f in reranker-int8.onnx reranker-tokenizer.json; do
-        curl -fsSL -o "$work/$f" "$base/$f" 2>/dev/null || {
-            rm -rf "$work"
-            return 1
-        }
-        verify "$work/$f" "$f" "$work/SHA256SUMS"
-    done
-    # Named as the loader expects only once both are whole: a half-written
-    # graph that loads is worse than one that is plainly absent.
-    mv "$work/reranker-int8.onnx" "$model_dir/model.onnx" || { rm -rf "$work"; return 1; }
-    mv "$work/reranker-tokenizer.json" "$model_dir/tokenizer.json" || { rm -rf "$work"; return 1; }
+    # Each file is skipped when it is already here, because they do not always
+    # go missing together. A machine that reranked under a build with its own
+    # linked runtime has the 568 MB model and no library at all, and pulling
+    # the model again to collect a 37 MB dylib is 568 MB of nothing.
+    #
+    # The remote name is not the local one. The asset carries the platform
+    # because which ONNX Runtime a machine can load is a per-platform answer -
+    # 1.28 nearly everywhere, 1.23 on Intel macOS, where 1.23 is the last one
+    # Microsoft built - and the loader only ever wants a library.
+    #
+    # Verified and renamed one at a time. Each file is whole or absent, never
+    # half-written, and a set that is missing one of the three simply does not
+    # report ready: `brain` checks all three before it believes it has a
+    # reranker, so an interrupted fetch costs a retry rather than a model that
+    # loads and answers differently.
+    fetch_one() {
+        remote="$1"
+        local_name="$2"
+        [ -s "$model_dir/$local_name" ] && return 0
+        curl -fsSL -o "$work/$remote" "$base/$remote" 2>/dev/null || return 1
+        verify "$work/$remote" "$remote" "$work/SHA256SUMS"
+        mv "$work/$remote" "$model_dir/$local_name" || return 1
+    }
+    fetch_one reranker-int8.onnx       model.onnx      || { rm -rf "$work"; return 1; }
+    fetch_one reranker-tokenizer.json  tokenizer.json  || { rm -rf "$work"; return 1; }
+    fetch_one "onnxruntime-$platform"  "$runtime_name" || { rm -rf "$work"; return 1; }
+    chmod +x "$model_dir/$runtime_name" 2>/dev/null || true
     rm -rf "$work"
     say "Local reranking is ready."
 }

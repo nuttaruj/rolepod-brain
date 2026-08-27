@@ -23,15 +23,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Every target carries the reranker now. Nothing links ONNX Runtime
+          # at build time — `ort` runs in `load-dynamic` mode and opens a
+          # library file at runtime — so the feature no longer depends on
+          # whether a prebuilt runtime exists for the builder's toolchain. It
+          # was that dependency, not the model or the code, that kept this off
+          # Intel macOS and every Linux: the crate's own prebuilt wanted glibc
+          # 2.38, while Microsoft's official ONNX Runtime needs only 2.27.
+          #
+          # Which runtime each platform receives is decided in the `runtime`
+          # job below, not here.
           - target: aarch64-apple-darwin
             runner: macos-14
             test: true
-            # Local reranking needs `ort`, which publishes prebuilt
-            # onnxruntime per target. Every target here has one except Intel
-            # macOS, which is built by cross-compiling from this same runner —
-            # so that binary goes without, and reranking there falls through to
-            # the host CLI exactly as it does on any machine that has not
-            # downloaded the weights.
             features: local-rerank
           # Cross-compiled from the arm64 runner rather than built on an Intel
           # one. GitHub is retiring the Intel macOS runners, and a release that
@@ -43,7 +47,7 @@ jobs:
           - target: x86_64-apple-darwin
             runner: macos-14
             test: false
-            features: ""
+            features: local-rerank
           # Built on the oldest runner we support rather than the newest, so
           # the glibc it links against is one an older distribution actually
           # has. A binary that only runs on the machine that built it is not a
@@ -51,21 +55,11 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
             test: true
-            # No local reranker on Linux, for the same reason this job runs on
-            # the oldest supported runner in the first place. `ort` ships
-            # prebuilt onnxruntime built against a newer toolchain than
-            # 22.04 has: x86_64 wants glibc's `__isoc23_strtoll`, arm64 wants
-            # libstdc++'s `__cxa_call_terminate`, and neither exists here.
-            # Building on a newer runner would fix the link and break the
-            # binary for every distribution older than that runner, which is
-            # the trade this matrix was arranged to avoid. Reranking on Linux
-            # goes through the host CLI until `ort` publishes a build that
-            # links against something a 2022 distribution has.
-            features: ""
+            features: local-rerank
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
             test: true
-            features: ""
+            features: local-rerank
     steps:
       - uses: actions/checkout@v4
 
@@ -209,11 +203,68 @@ jobs:
           fi
           ls -l "$R"
 
+      # ONNX Runtime, one per platform, taken from Microsoft's own releases
+      # rather than linked into the binary.
+      #
+      # This table is the only place the per-platform version lives. It is not
+      # one version because it cannot be: Microsoft stopped building for Intel
+      # macOS after 1.23, and 1.23 is therefore the newest runtime that
+      # platform can be given. Everywhere else gets 1.28, which is measurably
+      # faster on this model - 1.161s against 1.575s for the same thirty pairs
+      # - and the gap between 1.23 and 1.28 is adjacent swaps inside an
+      # identical top ten, not a different answer.
+      #
+      # 1.22 is deliberately not here despite covering every platform at once:
+      # it is 3.208s on the same batch, slower than the two above by more than
+      # the coverage is worth. The measurements are in brief/11.
+      #
+      # These are the official binaries, which need only glibc 2.27. The crate
+      # `ort` publishes its own, and those are what wanted glibc 2.38 and what
+      # never existed for Intel macOS at all.
+      - name: Fetch ONNX Runtime
+        run: |
+          set -eu
+          mkdir -p runtimes
+          # PROVENANCE.md says these are copied unmodified. The fifth column is
+          # what makes that a checkable claim rather than a promise: these are
+          # the libraries that were measured, and a release asset that upstream
+          # replaced under the same name would stop this job rather than ship.
+          fetch() {
+              target="$1"; pack="$2"; version="$3"; inner="$4"; want="$5"
+              url="https://github.com/microsoft/onnxruntime/releases/download"
+              url="$url/v$version/onnxruntime-$pack-$version.tgz"
+              echo "$target <- onnxruntime $version ($pack)"
+              curl -fsSL -o rt.tgz "$url"
+              tar xzf rt.tgz
+              # Copied, not moved: the archive ships the real library beside
+              # unversioned symlinks pointing at it, and a release asset that
+              # is a dangling symlink is a zero-byte download.
+              cp "onnxruntime-$pack-$version/lib/$inner" "runtimes/onnxruntime-$target"
+              got=$(sha256sum "runtimes/onnxruntime-$target" | cut -d' ' -f1)
+              if [ "$got" != "$want" ]; then
+                  echo "onnxruntime $version for $target is not the one we measured" >&2
+                  echo "  expected $want" >&2
+                  echo "  got      $got" >&2
+                  exit 1
+              fi
+              rm -rf rt.tgz "onnxruntime-$pack-$version"
+          }
+          fetch aarch64-apple-darwin      osx-arm64      1.28.0 "libonnxruntime.1.28.0.dylib" \
+              dc19bbcb2f5c9fb3c68b4f9248aa0a35065ff702c5dbeae75eac54a74da97b6d
+          fetch x86_64-apple-darwin       osx-x86_64     1.23.0 "libonnxruntime.1.23.0.dylib" \
+              091d265e49da84ac8eafd6ff76b67688555192a272d784a252d550a858797d6f
+          fetch x86_64-unknown-linux-gnu  linux-x64      1.28.0 "libonnxruntime.so.1.28.0" \
+              1461ef7cc3d9e49982591721683cc3e3a55580aeca9a5254e7aac47b75ee4bab
+          fetch aarch64-unknown-linux-gnu linux-aarch64  1.28.0 "libonnxruntime.so.1.28.0" \
+              f1ec1a08eb99bd6e5401340f0a2b101381bf4694415480291dc13bcaa30f9ec7
+          ls -l runtimes
+
       - name: Collect
         run: |
           set -eu
           mkdir -p dist
           find artifacts -type f -exec cp {} dist/ \;
+          cp runtimes/onnxruntime-* dist/
           cp assets/potion-multilingual-128M/model-int8.safetensors dist/
           cp assets/potion-multilingual-128M/tokenizer.json dist/
           # Named apart from the embedding model's files: both are "a model
@@ -222,7 +273,8 @@ jobs:
           cp assets/bge-reranker-v2-m3-int8/model.onnx dist/reranker-int8.onnx
           cp assets/bge-reranker-v2-m3-int8/tokenizer.json dist/reranker-tokenizer.json
           cd dist
-          for f in model-int8.safetensors tokenizer.json reranker-int8.onnx reranker-tokenizer.json; do
+          for f in model-int8.safetensors tokenizer.json reranker-int8.onnx \
+                   reranker-tokenizer.json onnxruntime-*; do
               sha256sum "$f" > "$f.sha256"
           done
           # One file the installer can fetch to check any binary against,
