@@ -135,7 +135,9 @@ verify() {
     file="$1"
     name="$2"
     sums="$3"
-    want=$(grep " $name\$" "$sums" 2>/dev/null | awk '{print $1}' | head -n 1)
+    # Either separator: two spaces, or the ` *` that `sha256sum` writes in
+    # binary mode. A published file has carried both.
+    want=$(grep -E "[ *]$name\$" "$sums" 2>/dev/null | awk '{print $1}' | head -n 1)
     [ -n "$want" ] || die "no checksum published for $name — refusing to install"
     if command -v shasum >/dev/null 2>&1; then
         got=$(shasum -a 256 "$file" | awk '{print $1}')

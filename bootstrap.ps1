@@ -54,8 +54,12 @@ if (-not $Base) { $Base = "https://github.com/$Repo/releases/download/$Version" 
 # This binary reads what you type into your editor.
 function Get-Verified($url, $name, $sums, $into) {
     Invoke-WebRequest -Uri $url -OutFile $into
-    $want = (Select-String -Path $sums -Pattern "\s$([regex]::Escape($name))$" |
-        Select-Object -First 1).Line -split '\s+' | Select-Object -First 1
+    # `[ *]` and not `\s`: `sha256sum` in binary mode separates the hash from
+    # the name with a space and an asterisk, which is what the Windows runner
+    # produces and what this failed to match the first time.
+    $line = (Select-String -Path $sums -Pattern "[ *]$([regex]::Escape($name))$" |
+        Select-Object -First 1).Line
+    $want = if ($line) { ($line -split '[\s*]+' | Select-Object -First 1) } else { $null }
     if (-not $want) { Die "no checksum published for $name - refusing to install" }
     $got = (Get-FileHash -Algorithm SHA256 -Path $into).Hash.ToLower()
     if ($want.ToLower() -ne $got) { Die "checksum mismatch for $name (expected $want, got $got)" }
