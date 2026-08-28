@@ -588,7 +588,8 @@ impl Store {
     /// # Errors
     /// Returns an error when the insert fails.
     pub fn index(&self, event: &Event) -> Result<()> {
-        let files = serde_json::to_string(&event.files).unwrap_or_else(|_| "[]".to_string());
+        let subject = self.subject_files_for(event)?;
+        let files = serde_json::to_string(&subject).unwrap_or_else(|_| "[]".to_string());
         self.conn
             .execute(
                 "INSERT INTO events
@@ -649,7 +650,7 @@ impl Store {
             _ => {}
         }
 
-        for path in &event.files {
+        for path in &subject {
             self.conn
                 .execute(
                     "INSERT OR IGNORE INTO event_files (event_id, path, project)
@@ -659,6 +660,46 @@ impl Store {
                 .context("index event file")?;
         }
         Ok(())
+    }
+
+    /// The files this event should be findable by.
+    ///
+    /// Normally the event's own list. Summaries and knowledge pages written
+    /// before they carried one are the exception: they name the events they
+    /// were drawn from, so the list can be rebuilt from those rather than lost.
+    ///
+    /// That is what makes `brain reindex` a backfill rather than a copy. The
+    /// log is replayed in order, so a summary's observations are already
+    /// indexed when it arrives, and a knowledge page's summaries have already
+    /// been through this same derivation - two hops, both of them upstream.
+    ///
+    /// Only these two kinds, and only when the list is empty: an event that
+    /// carries files carries them because something meant it to, and a
+    /// derivation that overruled that would be inventing history rather than
+    /// completing it.
+    fn subject_files_for(&self, event: &Event) -> Result<Vec<String>> {
+        if !event.files.is_empty()
+            || !matches!(event.kind, EventKind::SessionSummary | EventKind::Knowledge)
+            || event.links.is_empty()
+        {
+            return Ok(event.files.clone());
+        }
+        let slots = std::iter::repeat_n("?", event.links.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT path, COUNT(*) AS touches FROM event_files
+             WHERE event_id IN ({slots})
+             GROUP BY path
+             ORDER BY touches DESC, path
+             LIMIT {}",
+            crate::consolidate::SUBJECT_FILES_MAX
+        );
+        let mut stmt = self.conn.prepare(&sql).context("prepare subject files")?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(event.links.iter()), |row| {
+                row.get::<_, String>(0)
+            })
+            .context("run subject files")?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
     }
 
     /// Full-text search within one project, most relevant first.

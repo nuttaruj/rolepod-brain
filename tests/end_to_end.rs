@@ -210,6 +210,23 @@ impl Fixture {
     }
 
     /// Every event-log line on disk, across all projects.
+    /// Every `.jsonl` under the wiki: the append-only log itself.
+    fn log_files(&self) -> Vec<PathBuf> {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).into_iter().flatten().filter_map(Result::ok) {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.wiki(), &mut out);
+        out
+    }
+
     fn log_text(&self) -> String {
         let mut out = String::new();
         collect_jsonl(&self.wiki(), &mut out);
@@ -2157,6 +2174,88 @@ fn session_start_injects_pointers_and_never_bodies() {
         context.len() <= 4096,
         "primer was {} bytes, over the 4096-byte default budget",
         context.len()
+    );
+}
+
+#[test]
+fn reindex_gives_older_summaries_the_files_they_were_drawn_from() {
+    // Subject files arrived after this brain had already written 643
+    // summaries and 248 knowledge pages, and the log is append-only, so every
+    // one of them carries an empty list forever. Anyone upgrading keeps a
+    // memory whose most distilled half stays unreachable by file - which is
+    // most people, since a store that has run for a while is the case this is
+    // for.
+    //
+    // Nothing rewrites the log. Those entries name what they were drawn from,
+    // so the list is derived when they are indexed, and replaying the log is
+    // what fills it in.
+    let fixture = Fixture::new("backfill");
+    let bin = fixture.fake_cli("claude", GOOD_CLI);
+    let file = fixture.project.join("src/auth.rs");
+
+    for index in 0..3 {
+        let payload = serde_json::json!({
+            "session_id": "0199c000-0000-7000-8000-000000000001",
+            "cwd": fixture.project,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": file, "new_string": format!("change {index}")}
+        })
+        .to_string();
+        fixture.hook("claude-code", "PostToolUse", &payload);
+    }
+    assert!(
+        fixture.brain_with_path(&["consolidate", "--force"], Some(&bin)).status.success(),
+        "consolidate failed"
+    );
+
+    // Rewrite the log the way every existing install looks: the links stay,
+    // the file list goes.
+    let mut stripped_any = false;
+    for log in fixture.log_files() {
+        let text = std::fs::read_to_string(&log).expect("read log");
+        let mut out = String::new();
+        for line in text.lines() {
+            match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(mut value) => {
+                    if value.get("kind").and_then(serde_json::Value::as_str)
+                        == Some("session_summary")
+                    {
+                        value["files"] = serde_json::json!([]);
+                        stripped_any = true;
+                    }
+                    out.push_str(&value.to_string());
+                }
+                Err(_) => out.push_str(line),
+            }
+            out.push('\n');
+        }
+        std::fs::write(&log, out).expect("write log");
+    }
+    assert!(stripped_any, "precondition: a summary with files must exist to strip");
+
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(fixture.home.join(format!("brain.db{suffix}")));
+    }
+    assert!(fixture.brain(&["reindex"]).status.success(), "reindex failed");
+
+    // The summary is reachable by the file its session worked on, rebuilt
+    // from a log line that never mentioned that file.
+    let read = serde_json::json!({
+        "session_id": "0199c000-0000-7000-8000-000000000002",
+        "cwd": fixture.project,
+        "tool_name": "Read",
+        "tool_input": {"file_path": file}
+    })
+    .to_string();
+    let out = fixture.hook("claude-code", "PostToolUse", &read);
+    let out: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    let context = out["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("file memory should be injected");
+    assert!(
+        context.contains("SUM"),
+        "reindex left the older summary unreachable by its own file: {context}"
     );
 }
 

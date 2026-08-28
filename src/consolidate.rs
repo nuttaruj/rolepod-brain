@@ -1749,7 +1749,7 @@ const MAX_PER_ROUND: usize = 5;
 /// whole and trims only the outliers - and on those, the files that survive are
 /// the ones the work was plainly about (95, 85, 64 touches) rather than the
 /// long tail a session merely opened once.
-const SUBJECT_FILES_MAX: usize = 8;
+pub const SUBJECT_FILES_MAX: usize = 8;
 
 /// The files a piece of work was actually about, most-touched first.
 ///
