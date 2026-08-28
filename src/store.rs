@@ -636,6 +636,24 @@ impl Store {
                         .context("apply tombstone")?;
                 }
             }
+            // A human saying "this is stale" is a judgement the log has to
+            // carry, for the same reason a correction does. It did not: the
+            // MCP handler lowered the column and appended nothing, so a
+            // rebuild raised every flagged entry back to the top of its
+            // ranking and emptied the review page - the one place flagging
+            // leads anywhere. Unlike a read count there was no second table to
+            // recover it from; on this machine two rebuilds in a day left zero
+            // flags behind and no way to tell what had been flagged.
+            EventKind::Note if event.source.hook == "feedback" => {
+                for target in &event.links {
+                    self.conn
+                        .execute(
+                            "UPDATE events SET confidence = confidence - 1 WHERE id = ?1",
+                            params![target],
+                        )
+                        .context("apply feedback")?;
+                }
+            }
             EventKind::Note if event.source.hook == "correct" => {
                 for target in &event.links {
                     self.conn
@@ -661,6 +679,32 @@ impl Store {
         // already here when it arrives. Deriving the flag from the summary
         // rather than storing it separately is what makes the index disposable
         // in fact and not only in the README.
+        // What an agent went back and read outlives the index that recorded
+        // it. `recalled` is deliberately spared by `clear()` - the comment
+        // there says so - but `read_count` sits on the row, which a replay
+        // deletes and re-inserts at its default. So every rebuild quietly
+        // flattened the one signal `rank()` has that is evidence rather than
+        // heuristic, and nothing said a word: measured after two rebuilds in
+        // one day, 0 of 28,854 events had a read to their name while
+        // `recalled` still held 529 rows.
+        //
+        // Counted per session, matching how it is incremented: re-reading an
+        // entry in one conversation says nothing extra about its worth.
+        if let Ok(reads) = self.conn.query_row(
+            "SELECT COUNT(*) FROM recalled WHERE event_id = ?1",
+            params![event.id],
+            |row| row.get::<_, i64>(0),
+        ) {
+            if reads > 0 {
+                self.conn
+                    .execute(
+                        "UPDATE events SET read_count = ?2 WHERE id = ?1",
+                        params![event.id, reads],
+                    )
+                    .context("restore read count")?;
+            }
+        }
+
         if event.kind == EventKind::SessionSummary && !event.links.is_empty() {
             // Only a model-backed summary finishes its events. The rule-based
             // floor writes a page too, and leaves them pending on purpose so a
@@ -783,7 +827,7 @@ impl Store {
                      JOIN events e ON e.rowid = events_fts.rowid
                      WHERE events_fts MATCH ?1 AND e.project = ?2 AND e.forgotten = 0
                            AND e.kind != 'tombstone'
-                                 AND e.hook != 'correct'
+                                 AND e.hook NOT IN ('correct', 'feedback')
                            AND (?5 IS NULL OR e.topic = ?5)
                  )
                  SELECT id, ts, cli, kind, title, snip, session FROM (
@@ -1017,7 +1061,7 @@ impl Store {
                  WHERE n.name IN (SELECT name FROM subject)
                        AND e.project = ?2 AND e.id != ?1
                        AND e.forgotten = 0 AND e.kind != 'tombstone'
-                       AND e.hook != 'correct'
+                       AND e.hook NOT IN ('correct', 'feedback')
                  GROUP BY e.id
                  ORDER BY shared DESC,
                           CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END,
@@ -1077,7 +1121,7 @@ impl Store {
                  FROM events_tri
                  JOIN events e ON e.rowid = events_tri.rowid
                  WHERE events_tri MATCH ?1 AND e.project = ?2 AND e.forgotten = 0
-                       AND e.kind != 'tombstone' AND e.hook != 'correct'
+                       AND e.kind != 'tombstone' AND e.hook NOT IN ('correct', 'feedback')
                        AND (?4 IS NULL OR e.topic = ?4)
                  ORDER BY CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END, rank
                  LIMIT ?3",
@@ -1170,7 +1214,7 @@ impl Store {
                  FROM events e
                  JOIN matched m ON m.session = e.session
                  WHERE e.project = ?1 AND e.forgotten = 0 AND e.kind != 'tombstone'
-                       AND e.hook != 'correct'
+                       AND e.hook NOT IN ('correct', 'feedback')
                        AND (?2 IS NULL OR e.topic = ?2)
              )
              SELECT id, ts, cli, kind, title, snip, session FROM candidates
@@ -1269,7 +1313,7 @@ impl Store {
              JOIN shared s ON s.session = e.session
              WHERE e.project = ?1
                    AND e.forgotten = 0 AND e.kind != 'tombstone'
-                   AND e.hook != 'correct'
+                   AND e.hook NOT IN ('correct', 'feedback')
                    AND (?2 IS NULL OR e.topic = ?2)
              ORDER BY s.shared DESC,
                       CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END,
@@ -1318,7 +1362,7 @@ impl Store {
     /// # Errors
     /// Returns an error when a query fails.
     pub fn outline(&self, project: &str, limit: usize) -> Result<Outline> {
-        let live = "forgotten = 0 AND kind != 'tombstone' AND hook != 'correct'";
+        let live = "forgotten = 0 AND kind != 'tombstone' AND hook NOT IN ('correct', 'feedback')";
         let count = |extra: &str| -> Result<i64> {
             self.conn
                 .query_row(
@@ -1382,7 +1426,7 @@ impl Store {
                 "SELECT id, ts, cli, kind, title, substr(COALESCE(body, ''), 1, 160), session
                  FROM events
                  WHERE id = ?1 AND forgotten = 0 AND kind != 'tombstone'
-                       AND hook != 'correct'",
+                       AND hook NOT IN ('correct', 'feedback')",
             )
             .context("prepare hits by id")?;
         for id in ids {
@@ -1536,7 +1580,7 @@ impl Store {
                  FROM event_vec v
                  JOIN events e ON e.id = v.event_id
                  WHERE e.project = ?1 AND e.forgotten = 0 AND e.kind != 'tombstone'
-                       AND e.hook != 'correct'
+                       AND e.hook NOT IN ('correct', 'feedback')
                        AND (?2 IS NULL OR e.topic = ?2)",
             )
             .context("prepare nearest")?;
@@ -1649,7 +1693,7 @@ impl Store {
             .prepare(
                 "SELECT id, ts, cli, kind, title, session
                  FROM events WHERE project = ?1 AND forgotten = 0 AND kind != 'tombstone'
-                       AND hook != 'correct'
+                       AND hook NOT IN ('correct', 'feedback')
                        AND (?3 IS NULL OR cli = ?3)
                        AND (?4 IS NULL OR kind = ?4)
                        AND (?5 IS NULL OR session = ?5)
@@ -2133,7 +2177,7 @@ impl Store {
                  JOIN entities n ON n.session = e.session AND n.project = e.project
                  WHERE e.project = ?1 AND n.name = ?2 AND e.forgotten = 0
                        AND e.kind != 'tombstone'
-                             AND e.hook != 'correct'
+                             AND e.hook NOT IN ('correct', 'feedback')
                  ORDER BY CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END, e.id DESC
                  LIMIT ?3",
             )
@@ -2152,24 +2196,6 @@ impl Store {
             })
             .context("run entity search")?;
         rows.collect::<rusqlite::Result<Vec<_>>>().context("read entity search")
-    }
-
-    /// Lower an entry's standing after a human called it stale or wrong.
-    ///
-    /// Deliberately not a learning system: a counter and a sort key. Nothing
-    /// is destroyed, because a human calling something stale is a judgement
-    /// about usefulness, not a claim that it never happened.
-    ///
-    /// # Errors
-    /// Returns an error when the write fails.
-    pub fn lower_confidence(&self, id: &str) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE events SET confidence = confidence - 1 WHERE id = ?1",
-                params![id],
-            )
-            .context("lower confidence")?;
-        Ok(())
     }
 
     /// Entries a human has flagged, for the lint page.
@@ -2738,7 +2764,7 @@ impl Store {
             // that only disappears from search has not been withdrawn.
             "SELECT id, ts, kind, title, topic, files, hook FROM events
              WHERE project = ?1 AND forgotten = 0 AND kind != 'tombstone'
-                   AND hook != 'correct'
+                   AND hook NOT IN ('correct', 'feedback')
                    AND (?3 IS NULL OR kind = ?3)
              ORDER BY {}, id DESC
              LIMIT ?2",
@@ -2792,7 +2818,7 @@ impl Store {
                 // first, and what a real event store showed within minutes.
                 "SELECT id, ts, kind, title, topic, files, hook FROM events
                  WHERE project = ?1 AND consolidated = 0 AND forgotten = 0
-                       AND kind != 'tombstone' AND hook != 'correct'
+                       AND kind != 'tombstone' AND hook NOT IN ('correct', 'feedback')
                        AND (topic IS NOT NULL
                             OR kind != 'observation'
                             OR files != '[]'
@@ -2837,7 +2863,7 @@ impl Store {
              JOIN events e ON e.id = f.event_id
              WHERE f.project = ?1 AND f.path = ?2 AND e.forgotten = 0
                    AND e.kind != 'tombstone'
-                         AND e.hook != 'correct'
+                         AND e.hook NOT IN ('correct', 'feedback')
              ORDER BY {}, e.id DESC
              LIMIT ?3",
             Self::rank("e.")
@@ -2869,7 +2895,7 @@ impl Store {
             .prepare(
                 "SELECT id, ts, cli, kind, title, session FROM events
                  WHERE project = ?1 AND ts >= ?2 AND forgotten = 0 AND kind != 'tombstone'
-                       AND hook != 'correct'
+                       AND hook NOT IN ('correct', 'feedback')
                  ORDER BY id
                  LIMIT ?3",
             )
@@ -3710,6 +3736,53 @@ mod tests {
     }
 
     #[test]
+    fn a_flag_survives_the_rebuild_that_forgets_everything_else() {
+        // `brain_feedback` used to lower the column and append nothing, so a
+        // rebuild raised every flagged entry back to the top and emptied the
+        // review page - the only place flagging leads anywhere. There was no
+        // second table to recover from either: on a real store two rebuilds in
+        // one day left zero flags and no record of what had been flagged.
+        //
+        // A correction and a withdrawal both travel as events. So does this.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let target = event("Old approach", "superseded", project);
+        store.index(&target).unwrap();
+
+        let mut flag = event("Flagged: Old approach", "", project);
+        flag.kind = EventKind::Note;
+        flag.source.hook = "feedback".to_string();
+        flag.links = vec![target.id.clone()];
+        store.index(&flag).unwrap();
+
+        let confidence = |label: &str| -> i64 {
+            store
+                .conn
+                .query_row("SELECT confidence FROM events WHERE id = ?1", [&target.id], |r| {
+                    r.get(0)
+                })
+                .expect(label)
+        };
+        assert!(confidence("before") < 0, "precondition: flagging demotes");
+
+        store.clear().unwrap();
+        store.index(&target).unwrap();
+        store.index(&flag).unwrap();
+
+        assert!(
+            confidence("after") < 0,
+            "the rebuild raised a flagged entry back to the top of its ranking"
+        );
+        assert_eq!(store.flagged(&project.to_string()).unwrap().len(), 1, "the review page emptied");
+
+        // And the flag itself is bookkeeping, not memory: it must not come
+        // back as a search result of its own, the same as a correction note.
+        let hits =
+            store.search(&project.to_string(), "Flagged", None, 10, Recall::Fused).unwrap();
+        assert!(hits.iter().all(|h| h.id != flag.id), "a flag surfaced as a memory: {hits:?}");
+    }
+
+    #[test]
     fn a_demoted_entry_sorts_last_after_multi_stream_fusion() {
         // Both events reach the results through the entity stream; the one a
         // human flagged stale must not represent the search.
@@ -3726,7 +3799,14 @@ mod tests {
                 .record_entities(&session.to_string(), &project.to_string(), &["src/billing.rs".to_string()])
                 .unwrap();
         }
-        store.lower_confidence(&stale_id).unwrap();
+        // Through the log, the way `brain_feedback` does it: the flag has to
+        // survive a rebuild, so it travels as an event rather than a column
+        // write nobody records.
+        let mut flag = event_in_session("Flagged: Old approach", "", project, stale);
+        flag.kind = EventKind::Note;
+        flag.source.hook = "feedback".to_string();
+        flag.links = vec![stale_id.clone()];
+        store.index(&flag).unwrap();
 
         let hits =
             store.search(&project.to_string(), "src/billing.rs", None, 10, Recall::Fused).unwrap();
@@ -3809,6 +3889,38 @@ mod tests {
         store.migrate().unwrap();
         store.migrate().unwrap();
         assert!(store.has_column("events", "topic").unwrap());
+    }
+
+    #[test]
+    fn a_rebuild_remembers_what_an_agent_went_back_and_read() {
+        // `rank()` puts an entry an agent actually opened above one merely
+        // guessed at - evidence over heuristic, and the only such signal here.
+        // It lives in `read_count` on the row, which a replay deletes and
+        // re-inserts at its default, while the `recalled` table it came from
+        // is deliberately spared by `clear`. So every rebuild flattened it in
+        // silence: on a real store after two rebuilds in one day, 0 of 28,854
+        // events had a read to their name and `recalled` still held 529 rows.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let event = event("read me", "body", project);
+        store.index(&event).unwrap();
+
+        store.record_recalled("session-a", std::iter::once(event.id.as_str())).unwrap();
+        store.record_opened("session-b", std::iter::once(event.id.as_str())).unwrap();
+        let before: i64 = store
+            .conn
+            .query_row("SELECT read_count FROM events WHERE id = ?1", [&event.id], |r| r.get(0))
+            .unwrap();
+        assert!(before > 0, "precondition: a read is counted, got {before}");
+
+        store.clear().unwrap();
+        store.index(&event).unwrap();
+
+        let after: i64 = store
+            .conn
+            .query_row("SELECT read_count FROM events WHERE id = ?1", [&event.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, before, "the rebuild forgot that this entry had been read");
     }
 
     #[test]

@@ -524,7 +524,8 @@ fn call_tool(paths: &Paths, project: &str, session: &str, params: &Value) -> Res
                 store.already_injected(session, id)? || store.was_recalled(session, id)?,
                 "id {id} has not been surfaced in this session; search for it first"
             );
-            store.lower_confidence(id)?;
+            let reason = arguments.get("reason").and_then(Value::as_str);
+            crate::revise::flag(id, reason)?;
             json!({
                 "flagged": id,
                 "effect": "ranked lower and listed for review; nothing was deleted",

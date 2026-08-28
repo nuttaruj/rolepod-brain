@@ -190,6 +190,47 @@ pub fn correct(id: &str, text: &str) -> Result<Outcome> {
     Ok(Outcome { id: event.id, target_title: title })
 }
 
+/// Sink a memory the user distrusts, through the log rather than around it.
+///
+/// `correct` and `forget` both append; this one used to reach past the log and
+/// lower the column directly, so a rebuild undid every flag ever set. The
+/// event carries no text of its own - the judgement is "this one", not a
+/// replacement - so the title names what was flagged, for anyone reading the
+/// log by eye.
+///
+/// # Errors
+/// Returns an error when the memory is unknown or the append fails.
+pub fn flag(id: &str, reason: Option<&str>) -> Result<Outcome> {
+    let (paths, store, scope) = context()?;
+    let (_, title) = store
+        .event_summary(id)?
+        .with_context(|| format!("no memory with id {id}"))?;
+    anyhow::ensure!(store.event_exists(id)?, "{id} was forgotten; there is nothing to flag");
+
+    let config = crate::config::Config::load(&paths.config_file())?;
+    let sanitizer = crate::sanitize::Sanitizer::new(&config.sanitize)
+        .context("compile sanitizer patterns")?;
+    let body = reason.map(|text| sanitizer.scrub_body(text)).unwrap_or_default();
+
+    let mut event = Event::new(
+        scope.workspace_id,
+        scope.project_id,
+        uuid::Uuid::nil(),
+        Source { cli: "brain".to_string(), hook: "feedback".to_string() },
+        EventKind::Note,
+        crate::sanitize::truncate(&format!("Flagged: {title}"), 120),
+        body,
+    );
+    event.links = vec![id.to_string()];
+    event.consolidated = true;
+
+    let log = EventLog::open(&paths.project_dir(&scope))?;
+    log.append(&event)?;
+    store.index(&event)?;
+
+    Ok(Outcome { id: event.id, target_title: title })
+}
+
 fn context() -> Result<(Paths, Store, ids::ProjectScope)> {
     let paths = Paths::resolve()?;
     paths.ensure()?;
