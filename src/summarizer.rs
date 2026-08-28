@@ -500,6 +500,26 @@ fn interpreter_path(program: &Path) -> Option<std::ffi::OsString> {
     std::env::join_paths(dirs).ok()
 }
 
+/// A directory the child can actually start in.
+///
+/// `current_dir` is not a hint. If the directory does not exist the spawn
+/// fails with ENOENT - the same errno a missing program gives, about a program
+/// that is sitting right there - and it fails that way for every rung at once,
+/// scripts and native binaries alike, because no interpreter is involved. That
+/// is how this was found: four CLIs reporting a missing file, two of them
+/// Mach-O binaries with no shebang to blame.
+///
+/// A host CLI can hand its hooks a `TMPDIR` that no longer exists, so the
+/// directory is created rather than assumed. On failure this is an error, not
+/// a fallback to the current directory: running a headless CLI inside the
+/// user's repo is the thing the inert directory exists to prevent, and doing
+/// it silently to keep a summary alive is the wrong trade.
+fn inert_dir(candidate: PathBuf) -> Result<PathBuf> {
+    std::fs::create_dir_all(&candidate)
+        .with_context(|| format!("no usable working directory at {}", candidate.display()))?;
+    Ok(candidate)
+}
+
 /// Run one CLI once and return its answer.
 fn invoke(spec: &CliSpec, model: &str, prompt: &str, timeout: Duration) -> Result<String> {
     // A prompt that begins with a dash would be read as a flag by whichever
@@ -546,19 +566,22 @@ fn invoke(spec: &CliSpec, model: &str, prompt: &str, timeout: Duration) -> Resul
         .stderr(Stdio::piped())
         // Run somewhere inert: a headless CLI started inside the user's repo
         // may read project instructions we neither need nor want to pay for.
-        .current_dir(std::env::temp_dir());
+        .current_dir(inert_dir(std::env::temp_dir())?);
     if let Some(path) = interpreter_path(&program) {
         command.env("PATH", path);
     }
 
     let mut child = command.spawn().with_context(|| {
-        // A resolved path that will not start is almost always a script whose
-        // interpreter is missing, not a missing program - the program was
-        // found a line ago. Saying "No such file or directory" about a file
-        // that exists is what made this cost an afternoon.
+        // "No such file or directory" here is never about the program: it was
+        // resolved to an existing file a line ago. Two other things wear the
+        // same errno, and the message names both because guessing between
+        // them cost an afternoon each. A script's interpreter missing from the
+        // child's PATH is one. The directory the child was told to start in
+        // not existing is the other - and that one fails every rung
+        // identically, native binaries included, which is what gives it away.
         format!(
-            "spawn {} ({}) - if this says no such file, the script's interpreter \
-             is missing from PATH, not the script",
+            "spawn {} ({}) - if this says no such file, it is the script's \
+             interpreter or the working directory, not the program",
             spec.program,
             program.display()
         )
@@ -781,6 +804,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_child_is_never_told_to_start_in_a_directory_that_is_not_there() {
+        // The failure this closes reports itself as a missing program. A
+        // `current_dir` that does not exist makes `spawn` return ENOENT, which
+        // reads exactly like the executable is gone - and it does that to
+        // every rung at once, including native binaries with no interpreter to
+        // suspect. A host CLI handing its hooks a stale `TMPDIR` is enough.
+        let root = std::env::temp_dir().join(format!("brain-inert-{}", ulid::Ulid::new()));
+        assert!(!root.exists(), "the fixture must start from nothing");
+
+        let dir = inert_dir(root.join("deeper")).expect("a missing directory is created, not fatal");
+        assert!(dir.is_dir(), "inert_dir returned a path the child still cannot enter");
+
+        // Idempotent: the ordinary case is a directory that already exists.
+        assert!(inert_dir(dir.clone()).is_ok());
+
+        // And it is an error rather than a silent fallback to the user's repo,
+        // which is the whole reason the child is sent elsewhere.
+        let file = root.join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(inert_dir(file.join("under-a-file")).is_err());
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

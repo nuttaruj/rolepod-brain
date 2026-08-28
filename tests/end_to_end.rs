@@ -1742,6 +1742,39 @@ esac
 }
 
 #[test]
+fn a_stale_tmpdir_does_not_look_like_every_cli_vanishing() {
+    // Found on a real machine: four rungs failing at once with "No such file
+    // or directory" naming programs that were all sitting right there, two of
+    // them native binaries with no interpreter to blame. The cause was the
+    // working directory the child is given, not the child - and a summarizer
+    // that silently drops to rule-based for every session is the kind of
+    // failure this project exists to make impossible.
+    let fixture = Fixture::new("stale-tmpdir");
+    let bin = fixture.fake_cli("claude", GOOD_CLI);
+    fixture.seed_session(4);
+
+    let gone = fixture.home.parent().unwrap().join("tmpdir-that-was-cleaned");
+    assert!(!gone.exists(), "the point is that this directory is missing");
+
+    let mut command = std::process::Command::new(BRAIN);
+    command
+        .args(["consolidate", "--force"])
+        .current_dir(&fixture.project)
+        .env("ROLEPOD_BRAIN_HOME", &fixture.home)
+        .env("HOME", fixture.home.parent().unwrap())
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("TMPDIR", &gone);
+    let output = command.output().expect("run brain");
+
+    assert!(output.status.success(), "consolidate errored: {output:?}");
+    let summary = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !summary.contains("rule-based"),
+        "a working CLI was reported as unreachable: {summary}"
+    );
+}
+
+#[test]
 fn a_round_that_finds_nothing_is_finished_not_retried() {
     // The common outcome, and the one that used to cost the most. An empty
     // list was read as an unusable answer, which did two things: it charged
