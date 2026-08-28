@@ -270,14 +270,44 @@ fn embed_backlog(store: &Store, project: &str) -> usize {
     count
 }
 
+/// Has this session been quiet long enough that no more events are coming?
+///
+/// Read out of the id rather than stored beside it: event ids are ULIDs, and a
+/// ULID carries the millisecond it was minted. The newest pending event dates
+/// the session's last sign of life, which is the only thing this question
+/// needs.
+///
+/// An unparseable id counts as settled. The alternative is a session that can
+/// never be finished for a reason nobody can see, which is the shape of the
+/// bug this exists to close.
+fn session_is_settled(newest_event_id: &str) -> bool {
+    let Ok(id) = newest_event_id.parse::<ulid::Ulid>() else { return true };
+    let minted = i64::try_from(id.timestamp_ms() / 1000).unwrap_or(i64::MAX);
+    jiff::Timestamp::now().as_second() - minted >= crate::hook::STALE_BACKLOG_SECS
+}
+
 /// `retriable` is whether a model is reachable right now - see
 /// [`crate::summarizer::Ladder::could_answer`]. It is the only thing that
 /// makes redoing a degraded run worth the write, and asking it here rather
 /// than inside keeps this function's tests independent of what is on `PATH`.
 fn should_wait(store: &Store, pending: &PendingSession, retriable: bool) -> Result<bool> {
     let Some(last) = store.session_run(&pending.session)? else {
-        // Never consolidated: only the volume rule applies.
-        return Ok(pending.pending < MIN_PENDING);
+        // Never consolidated. The volume rule is a bet that more events are
+        // coming - true while someone is still typing, and false forever once
+        // the session is over. Held unconditionally it stranded 73 sessions on
+        // one real machine, none of them ever reaching three events, the
+        // oldest four and a half days old. They cost nothing to store and
+        // everything to leave: an unconsolidated event older than the backstop
+        // window makes the backlog permanently stale, so every session opening
+        // spawned a run that could never finish the work that summoned it.
+        //
+        // So the bet expires. Past the same window the backstop uses, a small
+        // session is finished rather than waited on - two events are a thin
+        // page, and a thin page is better than a queue that never empties.
+        if pending.pending >= MIN_PENDING {
+            return Ok(false);
+        }
+        return Ok(!session_is_settled(&pending.newest_event_id));
     };
 
     // A rule-based run left the events pending on purpose; retrying it sooner
@@ -2525,16 +2555,45 @@ mod tests {
     #[test]
     fn a_fresh_session_waits_until_it_has_enough_events() {
         let store = Store::open_memory().unwrap();
+        let now = ulid::Ulid::new().to_string();
         let few = PendingSession {
             session: "s1".into(),
             pending: 1,
-            newest_event_id: "01A".into(),
+            newest_event_id: now,
             cli: "codex".into(),
         };
-        assert!(should_wait(&store, &few, true).unwrap());
+        assert!(should_wait(&store, &few, true).unwrap(), "a live session lost its thin start");
 
-        let many = PendingSession { pending: MIN_PENDING, ..few };
+        let many = PendingSession { pending: MIN_PENDING, ..few.clone() };
         assert!(!should_wait(&store, &many, true).unwrap());
+    }
+
+    #[test]
+    fn a_session_that_ended_small_is_finished_rather_than_waited_on_forever() {
+        // The wait for more events is a bet that more are coming. It was held
+        // unconditionally, and on a real machine that stranded 73 sessions -
+        // none ever reaching three events, the oldest four and a half days
+        // old. None of them could ever be consolidated, so the backlog stayed
+        // permanently stale and every session opening spawned a run that could
+        // not finish the work that summoned it.
+        let store = Store::open_memory().unwrap();
+        let old_ms = u64::try_from(
+            (jiff::Timestamp::now().as_second() - crate::hook::STALE_BACKLOG_SECS - 60) * 1000,
+        )
+        .unwrap();
+        let stale = ulid::Ulid::from_parts(old_ms, 1).to_string();
+
+        let ended = PendingSession {
+            session: "s1".into(),
+            pending: 1,
+            newest_event_id: stale,
+            cli: "codex".into(),
+        };
+        assert!(
+            !should_wait(&store, &ended, true).unwrap(),
+            "a session quiet past the backstop window is still waiting for events that will \
+             never come"
+        );
     }
 
     #[test]

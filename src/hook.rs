@@ -32,7 +32,7 @@ const TITLE_MAX_BYTES: usize = 120;
 ///
 /// Comfortably longer than the consolidation debounce, so an active machine
 /// never triggers this path and a returning one always does.
-const STALE_BACKLOG_SECS: i64 = 15 * 60;
+pub const STALE_BACKLOG_SECS: i64 = 15 * 60;
 
 /// Set in every subprocess we spawn into a host CLI.
 ///

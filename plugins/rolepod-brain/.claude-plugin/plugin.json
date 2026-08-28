@@ -1,6 +1,6 @@
 {
   "name": "rolepod-brain",
-  "version": "0.35.3",
+  "version": "0.35.4",
   "description": "Persistent memory for AI coding agents. Captures your sessions, consolidates them into a searchable markdown wiki, and hands the next session a short list of pointers. One binary, nothing resident.",
   "author": {
     "name": "nuttaruj",
