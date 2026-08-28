@@ -41,8 +41,8 @@ pub const POOL: usize = 15;
 /// whole pool regardless and truncation only trims the tail.
 ///
 /// Not yet established: that thirty ranks BETTER than fifteen here. Only that
-/// it is affordable. `brief/10-cross-encoder-spike.md` has the measurements
-/// and the caveat.
+/// it is affordable, and the pool is sized on that rather than on a ranking
+/// claim nobody has measured.
 pub const LOCAL_POOL: usize = 30;
 
 /// Which reranker the local path reads, and the directory its files live in.
@@ -51,7 +51,6 @@ pub const LOCAL_POOL: usize = 30;
 /// `mmarco-mMiniLMv2-L12` (0.1B, 118 MB) because the small one does not do the
 /// job: measured across fifteen queries it left English rankings slightly
 /// worse than it found them, while this one improves English and Thai alike.
-/// `brief/10-cross-encoder-spike.md` has both sets of numbers.
 ///
 /// Named here rather than in `xencoder` so a caller need not know whether this
 /// build has the feature at all. The name is in the path so a build expecting

@@ -555,6 +555,7 @@ fn invoke(spec: &CliSpec, model: &str, prompt: &str, timeout: Duration) -> Resul
     // file `PATH` would have found, just named in full.
     let program = resolve(spec.program)
         .with_context(|| format!("{} is not on PATH", spec.program))?;
+    let workdir = inert_dir(std::env::temp_dir())?;
     let mut command = Command::new(&program);
     command
         .args(&args)
@@ -566,7 +567,7 @@ fn invoke(spec: &CliSpec, model: &str, prompt: &str, timeout: Duration) -> Resul
         .stderr(Stdio::piped())
         // Run somewhere inert: a headless CLI started inside the user's repo
         // may read project instructions we neither need nor want to pay for.
-        .current_dir(inert_dir(std::env::temp_dir())?);
+        .current_dir(&workdir);
     if let Some(path) = interpreter_path(&program) {
         command.env("PATH", path);
     }
@@ -574,16 +575,18 @@ fn invoke(spec: &CliSpec, model: &str, prompt: &str, timeout: Duration) -> Resul
     let mut child = command.spawn().with_context(|| {
         // "No such file or directory" here is never about the program: it was
         // resolved to an existing file a line ago. Two other things wear the
-        // same errno, and the message names both because guessing between
-        // them cost an afternoon each. A script's interpreter missing from the
-        // child's PATH is one. The directory the child was told to start in
-        // not existing is the other - and that one fails every rung
-        // identically, native binaries included, which is what gives it away.
+        // same errno, and the message names both - and now names the
+        // directory too, because the first time this happened the report did
+        // not carry enough to tell them apart and the cause was never pinned
+        // down. A script's interpreter missing from the child's PATH is one.
+        // The working directory not existing is the other, and that one fails
+        // every rung identically, native binaries included.
         format!(
-            "spawn {} ({}) - if this says no such file, it is the script's \
-             interpreter or the working directory, not the program",
+            "spawn {} ({}) in {} - if this says no such file, it is the \
+             script's interpreter or that directory, not the program",
             spec.program,
-            program.display()
+            program.display(),
+            workdir.display()
         )
     })?;
 

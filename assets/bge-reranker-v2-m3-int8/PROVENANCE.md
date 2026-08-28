@@ -45,8 +45,8 @@ Half the bytes, a third off the inference, and quality inside the noise.
 
 Reranking through a host CLI is measured at a median of 12.2s on this brain.
 The same judgement here costs 1.1s of inference, spends no subscription, needs
-no credential, and starts no process. `brief/10-cross-encoder-spike.md` has the
-full measurement, including what was tried and rejected.
+no credential, and starts no process. Smaller cross-encoders were measured
+against this one before it was chosen; the comparison is in the note above.
 
 ## The runtime that runs it
 

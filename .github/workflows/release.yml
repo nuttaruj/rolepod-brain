@@ -246,7 +246,7 @@ jobs:
       #
       # 1.22 is deliberately not here despite covering every platform at once:
       # it is 3.208s on the same batch, slower than the two above by more than
-      # the coverage is worth. The measurements are in brief/11.
+      # the coverage is worth.
       #
       # These are the official binaries, which need only glibc 2.27. The crate
       # `ort` publishes its own, and those are what wanted glibc 2.38 and what
