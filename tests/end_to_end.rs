@@ -2289,6 +2289,57 @@ fn a_rebuild_still_leaves_the_rule_based_floor_to_be_redone() {
 }
 
 #[test]
+fn a_lock_left_by_a_killed_run_does_not_block_the_next_one() {
+    // A run that is killed never reaches its `Drop`, and the timeout alone
+    // then blocked every consolidation for half an hour - seen the first time
+    // a run here was interrupted. The lock names its holder, so the next run
+    // can ask whether that process still exists instead of waiting out a clock.
+    let fixture = Fixture::new("dead-lock");
+    let bin = fixture.fake_cli("claude", GOOD_CLI);
+    fixture.seed_session(4);
+
+    // A pid that cannot be running: `kill -0` on it fails, so the lock is
+    // stealable even though the file was written a moment ago.
+    let lock = fixture.home.join(".brain-consolidate.lock");
+    std::fs::write(&lock, b"2147483646").expect("write lock");
+
+    let out = fixture.brain_with_path(&["consolidate", "--force"], Some(&bin));
+    assert!(out.status.success(), "consolidate failed: {out:?}");
+    assert_eq!(
+        fixture.pending_count(),
+        0,
+        "a lock whose holder is gone kept the next run out"
+    );
+}
+
+#[test]
+fn a_run_that_stands_aside_says_so_rather_than_reporting_an_empty_backlog() {
+    // The first version printed "Nothing to consolidate" when it had in fact
+    // yielded to another run - which reads as an empty backlog and would send
+    // the next person looking for a bug in the wrong place.
+    let fixture = Fixture::new("yield-message");
+    let bin = fixture.fake_cli("claude", GOOD_CLI);
+    fixture.seed_session(4);
+
+    // Held by this test process, which is certainly alive.
+    let lock = fixture.home.join(".brain-consolidate.lock");
+    std::fs::write(&lock, std::process::id().to_string()).expect("write lock");
+
+    let out = fixture.brain_with_path(&["consolidate", "--force"], Some(&bin));
+    let said = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "a skipped run is not a failure: {out:?}");
+    assert!(
+        said.contains("stood aside"),
+        "a yielded run reported something else: {said}"
+    );
+    assert!(
+        !said.contains("Nothing to consolidate"),
+        "a yielded run claimed the backlog was empty: {said}"
+    );
+    assert!(fixture.pending_count() > 0, "it did the work anyway");
+}
+
+#[test]
 fn a_second_consolidation_leaves_rather_than_joining_in() {
     // Nine of these were found running at once on a real machine, the oldest
     // thirty-eight minutes old, each with its own model call in flight: every

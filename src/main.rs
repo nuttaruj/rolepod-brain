@@ -234,7 +234,12 @@ fn run(command: Commands) -> Result<()> {
                     outcome.adopted
                 );
             }
-            if outcome.sessions == 0 {
+            if outcome.yielded {
+                println!(
+                    "Another consolidation run is working; this one stood aside. \
+                     Nothing is lost - the work stays pending for whichever run holds it."
+                );
+            } else if outcome.sessions == 0 {
                 println!(
                     "Nothing to consolidate ({} session(s) waiting for more events or a debounce).",
                     outcome.skipped

@@ -88,6 +88,12 @@ pub struct Outcome {
     pub adopted: usize,
     /// Events given a semantic vector this run.
     pub embedded: usize,
+    /// Another run held the lock, so this one did nothing.
+    ///
+    /// Distinct from an empty backlog, and the report has to say which: a run
+    /// that stood aside reporting "nothing to consolidate" is a lie that would
+    /// send the next person looking for a bug in the backlog.
+    pub yielded: bool,
 }
 
 /// Consolidate pending work.
@@ -111,7 +117,7 @@ pub fn run(session: Option<&str>, all_projects: bool, force: bool) -> Result<Out
     let paths = Paths::resolve()?;
     paths.ensure()?;
     let Some(run_lock) = RunLock::take(&paths.db().with_file_name(".brain-consolidate.lock"))? else {
-        return Ok(Outcome::default());
+        return Ok(Outcome { yielded: true, ..Outcome::default() });
     };
     // When THIS invocation began, which is the line between "a run we raced"
     // and "the previous state of the world". See the `superseded` check below
@@ -1507,12 +1513,13 @@ impl RunLock {
             std::fs::create_dir_all(parent).ok();
         }
         match std::fs::OpenOptions::new().create_new(true).write(true).open(path) {
-            Ok(_) => Ok(Some(Self { path: path.to_path_buf() })),
+            Ok(mut file) => {
+                use std::io::Write as _;
+                let _ = write!(file, "{}", std::process::id());
+                Ok(Some(Self { path: path.to_path_buf() }))
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = std::fs::metadata(path)
-                    .and_then(|meta| meta.modified())
-                    .is_ok_and(|at| at.elapsed().is_ok_and(|age| age > Self::STALE));
-                if !stale {
+                if Self::holder_is_alive(path) {
                     return Ok(None);
                 }
                 let _ = std::fs::remove_file(path);
@@ -1522,10 +1529,40 @@ impl RunLock {
         }
     }
 
+    /// Is whoever wrote this lock still running?
+    ///
+    /// The timeout alone was not enough. A run killed outright never reaches
+    /// `Drop`, and the file it leaves behind blocked every consolidation for
+    /// the next half hour - observed here the first time a run was interrupted.
+    /// Asking after the process turns that into seconds. The timeout stays as
+    /// the answer for everything the question cannot cover: an unreadable pid,
+    /// a machine without a way to ask, a pid a later process now wears.
+    fn holder_is_alive(path: &Path) -> bool {
+        let fresh = std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .is_ok_and(|at| at.elapsed().is_ok_and(|age| age <= Self::STALE));
+        let Ok(text) = std::fs::read_to_string(path) else { return fresh };
+        let Ok(pid) = text.trim().parse::<u32>() else { return fresh };
+        if pid == std::process::id() {
+            return fresh;
+        }
+        match std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            Ok(status) => status.success(),
+            // No way to ask: fall back to the clock rather than stealing a
+            // lock from a run that is very likely still going.
+            Err(_) => fresh,
+        }
+    }
+
     /// Say the run is still moving, so a long backlog is not mistaken for a
     /// crash by whatever starts next.
     fn touch(&self) {
-        let _ = std::fs::OpenOptions::new().write(true).open(&self.path).map(|f| f.set_len(0));
+        let _ = std::fs::write(&self.path, std::process::id().to_string());
     }
 }
 
