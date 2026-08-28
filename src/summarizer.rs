@@ -97,7 +97,17 @@ pub const SPECS: &[CliSpec] = &[
         // `--tools=` (the = matters: the flag is variadic and would swallow
         // the prompt) empties the built-in set. Nothing loaded, nothing to
         // ask about.
-        args: &["-p", "--model", "{model}", "--strict-mcp-config", "--tools="],
+        args: &[
+            "-p",
+            "--model",
+            "{model}",
+            "--strict-mcp-config",
+            "--tools=",
+            // A summarizer worker is not an agent the user started, so the
+            // host must not announce it as one. Without this, a machine
+            // draining a backlog sent its owner one push notification per
+            // summary - to the phone, carrying the text of the summary.
+        ],
     },
     CliSpec {
         cli: "codex",
@@ -510,20 +520,36 @@ fn interpreter_path(program: &Path) -> Option<std::ffi::OsString> {
 /// three separate experiments here measure nothing, because a `claude` started
 /// from inside a `claude` is not the same program.
 ///
+/// The `ORCA_` family is what taught this lesson properly. Orca hosts the
+/// terminal the session runs in and installs a `Stop` hook that posts each
+/// finished run to a local port so it can be announced. Its hook already
+/// declines to report other people's background work - it checks for
+/// `DEVIN_PROJECT_DIR` and `CLAUDE_JOB_DIR` and leaves - and it needs
+/// `ORCA_AGENT_HOOK_PORT`, `ORCA_AGENT_HOOK_TOKEN` and `ORCA_PANE_KEY` to do
+/// anything at all. Passing those through made every summariser look like the
+/// user's own pane finishing a turn, and a machine draining a backlog sent its
+/// owner one push notification per summary, to the phone, carrying the text of
+/// the summary. Dropping them lets Orca's own guard do the rest; nothing of
+/// Orca's is touched.
+///
 /// Only identity is removed. Credentials are not: a user who set
 /// `ANTHROPIC_API_KEY` meant it, and deciding otherwise would move their spend
 /// without asking.
 fn host_session_vars() -> Vec<std::ffi::OsString> {
-    const PREFIXES: &[&str] = &["CLAUDE_CODE_", "CODEX_COMPANION_", "CURSOR_SESSION_"];
-    const EXACT: &[&str] =
-        &["CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "CLAUDE_PLUGIN_DATA", "CLAUDE_PROJECT_DIR"];
     std::env::vars_os()
         .map(|(key, _)| key)
-        .filter(|key| {
-            let Some(name) = key.to_str() else { return false };
-            PREFIXES.iter().any(|p| name.starts_with(p)) || EXACT.contains(&name)
-        })
+        .filter(|key| key.to_str().is_some_and(is_host_session_var))
         .collect()
+}
+
+/// Split out from the sweep above so it can be tested without touching the
+/// process environment, which no test can do without racing every other one.
+fn is_host_session_var(name: &str) -> bool {
+    const PREFIXES: &[&str] =
+        &["CLAUDE_CODE_", "CODEX_COMPANION_", "CURSOR_SESSION_", "ORCA_", "DEVIN_"];
+    const EXACT: &[&str] =
+        &["CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "CLAUDE_PLUGIN_DATA", "CLAUDE_PROJECT_DIR"];
+    PREFIXES.iter().any(|prefix| name.starts_with(prefix)) || EXACT.contains(&name)
 }
 
 /// A directory the child can actually start in.
@@ -835,6 +861,41 @@ mod tests {
                     spec.cli
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_worker_does_not_wear_the_identity_of_the_session_that_started_it() {
+        // Measured, not reasoned about. Orca hosts the terminal the session
+        // runs in and installs a `Stop` hook that posts every finished run to
+        // a local port so it can be announced; it needs `ORCA_AGENT_HOOK_PORT`,
+        // `ORCA_AGENT_HOOK_TOKEN` and `ORCA_PANE_KEY`, and it already declines
+        // to report other tools' background work by checking for
+        // `DEVIN_PROJECT_DIR` and `CLAUDE_JOB_DIR`. Passing its variables
+        // through made every summariser look like the user's own pane
+        // finishing a turn, one phone notification per summary, each carrying
+        // the text of the summary.
+        //
+        // Dropping them lets Orca's own guard do the rest. Nothing of Orca's is
+        // touched - an earlier attempt to solve this by editing its hook script
+        // left a `.bak-brain-guard` beside a file that no longer differed from
+        // it, because the tool had since replaced its own script.
+        for name in [
+            "ORCA_AGENT_HOOK_PORT",
+            "ORCA_AGENT_HOOK_TOKEN",
+            "ORCA_PANE_KEY",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDECODE",
+            "CLAUDE_PLUGIN_DATA",
+            "DEVIN_PROJECT_DIR",
+        ] {
+            assert!(is_host_session_var(name), "{name} would still reach the worker");
+        }
+
+        // Credentials are not identity. A user who set one meant it, and
+        // taking it away would move their spend without asking.
+        for name in ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "PATH", "HOME", "AWS_PROFILE"] {
+            assert!(!is_host_session_var(name), "{name} must survive");
         }
     }
 
