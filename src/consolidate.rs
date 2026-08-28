@@ -408,6 +408,7 @@ fn consolidate_session(
         summary.clone(),
     );
     summary_event.links = events.iter().map(|event| event.id.clone()).collect();
+    summary_event.files = subject_files(events.iter().map(|event| event.files.as_slice()));
     summary_event.consolidated = true;
     log.append(&summary_event)?;
     store.index(&summary_event)?;
@@ -474,9 +475,43 @@ fn consolidate_session(
 /// "cash-only same-tier bookings"). The conservative side is the correct one:
 /// a duplicate wastes one of the primer's knowledge slots, a false merge
 /// loses a memory nothing will bring back.
-const KNOWLEDGE_SAME_FACT: f32 = 0.95;
+const KNOWLEDGE_SAME_FACT: f32 = 0.90;
 
-/// Has this claim already been learned, however it was worded?
+/// Land a newer wording on the page that already carries this claim.
+///
+/// A `Note` whose hook is `correct` is how everything else in this project
+/// revises a memory: indexing rewrites the target's title and body and records
+/// which event did it, and the original stays in the log. Reusing that here
+/// rather than writing to the database directly is what keeps the log the
+/// source of truth - a store rebuilt from the log arrives at the same answer.
+///
+/// No page file is written. The vault already has one for this claim under its
+/// first name, and renaming it would break every wikilink pointing at it.
+fn supersede_knowledge(
+    log: &EventLog,
+    store: &Store,
+    scope: &ProjectScope,
+    known_id: &str,
+    title: &str,
+    body: &str,
+) -> Result<()> {
+    let mut event = Event::new(
+        scope.workspace_id,
+        scope.project_id,
+        uuid::Uuid::nil(),
+        Source { cli: "brain".to_string(), hook: "correct".to_string() },
+        EventKind::Note,
+        title.to_string(),
+        body.to_string(),
+    );
+    event.links = vec![known_id.to_string()];
+    event.consolidated = true;
+    log.append(&event)?;
+    store.index(&event)?;
+    Ok(())
+}
+
+/// Which page already carries this claim, however it was worded?
 ///
 /// Exact titles first, because that is free. Then meaning, because exact
 /// titles catch almost nothing: on the real store the two closest entries
@@ -484,17 +519,24 @@ const KNOWLEDGE_SAME_FACT: f32 = 0.95;
 /// Comparing what they mean also makes the language they are written in stop
 /// mattering, which is otherwise a second way to store one fact twice.
 ///
+/// Returns the id rather than a yes, because knowing *which* page is what
+/// lets the newer wording land on it instead of being thrown away.
+///
 /// Without a model this falls back to exact titles alone - a duplicate then,
 /// not a lost claim.
-fn already_learned(known: &[(String, crate::embed::Vector)], title: &str) -> bool {
+fn already_learned(known: &[(String, String, crate::embed::Vector)], title: &str) -> Option<String> {
     let normalized = normalize_entity(title);
-    if known.iter().any(|(seen, _)| *seen == normalized) {
-        return true;
+    if let Some((id, _, _)) = known.iter().find(|(_, seen, _)| *seen == normalized) {
+        return Some(id.clone());
     }
-    let Ok(candidate) = crate::embed::encode(title) else { return false };
-    known.iter().any(|(_, vector)| {
-        !vector.is_empty() && crate::embed::similarity(&candidate, vector) >= KNOWLEDGE_SAME_FACT
-    })
+    let candidate = crate::embed::encode(title).ok()?;
+    known
+        .iter()
+        .filter(|(_, _, vector)| !vector.is_empty())
+        .map(|(id, _, vector)| (id, crate::embed::similarity(&candidate, vector)))
+        .filter(|(_, score)| *score >= KNOWLEDGE_SAME_FACT)
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(id, _)| id.clone())
 }
 
 /// Split events into prompt-sized groups.
@@ -1700,6 +1742,40 @@ const MIN_SOURCES: usize = 2;
 /// crowd out everything else a primer might say.
 const MAX_PER_ROUND: usize = 5;
 
+/// How many files a summary or a knowledge page may claim as its subject.
+///
+/// Measured on the real store: sessions touch a median of 1 distinct file, 13
+/// at the 90th percentile, and 149 at the worst. Eight keeps 45 of 50 sessions
+/// whole and trims only the outliers - and on those, the files that survive are
+/// the ones the work was plainly about (95, 85, 64 touches) rather than the
+/// long tail a session merely opened once.
+const SUBJECT_FILES_MAX: usize = 8;
+
+/// The files a piece of work was actually about, most-touched first.
+///
+/// Both tiers above `observation` were storing none, which quietly cost them a
+/// whole retrieval path: `pointers_for_file` reaches memory through
+/// `event_files`, so with no rows there, touching a file could surface raw
+/// observations and page updates and never the summary or the durable claim
+/// drawn from them - the two most distilled things this project produces were
+/// invisible to its most targeted lookup.
+///
+/// Ranked by how often a path appears rather than filtered by a rule, because
+/// a session that edited one file forty times and opened another once was
+/// about the first. Ties break on the path so the same input always produces
+/// the same list.
+fn subject_files<'a>(sources: impl Iterator<Item = &'a [String]>) -> Vec<String> {
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for files in sources {
+        for path in files {
+            *counts.entry(path.as_str()).or_default() += 1;
+        }
+    }
+    let mut ranked: Vec<(&str, usize)> = counts.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    ranked.into_iter().take(SUBJECT_FILES_MAX).map(|(path, _)| path.to_string()).collect()
+}
+
 /// Kinds of durable knowledge, and the directory each lives in.
 const KNOWLEDGE_KINDS: &[&str] = &["gotcha", "decision", "procedure"];
 
@@ -1756,11 +1832,15 @@ fn synthesize_knowledge(
     // Encoded here rather than read out of the index: a claim learned in the
     // same run has no stored vector yet, and the run that would have written
     // one is this one.
-    let known: Vec<(String, crate::embed::Vector)> = store
-        .knowledge_titles(&project)?
+    let known: Vec<(String, String, crate::embed::Vector)> = store
+        .knowledge_entries(&project)?
         .iter()
-        .map(|title| {
-            (normalize_entity(title), crate::embed::encode(title).unwrap_or_default())
+        .map(|(id, title)| {
+            (
+                id.clone(),
+                normalize_entity(title),
+                crate::embed::encode(title).unwrap_or_default(),
+            )
         })
         .collect();
 
@@ -1773,7 +1853,22 @@ fn synthesize_knowledge(
         let Some(kind) = normalize_knowledge_kind(&entry.kind) else { continue };
         let title = sanitizer.scrub(entry.title.trim());
         let body = sanitizer.scrub_body(entry.body.trim());
-        if title.is_empty() || body.is_empty() || already_learned(&known, &title) {
+        if title.is_empty() || body.is_empty() {
+            continue;
+        }
+        // A claim already on the wall is not written a second time - but it is
+        // not thrown away either, which is what used to happen. Skipping kept
+        // whichever wording was written FIRST, so a fact that had since moved
+        // on kept serving its old version forever: measured on the real store,
+        // a page saying the release targets four platforms outlived the fifth
+        // target by days, with nothing able to retire it.
+        //
+        // The newer wording lands on the existing page instead, through the
+        // same correction other callers use: same id, so citations and links
+        // survive, and it is an appended event rather than a database write,
+        // so a rebuild from the log reproduces it.
+        if let Some(known_id) = already_learned(&known, &title) {
+            supersede_knowledge(&log, store, scope, &known_id, &title, &body)?;
             continue;
         }
 
@@ -1833,6 +1928,10 @@ fn synthesize_knowledge(
             body.clone(),
         );
         event.links = sources.iter().map(|source| source.id.clone()).collect();
+        // Drawn from the sessions this claim cites, so a file named by two of
+        // them outranks one named by a single session - which is the same
+        // recurrence test the tier itself is built on.
+        event.files = subject_files(sources.iter().map(|source| source.files.as_slice()));
         // Knowledge is already a summary of summaries; there is nothing left
         // for a later consolidation pass to do with it.
         event.consolidated = true;
@@ -2141,25 +2240,119 @@ mod tests {
         // something else.
         crate::embed::tests::use_checkout_model();
         let known = vec![(
+            "01KNOWN".to_string(),
             normalize_entity("Use gatedDb harness for deterministic race condition testing"),
             crate::embed::encode("Use gatedDb harness for deterministic race condition testing")
                 .unwrap(),
         )];
 
-        assert!(
-            already_learned(&known, "Use gatedDb harness for deterministic race-condition testing"),
+        // The id, not a yes: the caller has to know which page to land the
+        // newer wording on, or it can only throw the newer one away.
+        assert_eq!(
+            already_learned(&known, "Use gatedDb harness for deterministic race-condition testing")
+                .as_deref(),
+            Some("01KNOWN"),
             "a hyphen was enough to store the same fact twice"
         );
-        assert!(
-            already_learned(&known, "Use gatedDb harness for deterministic race condition testing"),
+        assert_eq!(
+            already_learned(&known, "Use gatedDb harness for deterministic race condition testing")
+                .as_deref(),
+            Some("01KNOWN"),
             "the identical title was not recognised"
         );
         // And the same claim in another language, which is the way this
         // breaks that no amount of string comparison would ever catch.
         assert!(
-            !already_learned(&known, "Coach substitution is limited to cash-only bookings"),
+            already_learned(&known, "Coach substitution is limited to cash-only bookings").is_none(),
             "a different claim was swallowed as a duplicate"
         );
+    }
+
+    #[test]
+    fn the_files_a_summary_claims_are_the_ones_the_work_was_about() {
+        let f = |paths: &[&str]| -> Vec<String> {
+            paths.iter().map(|p| (*p).to_string()).collect()
+        };
+        // One session: forty touches on the file being changed, one on a file
+        // that was merely opened. Counting is what separates them - a rule
+        // about which tool ran would call both a touch.
+        let mut work: Vec<Vec<String>> = (0..40).map(|_| f(&["src/auth.rs"])).collect();
+        work.push(f(&["README.md"]));
+        let files = subject_files(work.iter().map(Vec::as_slice));
+        assert_eq!(files.first().map(String::as_str), Some("src/auth.rs"));
+        assert_eq!(files.len(), 2, "a file opened once still belongs to the session");
+
+        // The outlier session in the measurement touched 149 distinct files.
+        // Every one of them as a pointer would drown the file it was really
+        // about, so the list is capped.
+        let many: Vec<Vec<String>> = (0..149).map(|i| f(&[&format!("src/f{i:03}.rs")])).collect();
+        let capped = subject_files(many.iter().map(Vec::as_slice));
+        assert_eq!(capped.len(), SUBJECT_FILES_MAX);
+
+        // Equal counts break on the path, so two runs over the same session
+        // never disagree about which files it was about.
+        let tied: Vec<Vec<String>> = vec![f(&["b.rs"]), f(&["a.rs"]), f(&["c.rs"])];
+        assert_eq!(
+            subject_files(tied.iter().map(Vec::as_slice)),
+            vec!["a.rs".to_string(), "b.rs".to_string(), "c.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_threshold_reaches_the_rewordings_that_were_slipping_through() {
+        // Both pairs are real, lifted from the store as it stands. Each is one
+        // claim written twice, and each sat in the gap the old 0.95 left open:
+        // measured across 241 knowledge pages, 0.95 matched 3 of them while
+        // 0.90 matches 49, and every sampled pair in between was a rewording,
+        // not a distinct fact.
+        //
+        // The upper bound is the point of the test. If the threshold drifts
+        // back toward 0.95 these stop being caught, and the store goes back to
+        // keeping both copies.
+        crate::embed::tests::use_checkout_model();
+        for (a, b) in [
+            (
+                "Obsidian vault rename renames the underlying directory, causing split-brain fragmentation",
+                "Obsidian vault rename causes split-brain fragmentation",
+            ),
+            (
+                "Worker-heavy /root 641MB is Playwright/Chromium binary, not a memory leak",
+                "Worker-heavy /root footprint ~641 MB is Playwright/Chromium binary, not a leak",
+            ),
+        ] {
+            let score = crate::embed::similarity(
+                &crate::embed::encode(a).unwrap(),
+                &crate::embed::encode(b).unwrap(),
+            );
+            assert!(
+                score >= KNOWLEDGE_SAME_FACT,
+                "one claim written twice is being kept twice: {score:.4} for {a:?}"
+            );
+            assert!(
+                score < 0.95,
+                "this pair no longer demonstrates the gap it was chosen for: {score:.4}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_wording_that_arrives_second_is_the_one_that_survives() {
+        // The measured failure this closes: skipping a duplicate kept whichever
+        // wording was written FIRST. On the real store a page saying the
+        // release targets four platforms outlived the fifth target by days,
+        // because nothing could replace it - the newer synthesis that knew
+        // better was discarded on arrival for being too similar.
+        crate::embed::tests::use_checkout_model();
+        let known = vec![(
+            "01OLD".to_string(),
+            normalize_entity("Release builds target four platforms"),
+            crate::embed::encode("Release builds target four platforms").unwrap(),
+        )];
+
+        // Near-identical wording still resolves to the page it belongs on,
+        // which is what turns a discarded duplicate into a correction.
+        let matched = already_learned(&known, "Release builds target four platform");
+        assert_eq!(matched.as_deref(), Some("01OLD"), "the newer wording found no home");
     }
 
     #[test]

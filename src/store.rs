@@ -1286,7 +1286,7 @@ impl Store {
         Ok(Outline {
             sessions,
             observations: count("")?,
-            knowledge: self.knowledge_titles(project)?,
+            knowledge: self.knowledge_entries(project)?.into_iter().map(|(_, title)| title).collect(),
             summaries: count("AND kind = 'session_summary'")?,
             subjects,
         })
@@ -1956,11 +1956,13 @@ impl Store {
     /// Synthesis runs again every few sessions and will happily rediscover
     /// what it found last time; without this, one durable fact would accrete
     /// one entry per run until the primer said little else.
-    pub fn knowledge_titles(&self, project: &str) -> Result<Vec<String>> {
+    pub fn knowledge_entries(&self, project: &str) -> Result<Vec<(String, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT title FROM events WHERE project = ?1 AND kind = 'knowledge' AND forgotten = 0",
+            "SELECT id, title FROM events
+             WHERE project = ?1 AND kind = 'knowledge' AND forgotten = 0",
         )?;
-        let rows = stmt.query_map([project], |row| row.get::<_, String>(0))?;
+        let rows = stmt
+            .query_map([project], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
         Ok(rows.filter_map(std::result::Result::ok).collect())
     }
 

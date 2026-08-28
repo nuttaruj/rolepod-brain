@@ -1741,6 +1741,75 @@ esac
     )
 }
 
+/// A stub whose synthesis answer is REWORDED between rounds: one claim, told
+/// twice, the second time with the detail that had since been learned.
+fn reworded_knowledge_cli(counter: &Path) -> String {
+    format!(
+        r#"
+case "$*" in
+  *"SESSION SUMMARIES"*)
+    echo x >> {counter}
+    ROUND=$(wc -l < {counter} | tr -d ' ')
+    IDS=$(echo "$*" | grep -oE 'id=[0-9A-Z]{{26}}' | cut -d= -f2)
+    ID=$(echo "$IDS" | head -1); ID2=$(echo "$IDS" | head -2 | tail -1)
+    if [ "$ROUND" = "1" ]; then
+      echo "{{\"knowledge\":[{{\"kind\":\"gotcha\",\"title\":\"Use gatedDb harness for deterministic race condition testing\",\"body\":\"The harness serialises the two writers.\",\"sources\":[\"$ID\",\"$ID2\"]}}]}}"
+    else
+      echo "{{\"knowledge\":[{{\"kind\":\"gotcha\",\"title\":\"Use gatedDb harness for deterministic race-condition testing\",\"body\":\"The harness serialises the two writers and needs the barrier released twice.\",\"sources\":[\"$ID\",\"$ID2\"]}}]}}"
+    fi ;;
+  *) echo '{{"summary":"Refactored the auth path and fixed token expiry.","titles":[]}}' ;;
+esac
+"#,
+        counter = counter.display()
+    )
+}
+
+#[test]
+fn a_reworded_claim_updates_its_page_instead_of_being_discarded() {
+    // Skipping a duplicate kept whichever wording arrived FIRST, so a later
+    // round that knew more had nowhere to put it. Measured on the real store:
+    // 49 of 241 knowledge pages have a near-twin at 0.90, against 3 at the
+    // 0.95 the threshold used to sit at - every sampled pair in between was
+    // one claim written twice, none of them a distinct fact.
+    //
+    // Superseding is not contradiction handling and cannot be: a page saying
+    // the release targets four platforms sits 0.643 from the page about the
+    // fifth. That is a different problem, and no threshold reaches it.
+    let fixture = Fixture::new("reworded-knowledge");
+    let counter = fixture.home.parent().unwrap().join("synth-calls");
+    let bin = fixture.fake_cli("claude", &reworded_knowledge_cli(&counter));
+
+    for session in 0..10 {
+        let payload = serde_json::json!({
+            "session_id": format!("0199a1f2-3c4d-7e8f-9012-3456789200{session:02}"),
+            "cwd": fixture.project,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": fixture.project.join("src/auth.rs")}
+        })
+        .to_string();
+        fixture.hook("claude-code", "PostToolUse", &payload);
+        assert!(
+            fixture.brain_with_path(&["consolidate", "--force"], Some(&bin)).status.success(),
+            "consolidate {session} failed"
+        );
+    }
+
+    assert_eq!(
+        fixture.knowledge_pages().len(),
+        1,
+        "the rewording was stored as a rival page instead of landing on the first"
+    );
+
+    // What recall serves is the later wording, with what the second round
+    // had learned. Before this, the first wording served forever.
+    let hits = String::from_utf8_lossy(&fixture.brain(&["search", "barrier"]).stdout).into_owned();
+    // Search brackets the term it matched, so assert on the words around it.
+    assert!(
+        hits.contains("released twice"),
+        "the newer wording never reached the page it belongs to: {hits}"
+    );
+}
+
 #[test]
 fn a_stale_tmpdir_does_not_look_like_every_cli_vanishing() {
     // Found on a real machine: four rungs failing at once with "No such file
@@ -2088,6 +2157,57 @@ fn session_start_injects_pointers_and_never_bodies() {
         context.len() <= 4096,
         "primer was {} bytes, over the 4096-byte default budget",
         context.len()
+    );
+}
+
+#[test]
+fn touching_a_file_reaches_the_durable_claim_drawn_from_it() {
+    // `pointers_for_file` has always ranked knowledge first and session
+    // summaries second - but neither tier stored any files, so on the real
+    // store `event_files` held only page updates, observations and three
+    // notes. Both branches of that ordering were dead, and touching a file
+    // could return the raw record of what happened to it and never what the
+    // project concluded about it.
+    let fixture = Fixture::new("file-reaches-knowledge");
+    let counter = fixture.home.parent().unwrap().join("synth-calls");
+    let bin = fixture.fake_cli("claude", &knowledge_cli(&counter));
+    let file = fixture.project.join("src/auth.rs");
+
+    // Five sessions of work on one file is what promotes a claim about it.
+    for session in 0..5 {
+        let payload = serde_json::json!({
+            "session_id": format!("0199a1f2-3c4d-7e8f-9012-34567890300{session}"),
+            "cwd": fixture.project,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": file, "new_string": "x"}
+        })
+        .to_string();
+        fixture.hook("claude-code", "PostToolUse", &payload);
+        assert!(
+            fixture.brain_with_path(&["consolidate", "--force"], Some(&bin)).status.success(),
+            "consolidate {session} failed"
+        );
+    }
+    assert_eq!(fixture.knowledge_pages().len(), 1, "no durable claim to reach");
+
+    // A later session opens the file it was drawn from.
+    let read = serde_json::json!({
+        "session_id": "0199b000-0000-7000-8000-000000000777",
+        "cwd": fixture.project,
+        "tool_name": "Read",
+        "tool_input": {"file_path": file}
+    })
+    .to_string();
+    let out = fixture.hook("claude-code", "PostToolUse", &read);
+    let out: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    let context = out["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("file memory should be injected");
+
+    assert!(
+        context.contains("vitest must run file-by-file here"),
+        "the claim this file taught the project never came back with it: {context}"
     );
 }
 
