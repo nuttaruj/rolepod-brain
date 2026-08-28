@@ -88,6 +88,39 @@ Those lines are **titles only, never content**. If one looks relevant, call
 `brain_get` with its id. When you touch a file that has history, one to three
 of its pointers arrive the same way.
 
+## When memory is wrong
+
+The entries you are given were true when someone wrote them. Some of them
+stopped being true afterwards, and nothing in this system notices on its own:
+there is a path that writes durable claims and no path that retires them.
+
+Measured on a real store: a page saying the release targeted four platforms
+outlived the fifth by three days, still arriving in every session as current
+fact — while a second page about adding that fifth target sat beside it,
+unconnected. Three more had been fixed the same morning they were written.
+
+So when a claim you were given disagrees with what is in front of you:
+
+- **The file wins.** A memory is a record of what someone concluded once; the
+  code is what is true now. Do not edit around a stale claim to keep it true.
+- **Correct it while you are here.** `brain_correct(id, text)` replaces what
+  recall returns; the original stays in the log. This is the whole retirement
+  mechanism — if you skip it, the next session is told the same wrong thing,
+  and so is the one after that.
+- **Write it as a claim, not a note.** The first line becomes the title, so
+  put the corrected fact there and the detail underneath.
+- **Say what changed, not just what is right.** "This said four until the
+  Windows target landed" is worth more than "five", because it tells the next
+  reader the claim moves.
+- **Unsure whether it is stale or you are wrong?** `brain_feedback(id)` sinks
+  it for review without destroying anything, and the flagged list is written
+  to the vault. Reach for that rather than leaving a claim you distrust
+  ranking first.
+
+What this is NOT: an invitation to rewrite memory to match an opinion. Correct
+what you have checked — the file, the command output, the test — and leave the
+rest alone.
+
 ## Keeping something out of memory
 
 Text wrapped in `<private>` … `</private>` is removed before anything is

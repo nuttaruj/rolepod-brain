@@ -248,11 +248,19 @@ fn tool_definitions(local_rerank: bool) -> Value {
         },
         {
             "name": "brain_correct",
-            "description": "Replace what a memory says, when the user tells you the \
-                            recorded version is wrong but the event itself matters. \
-                            The original stays in the log; recall returns your text. \
-                            Prefer this over brain_forget when something happened but \
-                            was described badly.",
+            "description": "Replace what a memory says, when the recorded version is \
+                            wrong but the event itself matters. The user telling you is \
+                            one way to learn that; FINDING IT YOURSELF is the common \
+                            one - a claim here can be true when written and false a \
+                            week later, and nothing else in this system retires it. If \
+                            memory says something the code in front of you \
+                            contradicts, correcting it is part of the work, not a \
+                            favour: the next session is told the same thing otherwise. \
+                            Write the replacement with a SHORT FIRST LINE - it becomes \
+                            the title - and the detail below it. The original stays in \
+                            the log; recall returns your text. Prefer this over \
+                            brain_forget when something happened but was described \
+                            badly, or was described correctly and has since changed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

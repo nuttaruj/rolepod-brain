@@ -2178,6 +2178,61 @@ fn session_start_injects_pointers_and_never_bodies() {
 }
 
 #[test]
+fn a_correction_takes_its_title_from_its_first_line() {
+    // The skill tells agents to retire a stale claim with `brain correct`, and
+    // to write a short first line because it becomes the title. That is a
+    // contract, not a description: the first correction written in this
+    // project as one long sentence produced a page titled with 120 characters
+    // of run-on prose, and the advice only works while this holds.
+    let fixture = Fixture::new("correct-title");
+    let bin = fixture.fake_cli("claude", GOOD_CLI);
+    fixture.seed_session(4);
+    assert!(
+        fixture.brain_with_path(&["consolidate", "--force"], Some(&bin)).status.success(),
+        "consolidate failed"
+    );
+
+    let listing = fixture.brain(&["search", "auth"]);
+    let listing = String::from_utf8_lossy(&listing.stdout).into_owned();
+    let id = listing
+        .split_whitespace()
+        .find(|word| word.len() == 26 && word.chars().all(|c| c.is_ascii_alphanumeric()))
+        .expect("a search result carries an id")
+        .to_string();
+
+    let out = fixture.brain(&[
+        "correct",
+        &id,
+        "Token expiry is checked inclusively\nThe comparison uses <= so a token expiring this second is still rejected.",
+    ]);
+    assert!(out.status.success(), "correct failed: {out:?}");
+
+    // Read the stored title, not the rendered one: a title that swallowed the
+    // whole body still prints across two lines, so the terminal cannot tell
+    // the two apart and neither could a test that reads it.
+    let correction = fixture
+        .log_text()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value.get("hook").and_then(serde_json::Value::as_str) == Some("correct")
+            || value.pointer("/source/hook").and_then(serde_json::Value::as_str) == Some("correct"))
+        .expect("the correction is an event in the log");
+    let title = correction["title"].as_str().expect("a correction has a title");
+    assert_eq!(
+        title, "Token expiry is checked inclusively",
+        "the title is not the first line of the correction"
+    );
+
+    // And recall serves it.
+    let after = fixture.brain(&["search", "expiry"]);
+    let after = String::from_utf8_lossy(&after.stdout).into_owned();
+    assert!(
+        after.contains("Token expiry is checked inclusively"),
+        "the corrected claim is not what recall returns: {after}"
+    );
+}
+
+#[test]
 fn reindex_gives_older_summaries_the_files_they_were_drawn_from() {
     // Subject files arrived after this brain had already written 643
     // summaries and 248 knowledge pages, and the log is append-only, so every
