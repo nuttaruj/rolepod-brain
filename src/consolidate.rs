@@ -98,12 +98,25 @@ pub struct Outcome {
 /// # Errors
 /// Returns an error when the store or event log cannot be opened.
 pub fn run(session: Option<&str>, all_projects: bool, force: bool) -> Result<Outcome> {
+    // One run at a time, machine-wide. Without this they pile up: every
+    // session boundary starts another, and while a large backlog is draining
+    // each new one finds the same work still pending and joins in. Measured on
+    // a real machine mid-incident - nine `brain consolidate` processes, the
+    // oldest thirty-eight minutes old, each with a model call of its own in
+    // flight. The git lock below kept the wiki intact through all of it, which
+    // is why nothing looked broken while the spend doubled and doubled again.
+    //
+    // Skipping is the right answer rather than waiting: the work is not lost,
+    // it is pending, and whichever run holds the lock is already doing it.
+    let paths = Paths::resolve()?;
+    paths.ensure()?;
+    let Some(run_lock) = RunLock::take(&paths.db().with_file_name(".brain-consolidate.lock"))? else {
+        return Ok(Outcome::default());
+    };
     // When THIS invocation began, which is the line between "a run we raced"
     // and "the previous state of the world". See the `superseded` check below
     // for why the moment we listed is not that line.
     let began = jiff::Timestamp::now();
-    let paths = Paths::resolve()?;
-    paths.ensure()?;
     let config = Config::load(&paths.config_file())?;
     let store = Store::open(&paths.db())?;
     let ladder = Ladder::new(&store, &config.summarizer);
@@ -128,6 +141,9 @@ pub fn run(session: Option<&str>, all_projects: bool, force: bool) -> Result<Out
     // because everything captured passes through here.
     let mut outcome = Outcome::default();
     for (scope, project_dir) in projects {
+        // Progress, not a heartbeat thread: a run that is still finishing
+        // projects is alive, and one that stopped between them is not.
+        run_lock.touch();
         let project = scope.project_id.to_string();
         outcome.embedded += embed_backlog(&store, &project);
         // Before writing anything, take back what a human wrote by hand.
@@ -409,6 +425,12 @@ fn consolidate_session(
     );
     summary_event.links = events.iter().map(|event| event.id.clone()).collect();
     summary_event.files = subject_files(events.iter().map(|event| event.files.as_slice()));
+    // Which tier wrote this, recorded in the log rather than only in the
+    // health table. Indexing needs it: a model-backed summary means its events
+    // are done, and a rule-based one deliberately means the opposite - they
+    // stay pending so a working model can redo them. That difference used to
+    // live only in the database, where a rebuild could not find it.
+    summary_event.extra.insert("tier".to_string(), serde_json::Value::from(tier_label.clone()));
     summary_event.consolidated = true;
     log.append(&summary_event)?;
     store.index(&summary_event)?;
@@ -1461,6 +1483,56 @@ fn run_git(dir: &Path, args: &[&str]) -> Result<()> {
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(())
+}
+
+/// The whole-run lock: taken once, never waited on.
+///
+/// `LockFile` below waits, because two commits racing corrupts a git index and
+/// one of them has to go second. This one does the opposite - a second run has
+/// nothing to add, so it leaves. The file carries the time it was taken and is
+/// refreshed as each project finishes, which makes the staleness test "no
+/// progress for half an hour" rather than "started half an hour ago": a
+/// backlog can legitimately take longer than any fixed timeout, and a crashed
+/// run must not block the next one forever.
+struct RunLock {
+    path: PathBuf,
+}
+
+impl RunLock {
+    const STALE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+    /// `None` when another run holds it.
+    fn take(path: &Path) -> Result<Option<Self>> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        match std::fs::OpenOptions::new().create_new(true).write(true).open(path) {
+            Ok(_) => Ok(Some(Self { path: path.to_path_buf() })),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(path)
+                    .and_then(|meta| meta.modified())
+                    .is_ok_and(|at| at.elapsed().is_ok_and(|age| age > Self::STALE));
+                if !stale {
+                    return Ok(None);
+                }
+                let _ = std::fs::remove_file(path);
+                Ok(Self::take(path)?)
+            }
+            Err(error) => Err(error).with_context(|| format!("lock {}", path.display())),
+        }
+    }
+
+    /// Say the run is still moving, so a long backlog is not mistaken for a
+    /// crash by whatever starts next.
+    fn touch(&self) {
+        let _ = std::fs::OpenOptions::new().write(true).open(&self.path).map(|f| f.set_len(0));
+    }
+}
+
+impl Drop for RunLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// Advisory lock held for the life of the value.

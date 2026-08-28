@@ -500,6 +500,32 @@ fn interpreter_path(program: &Path) -> Option<std::ffi::OsString> {
     std::env::join_paths(dirs).ok()
 }
 
+/// Variables that tell a child it is part of the session that spawned it.
+///
+/// A summarizer worker is not the user's agent. Left in place, these make the
+/// host treat it as one: the finished-agent notification a real machine
+/// received named the project of the session whose hook happened to start the
+/// run, for work belonging to a different project entirely, once per summary
+/// in a backlog. They also changed the child's behaviour in ways that made
+/// three separate experiments here measure nothing, because a `claude` started
+/// from inside a `claude` is not the same program.
+///
+/// Only identity is removed. Credentials are not: a user who set
+/// `ANTHROPIC_API_KEY` meant it, and deciding otherwise would move their spend
+/// without asking.
+fn host_session_vars() -> Vec<std::ffi::OsString> {
+    const PREFIXES: &[&str] = &["CLAUDE_CODE_", "CODEX_COMPANION_", "CURSOR_SESSION_"];
+    const EXACT: &[&str] =
+        &["CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "CLAUDE_PLUGIN_DATA", "CLAUDE_PROJECT_DIR"];
+    std::env::vars_os()
+        .map(|(key, _)| key)
+        .filter(|key| {
+            let Some(name) = key.to_str() else { return false };
+            PREFIXES.iter().any(|p| name.starts_with(p)) || EXACT.contains(&name)
+        })
+        .collect()
+}
+
 /// A directory the child can actually start in.
 ///
 /// `current_dir` is not a hint. If the directory does not exist the spawn
@@ -557,6 +583,9 @@ fn invoke(spec: &CliSpec, model: &str, prompt: &str, timeout: Duration) -> Resul
         .with_context(|| format!("{} is not on PATH", spec.program))?;
     let workdir = inert_dir(std::env::temp_dir())?;
     let mut command = Command::new(&program);
+    for key in host_session_vars() {
+        command.env_remove(key);
+    }
     command
         .args(&args)
         .arg(prompt)

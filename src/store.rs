@@ -650,6 +650,41 @@ impl Store {
             _ => {}
         }
 
+        // Consolidation progress has to survive a rebuild, and it very nearly
+        // did not: `mark_consolidated` writes only to this table, so a
+        // `reindex` replayed the log, found every observation flagged unread,
+        // and re-summarised the entire history - 141 model calls in ten
+        // minutes on the store this was found on, each one work already done.
+        //
+        // The log does carry the answer. A summary names the events it was
+        // drawn from, and the log replays in order, so those events are
+        // already here when it arrives. Deriving the flag from the summary
+        // rather than storing it separately is what makes the index disposable
+        // in fact and not only in the README.
+        if event.kind == EventKind::SessionSummary && !event.links.is_empty() {
+            // Only a model-backed summary finishes its events. The rule-based
+            // floor writes a page too, and leaves them pending on purpose so a
+            // working model can redo them later - the one property this whole
+            // ladder is built to keep. Restoring progress without checking
+            // which tier wrote the page consumed those events on a rebuild,
+            // which an end-to-end test caught before it shipped.
+            //
+            // A summary written before the tier was recorded has none. Those
+            // are treated as done: the alternative is re-summarising every
+            // session a store has ever had, which is the failure this whole
+            // change exists to stop, and it was measured at 141 model calls in
+            // ten minutes. The cost is that a legacy rule-based page keeps its
+            // rule-based text.
+            let model_backed = event
+                .extra
+                .get("tier")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|tier| tier != "rule-based");
+            if model_backed {
+                self.mark_consolidated(&event.links)?;
+            }
+        }
+
         for path in &subject {
             self.conn
                 .execute(

@@ -2233,6 +2233,94 @@ fn a_correction_takes_its_title_from_its_first_line() {
 }
 
 #[test]
+fn a_rebuild_does_not_ask_for_every_summary_to_be_written_again() {
+    // The failure this closes cost a real machine 141 model calls in ten
+    // minutes. `mark_consolidated` wrote only to the database, so `reindex`
+    // replayed the log, found every observation unfinished, and re-summarised
+    // the entire history - while nine consolidation processes stacked up
+    // racing each other through it.
+    let fixture = Fixture::new("rebuild-progress");
+    let bin = fixture.fake_cli("claude", GOOD_CLI);
+    fixture.seed_session(4);
+    assert!(
+        fixture.brain_with_path(&["consolidate", "--force"], Some(&bin)).status.success(),
+        "consolidate failed"
+    );
+    assert_eq!(fixture.pending_count(), 0, "precondition: the run finished its events");
+
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(fixture.home.join(format!("brain.db{suffix}")));
+    }
+    assert!(fixture.brain(&["reindex"]).status.success(), "reindex failed");
+
+    assert_eq!(
+        fixture.pending_count(),
+        0,
+        "the rebuild asked for work that was already done, which is a model call per session"
+    );
+}
+
+#[test]
+fn a_rebuild_still_leaves_the_rule_based_floor_to_be_redone() {
+    // The other half, and the one that matters more: a degraded run leaves its
+    // events pending on purpose so a working model can redo them. Restoring
+    // progress without asking which tier wrote the page consumed exactly those
+    // events - quality lost permanently, quietly, on a rebuild.
+    let fixture = Fixture::new("rebuild-floor");
+    let bin = fixture.fake_cli("claude", FAILING_CLI);
+    fixture.seed_session(4);
+    assert!(
+        fixture.brain_with_path(&["consolidate", "--force"], Some(&bin)).status.success(),
+        "consolidate failed"
+    );
+    let pending = fixture.pending_count();
+    assert!(pending > 0, "precondition: a degraded run keeps its events");
+
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(fixture.home.join(format!("brain.db{suffix}")));
+    }
+    assert!(fixture.brain(&["reindex"]).status.success(), "reindex failed");
+
+    assert_eq!(
+        fixture.pending_count(),
+        pending,
+        "a rebuild treated the rule-based floor as finished work"
+    );
+}
+
+#[test]
+fn a_second_consolidation_leaves_rather_than_joining_in() {
+    // Nine of these were found running at once on a real machine, the oldest
+    // thirty-eight minutes old, each with its own model call in flight: every
+    // session boundary started another, and each new one found the same
+    // backlog still pending and set to work on it. The git lock kept the wiki
+    // intact throughout, which is why nothing looked wrong while the spend
+    // multiplied.
+    let fixture = Fixture::new("run-lock");
+    let bin = fixture.fake_cli("claude", GOOD_CLI);
+    fixture.seed_session(4);
+
+    // A lock left behind by a run still in progress.
+    let lock = fixture.home.join(".brain-consolidate.lock");
+    std::fs::write(&lock, b"").expect("write lock");
+
+    let out = fixture.brain_with_path(&["consolidate", "--force"], Some(&bin));
+    assert!(out.status.success(), "a skipped run is not a failure: {out:?}");
+    assert!(
+        fixture.pending_count() > 0,
+        "a second run worked the backlog anyway, which is what stacked nine of them up"
+    );
+
+    // And once the holder is gone, the next run proceeds.
+    std::fs::remove_file(&lock).expect("release lock");
+    assert!(
+        fixture.brain_with_path(&["consolidate", "--force"], Some(&bin)).status.success(),
+        "consolidate failed after the lock was released"
+    );
+    assert_eq!(fixture.pending_count(), 0, "the lock outlived its holder");
+}
+
+#[test]
 fn reindex_gives_older_summaries_the_files_they_were_drawn_from() {
     // Subject files arrived after this brain had already written 643
     // summaries and 248 knowledge pages, and the log is append-only, so every
