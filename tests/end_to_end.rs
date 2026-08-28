@@ -2233,6 +2233,48 @@ fn a_correction_takes_its_title_from_its_first_line() {
 }
 
 #[test]
+fn every_installer_flag_has_a_default_before_the_loop_that_sets_it() {
+    // `bootstrap.sh` runs under `set -u` and reads these at the top level
+    // whether or not their flag was passed. Three were added without a
+    // default, and for two days every release shipped an installer that died
+    // with `reranker_only: unbound variable` after downloading the binary and
+    // before wiring anything - found only by installing into a clean HOME,
+    // which nothing in this repository had ever done.
+    //
+    // The whole script cannot be executed from a test: reaching the line that
+    // failed means downloading a release first. So the shape is checked
+    // instead - every variable the argument loop assigns must already have a
+    // value before the loop reaches it.
+    let script = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap.sh"),
+    )
+    .expect("bootstrap.sh is part of the repository");
+
+    let loop_at = script.find("for arg in").expect("the argument loop moved");
+    let (preamble, arg_loop) = script.split_at(loop_at);
+
+    let mut checked = 0usize;
+    for line in arg_loop.lines() {
+        // `--flag) name=1 ;;` and `--flag=*) name="${arg#...}" ;;`
+        let Some(rest) = line.trim().strip_prefix("--") else { continue };
+        let Some((_, assignment)) = rest.split_once(')') else { continue };
+        for token in assignment.split_whitespace() {
+            let Some((name, _)) = token.split_once('=') else { continue };
+            if name.is_empty() || !name.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                preamble.lines().any(|l| l.trim_start().starts_with(&format!("{name}="))),
+                "`{name}` is set by a flag but has no default before the loop; \
+                 an install that omits that flag dies on `set -u`"
+            );
+        }
+    }
+    assert!(checked >= 4, "the loop parser matched almost nothing ({checked}); it has drifted");
+}
+
+#[test]
 fn a_rebuild_does_not_ask_for_every_summary_to_be_written_again() {
     // The failure this closes cost a real machine 141 model calls in ten
     // minutes. `mark_consolidated` wrote only to the database, so `reindex`

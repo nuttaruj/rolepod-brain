@@ -33,6 +33,14 @@ target=""
 assume_yes=""
 uninstall=""
 binary_only="${BRAIN_NO_SETUP:-}"
+# Declared even though the loop below sets them, because `set -u` is on and
+# these are read at the top level whether or not their flag was passed. Left
+# out, an ordinary install died with `reranker_only: unbound variable` after
+# downloading the binary and before wiring anything - every release for two
+# days shipped an installer nobody could run.
+model_only=""
+reranker_only=""
+model_into=""
 
 for arg in "$@"; do
     case "$arg" in
