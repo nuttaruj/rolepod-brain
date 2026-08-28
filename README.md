@@ -241,11 +241,15 @@ the machine, the fewer sessions end up with the rule-based floor. Nothing is
 sent anywhere: these are CLIs you are already signed into, invoked locally on
 their cheap tier.
 
-Most of them are pinned to a specific cheap model. Two are not: OpenCode fronts
-whatever providers you authenticated, so it runs on whatever that install is
-already set to — and is asked last for the same reason — and Cursor is left on
-`auto`, which routes the call itself and measured no slower here than naming
-its fast model did. Either can be pinned under `summarizer.models`.
+Most of them are pinned to a specific cheap model, and those can be repinned
+under `summarizer.models`. Two are not pinned at all: OpenCode fronts whatever
+providers you authenticated, and Cursor's model list differs per plan — not
+every plan carries `auto`, and naming a model a plan does not have fails the
+call rather than routing around it. Both run on whatever that install is
+already set to, which is the one request valid everywhere. Because neither
+sends a model name, `summarizer.models` does not reach them; `brain doctor`
+prints them as `(its own default)` so the report never claims a model the
+call does not send.
 
 Gemini CLI stays in the table because Google closed it to *individual*
 accounts, not to everyone: enterprise and Code Assist Standard licences were
@@ -351,14 +355,18 @@ uncomment a line to change it; it never overwrites a file you have edited.
 
 ```toml
 [summarizer]
-mode = "auto"          # auto | claude-code | codex | gemini | off
+mode = "auto"          # auto | off | or pin one:
+                       #   claude-code | codex | antigravity | cursor
+                       #   opencode | gemini
                        # "off" = permanent rule-based summaries, fully functional
 
 [summarizer.models]    # optional per-CLI model overrides. Memory quality is
                        # a spend decision: the default is each CLI's cheap
                        # tier, and naming a better model here buys better
                        # summaries at that CLI's price. Per-CLI because model
-                       # names do not travel between vendors.
+                       # names do not travel between vendors. Cursor and
+                       # OpenCode send no model name at all, so this does not
+                       # reach them - change the default inside those CLIs.
 # "claude-code" = "sonnet"
 
 [injection]

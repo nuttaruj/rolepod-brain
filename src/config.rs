@@ -63,6 +63,10 @@ pub struct SummarizerConfig {
     /// model it cannot run — which fails exactly like an outage and charges
     /// the breaker for it. A CLI not named here keeps its cheap default:
     /// quality is opt-in per CLI, never an accident of config.
+    ///
+    /// Reaches only the rungs that pass a model name. Cursor and OpenCode do
+    /// not — see `CliSpec::passes_a_model` — and `brain doctor` reports them
+    /// as running their own default rather than echoing a name back.
     pub models: std::collections::HashMap<String, String>,
 }
 

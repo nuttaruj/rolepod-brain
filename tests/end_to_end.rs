@@ -1725,6 +1725,64 @@ fn what_recurs_across_sessions_becomes_a_page_that_outlives_them() {
     );
 }
 
+/// A stub that answers the synthesis call the way most rounds really end:
+/// well-formed JSON saying nothing recurred.
+fn empty_knowledge_cli(counter: &Path) -> String {
+    format!(
+        r#"
+case "$*" in
+  *"SESSION SUMMARIES"*)
+    echo x >> {counter}
+    echo '{{"knowledge":[]}}' ;;
+  *) echo '{{"summary":"Refactored the auth path and fixed token expiry.","titles":[]}}' ;;
+esac
+"#,
+        counter = counter.display()
+    )
+}
+
+#[test]
+fn a_round_that_finds_nothing_is_finished_not_retried() {
+    // The common outcome, and the one that used to cost the most. An empty
+    // list was read as an unusable answer, which did two things: it charged
+    // the rung a breaker failure for being right - benching a working CLI
+    // after three honest rounds - and it skipped the watermark, so the same
+    // synthesis prompt fired again at every single consolidation instead of
+    // once per five sessions.
+    let fixture = Fixture::new("empty-synthesis");
+    let counter = fixture.home.parent().unwrap().join("synth-calls");
+    let bin = fixture.fake_cli("claude", &empty_knowledge_cli(&counter));
+    let synth_calls = || std::fs::read_to_string(&counter).unwrap_or_default().lines().count();
+
+    for session in 0..10 {
+        let payload = serde_json::json!({
+            "session_id": format!("0199a1f2-3c4d-7e8f-9012-3456789100{session:02}"),
+            "cwd": fixture.project,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": fixture.project.join("src/auth.rs")}
+        })
+        .to_string();
+        fixture.hook("claude-code", "PostToolUse", &payload);
+        assert!(
+            fixture.brain_with_path(&["consolidate", "--force"], Some(&bin)).status.success(),
+            "consolidate {session} failed"
+        );
+    }
+
+    // Twice in ten sessions, not once per consolidation. Under the old
+    // reading the watermark never advanced, so this counted six.
+    assert_eq!(synth_calls(), 2, "an empty answer did not finish the round");
+    assert!(fixture.knowledge_pages().is_empty(), "nothing recurred, so nothing is durable");
+
+    // And the rung that told the truth is still trusted.
+    let doctor = fixture.brain_with_path(&["doctor"], Some(&bin));
+    let report = String::from_utf8_lossy(&doctor.stdout);
+    assert!(
+        !report.contains("consecutive failure"),
+        "a correct empty answer was charged to the breaker: {report}"
+    );
+}
+
 #[test]
 fn a_model_override_reaches_the_spawned_command_line() {
     // The quality knob has to actually turn: config names a better model for

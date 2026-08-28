@@ -1713,6 +1713,12 @@ const KNOWLEDGE_KINDS: &[&str] = &["gotcha", "decision", "procedure"];
 /// Triggered by a watermark inside ordinary consolidation rather than a
 /// scheduler, and bounded to a single extra cheap-tier call: one per five
 /// sessions, over their summaries rather than their events.
+///
+/// A round that finds nothing is a finished round. The watermark advances on
+/// an empty answer exactly as it does when there are too few summaries to
+/// compare - both are "nothing recurs", reached from different ends - and the
+/// twenty-summary window is four times the cadence, so anything that starts
+/// recurring across this boundary is still in view next round.
 fn synthesize_knowledge(
     project_dir: &Path,
     scope: &ProjectScope,
@@ -1740,6 +1746,10 @@ fn synthesize_knowledge(
     // produce confident nonsense. Without a model, this simply does not run,
     // and the watermark is left alone so a working CLI does it later.
     let Tier::Cli(_) = tier else { return Ok(Vec::new()) };
+    // `usable` above already required this to parse, so the `else` is a guard
+    // rather than a path. An empty list is not it: that falls through the loop
+    // below, writes nothing, and reaches the watermark - the point being that
+    // "nothing recurred this round" is a finished round, not a retry.
     let Some(entries) = parse_knowledge(&answer) else { return Ok(Vec::new()) };
 
     // What is already known does not need learning twice.
@@ -1859,9 +1869,11 @@ fn parse_knowledge(raw: &str) -> Option<Vec<Knowledge>> {
         .filter_map(|entry| serde_json::from_value(entry.clone()).ok())
         .filter(|entry: &Knowledge| !entry.title.trim().is_empty())
         .collect();
-    // An answer with nothing usable is no answer; the ladder should try the
-    // next rung rather than record an empty synthesis.
-    (!parsed.is_empty()).then_some(parsed)
+    // An empty list is an answer: most rounds genuinely have nothing that
+    // recurs. `None` is reserved for text this cannot read at all - a quota
+    // banner, a login prompt, prose instead of JSON - which is the only kind
+    // of reply the ladder should charge to a rung and walk away from.
+    Some(parsed)
 }
 
 fn normalize_knowledge_kind(raw: &str) -> Option<&'static str> {
@@ -2006,11 +2018,21 @@ mod tests {
     }
 
     #[test]
-    fn an_answer_with_nothing_usable_is_treated_as_no_answer() {
-        // So the ladder advances to another CLI rather than recording an
-        // empty synthesis and resetting the watermark.
-        assert!(parse_knowledge(r#"{"knowledge": []}"#).is_none());
+    fn a_well_formed_empty_answer_is_an_answer_and_prose_is_not() {
+        // This pair used to be one case, and treating them alike was a bug
+        // with two costs. `{"knowledge": []}` is what a model returns when
+        // nothing recurred - the common outcome, and one three vendors were
+        // observed agreeing on - and calling it unusable charged each of them
+        // a breaker failure for being right, benching working rungs. It also
+        // skipped `note_knowledge_synthesized`, so the same prompt ran again
+        // at every consolidation forever, against a doc comment promising one
+        // call per five sessions.
+        //
+        // Prose is still a non-answer: no brace, nothing parsed, and the CLI
+        // that produced it is the one to charge and step past.
+        assert_eq!(parse_knowledge(r#"{"knowledge": []}"#).map(|k| k.len()), Some(0));
         assert!(parse_knowledge("I could not find anything durable.").is_none());
+        assert!(parse_knowledge("You have run out of quota.").is_none());
     }
 
     #[test]

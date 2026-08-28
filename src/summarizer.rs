@@ -55,6 +55,19 @@ pub struct CliSpec {
     pub args: &'static [&'static str],
 }
 
+impl CliSpec {
+    /// Does this rung actually hand a model name to its CLI?
+    ///
+    /// Two of them do not, and for them `model` is empty and
+    /// `summarizer.models` reaches nothing - a distinction `brain doctor`
+    /// has to make too, so the string that decides it lives here rather than
+    /// being spelled out again at the reporting end.
+    #[must_use]
+    pub fn passes_a_model(&self) -> bool {
+        self.args.contains(&"{model}")
+    }
+}
+
 /// Where a CLI puts its final answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputMode {
@@ -113,16 +126,21 @@ pub const SPECS: &[CliSpec] = &[
     CliSpec {
         cli: "cursor",
         program: "cursor-agent",
-        // The one rung that is not a named cheap tier, because on this CLI
-        // naming one bought nothing. `auto` lets Cursor route the call, and
-        // measured against its own fast model over five and three runs it was
-        // not the slower choice - `composer-2.5` averaged 20.3s and went over
-        // the rerank leash three times in five, `auto` averaged 18.1s and
-        // went over once in three. A pin whose whole argument was
-        // predictability, that is neither cheaper to wait for nor more
-        // reliable, is just a worse model. Anyone who wants one back can name
-        // it under `summarizer.models`.
-        model: "auto",
+        // Unpinned, like OpenCode below, but for its own reason: Cursor's
+        // model list is per-plan. `--list-models` marks `auto` the default on
+        // a plan that carries it, and not every plan does - so naming it, or
+        // any other id, is a call that fails outright on the plans without it
+        // rather than routing around it. Omitting `--model` asks for whatever
+        // that install is already set to, the one request every plan can
+        // answer. Measured without the flag at 20s, in line with the 18.1s
+        // `auto` and 20.3s `composer-2.5` means that replaced each other here
+        // before; that was on an account whose default is `auto`, so plans
+        // defaulting elsewhere are unmeasured.
+        //
+        // No `{model}` below to substitute, so `summarizer.models` does not
+        // reach this rung. See
+        // `a_spec_without_a_model_placeholder_names_no_model`.
+        model: "",
         output: OutputMode::Stdout,
         // Two restrictions, both load-bearing. `-p` on its own, in Cursor's
         // own words, "has access to all tools, including write and shell" -
@@ -132,7 +150,7 @@ pub const SPECS: &[CliSpec] = &[
         // every call hang; it applies to the temp directory `invoke` runs in,
         // never the user's repo. `-f` and `--yolo` do what their names say
         // and are not here.
-        args: &["-p", "--output-format", "text", "--mode", "ask", "--trust", "--model", "{model}"],
+        args: &["-p", "--output-format", "text", "--mode", "ask", "--trust"],
     },
     CliSpec {
         // Second to last. OpenCode is a front end for whatever providers
@@ -795,9 +813,8 @@ mod tests {
         // nothing about what runs. An empty default makes the report say so
         // out loud instead.
         for spec in SPECS {
-            let substitutes = spec.args.contains(&"{model}");
             assert_eq!(
-                substitutes,
+                spec.passes_a_model(),
                 !spec.model.is_empty(),
                 "{}: a model that is never passed, or a placeholder with nothing to put in it",
                 spec.cli

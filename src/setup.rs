@@ -591,7 +591,8 @@ const CONFIG_TEMPLATE: &str = r#"# rolepod-brain configuration.
 [summarizer]
 # Which CLI's model writes the summaries.
 #   auto        borrow the CLI that produced the events, cheapest tier
-#   claude-code / codex / gemini   pin one CLI
+#   claude-code / codex / antigravity / cursor / opencode / gemini
+#               pin one CLI
 #   off         permanent rule-based summaries - fully functional, never
 #               spends a model call
 # mode = "auto"
@@ -601,6 +602,11 @@ const CONFIG_TEMPLATE: &str = r#"# rolepod-brain configuration.
 # each CLI's cheap tier, and naming a better model here buys better summaries
 # at that CLI's price. Per-CLI because model names do not travel between
 # vendors. A CLI not named here keeps its cheap default.
+#
+# Cursor and OpenCode send no model name at all - Cursor's list differs per
+# plan and OpenCode fronts whatever you authenticated - so this does not
+# reach them. Change the default inside those CLIs instead. `brain doctor`
+# prints both as "(its own default)".
 # "claude-code" = "sonnet"
 
 [injection]

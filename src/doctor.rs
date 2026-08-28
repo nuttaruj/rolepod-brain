@@ -4,6 +4,7 @@
 //! never installed, because the user keeps trusting it. This command exists so
 //! that failure is always one command away from being visible.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -326,6 +327,22 @@ fn semantic_check(paths: &Paths) -> Check {
     Check::pass("semantic", detail)
 }
 
+/// How one rung should read in the health line, overrides applied.
+///
+/// A rung with no model of ours runs on whatever that CLI is configured for.
+/// Printing `opencode=` reads as a broken lookup; saying so reads as the fact
+/// it is. The override is consulted only for rungs that pass a model at all -
+/// reading it for the others would print a name the call never sends, which is
+/// the same report about a machine that does not exist, arrived at from the
+/// other direction.
+fn model_label(spec: &crate::summarizer::CliSpec, overrides: &HashMap<String, String>) -> String {
+    if !spec.passes_a_model() {
+        return format!("{}=(its own default)", spec.cli);
+    }
+    let model = overrides.get(spec.cli).map_or(spec.model, String::as_str);
+    format!("{}={model}", spec.cli)
+}
+
 fn summarizer_checks(paths: &Paths) -> Vec<Check> {
     let mut checks = Vec::new();
     // Effective models, overrides applied: a report that shows the spec's
@@ -335,16 +352,7 @@ fn summarizer_checks(paths: &Paths) -> Vec<Check> {
     let installed: Vec<String> = crate::summarizer::SPECS
         .iter()
         .filter(|spec| crate::summarizer::installed(spec.program))
-        .map(|spec| {
-            let model = overrides.get(spec.cli).map_or(spec.model, String::as_str);
-            // A rung with no model of ours runs on whatever that CLI is
-            // configured for. Printing `opencode=` reads as a broken lookup;
-            // saying so reads as the fact it is.
-            if model.is_empty() {
-                return format!("{}=(its own default)", spec.cli);
-            }
-            format!("{}={model}", spec.cli)
-        })
+        .map(|spec| model_label(spec, &overrides))
         .collect();
 
     if installed.is_empty() {
@@ -659,6 +667,40 @@ mod tests {
     fn all_passing_reports_ok() {
         let (_, ok) = render(&[Check::pass("a", "fine")]);
         assert!(ok);
+    }
+
+    #[test]
+    fn a_rung_that_passes_no_model_reports_its_own_default_whatever_config_says() {
+        // The report has to survive a user naming a model for a rung that
+        // never sends one. Showing that name would claim the ladder runs
+        // something it does not - and the fix is not to drop the override
+        // silently but to say which rungs it can reach, which is what the
+        // label does.
+        let unpinned = crate::summarizer::SPECS
+            .iter()
+            .find(|spec| !spec.passes_a_model())
+            .expect("at least one rung runs on its CLI's own default");
+
+        let mut overrides = HashMap::new();
+        assert_eq!(
+            model_label(unpinned, &overrides),
+            format!("{}=(its own default)", unpinned.cli)
+        );
+
+        overrides.insert(unpinned.cli.to_string(), "composer-2.5".to_string());
+        assert_eq!(
+            model_label(unpinned, &overrides),
+            format!("{}=(its own default)", unpinned.cli),
+            "an override on a rung with no `{{model}}` argument must not be reported as running"
+        );
+
+        let pinned = crate::summarizer::SPECS
+            .iter()
+            .find(|spec| spec.passes_a_model())
+            .expect("at least one rung names a model");
+        let mut overrides = HashMap::new();
+        overrides.insert(pinned.cli.to_string(), "sonnet".to_string());
+        assert_eq!(model_label(pinned, &overrides), format!("{}=sonnet", pinned.cli));
     }
 
     #[test]
