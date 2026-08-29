@@ -349,11 +349,11 @@ fn summarizer_checks(paths: &Paths) -> Vec<Check> {
     // default while config runs something else is a report about a machine
     // that does not exist.
     let overrides = Config::load(&paths.config_file()).unwrap_or_default().summarizer.models;
-    let installed: Vec<String> = crate::summarizer::SPECS
+    let (installed, missing): (Vec<_>, Vec<_>) = crate::summarizer::SPECS
         .iter()
-        .filter(|spec| crate::summarizer::installed(spec.program))
-        .map(|spec| model_label(spec, &overrides))
-        .collect();
+        .partition(|spec| crate::summarizer::installed(spec.program));
+    let installed: Vec<String> =
+        installed.iter().map(|spec| model_label(spec, &overrides)).collect();
 
     if installed.is_empty() {
         checks.push(Check::fail(
@@ -361,7 +361,17 @@ fn summarizer_checks(paths: &Paths) -> Vec<Check> {
             "no supported CLI on PATH — consolidation stays rule-based",
         ));
     } else {
-        checks.push(Check::pass("summarizer", installed.join(" ")));
+        // The rungs that are NOT here are stated, not omitted. A row that
+        // lists only what exists invites filling the silence: a machine with
+        // Codex the desktop app and no `codex` binary read as having a
+        // fallback it did not have, and the outage that followed looked like
+        // the ladder refusing to cascade.
+        let mut detail = installed.join(" ");
+        if !missing.is_empty() {
+            let absent: Vec<&str> = missing.iter().map(|spec| spec.cli).collect();
+            detail.push_str(&format!(" — not on this machine: {}", absent.join(", ")));
+        }
+        checks.push(Check::pass("summarizer", detail));
     }
 
     // A rung the current table no longer names - renamed or dropped - cannot

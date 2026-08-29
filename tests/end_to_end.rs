@@ -4598,3 +4598,112 @@ fn the_config_template_survives_a_home_brain_has_never_seen() {
     );
     assert!(fixture.home.join("config.toml").exists(), "template missing:\n{stdout}");
 }
+
+/// The report that drove this: "when claude is down, nothing falls through
+/// to the CLIs I do have — everything lands on rule-based." The ladder's
+/// whole design says otherwise; this pins the design so a regression (or
+/// the report's missing detail) has a test to argue with.
+#[test]
+fn a_broken_preferred_cli_falls_through_to_the_next_vendor() {
+    let fixture = Fixture::new("fallthrough");
+    fixture.seed_session(3);
+    // The preferred rung for a claude-code session is claude, and it is down
+    // the way an outage looks: immediate nonzero exit.
+    fixture.fake_cli("claude", "echo 'API Error: 529 overloaded' >&2; exit 1");
+    let bin = fixture.fake_cli("gemini", GOOD_CLI);
+
+    let out = fixture.brain_with_path(&["consolidate", "--force"], Some(&bin));
+    assert!(out.status.success(), "consolidate failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        stdout.contains("gemini-cli"),
+        "the session should be summarized by the next vendor, not floored: {stdout}"
+    );
+
+    let mut pages = Vec::new();
+    collect_under(&fixture.wiki(), "sessions", &mut pages);
+    let page = pages
+        .into_iter()
+        .find(|path| path.extension().is_some_and(|ext| ext == "md"))
+        .expect("a session page");
+    let text = std::fs::read_to_string(&page).unwrap();
+    assert!(
+        text.contains("Refactored the auth path"),
+        "the page should carry the model's summary, not the rule-based floor: {text}"
+    );
+}
+
+/// Same report, other common pair: claude down, codex behind it. Codex
+/// answers through the `-o` file, not stdout — the shape most machines
+/// would actually fall through to.
+#[test]
+fn a_broken_preferred_cli_falls_through_to_codex_s_file_protocol() {
+    let fixture = Fixture::new("fallthrough-codex");
+    fixture.seed_session(3);
+    fixture.fake_cli("claude", "echo 'API Error: 529 overloaded' >&2; exit 1");
+    let bin = fixture.fake_cli(
+        "codex",
+        r#"out=""
+prev=""
+for a in "$@"; do
+  [ "$prev" = "-o" ] && out="$a"
+  prev="$a"
+done
+[ -n "$out" ] || { echo "no -o flag" >&2; exit 2; }
+printf '%s' '{"summary":"Refactored the auth path and fixed token expiry.","titles":[]}' > "$out"
+echo "tokens used: 1234""#,
+    );
+
+    let out = fixture.brain_with_path(&["consolidate", "--force"], Some(&bin));
+    assert!(out.status.success(), "consolidate failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        stdout.contains("codex"),
+        "the session should be summarized by codex, not floored: {stdout}"
+    );
+}
+
+/// A hook spawned by a GUI-launched host gets launchd's minimal PATH. The
+/// CLI a user installed through nvm is real, working, and invisible to that
+/// PATH - so the ladder must look where CLIs actually land, not only where
+/// PATH points. Here codex lives in an nvm bin the pinned PATH cannot see.
+#[test]
+fn the_ladder_reaches_a_cli_the_minimal_path_cannot_see() {
+    let fixture = Fixture::new("nvm-invisible");
+    fixture.seed_session(3);
+    let home = fixture.home.parent().unwrap().to_path_buf();
+
+    // claude is on PATH and down; codex is installed the way npm installs
+    // it - under nvm, off PATH.
+    let bin = fixture.fake_cli("claude", "echo 'API Error: 529 overloaded' >&2; exit 1");
+    let nvm_bin = home.join(".nvm/versions/node/v24.0.0/bin");
+    std::fs::create_dir_all(&nvm_bin).unwrap();
+    let codex = nvm_bin.join("codex");
+    std::fs::write(
+        &codex,
+        concat!(
+            "#!/bin/sh\n",
+            "out=\"\"\nprev=\"\"\n",
+            "for a in \"$@\"; do\n",
+            "  [ \"$prev\" = \"-o\" ] && out=\"$a\"\n",
+            "  prev=\"$a\"\n",
+            "done\n",
+            "[ -n \"$out\" ] || exit 2\n",
+            "printf '%s' '{\"summary\":\"Refactored the auth path.\",\"titles\":[]}' > \"$out\"\n"
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let out = fixture.brain_with_path(&["consolidate", "--force"], Some(&bin));
+    assert!(out.status.success(), "consolidate failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        stdout.contains("codex"),
+        "an nvm-installed CLI off PATH should still be reached: {stdout}"
+    );
+}

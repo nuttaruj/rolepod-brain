@@ -451,14 +451,22 @@ const PROGRAM_EXTENSIONS: &[&str] = &["", "exe", "cmd", "bat"];
 #[cfg(not(windows))]
 const PROGRAM_EXTENSIONS: &[&str] = &[""];
 
-/// Where `program` really is on `PATH`, if it is anywhere.
+/// Where `program` really is, if it is anywhere: `PATH` first, then the
+/// directories CLIs actually install into.
 ///
 /// Returns the full path rather than the bare name, because on Windows the
 /// difference between the two is whether the program can be started at all.
+///
+/// The fallback exists because of who spawns us. Consolidation runs from a
+/// hook, and a GUI-launched host hands its hooks launchd's minimal `PATH`.
+/// A real machine showed what that costs: claude primary (native installer,
+/// `~/.local/bin`, visible), codex working (an nvm `bin`, invisible) — when
+/// claude went down, every call skipped codex as "not installed" and floored
+/// every session to rule-based. The CLI was there the whole time; only the
+/// hook's `PATH` could not see it.
 #[must_use]
 pub fn resolve(program: &str) -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).find_map(|dir| {
+    let in_dir = |dir: &Path| {
         let candidate = dir.join(program);
         PROGRAM_EXTENSIONS.iter().find_map(|extension| {
             let candidate = if extension.is_empty() {
@@ -468,7 +476,37 @@ pub fn resolve(program: &str) -> Option<std::path::PathBuf> {
             };
             candidate.is_file().then_some(candidate)
         })
-    })
+    };
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .find_map(|dir| in_dir(&dir))
+        .or_else(|| fallback_dirs().iter().find_map(|dir| in_dir(dir)))
+}
+
+/// Where the CLIs in the table land when the caller's `PATH` misses them.
+///
+/// Only directories under the user's home: native installers
+/// (`~/.local/bin` — claude, cursor-agent, agy) and every nvm version's
+/// `bin`, newest first (codex and gemini are npm packages, and nvm is where
+/// npm usually puts them). System-wide directories like `/opt/homebrew/bin`
+/// are deliberately absent even though a brewed CLI can live there: a test
+/// that redirects `HOME` must be able to hide every CLI on the machine it
+/// runs on, and an absolute directory in this list would leak the host's
+/// real CLIs into every fixture. Windows hooks inherit the user's real
+/// environment, so it gets no list of its own.
+fn fallback_dirs() -> Vec<PathBuf> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    let mut dirs = vec![home.join(".local/bin")];
+    if let Ok(entries) = std::fs::read_dir(home.join(".nvm/versions/node")) {
+        let mut versions: Vec<PathBuf> =
+            entries.flatten().map(|entry| entry.path().join("bin")).collect();
+        versions.sort();
+        versions.reverse();
+        dirs.extend(versions);
+    }
+    dirs
 }
 
 /// Is a program on `PATH`?
