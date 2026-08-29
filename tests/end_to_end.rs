@@ -4633,6 +4633,52 @@ fn a_broken_preferred_cli_falls_through_to_the_next_vendor() {
     );
 }
 
+/// The report that made this row: the fallback WORKED, but doctor's capture
+/// row (`codex=1` — events codex produced) was read as "codex never
+/// answered", and the proof of the cascade sat in `session_state.last_tier`
+/// where only a SQL query finds it. Doctor now states who answered, so
+/// capture counts cannot be mistaken for summarizer usage.
+#[test]
+fn doctor_names_the_tier_that_answered_so_capture_counts_cannot_be_misread() {
+    let fixture = Fixture::new("doctor-answered");
+    fixture.seed_session(3);
+    fixture.fake_cli("claude", "echo 'API Error: 529 overloaded' >&2; exit 1");
+    let bin = fixture.fake_cli("gemini", GOOD_CLI);
+
+    let out = fixture.brain_with_path(&["consolidate", "--force"], Some(&bin));
+    assert!(out.status.success(), "consolidate failed: {out:?}");
+
+    let doctor = fixture.brain_with_path(&["doctor"], Some(&bin));
+    let report = String::from_utf8_lossy(&doctor.stdout).to_string();
+    assert!(
+        report.contains("answered by: gemini-cli=1"),
+        "doctor must say which tier answered, not leave it to the database: {report}"
+    );
+}
+
+/// The inverse shape is the one live warning: every session floored at
+/// rule-based while a CLI is visibly installed. That is what a hook running
+/// under a PATH that hides every CLI looks like — the machine both reports
+/// in this incident class had exactly this state, and nothing in doctor
+/// said so.
+#[test]
+fn every_session_stuck_on_rule_based_with_a_model_present_fails_doctor() {
+    let fixture = Fixture::new("doctor-stuck");
+    fixture.seed_session(3);
+    // No CLI reachable at consolidation time: the floor answers.
+    let out = fixture.brain(&["consolidate", "--force"]);
+    assert!(out.status.success(), "consolidate failed: {out:?}");
+
+    // Doctor runs where a CLI IS visible — a terminal PATH, not the hook's.
+    let bin = fixture.fake_cli("claude", "exit 0");
+    let doctor = fixture.brain_with_path(&["doctor"], Some(&bin));
+    let report = String::from_utf8_lossy(&doctor.stdout).to_string();
+    assert!(
+        report.contains("FAIL consolidation"),
+        "a model nobody ever reaches must be reported, not summed silently: {report}"
+    );
+}
+
 /// Same report, other common pair: claude down, codex behind it. Codex
 /// answers through the `-o` file, not stdout — the shape most machines
 /// would actually fall through to.

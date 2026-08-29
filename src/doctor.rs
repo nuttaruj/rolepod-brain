@@ -348,12 +348,13 @@ fn summarizer_checks(paths: &Paths) -> Vec<Check> {
     // Effective models, overrides applied: a report that shows the spec's
     // default while config runs something else is a report about a machine
     // that does not exist.
-    let overrides = Config::load(&paths.config_file()).unwrap_or_default().summarizer.models;
+    let summarizer_cfg = Config::load(&paths.config_file()).unwrap_or_default().summarizer;
     let (installed, missing): (Vec<_>, Vec<_>) = crate::summarizer::SPECS
         .iter()
         .partition(|spec| crate::summarizer::installed(spec.program));
+    let a_model_is_installed = !installed.is_empty();
     let installed: Vec<String> =
-        installed.iter().map(|spec| model_label(spec, &overrides)).collect();
+        installed.iter().map(|spec| model_label(spec, &summarizer_cfg.models)).collect();
 
     if installed.is_empty() {
         checks.push(Check::fail(
@@ -383,6 +384,13 @@ fn summarizer_checks(paths: &Paths) -> Vec<Check> {
     let live_rungs: Vec<&str> = crate::summarizer::SPECS.iter().map(|spec| spec.cli).collect();
 
     if let Ok(store) = Store::open(&paths.db()) {
+        if let Some(check) = consolidation_check(
+            &store.consolidation_tiers().unwrap_or_default(),
+            &summarizer_cfg.mode,
+            a_model_is_installed,
+        ) {
+            checks.push(check);
+        }
         for health in store.summarizer_health().unwrap_or_default() {
             if health.failures == 0 || !live_rungs.contains(&health.cli.as_str()) {
                 continue;
@@ -408,6 +416,48 @@ fn summarizer_checks(paths: &Paths) -> Vec<Check> {
         }
     }
     checks
+}
+
+/// Who has actually answered consolidation, from each session's last run.
+///
+/// The `capture` row counts events each CLI *produced*; nothing in the report
+/// said which CLI *answered*. That silence got filled: a reader took
+/// `codex=1` under capture as "the ladder never reached codex" and called the
+/// fallback broken, while the proof it worked sat in
+/// `session_state.last_tier`, where only a SQL query would find it. The
+/// report states it instead.
+///
+/// One shape IS a live warning: every session floored at rule-based while a
+/// model is installed and enabled. That is what a hook running under a PATH
+/// that hides every CLI looks like from the inside, and nothing else in the
+/// report can see it - the summarizer row checks THIS process's PATH, which
+/// is usually a terminal's, not the hook's.
+fn consolidation_check(
+    tiers: &[(String, i64)],
+    mode: &str,
+    a_model_is_installed: bool,
+) -> Option<Check> {
+    if tiers.is_empty() {
+        // The capture row already says nothing has happened yet.
+        return None;
+    }
+    let tally = tiers
+        .iter()
+        .map(|(tier, count)| format!("{tier}={count}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let stuck =
+        mode != "off" && a_model_is_installed && tiers.iter().all(|(tier, _)| tier == "rule-based");
+    if stuck {
+        return Some(Check::fail(
+            "consolidation",
+            format!(
+                "{tally} — a model is installed and enabled, yet no session has ever been \
+                 answered by one; the hook likely runs under a PATH that cannot see any CLI"
+            ),
+        ));
+    }
+    Some(Check::pass("consolidation", format!("answered by: {tally} (each session's last run)")))
 }
 
 /// Is our wiring actually present, for every CLI we know how to wire?
@@ -747,5 +797,34 @@ mod tests {
     fn missing_error_log_is_a_pass_not_a_failure() {
         let check = error_log_check(Path::new("/nonexistent/brain.log"));
         assert!(check.ok);
+    }
+
+    #[test]
+    fn the_consolidation_row_names_the_tier_that_answered() {
+        let tiers = vec![("claude-code".to_string(), 41), ("codex".to_string(), 3)];
+        let check = consolidation_check(&tiers, "auto", true).expect("sessions exist");
+        assert!(check.ok);
+        assert!(check.detail.contains("codex=3"), "{}", check.detail);
+    }
+
+    #[test]
+    fn nothing_consolidated_yet_adds_no_consolidation_row() {
+        assert!(consolidation_check(&[], "auto", true).is_none());
+    }
+
+    #[test]
+    fn every_session_stuck_on_rule_based_fails_only_when_a_model_could_answer() {
+        let stuck = vec![("rule-based".to_string(), 7)];
+        assert!(
+            !consolidation_check(&stuck, "auto", true).expect("row").ok,
+            "a model nobody ever reaches is the reported outage, not health"
+        );
+        // mode off: rule-based is what the user asked for.
+        assert!(consolidation_check(&stuck, "off", true).expect("row").ok);
+        // No CLI installed: the summarizer row already fails, and louder.
+        assert!(consolidation_check(&stuck, "auto", false).expect("row").ok);
+        // One model answer anywhere proves the ladder reaches a CLI.
+        let mixed = vec![("rule-based".to_string(), 7), ("codex".to_string(), 1)];
+        assert!(consolidation_check(&mixed, "auto", true).expect("row").ok);
     }
 }
