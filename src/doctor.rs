@@ -546,25 +546,33 @@ fn timer_check() -> Check {
     )
 }
 
-/// The core promise: nothing of ours is running right now.
+/// What of ours is running, if anything.
+///
+/// Named for what it reports rather than what it promises. It used to be
+/// called "no resident process", which read as a contradiction the moment
+/// anything was running - `no resident process  7 live` sent the first person
+/// to read it looking for a leak. There is no daemon to assert the absence of;
+/// the honest line is the count and what those processes are.
 ///
 /// This check runs inside a `brain` process, so it must not count itself.
 fn resident_check() -> Check {
     let Some(running) = running_brains() else {
-        return Check::fail("no resident process", "could not list processes");
+        return Check::fail("processes", "could not list processes");
     };
     let me = std::process::id();
     let stray: Vec<String> =
         running.into_iter().filter(|pid| *pid != me).map(|pid| format!("pid {pid}")).collect();
 
     if stray.is_empty() {
-        Check::pass("no resident process", "nothing of ours is running")
+        Check::pass("processes", "none running")
     } else {
-        // Not automatically wrong — an MCP server lives for the length of a
-        // session — but it is the one invariant worth showing plainly.
         Check::pass(
-            "no resident process",
-            format!("{} live: {} (expected only while a session is open)", stray.len(), stray.join(", ")),
+            "processes",
+            format!(
+                "{} MCP server(s), one per open session — {}",
+                stray.len(),
+                stray.join(", ")
+            ),
         )
     }
 }

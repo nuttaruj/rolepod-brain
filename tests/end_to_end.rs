@@ -1374,6 +1374,66 @@ fn a_correction_replaces_a_memory_rather_than_joining_it() {
 }
 
 #[test]
+fn the_health_check_can_be_asked_for_without_a_terminal() {
+    // Most of what fails in this project fails silently - a day of them was
+    // measured - and `brain doctor` is the only thing that says so. A user who
+    // never opens a terminal could not reach it, which made the one
+    // instruction worth giving ("run doctor now and then") the one nobody
+    // follows. It answers with the checks themselves rather than the rendered
+    // text, so an agent can name the failing one instead of quoting a wall.
+    let fixture = Fixture::new("mcp-doctor");
+    fixture.hook("claude-code", "PostToolUse", &claude_payload(&fixture.project));
+
+    let responses = fixture.mcp(&[
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"brain_doctor","arguments":{}}}"#,
+    ]);
+    let report = &responses[1]["result"]["structuredContent"];
+    let checks = report["checks"].as_array().expect("checks is a list");
+
+    assert!(checks.len() > 5, "a health report with {} checks is not one", checks.len());
+    assert!(
+        checks
+            .iter()
+            .all(|c| c["name"].is_string() && c["ok"].is_boolean() && c["detail"].is_string()),
+        "every check needs a name, a verdict and a line to show: {checks:?}"
+    );
+    assert!(
+        checks.iter().any(|c| c["name"] == "capture"),
+        "the check people actually ask about is missing: {checks:?}"
+    );
+
+    // The process line reports what is running rather than promising what is
+    // not. `no resident process  7 live` read as a contradiction to the first
+    // person who met it, and that person had been using this for a week.
+    let processes =
+        checks.iter().find(|c| c["name"] == "processes").expect("the process check lost its name");
+    assert!(
+        !processes["detail"].as_str().unwrap_or_default().contains("resident"),
+        "the line still promises an absence while listing a presence: {processes:?}"
+    );
+}
+
+#[test]
+fn where_memory_lives_is_answerable_in_the_conversation() {
+    let fixture = Fixture::new("mcp-where");
+    // Folded into the health report rather than a tool of its own: "is it
+    // working" and "where is it kept" are one question in a conversation.
+    let responses = fixture.mcp(&[
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"brain_doctor","arguments":{}}}"#,
+    ]);
+    let where_ = &responses[1]["result"]["structuredContent"];
+    for key in ["data_directory", "wiki", "project"] {
+        assert!(where_[key].is_string(), "`{key}` missing from {where_}");
+    }
+    assert!(
+        where_["wiki"].as_str().unwrap().contains("Rolepod Brain"),
+        "the wiki path should name the vault a person can open: {where_}"
+    );
+}
+
+#[test]
 fn mcp_recall_returns_what_was_captured() {
     let fixture = Fixture::new("mcp");
     fixture.hook("claude-code", "PostToolUse", &claude_payload(&fixture.project));
@@ -2230,6 +2290,47 @@ fn a_correction_takes_its_title_from_its_first_line() {
         after.contains("Token expiry is checked inclusively"),
         "the corrected claim is not what recall returns: {after}"
     );
+}
+
+#[test]
+fn every_skill_is_shipped_and_says_when_to_use_it() {
+    // A skill is a directory nobody compiles, so nothing here notices when one
+    // is added and left out of the package, or written without the front
+    // matter that decides whether it is ever invoked. Same shape as the
+    // installer flag that went undeclared for two days: not a bug in code, a
+    // gap in what is checked.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("plugins/rolepod-brain/skills");
+    let mut found = 0usize;
+    for entry in std::fs::read_dir(&root).expect("the skills directory ships with the plugin") {
+        let dir = entry.expect("readable entry").path();
+        if !dir.is_dir() {
+            continue;
+        }
+        found += 1;
+        let name = dir.file_name().unwrap().to_string_lossy().to_string();
+        let manifest = dir.join("SKILL.md");
+        let text = std::fs::read_to_string(&manifest)
+            .unwrap_or_else(|_| panic!("`{name}` has no SKILL.md, so it is a directory and not a skill"));
+
+        assert!(text.starts_with("---\n"), "`{name}` has no front matter");
+        let front = text.split("---").nth(1).unwrap_or_default();
+        assert!(
+            front.contains(&format!("name: {name}")),
+            "`{name}` declares a different name than its directory, so it is invoked by neither"
+        );
+        // The description is the whole of how a model decides to reach for it.
+        let described = front
+            .lines()
+            .find(|line| line.starts_with("description:"))
+            .map(|line| line.trim_start_matches("description:").trim().len())
+            .unwrap_or(0);
+        assert!(
+            described > 40,
+            "`{name}` has no usable description ({described} chars); nothing will ever trigger it"
+        );
+    }
+    assert!(found >= 3, "only {found} skill(s) found; the directory moved or emptied");
 }
 
 #[test]

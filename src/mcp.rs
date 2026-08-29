@@ -305,6 +305,20 @@ fn tool_definitions(local_rerank: bool) -> Value {
             },
         },
         {
+            "name": "brain_doctor",
+            "description": "Is this memory actually working? Runs the same checks \
+                            as `brain doctor` at a terminal and returns them as \
+                            data, one entry per check with `ok` and a `detail` \
+                            line - render it however suits the conversation. \
+                            Reach for it when the user asks whether brain is \
+                            working, when recall looks empty or stale, or when \
+                            anything about capture seems wrong. Most of what \
+                            fails here fails silently, and this is the only \
+                            thing that says so; a user who never opens a \
+                            terminal has no other way to find out.",
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
             "name": "brain_outline",
             "description": "What this project is, before you know what to ask. \
                             Returns durable knowledge, the subjects that recur \
@@ -463,6 +477,34 @@ fn call_tool(paths: &Paths, project: &str, session: &str, params: &Value) -> Res
             let hits = store.related(project, id, limit_from(&arguments))?;
             store.record_recalled(session, hits.iter().map(|hit| hit.id.as_str()))?;
             json!({ "hits": hits, "count": hits.len() })
+        }
+        "brain_doctor" => {
+            // The rendered text is for a terminal; an agent gets the checks
+            // themselves, so it can say which one failed rather than quote a
+            // wall of output.
+            //
+            // Where the memory lives rides along rather than being a tool of
+            // its own. "Is it working" and "where is it kept" are one question
+            // in a conversation, and a second call to answer the tail of the
+            // first is a tool nobody would think to make.
+            let checks = crate::doctor::run()?;
+            let failing = checks.iter().filter(|check| !check.ok).count();
+            let paths = Paths::resolve()?;
+            json!({
+                "ok": failing == 0,
+                "failing": failing,
+                "data_directory": paths.db().parent().map(|p| p.display().to_string()),
+                "wiki": paths.wiki().display().to_string(),
+                "project": project,
+                "checks": checks
+                    .iter()
+                    .map(|check| json!({
+                        "name": check.name,
+                        "ok": check.ok,
+                        "detail": check.detail,
+                    }))
+                    .collect::<Vec<_>>(),
+            })
         }
         "brain_outline" => {
             let outline = store.outline(project, limit_from(&arguments))?;
@@ -654,7 +696,7 @@ mod tests {
         for local_rerank in [false, true] {
             let tools = tool_definitions(local_rerank);
             let tools = tools.as_array().unwrap();
-            assert_eq!(tools.len(), 10);
+            assert_eq!(tools.len(), 11, "a tool was added or lost");
             for tool in tools {
                 assert!(tool.get("name").and_then(Value::as_str).is_some());
                 let description = tool.get("description").and_then(Value::as_str).unwrap();
