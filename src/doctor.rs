@@ -413,13 +413,29 @@ fn hook_checks() -> Vec<Check> {
         return vec![Check::fail("hooks", "cannot resolve home directory")];
     };
 
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
     targets
         .into_iter()
         // A CLI that is not installed is not a problem to report.
-        .filter(|target| target.hooks_file.parent().is_some_and(Path::is_dir))
+        .filter(crate::setup::config_dir_present)
         .map(|target| {
             let name = format!("hooks: {}", target.kind);
             let path = &target.hooks_file;
+
+            // A directory without the CLI is an IDE leftover or an old
+            // install, not something to wire — and never a FAIL: this can run
+            // inside an MCP server spawned with a minimal PATH, and a red row
+            // about the machine's PATH would teach people to ignore red rows.
+            if !crate::setup::binary_present(&target, &path_var) {
+                return Check::pass(
+                    &name,
+                    format!(
+                        "`{}` is not on PATH — nothing captures here, and `brain setup` \
+                         skips it",
+                        target.binaries.join("`/`"),
+                    ),
+                );
+            }
 
             // Codex installs through its own plugin flow, which is also what
             // grants the hooks permission to run - so the question is whether
@@ -509,7 +525,13 @@ fn trigger_checks() -> Vec<Check> {
     let Ok(targets) = crate::setup::targets(&exe) else { return Vec::new() };
     targets
         .into_iter()
-        .filter(|target| target.hooks_file.parent().is_some_and(Path::is_dir))
+        .filter(|target| {
+            crate::setup::config_dir_present(target)
+                && crate::setup::binary_present(
+                    target,
+                    &std::env::var_os("PATH").unwrap_or_default(),
+                )
+        })
         .map(|target| {
             let cli = target.kind.as_str().to_string();
             Check::pass(

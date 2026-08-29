@@ -910,6 +910,9 @@ fn an_installed_plugin_takes_over_the_mcp_registration() {
     let fixture = Fixture::new("pluginmcp");
     let home = fixture.home.parent().unwrap().to_path_buf();
     std::fs::create_dir_all(home.join(".cursor")).unwrap();
+    // The CLI itself has to exist: setup skips a directory with no
+    // executable behind it, and this test is about handover, not presence.
+    let bin = fixture.fake_cli("cursor-agent", "exit 0");
     std::fs::write(
         home.join(".cursor/mcp.json"),
         r#"{"mcpServers":{"brain":{"command":"/old/brain","args":["mcp"]},"other":{"command":"x"}}}"#,
@@ -917,7 +920,7 @@ fn an_installed_plugin_takes_over_the_mcp_registration() {
     .unwrap();
 
     // Without the plugin, setup owns the registration.
-    let plain = fixture.brain(&["setup", "--apply", "--cli", "cursor"]);
+    let plain = fixture.brain_with_path(&["setup", "--apply", "--cli", "cursor"], Some(&bin));
     assert!(plain.status.success(), "setup failed: {plain:?}");
     let servers = |label: &str| -> serde_json::Value {
         let text = std::fs::read_to_string(home.join(".cursor/mcp.json"))
@@ -930,7 +933,7 @@ fn an_installed_plugin_takes_over_the_mcp_registration() {
     // named after the plugin under the marketplace it came from.
     std::fs::create_dir_all(home.join(".cursor/plugins/cache/rolepod-brain/rolepod-brain")).unwrap();
 
-    let deferred = fixture.brain(&["setup", "--apply", "--cli", "cursor"]);
+    let deferred = fixture.brain_with_path(&["setup", "--apply", "--cli", "cursor"], Some(&bin));
     assert!(deferred.status.success(), "setup failed: {deferred:?}");
     let after = servers("deferred");
     assert!(
@@ -4527,4 +4530,71 @@ fn the_installer_does_not_overwrite_its_own_options() {
             );
         }
     }
+}
+
+/// The report that drove this: a one-line install on a machine with one CLI
+/// wrote hooks for six, because editors and old installs leave config
+/// directories behind and a directory was the whole presence test. The
+/// fixture's default PATH (`/usr/bin:/bin`) carries no CLI, so every
+/// directory here is exactly such a leftover.
+#[test]
+fn a_directory_left_by_an_editor_does_not_get_hooks() {
+    let fixture = Fixture::new("leftover-dirs");
+    let home = fixture.home.parent().unwrap().to_path_buf();
+    for dir in [".claude", ".cursor", ".gemini", ".gemini/config"] {
+        std::fs::create_dir_all(home.join(dir)).unwrap();
+    }
+
+    let output = fixture.brain(&["setup", "--apply"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        stdout.contains("is not on PATH — skipped"),
+        "setup should say why it wrote nothing:\n{stdout}"
+    );
+    for wrote in [".claude/settings.json", ".cursor/hooks.json", ".gemini/settings.json"] {
+        assert!(
+            !home.join(wrote).exists(),
+            "{wrote} was written for a CLI that is not on this machine"
+        );
+    }
+
+    // Doctor tells the same story: no hooks row may claim wired events, and
+    // the absence is stated, not painted red — this also runs inside MCP
+    // servers whose PATH can be minimal.
+    let report = String::from_utf8_lossy(&fixture.brain(&["doctor"]).stdout).to_string();
+    assert!(
+        !report.contains("event(s):"),
+        "doctor reported hooks for an absent CLI:\n{report}"
+    );
+    assert!(
+        report.contains("is not on PATH"),
+        "doctor should name what is missing:\n{report}"
+    );
+
+    // And the moment the CLI actually exists, the same directory is wired.
+    let bin = fixture.fake_cli("claude", "exit 0");
+    fixture.brain_with_path(&["setup", "--apply", "--cli", "claude-code"], Some(&bin));
+    assert!(
+        home.join(".claude/settings.json").exists(),
+        "a present CLI should still be wired"
+    );
+}
+
+/// `brain setup --apply` on a machine brain has never run on: the data
+/// directory does not exist yet, and the config template is the first thing
+/// that wants to live in it.
+#[test]
+fn the_config_template_survives_a_home_brain_has_never_seen() {
+    let fixture = Fixture::new("fresh-config-home");
+    std::fs::remove_dir_all(&fixture.home).unwrap();
+
+    let output = fixture.brain(&["setup", "--apply"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        !stdout.contains("could not write the config template"),
+        "the template needs its directory created first:\n{stdout}"
+    );
+    assert!(fixture.home.join("config.toml").exists(), "template missing:\n{stdout}");
 }

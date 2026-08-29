@@ -84,6 +84,12 @@ pub struct Target {
     pub grouped_events: &'static [&'static str],
     /// File holding lifecycle hooks.
     pub hooks_file: PathBuf,
+    /// Executable names that prove the CLI itself is on the machine. A config
+    /// directory alone does not: IDEs and uninstalled tools leave directories
+    /// behind (Cursor the editor makes `~/.cursor` without cursor-agent ever
+    /// existing), and hooks written next to that are clutter the user then has
+    /// to explain. Any one name resolving on PATH counts.
+    pub binaries: &'static [&'static str],
     /// Lifecycle events verified to exist for this CLI.
     pub events: &'static [&'static str],
     /// Value written as the hook timeout, in whatever unit this CLI reads.
@@ -122,6 +128,7 @@ pub fn targets_in(home: &Path, exe: &Path) -> Result<Vec<Target>> {
             layout: Layout::Grouped,
             grouped_events: &[],
             hooks_file: home.join(".claude/settings.json"),
+            binaries: &["claude"],
             timeout_overrides: &[],
             // `PreToolUse` is wired for one tool only. It is not a capture
             // surface - see `hook::captures` - it is there so that what we know
@@ -182,6 +189,7 @@ pub fn targets_in(home: &Path, exe: &Path) -> Result<Vec<Target>> {
             layout: Layout::External,
             grouped_events: &[],
             hooks_file: home.join(".codex/hooks.json"),
+            binaries: &["codex"],
             // Codex caps the SessionEnd hook at three seconds and prints
             // "clamping SessionEnd hook timeout to 3s" on every session when a
             // config asks for more. Capture still works, but a warning the
@@ -224,6 +232,7 @@ pub fn targets_in(home: &Path, exe: &Path) -> Result<Vec<Target>> {
             layout: Layout::Grouped,
             grouped_events: &[],
             hooks_file: home.join(".gemini/settings.json"),
+            binaries: &["gemini"],
             timeout_overrides: &[],
             matchers: &[],
             // Gemini names its lifecycle differently from the other two.
@@ -248,6 +257,7 @@ pub fn targets_in(home: &Path, exe: &Path) -> Result<Vec<Target>> {
             // the grouped shape, the rest as bare entries.
             grouped_events: &["PreToolUse", "PostToolUse"],
             hooks_file: home.join(".gemini/config/hooks.json"),
+            binaries: &["agy", "antigravity"],
             timeout_overrides: &[],
             matchers: &[],
             // Antigravity's own embedded docs list exactly five events:
@@ -275,6 +285,7 @@ pub fn targets_in(home: &Path, exe: &Path) -> Result<Vec<Target>> {
             // this machine, confirmed by the third-party plugin already
             // loading from it. The binary's own strings are ambiguous here.
             hooks_file: home.join(".config/opencode/plugins/rolepod-brain.js"),
+            binaries: &["opencode"],
             timeout_overrides: &[],
             matchers: &[],
             // Verified against the installed binary's own event names and a
@@ -290,6 +301,7 @@ pub fn targets_in(home: &Path, exe: &Path) -> Result<Vec<Target>> {
             layout: Layout::Flat,
             grouped_events: &[],
             hooks_file: home.join(".cursor/hooks.json"),
+            binaries: &["cursor-agent", "cursor"],
             timeout_overrides: &[],
             matchers: &[],
             // camelCase, a fifth spelling. `postToolUse` covers tool activity
@@ -395,7 +407,7 @@ pub fn uninstall(apply: bool) -> Result<Vec<Change>> {
     let mut changes = Vec::new();
 
     for target in targets(&exe)? {
-        if !cli_present(&target) {
+        if !config_dir_present(&target) {
             continue;
         }
         let label = target.kind.as_str().to_string();
@@ -531,6 +543,7 @@ fn strip_mcp(target: &Target, apply: bool) -> Vec<Change> {
 /// we refuse to overwrite a file we do not understand.
 pub fn run(only: Option<&str>, apply: bool) -> Result<Vec<Change>> {
     let exe = std::env::current_exe().context("locate our own binary")?;
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
     let mut changes = Vec::new();
 
     // A name nothing matches wired nothing and said nothing — the run looked
@@ -553,10 +566,26 @@ pub fn run(only: Option<&str>, apply: bool) -> Result<Vec<Change>> {
                 continue;
             }
         }
-        if !cli_present(&target) {
+        if !config_dir_present(&target) {
             changes.push(Change {
                 target: target.kind.as_str().to_string(),
                 detail: "not installed — skipped".to_string(),
+            });
+            continue;
+        }
+        if !binary_present(&target, &path_var) {
+            changes.push(Change {
+                target: target.kind.as_str().to_string(),
+                detail: format!(
+                    "`{}` is not on PATH — skipped (its directory {} exists, but an IDE \
+                     or an old install can leave that behind)",
+                    target.binaries.join("`/`"),
+                    target
+                        .hooks_file
+                        .parent()
+                        .map(|dir| dir.display().to_string())
+                        .unwrap_or_default(),
+                ),
             });
             continue;
         }
@@ -648,7 +677,13 @@ fn write_config_template(apply: bool) -> Vec<Change> {
         return Vec::new();
     }
     let detail = if apply {
-        match std::fs::write(&path, CONFIG_TEMPLATE) {
+        // On a machine brain has never run on, the data directory itself does
+        // not exist yet — the template is the first thing written into it.
+        let written = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&path, CONFIG_TEMPLATE));
+        match written {
             Ok(()) => format!("wrote {} (all defaults, commented out)", path.display()),
             Err(error) => format!("could not write the config template: {error}"),
         }
@@ -700,12 +735,45 @@ fn sweep_legacy_timer(apply: bool) -> Result<Vec<Change>> {
     }])
 }
 
-/// Is this CLI on the machine at all?
+/// Does this CLI's config directory exist?
 ///
-/// Presence is judged by its config directory: a CLI that has never run has
-/// nothing to wire into, and writing config for absent software is clutter.
-fn cli_present(target: &Target) -> bool {
+/// A CLI that has never run has nothing to wire into. This is also the whole
+/// of the uninstall gate: uninstall asks whether there is anything of ours to
+/// remove, and a directory is where it would be — gating removal on the
+/// binary too would strand our entries forever on exactly the machines where
+/// the CLI is already gone.
+pub fn config_dir_present(target: &Target) -> bool {
     target.hooks_file.parent().is_some_and(Path::is_dir)
+}
+
+/// Is the CLI itself on the machine — not merely its directory?
+///
+/// The directory alone proves nothing: IDEs and uninstalled tools leave
+/// directories behind, and a real install reported hooks wired for six CLIs
+/// on a machine that had one. `path_var` is threaded in rather than read
+/// here so a test can describe a machine other than the one it runs on —
+/// the same reason `targets_in` takes a home.
+///
+/// One special case: Claude Code's migrate-installer parks the binary at
+/// `~/.claude/local/claude` behind a shell alias, and an alias is invisible
+/// to a PATH walk — so a `local/` sibling of the config file counts too.
+pub fn binary_present(target: &Target, path_var: &std::ffi::OsStr) -> bool {
+    let found = |dir: &Path, name: &str| {
+        if dir.join(name).is_file() {
+            return true;
+        }
+        // Windows resolves commands through PATHEXT; npm shims are `.cmd`.
+        cfg!(windows)
+            && ["exe", "cmd", "bat"]
+                .iter()
+                .any(|ext| dir.join(format!("{name}.{ext}")).is_file())
+    };
+    target.binaries.iter().any(|name| {
+        std::env::split_paths(path_var)
+            .any(|dir| !dir.as_os_str().is_empty() && found(&dir, name))
+    }) || target.hooks_file.parent().is_some_and(|dir| {
+        target.binaries.iter().any(|name| found(&dir.join("local"), name))
+    })
 }
 
 /// Write (or preview) a plugin file.
@@ -1460,6 +1528,40 @@ fn shell_quote(input: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_leftover_directory_is_not_the_cli() {
+        let home = std::env::temp_dir().join(format!("brain-presence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".cursor")).unwrap();
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let path_var = std::env::join_paths([&bin]).unwrap();
+
+        let targets = targets_in(&home, Path::new("/opt/brain")).unwrap();
+        let cursor = targets.iter().find(|t| t.kind.as_str() == "cursor").unwrap();
+
+        assert!(config_dir_present(cursor), "the directory is there");
+        assert!(
+            !binary_present(cursor, &path_var),
+            "a directory with no executable behind it passed for the CLI"
+        );
+
+        // Either of the CLI's names on PATH settles it — cursor answers to
+        // both `cursor-agent` and `cursor`.
+        std::fs::write(bin.join("cursor-agent"), "#!/bin/sh\n").unwrap();
+        assert!(binary_present(cursor, &path_var));
+
+        // Claude Code's migrate-installer parks the binary at
+        // ~/.claude/local/claude behind a shell alias; nothing is on PATH.
+        let claude = targets.iter().find(|t| t.kind.as_str() == "claude-code").unwrap();
+        assert!(!binary_present(claude, &path_var));
+        std::fs::create_dir_all(home.join(".claude/local")).unwrap();
+        std::fs::write(home.join(".claude/local/claude"), "").unwrap();
+        assert!(binary_present(claude, &path_var), "the aliased install went unrecognized");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// The variables that decide where `dirs::home_dir()` points.
     ///
     /// `HOME` everywhere, and `USERPROFILE` as well on Windows, which is the
@@ -2073,6 +2175,7 @@ mod tests {
 
         let target = Target {
             kind: AgentKind::Codex,
+            binaries: &[],
             hooks_file: path.clone(),
             events: &["Stop"],
             timeout: HOOK_TIMEOUT_SECS,
@@ -2131,6 +2234,7 @@ mod tests {
 
         let target = Target {
             kind: AgentKind::Codex,
+            binaries: &[],
             hooks_file: path.clone(),
             events: &["Stop"],
             timeout: HOOK_TIMEOUT_SECS,
@@ -2174,6 +2278,7 @@ mod tests {
 
         let target = Target {
             kind: AgentKind::parse("antigravity"),
+            binaries: &[],
             layout: Layout::Namespaced,
             grouped_events: &["PostToolUse"],
             hooks_file: path.clone(),
@@ -2237,6 +2342,7 @@ mod tests {
 
         let target = Target {
             kind: AgentKind::parse("cursor"),
+            binaries: &[],
             layout: Layout::Flat,
             grouped_events: &[],
             hooks_file: path.clone(),
@@ -2324,6 +2430,7 @@ mod tests {
         let path = dir.join("hooks.json");
         let target = Target {
             kind: AgentKind::Codex,
+            binaries: &[],
             hooks_file: path.clone(),
             events: &["Stop"],
             timeout: HOOK_TIMEOUT_SECS,
