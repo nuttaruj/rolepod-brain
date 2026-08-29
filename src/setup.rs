@@ -1691,6 +1691,7 @@ mod tests {
             layout: Layout::Flat,
             grouped_events: &[],
             hooks_file: path.clone(),
+            binaries: &[],
             events: &["stop"],
             timeout: HOOK_TIMEOUT_SECS,
             timeout_overrides: &[],
