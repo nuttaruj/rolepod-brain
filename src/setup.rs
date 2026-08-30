@@ -617,6 +617,13 @@ const CONFIG_TEMPLATE: &str = r#"# rolepod-brain configuration.
 # change it; delete this file to return to all defaults. `brain doctor`
 # reports the effective settings.
 
+# [sync]
+# Multi-device sync, off by default - memory stays on this machine until you
+# run `brain sync init <dir>` yourself. The dir is any folder your machines
+# already share (iCloud, Dropbox, a NAS); bundles in it are encrypted, and
+# the key in sync.key never leaves your machines.
+# dir = "/path/to/shared/folder"
+
 [summarizer]
 # Which CLI's model writes the summaries.
 #   auto        borrow the CLI that produced the events, cheapest tier

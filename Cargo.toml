@@ -1,6 +1,6 @@
 [package]
 name = "rolepod-brain"
-version = "0.43.0"
+version = "0.44.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -24,8 +24,12 @@ local-rerank = ["dep:ort"]
 
 [dependencies]
 anyhow = "1"
+# Sync bundles are encrypted before they touch the user's shared folder -
+# the folder only ever sees ciphertext. Pure Rust, no unsafe in our use.
+chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
+getrandom = "0.3"
 jiff = "0.2"
 # `load-dynamic` is the whole reason every platform can have this. The crate's
 # own prebuilt onnxruntime is what demanded glibc 2.38 and what has no Intel

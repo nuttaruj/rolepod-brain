@@ -33,6 +33,19 @@ pub enum Existing {
 /// # Errors
 /// Returns an error when there is nothing to export or `tar` fails.
 pub fn export(archive: &Path) -> Result<String> {
+    export_members(archive, true)
+}
+
+/// The sync bundle: the wiki tree (which holds the logs) and nothing else.
+///
+/// A machine's config is its own - budgets, models and the sync dir itself
+/// differ per machine, and syncing them would fight the user's settings on
+/// every pull.
+pub fn export_wiki_only(archive: &Path) -> Result<String> {
+    export_members(archive, false)
+}
+
+fn export_members(archive: &Path, include_config: bool) -> Result<String> {
     let paths = Paths::resolve()?;
     let wiki = paths.wiki();
     anyhow::ensure!(wiki.is_dir(), "no wiki at {} to export", wiki.display());
@@ -42,7 +55,7 @@ pub fn export(archive: &Path) -> Result<String> {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| crate::config::WIKI_DIR.to_string());
     let mut members = vec![wiki_member];
-    if paths.config_file().is_file() {
+    if include_config && paths.config_file().is_file() {
         members.push("config.toml".to_string());
     }
 
@@ -65,6 +78,15 @@ pub fn export(archive: &Path) -> Result<String> {
 /// Returns an error when the archive is missing, a brain already exists and no
 /// policy was chosen, or unpacking fails.
 pub fn import(archive: &Path, existing: Existing) -> Result<String> {
+    import_counted(archive, existing).map(|(message, _)| message)
+}
+
+/// The same import, also saying how many events were new - what a sync
+/// loop needs to report without parsing its own message back.
+///
+/// # Errors
+/// As [`import`].
+pub fn import_counted(archive: &Path, existing: Existing) -> Result<(String, usize)> {
     anyhow::ensure!(archive.is_file(), "no archive at {}", archive.display());
     let paths = Paths::resolve()?;
     paths.ensure()?;
@@ -138,7 +160,7 @@ pub fn import(archive: &Path, existing: Existing) -> Result<String> {
         counts.events
     ));
 
-    Ok(notes.join("; "))
+    Ok((notes.join("; "), counts.events))
 }
 
 /// What a graft did, for the caller to report.

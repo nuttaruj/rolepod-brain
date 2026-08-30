@@ -579,6 +579,26 @@ summaries. Without a reachable CLI, synthesis simply does not run — deciding
 what recurs is a judgement, and a rule-based stand-in would produce confident
 nonsense.
 
+## Sync between your machines
+
+Off by default, forever — until you opt in, memory never leaves the machine.
+When you do, there is still no server and no account: point brain at any
+folder your machines already share, and everything is encrypted before it
+touches that folder.
+
+```sh
+brain sync init ~/Library/Mobile\ Documents/com~apple~CloudDocs/brain-sync
+# copy ~/.rolepod-brain/sync.key to your other machine (that IS the pairing)
+brain sync            # pull what the other machines said, push your own
+```
+
+The folder — iCloud, Dropbox, a NAS, a USB stick — only ever holds
+ciphertext bundles named by opaque store ids. Whoever hosts it learns
+nothing. Each machine writes only its own bundle, so there is nothing to
+conflict; merging is by event id, a repeat sync adds nothing, and a
+correction made on one machine lands on the others. A bundle written under
+a different key is reported and skipped, never absorbed.
+
 ## Retiring what nobody ever needed
 
 Memory grows. Most of the growth is raw observation bodies, and measured over

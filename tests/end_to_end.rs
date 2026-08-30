@@ -3180,18 +3180,105 @@ fn a_note_is_sanitized_like_any_captured_text() {
 }
 
 #[test]
-fn there_is_no_remote_sync_and_saying_so_is_the_point() {
-    // The wiki holds the architecture, decisions and dead ends of every
-    // project it watched. A command that quietly did nothing, or that reported
-    // success, would imply a backup exists somewhere it does not.
+fn sync_off_is_the_default_and_says_how_to_opt_in() {
+    // The old refusal survives as the default: an unconfigured `brain sync`
+    // must fail rather than quietly imply a backup exists somewhere, and
+    // memory leaves the machine only after the owner runs init themselves.
     let fixture = Fixture::new("nosync");
     fixture.seed_session(2);
     let output = fixture.brain(&["sync"]);
     assert!(!output.status.success(), "must not imply a sync happened");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("no remote sync"), "should say what it does not do: {stderr}");
-    assert!(stderr.contains("stays on this machine"), "and why");
-    assert!(stderr.contains("git"), "and where the local history actually is");
+    assert!(stderr.contains("not configured"), "should say sync is off: {stderr}");
+    assert!(stderr.contains("sync init"), "and how to opt in: {stderr}");
+}
+
+#[test]
+fn two_machines_one_brain_through_an_encrypted_folder() {
+    // Mode A end to end: a shared plain directory stands in for iCloud or
+    // Dropbox, holding only ciphertext. Pairing = copying one key file.
+    let marker = "[project]\nname = \"syncprop\"\n";
+    let a = Fixture::new("cloud-a");
+    let b = Fixture::new("cloud-b");
+    std::fs::write(a.project.join(".rolepod-brain.toml"), marker).unwrap();
+    std::fs::write(b.project.join(".rolepod-brain.toml"), marker).unwrap();
+    let shared = a.home.parent().unwrap().join("shared-folder");
+
+    let capture = |fixture: &Fixture, session: &str, prompt: &str| {
+        let payload = serde_json::json!({
+            "session_id": session,
+            "cwd": fixture.project,
+            "prompt": prompt
+        })
+        .to_string();
+        fixture.hook("claude-code", "UserPromptSubmit", &payload);
+    };
+    capture(&a, "0199a1f2-3c4d-7e8f-9012-3456789abc0a", "the alpha rendezvous fact");
+    capture(&b, "0199a1f2-3c4d-7e8f-9012-3456789abc0b", "the beta rendezvous fact");
+
+    let init_a = a.brain(&["sync", "init", shared.to_str().unwrap()]);
+    assert!(init_a.status.success(), "init A failed: {init_a:?}");
+    let init_b = b.brain(&["sync", "init", shared.to_str().unwrap()]);
+    assert!(init_b.status.success(), "init B failed: {init_b:?}");
+    // Pairing: B takes A's key.
+    std::fs::copy(a.home.join("sync.key"), b.home.join("sync.key")).unwrap();
+
+    // A publishes; B pulls it and publishes back; A pulls B.
+    assert!(a.brain(&["sync"]).status.success());
+    assert!(b.brain(&["sync"]).status.success());
+    assert!(a.brain(&["sync"]).status.success());
+
+    let on_b = String::from_utf8_lossy(&b.brain(&["search", "alpha"]).stdout).into_owned();
+    assert!(on_b.contains("alpha"), "A's fact never reached B: {on_b}");
+    let on_a = String::from_utf8_lossy(&a.brain(&["search", "beta"]).stdout).into_owned();
+    assert!(on_a.contains("beta"), "B's fact never reached A: {on_a}");
+
+    // Nothing new: a repeat sync gains zero events.
+    let again = b.brain(&["sync"]);
+    let stdout = String::from_utf8_lossy(&again.stdout).to_string();
+    assert!(stdout.contains("0 new event(s)"), "a repeat sync must gain nothing: {stdout}");
+
+    // The folder holds ciphertext only - no title, no id, no JSON.
+    for entry in std::fs::read_dir(&shared).unwrap().flatten() {
+        let bytes = std::fs::read(entry.path()).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains("rendezvous") && !text.contains("\"id\""),
+            "plaintext leaked into the shared folder: {}",
+            entry.path().display()
+        );
+    }
+}
+
+#[test]
+fn a_wrong_key_skips_the_bundle_and_says_so() {
+    // A foreign or corrupt bundle in the shared folder must not stop the
+    // owner's machines from converging - and must not be silently absorbed.
+    let marker = "[project]\nname = \"syncprop\"\n";
+    let a = Fixture::new("key-a");
+    let b = Fixture::new("key-b");
+    std::fs::write(a.project.join(".rolepod-brain.toml"), marker).unwrap();
+    std::fs::write(b.project.join(".rolepod-brain.toml"), marker).unwrap();
+    let shared = a.home.parent().unwrap().join("shared-folder");
+
+    let payload = serde_json::json!({
+        "session_id": "0199a1f2-3c4d-7e8f-9012-3456789abc0a",
+        "cwd": a.project,
+        "prompt": "the alpha rendezvous fact"
+    })
+    .to_string();
+    a.hook("claude-code", "UserPromptSubmit", &payload);
+
+    assert!(a.brain(&["sync", "init", shared.to_str().unwrap()]).status.success());
+    assert!(b.brain(&["sync", "init", shared.to_str().unwrap()]).status.success());
+    // No key copy: B minted its own, so A's bundle is unreadable to it.
+    assert!(a.brain(&["sync"]).status.success());
+    let out = b.brain(&["sync"]);
+    assert!(out.status.success(), "a foreign bundle must not be fatal: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(stdout.contains("skipped"), "the skip must be reported: {stdout}");
+    let hits = String::from_utf8_lossy(&b.brain(&["search", "alpha"]).stdout).into_owned();
+    assert!(!hits.contains("alpha"), "an unreadable bundle was absorbed: {hits}");
 }
 
 #[test]

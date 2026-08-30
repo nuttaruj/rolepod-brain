@@ -118,6 +118,11 @@ enum Commands {
         #[arg(long)]
         topic: Option<String>,
     },
+    /// Sync this brain with your other machines through a folder you own.
+    Sync {
+        #[command(subcommand)]
+        action: Option<SyncAction>,
+    },
     /// Drop the bodies of old, never-surfaced observations; keep every title and link.
     Retire {
         /// Only observations older than this many months.
@@ -172,8 +177,6 @@ enum Commands {
         /// What it should say instead.
         text: String,
     },
-    /// Explains why there is no remote sync.
-    Sync,
     /// Show where this directory's memory lives.
     Where {
         /// Print only where the embedding model belongs, and nothing else.
@@ -189,6 +192,15 @@ enum Commands {
         /// rebuilding the path, so the two can never disagree.
         #[arg(long)]
         reranker: bool,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum SyncAction {
+    /// Point this brain at a shared folder and mint the key.
+    Init {
+        /// A directory your machines already share (iCloud, Dropbox, NAS...).
+        dir: String,
     },
 }
 
@@ -298,6 +310,28 @@ fn run(command: Commands) -> Result<()> {
         Commands::Reindex => reindex(),
         Commands::Search { query, limit, topic } => search(&query, limit, topic.as_deref()),
         Commands::History { query, diff } => history::report(&query, diff),
+        Commands::Sync { action } => match action {
+            Some(SyncAction::Init { dir }) => {
+                println!("{}", sync::init(&dir)?);
+                Ok(())
+            }
+            None => {
+                let outcome = sync::run()?;
+                if outcome.pulled == 0 && outcome.skipped.is_empty() {
+                    println!("no peer bundles yet - this machine published its own");
+                } else {
+                    println!(
+                        "pulled {} bundle(s), {} new event(s)",
+                        outcome.pulled, outcome.gained
+                    );
+                }
+                for name in &outcome.skipped {
+                    println!("skipped {name} - wrong key or corrupt (not fatal)");
+                }
+                println!("pushed {} KB, encrypted", outcome.pushed_bytes / 1024);
+                Ok(())
+            }
+        },
         Commands::Retire { older_than_months, apply } => {
             let outcome = revise::retire(older_than_months, apply)?;
             let kb = outcome.bytes / 1024;
@@ -403,7 +437,6 @@ fn run(command: Commands) -> Result<()> {
             println!("Recorded as {}. Recall now returns your text instead.", outcome.id);
             Ok(())
         }
-        Commands::Sync => sync::run(),
         Commands::Where { models, reranker } => where_am_i(models, reranker),
     }
 }

@@ -31,6 +31,7 @@ pub struct Config {
     pub injection: InjectionConfig,
     pub sanitize: SanitizeConfig,
     pub search: SearchConfig,
+    pub sync: SyncConfig,
 }
 
 /// What happens after the index has answered.
@@ -44,6 +45,14 @@ pub struct SearchConfig {
     /// session, and text relevance is already right most of the time. Turn it
     /// on if your searches return the right entry in the wrong place.
     pub rerank: bool,
+}
+
+/// Where sync bundles go, when the owner opts in. `None` - the default,
+/// forever - means memory never leaves this machine.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyncConfig {
+    pub dir: Option<std::path::PathBuf>,
 }
 
 /// Which model tier consolidates, if any.

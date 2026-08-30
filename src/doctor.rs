@@ -93,6 +93,7 @@ pub fn run() -> Result<Vec<Check>> {
     checks.extend(trigger_checks());
     checks.push(timer_check());
     checks.push(resident_check());
+    checks.push(sync_check(&paths));
     checks.push(error_log_check(&paths.log_file()));
 
     Ok(checks)
@@ -703,6 +704,35 @@ fn running_brains() -> Option<Vec<u32>> {
             })
             .collect(),
     )
+}
+
+/// Whether this brain syncs anywhere, which is off unless the owner said so.
+fn sync_check(paths: &Paths) -> Check {
+    let config = Config::load(&paths.config_file()).unwrap_or_default();
+    let Some(dir) = config.sync.dir else {
+        return Check::pass(
+            "sync",
+            "off - memory stays on this machine (`brain sync init <dir>` to opt in)",
+        );
+    };
+    if !paths.data_dir.join("sync.key").is_file() {
+        return Check::fail(
+            "sync",
+            format!("{} configured but sync.key is missing - run `brain sync init`", dir.display()),
+        );
+    }
+    if !dir.is_dir() {
+        return Check::fail("sync", format!("configured dir {} does not exist", dir.display()));
+    }
+    let bundles = std::fs::read_dir(&dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".brain.enc"))
+                .count()
+        })
+        .unwrap_or(0);
+    Check::pass("sync", format!("{} - {bundles} bundle(s), key present", dir.display()))
 }
 
 /// Recent capture failures. Hooks never print to the host CLI, so this file is
