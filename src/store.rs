@@ -1679,6 +1679,7 @@ impl Store {
                         files: serde_json::from_str(&files).unwrap_or_default(),
                         links: Vec::new(),
                         topic: row.get(11)?,
+                        origin: None,
                         consolidated: row.get::<_, i32>(12)? != 0,
                         extra: serde_json::Map::new(),
                     })

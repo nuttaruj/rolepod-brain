@@ -1733,6 +1733,203 @@ esac
 }
 
 #[test]
+fn the_same_repo_is_the_same_project_wherever_it_lives() {
+    // Identity anchored to the root commit: clone the repo to a second
+    // path and events from both checkouts land in one brain. This is what
+    // makes a future multi-device sync converge without asking anyone
+    // anything.
+    let fixture = Fixture::new("gitident");
+    run_in(&fixture.project, "git", &["config", "user.email", "t@example.invalid"]);
+    run_in(&fixture.project, "git", &["config", "user.name", "t"]);
+    std::fs::write(fixture.project.join("README.md"), "hello").unwrap();
+    run_in(&fixture.project, "git", &["add", "."]);
+    run_in(&fixture.project, "git", &["commit", "-q", "-m", "root"]);
+
+    let capture = |cwd: &Path, session: &str| {
+        let payload = serde_json::json!({
+            "session_id": session,
+            "cwd": cwd,
+            "prompt": "an identity probe"
+        })
+        .to_string();
+        fixture.hook("claude-code", "UserPromptSubmit", &payload);
+    };
+    capture(&fixture.project, "0199a1f2-3c4d-7e8f-9012-3456789abc01");
+
+    let base = fixture.project.parent().unwrap();
+    run_in(base, "git", &["clone", "-q", fixture.project.to_str().unwrap(), "checkout-two"]);
+    capture(&base.join("checkout-two"), "0199a1f2-3c4d-7e8f-9012-3456789abc02");
+
+    let projects: std::collections::HashSet<String> = fixture
+        .log_text()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|line| line["project"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(projects.len(), 1, "two checkouts of one repo split the brain: {projects:?}");
+}
+
+#[test]
+fn an_existing_project_never_changes_identity() {
+    // The rungs below the cache may disagree with history - a repo that
+    // gains its first commit after memory exists would suddenly anchor to
+    // git - but memory written under an id must keep answering to it, even
+    // when the identity cache is gone (a store upgraded from before the
+    // ladder has none).
+    let fixture = Fixture::new("oldident");
+    let capture = |session: &str| {
+        let payload = serde_json::json!({
+            "session_id": session,
+            "cwd": fixture.project,
+            "prompt": "an identity probe"
+        })
+        .to_string();
+        fixture.hook("claude-code", "UserPromptSubmit", &payload);
+    };
+    // No commits yet: identity falls back to the path, the old rule.
+    capture("0199a1f2-3c4d-7e8f-9012-3456789abc01");
+
+    run_in(&fixture.project, "git", &["config", "user.email", "t@example.invalid"]);
+    run_in(&fixture.project, "git", &["config", "user.name", "t"]);
+    std::fs::write(fixture.project.join("README.md"), "hello").unwrap();
+    run_in(&fixture.project, "git", &["add", "."]);
+    run_in(&fixture.project, "git", &["commit", "-q", "-m", "root"]);
+    let _ = std::fs::remove_dir_all(fixture.home.join("identity"));
+
+    capture("0199a1f2-3c4d-7e8f-9012-3456789abc02");
+
+    let projects: std::collections::HashSet<String> = fixture
+        .log_text()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|line| line["project"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        projects.len(),
+        1,
+        "a first commit re-keyed a project that already had memory: {projects:?}"
+    );
+}
+
+#[test]
+fn an_event_carries_the_store_that_wrote_it() {
+    // Provenance for a future multi-store merge cannot be reconstructed
+    // after the fact, so every append stamps which store wrote the line -
+    // and the id is minted inside the isolated home, never derived from
+    // anything about the machine.
+    let fixture = Fixture::new("origin");
+    for n in 0..2 {
+        let payload = serde_json::json!({
+            "session_id": format!("0199a1f2-3c4d-7e8f-9012-3456789abc0{n}"),
+            "cwd": fixture.project,
+            "prompt": format!("observation number {n}")
+        })
+        .to_string();
+        fixture.hook("claude-code", "UserPromptSubmit", &payload);
+    }
+    let log = fixture.log_text();
+    let origins: Vec<String> = log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|line| line["origin"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(origins.len(), 2, "every appended event must be stamped: {log}");
+    assert_eq!(origins[0], origins[1], "one store, one origin");
+    assert!(
+        fixture.home.join("origin").is_file(),
+        "the store id must live inside the isolated home"
+    );
+}
+
+#[test]
+fn merging_two_stores_is_idempotent_order_blind_and_carries_revisions() {
+    // The sync contract, as a test instead of a document: export/import
+    // --merge must converge to one log whichever direction it runs, a
+    // repeat import must add nothing, and a revision made on one store
+    // must land on the other store's event after the trip.
+    let marker = "[project]\nname = \"syncprop\"\n";
+    let a = Fixture::new("sync-a");
+    let b = Fixture::new("sync-b");
+    std::fs::write(a.project.join(".rolepod-brain.toml"), marker).unwrap();
+    std::fs::write(b.project.join(".rolepod-brain.toml"), marker).unwrap();
+
+    let capture = |fixture: &Fixture, session: &str, prompt: &str| {
+        let payload = serde_json::json!({
+            "session_id": session,
+            "cwd": fixture.project,
+            "prompt": prompt
+        })
+        .to_string();
+        fixture.hook("claude-code", "UserPromptSubmit", &payload);
+    };
+    capture(&a, "0199a1f2-3c4d-7e8f-9012-3456789abc0a", "the alpha rendezvous fact");
+    capture(&b, "0199a1f2-3c4d-7e8f-9012-3456789abc0b", "the beta rendezvous fact");
+
+    let archive_a = a.home.parent().unwrap().join("a.tar.gz");
+    let out = a.brain(&["export", archive_a.to_str().unwrap()]);
+    assert!(out.status.success(), "export A failed: {out:?}");
+
+    // A's fact lands in B, and a second import of the same archive is a
+    // no-op rather than a duplicate.
+    let first = b.brain(&["import", archive_a.to_str().unwrap(), "--merge"]);
+    assert!(first.status.success(), "import into B failed: {first:?}");
+    let again = b.brain(&["import", archive_a.to_str().unwrap(), "--merge"]);
+    let stdout = String::from_utf8_lossy(&again.stdout).to_string();
+    assert!(stdout.contains("0 new event(s)"), "a repeat import must add nothing: {stdout}");
+    let hits = String::from_utf8_lossy(&b.brain(&["search", "alpha"]).stdout).into_owned();
+    assert!(hits.contains("alpha"), "A's fact never reached B: {hits}");
+
+    // B corrects A's event - a revision crossing stores.
+    let alpha_id = b
+        .log_text()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|line| {
+            line["title"].as_str().is_some_and(|title| title.contains("alpha"))
+        })
+        .and_then(|line| line["id"].as_str().map(str::to_string))
+        .expect("alpha event in B's log");
+    let call = |name: &str, args: String| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{name}","arguments":{args}}}}}"#
+        )
+    };
+    let search = call("brain_search", r#"{"query":"alpha"}"#.to_string());
+    let correct = call(
+        "brain_correct",
+        format!(r#"{{"id":"{alpha_id}","text":"the gamma rendezvous correction"}}"#),
+    );
+    let result = b.mcp(&[&search, &correct]);
+    let text = serde_json::to_string(&result).unwrap_or_default();
+    assert!(!text.contains("has not been surfaced"), "correction refused: {text}");
+
+    // The round trip: B's log (with the revision) flows back into A.
+    let archive_b = b.home.parent().unwrap().join("b.tar.gz");
+    let out = b.brain(&["export", archive_b.to_str().unwrap()]);
+    assert!(out.status.success(), "export B failed: {out:?}");
+    let back = a.brain(&["import", archive_b.to_str().unwrap(), "--merge"]);
+    assert!(back.status.success(), "import into A failed: {back:?}");
+
+    // Order-blind: both stores hold the same set of events.
+    let ids = |log: &str| {
+        let mut ids: Vec<String> = log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|line| line["id"].as_str().map(str::to_string))
+            .collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(ids(&a.log_text()), ids(&b.log_text()), "the stores did not converge");
+
+    // The revision made on B governs what A now remembers.
+    let corrected = String::from_utf8_lossy(&a.brain(&["search", "gamma"]).stdout).into_owned();
+    assert!(corrected.contains("gamma"), "B's correction never landed on A: {corrected}");
+    let beta = String::from_utf8_lossy(&a.brain(&["search", "beta"]).stdout).into_owned();
+    assert!(beta.contains("beta"), "B's own fact never reached A: {beta}");
+}
+
+#[test]
 fn retire_drops_only_the_bodies_nobody_ever_needed() {
     // Retention was deferred until it could be measured; the command is
     // the measurement (dry-run default), and the rule is usage-beats-age:

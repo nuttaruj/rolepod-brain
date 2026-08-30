@@ -142,6 +142,12 @@ pub struct Event {
     /// field means.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
+    /// Which store appended this line. Stamped at append time, absent on
+    /// events written before the field existed. Provenance for a future
+    /// multi-store merge: which replica wrote what cannot be reconstructed
+    /// after the fact, so it is recorded now, needed or not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
     /// Local processing state — deliberately NOT part of the sync contract.
     #[serde(default)]
     pub consolidated: bool,
@@ -176,9 +182,21 @@ impl Event {
             files: Vec::new(),
             links: Vec::new(),
             topic: None,
+            origin: None,
             consolidated: false,
             extra: serde_json::Map::new(),
         }
+    }
+
+    /// Is this event ABOUT another event - a tombstone, a retirement, a
+    /// correction or a flag? Replay applies these after everything they
+    /// could target, because cross-machine clocks make id order unreliable
+    /// between writers.
+    #[must_use]
+    pub fn is_revision(&self) -> bool {
+        matches!(self.kind, EventKind::Tombstone | EventKind::Retire)
+            || (self.kind == EventKind::Note
+                && matches!(self.source.hook.as_str(), "correct" | "feedback"))
     }
 
     /// Month bucket this event belongs to, from its own timestamp.
@@ -225,7 +243,14 @@ impl EventLog {
     /// Returns an error when the file cannot be opened, written, or synced.
     pub fn append(&self, event: &Event) -> Result<()> {
         let path = self.file_for(&event.month());
-        let mut line = serde_json::to_string(event).context("serialize event")?;
+        // Stamp which store wrote this line, unless the caller already knows
+        // better (an import replaying another machine's events must keep
+        // their origin, not claim it).
+        let mut event = event.clone();
+        if event.origin.is_none() {
+            event.origin = crate::ids::origin();
+        }
+        let mut line = serde_json::to_string(&event).context("serialize event")?;
         line.push('\n');
 
         let mut file = OpenOptions::new()
@@ -279,7 +304,20 @@ impl EventLog {
                 }
             }
         }
-        events.sort_by(|a, b| a.id.cmp(&b.id));
+        // ULID order is causal order on one machine, and only there. A
+        // clock running ahead on another machine can hand a correction an
+        // id SMALLER than the event it corrects; replayed in pure id order
+        // that correction runs before its target exists, its UPDATE lands
+        // on no row, and the revision silently evaporates on the very
+        // rebuild that was supposed to reproduce it. So: everything a
+        // revision could target replays first, revisions after, id order
+        // within each half (two corrections of one event stay last-wins).
+        // Complete in two passes because revisions never target revisions -
+        // correction and feedback notes are excluded from every surface, so
+        // nothing can cite one.
+        events.sort_by(|a, b| {
+            (a.is_revision(), &a.id).cmp(&(b.is_revision(), &b.id))
+        });
         Ok((events, skipped))
     }
 }
@@ -287,6 +325,35 @@ impl EventLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_correction_from_a_fast_clock_still_lands_on_its_target() {
+        // Another machine's clock running ahead gives a correction an id
+        // SMALLER than the event it corrects. Pure id order would replay
+        // it first, into nothing.
+        let dir = std::env::temp_dir().join(format!("brain-skew-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let log = EventLog::open(&dir).unwrap();
+
+        let mut target = sample();
+        target.id = "01TESTTARGET000000000000ZZ".to_string();
+        let mut correction = sample();
+        correction.id = "01TESTCORRECTION00000000AA".to_string();
+        correction.kind = EventKind::Note;
+        correction.source.hook = "correct".to_string();
+        correction.links = vec![target.id.clone()];
+
+        log.append(&correction).unwrap();
+        log.append(&target).unwrap();
+        let (events, skipped) = log.read_all().unwrap();
+        assert_eq!(skipped, 0);
+        assert_eq!(
+            events.iter().map(|event| event.id.as_str()).collect::<Vec<_>>(),
+            vec![target.id.as_str(), correction.id.as_str()],
+            "a revision must replay after anything it could target"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn sample() -> Event {
         Event::new(

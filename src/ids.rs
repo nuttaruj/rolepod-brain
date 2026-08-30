@@ -131,6 +131,144 @@ struct MarkerProject {
     name: Option<String>,
 }
 
+/// A project's id, preferring anchors that survive a change of machine.
+///
+/// In order:
+///
+/// 1. An id this store already uses for this root - the identity cache, or a
+///    project directory named with the old path-derived id. Memory written
+///    under an id must keep answering to it, so an existing project never
+///    changes identity, whatever the rungs below would say.
+/// 2. The repository's root commit: same repo, any checkout, any path, any
+///    machine. Skipped in a shallow clone, whose grafted "root" is a lie
+///    that differs from the real one.
+/// 3. The origin remote URL, normalized, for the shallow case.
+/// 4. The root path - exactly the old rule, for projects with no git at all.
+///
+/// Only reached for git repositories; anything else keeps pure path
+/// semantics with no IO. The chosen id is cached under
+/// `data/identity/<path-id>`, so the git subprocesses run once per project,
+/// not once per event.
+fn stable_project_id(root: &Path, workspace: &str, project: &str) -> Uuid {
+    let path_id = Uuid::new_v5(&NAMESPACE, root.to_string_lossy().as_bytes());
+    if git_root(root).is_none() {
+        return path_id;
+    }
+    let Ok(paths) = crate::config::Paths::resolve() else { return path_id };
+
+    let cache = paths.data_dir.join("identity").join(path_id.simple().to_string());
+    if let Some(cached) =
+        std::fs::read_to_string(&cache).ok().and_then(|text| text.trim().parse::<Uuid>().ok())
+    {
+        return cached;
+    }
+
+    // A directory named with the path-derived id is a project from before
+    // this ladder existed; renaming it would orphan its memory.
+    let candidate = ProjectScope {
+        workspace: workspace.to_string(),
+        workspace_id: Uuid::new_v5(&NAMESPACE, workspace.as_bytes()),
+        project: project.to_string(),
+        project_id: path_id,
+        root: root.to_path_buf(),
+    };
+    let chosen = if paths.project_dir(&candidate).is_dir() {
+        path_id
+    } else if let Some(anchor) = git_anchor(root) {
+        Uuid::new_v5(&NAMESPACE, anchor.as_bytes())
+    } else {
+        path_id
+    };
+
+    if paths.data_dir.is_dir() {
+        let _ = std::fs::create_dir_all(cache.parent().unwrap_or(&paths.data_dir));
+        let _ = std::fs::write(&cache, chosen.to_string());
+    }
+    chosen
+}
+
+/// The machine-independent anchor of a repository, if it has one.
+fn git_anchor(root: &Path) -> Option<String> {
+    let shallow = git(root, &["rev-parse", "--is-shallow-repository"])?;
+    if shallow != "true" {
+        // Oldest root commit, and the smallest hash when a merged history
+        // has several - any deterministic pick works, as long as every
+        // machine makes the same one.
+        if let Some(roots) = git(root, &["rev-list", "--max-parents=0", "HEAD"]) {
+            if let Some(first) = roots.lines().map(str::trim).filter(|l| !l.is_empty()).min() {
+                return Some(format!("git-root:{first}"));
+            }
+        }
+    }
+    let url = git(root, &["remote", "get-url", "origin"])?;
+    Some(format!("git-remote:{}", normalize_remote(&url)))
+}
+
+/// One git question, answered or None - a repo with no commits or no remote
+/// answers some of these with an error, which is an answer too.
+fn git(root: &Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("ROLEPOD_BRAIN_WORKER", "1")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+/// The same repository spelled every way people spell it.
+///
+/// `git@github.com:user/repo.git`, `ssh://git@github.com/user/repo` and
+/// `https://github.com/user/repo` are one project, not three.
+fn normalize_remote(url: &str) -> String {
+    let mut rest = url.trim().to_ascii_lowercase();
+    for prefix in ["https://", "http://", "ssh://", "git://"] {
+        if let Some(stripped) = rest.strip_prefix(prefix) {
+            rest = stripped.to_string();
+            break;
+        }
+    }
+    if let Some(stripped) = rest.strip_prefix("git@") {
+        rest = stripped.replacen(':', "/", 1);
+    }
+    rest.trim_end_matches('/').trim_end_matches(".git").to_string()
+}
+
+/// The stable id of this store, minted once and stamped on every event this
+/// machine appends from then on.
+///
+/// Random rather than derived: a hostname is personal data and machines get
+/// renamed, while a store id is neither and never changes. `None` when there
+/// is no data directory yet - stamping must never CREATE state as a side
+/// effect of serializing an event.
+pub fn origin() -> Option<String> {
+    static ORIGIN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    ORIGIN
+        .get_or_init(|| {
+            let paths = crate::config::Paths::resolve().ok()?;
+            if !paths.data_dir.is_dir() {
+                return None;
+            }
+            let path = paths.data_dir.join("origin");
+            if let Ok(existing) = std::fs::read_to_string(&path) {
+                let existing = existing.trim().to_string();
+                if !existing.is_empty() {
+                    return Some(existing);
+                }
+            }
+            let minted = ulid::Ulid::new().to_string();
+            std::fs::write(&path, &minted).ok()?;
+            Some(minted)
+        })
+        .clone()
+}
+
+
 /// Resolve the project scope for a working directory.
 ///
 /// Never fails: an unreadable or malformed marker is ignored in favour of the
@@ -175,7 +313,7 @@ pub fn resolve_scope(cwd: &Path) -> ProjectScope {
     // it is an explicit act, so that trade is the user's to make.
     let project_id = match marker_named {
         true => Uuid::new_v5(&NAMESPACE, format!("project:{project}").as_bytes()),
-        false => Uuid::new_v5(&NAMESPACE, root.to_string_lossy().as_bytes()),
+        false => stable_project_id(&root, &workspace, &project),
     };
     let workspace_id = Uuid::new_v5(&NAMESPACE, workspace.as_bytes());
 
@@ -352,6 +490,18 @@ mod tests {
         assert_eq!(strip_dir_suffix("notes--drafts"), "notes--drafts");
         assert_eq!(strip_dir_suffix("api--v2"), "api--v2");
         assert_eq!(strip_dir_suffix("x--12345"), "x--12345", "wrong length is not our suffix");
+    }
+
+    #[test]
+    fn every_spelling_of_one_remote_is_one_project() {
+        for url in [
+            "git@github.com:User/Repo.git",
+            "https://github.com/user/repo",
+            "ssh://git@github.com/user/repo.git",
+            "https://github.com/user/repo/",
+        ] {
+            assert_eq!(normalize_remote(url), "github.com/user/repo", "{url}");
+        }
     }
 
     #[test]
