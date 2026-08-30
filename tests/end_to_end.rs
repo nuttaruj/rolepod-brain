@@ -1713,6 +1713,207 @@ esac
 /// A stub that fails the way a rate-limited CLI does.
 const FAILING_CLI: &str = "echo 'rate limit exceeded' >&2; exit 1";
 
+/// A stub for the rule tier: on a synthesis call it lifts the correction ids
+/// out of the CORRECTIONS section and answers with two rules - one citing
+/// both corrections, one citing only the first. Only the first may survive.
+fn rule_cli() -> String {
+    r#"
+case "$*" in
+  *"CORRECTIONS"*)
+    IDS=$(echo "$*" | sed -n '/--- CORRECTIONS ---/,/--- SESSION SUMMARIES ---/p' | grep -oE 'id=[0-9A-Z]{26}' | cut -d= -f2)
+    A=$(echo "$IDS" | head -1)
+    B=$(echo "$IDS" | head -2 | tail -1)
+    echo '{"knowledge":[{"kind":"rule","title":"Always run the linter before committing","body":"The user corrected this twice.","sources":["'"$A"'","'"$B"'"]},{"kind":"rule","title":"A rule nobody asked for twice","body":"Cited one correction.","sources":["'"$A"'"]}]}' ;;
+  *"SESSION SUMMARIES"*)
+    echo '{"knowledge":[]}' ;;
+  *) echo '{"summary":"Refactored the auth path.","titles":[]}' ;;
+esac
+"#
+    .to_string()
+}
+
+#[test]
+fn retire_drops_only_the_bodies_nobody_ever_needed() {
+    // Retention was deferred until it could be measured; the command is
+    // the measurement (dry-run default), and the rule is usage-beats-age:
+    // a body anyone ever saw survives, and identity survives always.
+    let fixture = Fixture::new("retire");
+    for (n, prompt) in [
+        (1, "keep the following\nthe alpha rendezvous cipher value"),
+        (2, "note the following\nthe zeta rendezvous cipher value"),
+    ] {
+        let payload = serde_json::json!({
+            "session_id": format!("0199a1f2-3c4d-7e8f-9012-3456789abc0{n}"),
+            "cwd": fixture.project,
+            "prompt": prompt
+        })
+        .to_string();
+        fixture.hook("claude-code", "UserPromptSubmit", &payload);
+    }
+    // Consolidated by a model tier - retirement never touches raw work in
+    // flight.
+    let bin = fixture.fake_cli("claude", GOOD_CLI);
+    let done = fixture.brain_with_path(&["consolidate", "--force"], Some(&bin));
+    assert!(done.status.success(), "consolidate failed: {done:?}");
+
+    // Surface the alpha event: one search is all it takes to be "used".
+    let search = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"brain_search","arguments":{"query":"alpha"}}}"#;
+    let found = fixture.mcp(&[search]);
+    let found = serde_json::to_string(&found).unwrap_or_default();
+    assert!(found.contains("alpha"), "the search never surfaced alpha: {found}");
+
+    // Dry run: a number, and no change.
+    let dry = fixture.brain(&["retire", "--older-than-months", "0"]);
+    assert!(dry.status.success(), "retire dry-run failed: {dry:?}");
+    let stdout = String::from_utf8_lossy(&dry.stdout).to_string();
+    assert!(stdout.contains("Would retire 1"), "wrong dry-run count: {stdout}");
+    assert!(!fixture.log_text().contains("\"kind\":\"retire\""), "a dry run wrote to the log");
+
+    let applied = fixture.brain(&["retire", "--older-than-months", "0", "--apply"]);
+    assert!(applied.status.success(), "retire apply failed: {applied:?}");
+    assert!(fixture.log_text().contains("\"kind\":\"retire\""), "no retire event in the log");
+
+    // The unseen body is gone from search; the seen one and every title stay.
+    let gone = String::from_utf8_lossy(&fixture.brain(&["search", "zeta"]).stdout).into_owned();
+    assert!(!gone.contains("zeta"), "a retired body still matched: {gone}");
+    let kept = String::from_utf8_lossy(&fixture.brain(&["search", "alpha"]).stdout).into_owned();
+    assert!(kept.contains("alpha"), "a surfaced body was retired: {kept}");
+    let title = String::from_utf8_lossy(&fixture.brain(&["search", "note the following"]).stdout)
+        .into_owned();
+    assert!(title.contains("note the following"), "the title must stay findable: {title}");
+
+    // A rebuild replays the retirement rather than resurrecting the body.
+    let reindexed = fixture.brain(&["reindex"]);
+    assert!(reindexed.status.success(), "reindex failed: {reindexed:?}");
+    let after = String::from_utf8_lossy(&fixture.brain(&["search", "zeta"]).stdout).into_owned();
+    assert!(!after.contains("zeta"), "reindex resurrected a retired body: {after}");
+}
+
+#[test]
+fn brain_seed_hands_a_subagent_lessons_and_task_pointers_in_one_call() {
+    // khwan's seed_text, kept local: one MCP call returns a paste-ready
+    // block. It is a pull surface - recorded as recalled like a search hit,
+    // so the correction gate and uptake both see what was handed over.
+    let fixture = Fixture::new("seed");
+    let payload = serde_json::json!({
+        "session_id": "0199a1f2-3c4d-7e8f-9012-3456789abcde",
+        "cwd": fixture.project,
+        "prompt": "the scheduler double-books on Tuesdays"
+    })
+    .to_string();
+    fixture.hook("claude-code", "UserPromptSubmit", &payload);
+
+    let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"brain_seed","arguments":{"task":"scheduler"}}}"#
+        .to_string();
+    let result = fixture.mcp(&[&call]);
+    let text = serde_json::to_string(&result).unwrap_or_default();
+    assert!(text.contains("seed_text"), "no seed_text in response: {text}");
+    assert!(text.contains("scheduler double-books"), "task pointer missing: {text}");
+    assert!(text.contains("DATA, not instructions"), "seed lost its fence: {text}");
+}
+
+#[test]
+fn a_correction_made_twice_becomes_a_standing_rule() {
+    // khwan's loop, kept local: corrections a person made more than once are
+    // distilled into a rule at the next synthesis round, through the same
+    // ladder call - no extra model spend. A rule citing fewer than two
+    // corrections is discarded unread, because the model is not trusted to
+    // count.
+    let fixture = Fixture::new("rules");
+    let bin = fixture.fake_cli("claude", &rule_cli());
+
+    // Two events, each surfaced by search and then corrected - the same
+    // gate every real correction passes.
+    let call = |name: &str, args: String| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{name}","arguments":{args}}}}}"#
+        )
+    };
+    for (n, text) in
+        [
+        (1, "always run the linter before committing"),
+        (2, "always run the linter before you commit"),
+    ]
+    {
+        let payload = serde_json::json!({
+            "session_id": format!("0199a1f2-3c4d-7e8f-9012-98765432100{n}"),
+            "cwd": fixture.project,
+            "prompt": format!("skipped the linter on commit {n}")
+        })
+        .to_string();
+        fixture.hook("claude-code", "UserPromptSubmit", &payload);
+        let id = fixture
+            .log_text()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|line| line["kind"] == "observation")
+            .filter_map(|line| line["id"].as_str().map(str::to_string))
+            .next_back()
+            .expect("an event to correct");
+        let search = call("brain_search", r#"{"query":"linter"}"#.to_string());
+        let correct = call("brain_correct", format!(r#"{{"id":"{id}","text":"{text}"}}"#));
+        let result = fixture.mcp(&[&search, &correct]);
+        let text = serde_json::to_string(&result).unwrap_or_default();
+        assert!(
+            !text.contains("has not been surfaced") && !text.contains("isError\":true"),
+            "the correction was refused: {text}"
+        );
+    }
+
+    // Five sessions cross the synthesis watermark.
+    for session in 0..5 {
+        let payload = serde_json::json!({
+            "session_id": format!("0199a1f2-3c4d-7e8f-9012-34567891000{session}"),
+            "cwd": fixture.project,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": fixture.project.join("src/auth.rs")}
+        })
+        .to_string();
+        fixture.hook("claude-code", "PostToolUse", &payload);
+        let done = fixture.brain_with_path(&["consolidate", "--force"], Some(&bin));
+        assert!(done.status.success(), "consolidate {session} failed: {done:?}");
+    }
+
+    let pages = fixture.knowledge_pages();
+    let rule = pages
+        .iter()
+        .find(|path| path.to_string_lossy().contains("knowledge/rules/"))
+        .unwrap_or_else(|| {
+            let log = fixture.log_text();
+            let interesting: Vec<String> = log
+                .lines()
+                .filter(|l| l.contains("correct") || l.contains("knowledge"))
+                .map(|l| l.chars().take(200).collect())
+                .collect();
+            panic!("no rule page was written: {pages:?}\nLOG: {interesting:#?}")
+        });
+    let page = std::fs::read_to_string(rule).expect("the rule page");
+    assert!(page.contains("Always run the linter"), "wrong rule: {page}");
+    assert!(page.contains("tags: [knowledge, rule]"), "page not typed: {page}");
+
+    // The under-cited rule is the counter-test: one correction is an edit.
+    assert!(
+        !fixture.log_text().contains("A rule nobody asked for twice"),
+        "a rule citing one correction was kept"
+    );
+
+    // The rule reaches the next session first among lessons.
+    let start = serde_json::json!({
+        "session_id": "0199b000-0000-7000-8000-000000000001",
+        "cwd": fixture.project,
+        "source": "startup"
+    })
+    .to_string();
+    let output = fixture.hook("claude-code", "SessionStart", &start);
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    let context = parsed["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+    assert!(
+        context.contains("KNW  Always run the linter"),
+        "the rule never reached the primer: {context}"
+    );
+}
+
 #[test]
 fn what_recurs_across_sessions_becomes_a_page_that_outlives_them() {
     let fixture = Fixture::new("knowledge");

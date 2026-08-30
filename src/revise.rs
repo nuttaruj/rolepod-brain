@@ -231,6 +231,59 @@ pub fn flag(id: &str, reason: Option<&str>) -> Result<Outcome> {
     Ok(Outcome { id: event.id, target_title: title })
 }
 
+/// Ceiling on one retire event's links: a line the log and a reader can
+/// both take in, the same reasoning as `ENTITY_FORGET_MAX`.
+const RETIRE_BATCH: usize = 500;
+
+/// What one retire pass found, for the caller to report.
+pub struct Retirement {
+    pub count: usize,
+    pub bytes: i64,
+}
+
+/// Drop the bodies of old, never-surfaced observations - or measure what
+/// doing so would free, which is the default.
+///
+/// Retention was deferred until it could be measured against a real
+/// case; this command IS the measurement, and it acts only on `--apply`.
+/// The rule is usage-beats-age: only a consolidated observation older than
+/// `months` that was never injected, never recalled and never read loses
+/// its body. Identity - id, timestamp, title, topic, files, links - stays,
+/// the log keeps everything, and a rebuild replays the retirement.
+///
+/// # Errors
+/// Returns an error when the index cannot be read or the append fails.
+pub fn retire(months: u32, apply: bool) -> Result<Retirement> {
+    let (paths, store, scope) = context()?;
+    let cutoff = jiff::Timestamp::now()
+        .checked_sub(jiff::Span::new().try_seconds(i64::from(months) * 30 * 24 * 3600)?)
+        .context("compute retention cutoff")?
+        .to_string();
+    let (ids, bytes) = store.retirable(&scope.project_id.to_string(), &cutoff)?;
+    if apply && !ids.is_empty() {
+        let log = EventLog::open(&paths.project_dir(&scope))?;
+        for chunk in ids.chunks(RETIRE_BATCH) {
+            let mut event = Event::new(
+                scope.workspace_id,
+                scope.project_id,
+                uuid::Uuid::nil(),
+                Source { cli: "brain".to_string(), hook: "retire".to_string() },
+                EventKind::Retire,
+                format!(
+                    "Retired {} observation bodies older than {months} month(s)",
+                    chunk.len()
+                ),
+                String::new(),
+            );
+            event.links = chunk.to_vec();
+            event.consolidated = true;
+            log.append(&event)?;
+            store.index(&event)?;
+        }
+    }
+    Ok(Retirement { count: ids.len(), bytes })
+}
+
 fn context() -> Result<(Paths, Store, ids::ProjectScope)> {
     let paths = Paths::resolve()?;
     paths.ensure()?;

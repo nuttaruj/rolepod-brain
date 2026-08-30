@@ -298,15 +298,19 @@ brain doctor            # is capture actually working?
 brain stats             # what it has captured, consolidated, and injected
 brain search "auth"     # full-text search this project's memory
 brain where             # which project am I in, and where does it live
+brain seed "the task"   # a paste-ready block to hand a subagent
+brain retire            # measure what old, never-used memory would free (dry run)
 ```
 
-Your agent gets ten MCP tools. Four to read — `brain_search` by words and
+Your agent gets eleven MCP tools. Four to read — `brain_search` by words and
 meaning, `brain_get` for a full body, `brain_recent` to re-orient, and
 `brain_timeline` for a stretch of history. Two to move around memory rather
 than query it: `brain_outline`, for what a project IS before you know what to
 ask about it, and `brain_related`, for what sits beside a memory you are
 already holding. Four to write back — `brain_note`, `brain_correct`,
-`brain_feedback`, and `brain_forget`.
+`brain_feedback`, and `brain_forget`. And one to hand memory onward:
+`brain_seed`, a compact block — standing lessons first, then pointers
+relevant to a task — sized to paste into a subagent's prompt.
 
 On Codex the plugin also ships two skills:
 `using-brain`, describing when to reach for those tools — MCP tools that
@@ -549,8 +553,14 @@ that a migration here needs two steps in a particular order.
 Every fifth consolidated session, brain spends one extra cheap-tier call over
 the recent session summaries and asks what has become durably true. What comes
 back is written as pages under `knowledge/` — `gotchas/`, `decisions/`,
-`procedures/` — and recorded in memory proper, so it turns up in `brain_search`
-and in the primer alongside everything else, tagged `KNW`.
+`procedures/`, `rules/` — and recorded in memory proper, so it turns up in
+`brain_search` and in the primer alongside everything else, tagged `KNW`.
+
+`rules/` is the tier corrections earn. A correction you made once edits a
+memory; one you had to make twice is a standing rule this project keeps
+violating, and the same synthesis call distills it — the rule's title is the
+instruction itself, its sources are the corrections that forced it, and it
+reads out first among lessons.
 
 Three rules keep these honest:
 
@@ -568,6 +578,26 @@ Redaction and the anti-invention rules apply here exactly as they do to session
 summaries. Without a reachable CLI, synthesis simply does not run — deciding
 what recurs is a judgement, and a rule-based stand-in would produce confident
 nonsense.
+
+## Retiring what nobody ever needed
+
+Memory grows. Most of the growth is raw observation bodies, and measured over
+real use, 98% of them are never shown to anyone again — the summaries and
+knowledge distilled from them are what get recalled. `brain retire` acts on
+exactly that split:
+
+```sh
+brain retire            # dry run: how many bodies, how many KB — changes nothing
+brain retire --apply    # drop them from the index
+```
+
+The rule is usage-beats-age: only a consolidated observation older than six
+months (`--older-than-months` to change) that was never surfaced — never
+injected into a session, never returned by a search, never read — loses its
+body. Identity survives always: id, timestamp, title, topic, files and links
+stay, so pointers keep working and provenance keeps tracing. The append-only
+log is untouched, and a rebuild replays the retirement rather than undoing
+it. Nothing runs on a schedule; retiring is a decision, so it is a command.
 
 ## `ROLEPOD_BRAIN_WORKER` — a contract for other tools
 

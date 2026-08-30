@@ -2042,7 +2042,7 @@ fn subject_files<'a>(sources: impl Iterator<Item = &'a [String]>) -> Vec<String>
 }
 
 /// Kinds of durable knowledge, and the directory each lives in.
-const KNOWLEDGE_KINDS: &[&str] = &["gotcha", "decision", "procedure"];
+const KNOWLEDGE_KINDS: &[&str] = &["gotcha", "decision", "procedure", "rule"];
 
 /// Promote what recurs across sessions into pages that outlive them.
 ///
@@ -2082,7 +2082,9 @@ fn synthesize_knowledge(
 
     let known_titles: Vec<String> =
         store.knowledge_entries(&project)?.into_iter().map(|(_, title)| title).collect();
-    let prompt = knowledge_prompt(&summaries, &known_titles);
+    let corrections = store.recent_corrections(&project, CORRECTIONS_WINDOW)?;
+    let clusters = cluster_corrections(&corrections);
+    let prompt = knowledge_prompt(&summaries, &clusters, &known_titles);
     let (tier, answer) = ladder.run(&prompt, cli, |text| parse_knowledge(text).is_some())?;
     // Rule-based synthesis is not attempted: deciding what recurs across
     // sessions is a judgement, and inventing one from string frequency would
@@ -2143,16 +2145,34 @@ fn synthesize_knowledge(
         // to the sessions that produced it is indistinguishable from one the
         // model made up - and an entry only one session supports is a session
         // summary wearing a promotion.
+        // A rule cites the corrections that forced it; every other kind
+        // cites the summaries it recurred across. Resolving against the
+        // wrong pool silently empties `sources`, and the gates below then
+        // discard the entry - which is the right failure for a model citing
+        // ids it was never shown. Rules resolve only against corrections
+        // that made it into a group: a singleton correction cannot be
+        // cited at all.
         let mut sources: Vec<&Event> = Vec::new();
         for id in &entry.sources {
             if sources.iter().any(|event| &event.id == id) {
                 continue;
             }
-            if let Some(event) = summaries.iter().find(|event| &event.id == id) {
+            let found = if kind == "rule" {
+                clusters.iter().flatten().copied().find(|event| &event.id == id)
+            } else {
+                summaries.iter().find(|event| &event.id == id)
+            };
+            if let Some(event) = found {
                 sources.push(event);
             }
         }
-        if sources.len() < MIN_SOURCES {
+        if kind == "rule" {
+            // Count AND membership: the cited corrections must be one group
+            // that actually repeats, not any two the model happened to name.
+            if !one_cluster_backs_the_rule(&sources, &clusters) {
+                continue;
+            }
+        } else if sources.len() < MIN_SOURCES {
             continue;
         }
 
@@ -2247,6 +2267,7 @@ fn normalize_knowledge_kind(raw: &str) -> Option<&'static str> {
         "gotcha" | "gotchas" | "pitfall" | "caveat" => Some("gotcha"),
         "decision" | "decisions" | "choice" => Some("decision"),
         "procedure" | "procedures" | "howto" | "runbook" => Some("procedure"),
+        "rule" | "rules" | "lesson" | "lessons" => Some("rule"),
         _ => None,
     }
 }
@@ -2263,7 +2284,10 @@ const KNOWLEDGE_INSTRUCTIONS: &str = "Below are summaries of recent coding sessi
          kind: KNOWLEDGE_KINDS.\n\
          - gotcha: something that will bite someone who does not know it.\n\
          - decision: a choice that was made and should not be silently reversed.\n\
-         - procedure: how something is done here, when it is not obvious.\n\n\
+         - procedure: how something is done here, when it is not obvious.\n\
+         - rule: a standing instruction distilled from CORRECTIONS the user \
+         made more than once. Its title IS the rule - one imperative \
+         sentence - and its sources are correction ids, never summary ids.\n\n\
          title: one line, specific. body: two to five sentences.\n\
          sources: the ids of ALL the summaries that support it. An entry \
          supported by fewer than two is discarded unread, so cite every \
@@ -2288,8 +2312,87 @@ const KNOWLEDGE_INSTRUCTIONS: &str = "Below are summaries of recent coding sessi
 /// to be re-derived.
 const KNOWN_TITLES_BUDGET: usize = 3 * 1024;
 
+/// Two corrections repeat the same shape when their embeddings agree this
+/// much. Looser than `KNOWLEDGE_SAME_FACT` (0.90): rewordings of one rule
+/// ("always lint before committing", "run the linter before you commit")
+/// sit further apart than two printings of one title. A starting point -
+/// the real store has not yet produced enough correction pairs to
+/// calibrate against.
+const CORRECTION_SAME_SHAPE: f32 = 0.80;
+
+/// Group corrections that repeat each other; singletons drop out.
+///
+/// khwan's synthesis clusters BEFORE the model sees anything, and the
+/// reason ports intact: a count gate alone lets a model cite two unrelated
+/// corrections and mint a rule with fake provenance. Grouping is mechanical
+/// (embeddings and union-find, the `fold_duplicate_knowledge` shape), the
+/// prompt only ever shows whole groups, and the write path re-checks
+/// membership. When encoding is unavailable there are no groups and no
+/// rules this round, which is the same stance synthesis takes without a
+/// model: better silent than inventive.
+fn cluster_corrections(corrections: &[Event]) -> Vec<Vec<&Event>> {
+    if corrections.len() < MIN_SOURCES {
+        return Vec::new();
+    }
+    let mut vectors = Vec::with_capacity(corrections.len());
+    for correction in corrections {
+        let text = format!("{} {}", correction.title, correction.body);
+        let Ok(vector) = crate::embed::encode(&text) else { return Vec::new() };
+        vectors.push(vector);
+    }
+    let mut parent: Vec<usize> = (0..corrections.len()).collect();
+    fn root(parent: &mut [usize], mut index: usize) -> usize {
+        while parent[index] != index {
+            parent[index] = parent[parent[index]];
+            index = parent[index];
+        }
+        index
+    }
+    for a in 0..corrections.len() {
+        for b in (a + 1)..corrections.len() {
+            if crate::embed::similarity(&vectors[a], &vectors[b]) >= CORRECTION_SAME_SHAPE {
+                let (ra, rb) = (root(&mut parent, a), root(&mut parent, b));
+                if ra != rb {
+                    parent[rb] = ra;
+                }
+            }
+        }
+    }
+    let mut groups: std::collections::HashMap<usize, Vec<&Event>> =
+        std::collections::HashMap::new();
+    for (index, correction) in corrections.iter().enumerate() {
+        groups.entry(root(&mut parent, index)).or_default().push(correction);
+    }
+    let mut clusters: Vec<Vec<&Event>> =
+        groups.into_values().filter(|group| group.len() >= MIN_SOURCES).collect();
+    // Newest group first, deterministically - HashMap order is not an order.
+    clusters.sort_by(|a, b| b[0].id.cmp(&a[0].id));
+    clusters
+}
+
+/// A rule's provenance must be one group of corrections that actually
+/// repeat each other. The count gate alone would pass two unrelated
+/// corrections; this is the membership half of the guard.
+fn one_cluster_backs_the_rule(cited: &[&Event], clusters: &[Vec<&Event>]) -> bool {
+    cited.len() >= MIN_SOURCES
+        && clusters.iter().any(|cluster| {
+            cited.iter().all(|event| cluster.iter().any(|member| member.id == event.id))
+        })
+}
+
+/// Ceiling on the corrections section of a synthesis prompt.
+///
+/// Corrections are rarer and heavier than titles - each carries the wording
+/// a person actually typed - but the summaries are still the payload.
+const CORRECTIONS_BUDGET: usize = 4 * 1024;
+
+/// How many recent corrections synthesis may look across. Twice the summary
+/// window: corrections are sparse, and a rule needs the older instance of a
+/// pair to still be in view when the newer one lands.
+const CORRECTIONS_WINDOW: usize = 40;
+
 /// The synthesis prompt.
-fn knowledge_prompt(summaries: &[Event], known: &[String]) -> String {
+fn knowledge_prompt(summaries: &[Event], clusters: &[Vec<&Event>], known: &[String]) -> String {
     let mut prompt = String::with_capacity(PROMPT_MAX_BYTES / 2);
     prompt.push_str(
         &KNOWLEDGE_INSTRUCTIONS.replace("KNOWLEDGE_KINDS", &KNOWLEDGE_KINDS.join(" | ")),
@@ -2310,6 +2413,44 @@ fn knowledge_prompt(summaries: &[Event], known: &[String]) -> String {
             }
             spent += line.len();
             prompt.push_str(&line);
+        }
+        prompt.push('\n');
+    }
+    // One correction is an edit; a group of the same shape is a rule the
+    // project keeps violating. Grouping already happened, mechanically -
+    // the model only ever sees whole groups, so it cannot pair unrelated
+    // corrections, and an empty clustering omits the section along with
+    // the temptation to invent one.
+    if !clusters.is_empty() {
+        prompt.push_str(
+            "--- CORRECTIONS ---\n\
+             The user personally corrected or flagged these memories, in \
+             groups: a group holds corrections that repeat the same shape, \
+             and a group IS a standing rule this project keeps violating. \
+             For each group worth keeping, emit kind \"rule\" citing the \
+             ids of EVERY correction in that group. Never mix ids across \
+             groups; a rule citing fewer than two is discarded unread.\n",
+        );
+        let mut spent = 0usize;
+        for (number, cluster) in clusters.iter().enumerate() {
+            let mut lines = format!("group {}:\n", number + 1);
+            for event in cluster {
+                let _ = writeln!(
+                    lines,
+                    "- id={} {} {}\n  {}",
+                    event.id,
+                    &event.ts[..event.ts.len().min(10)],
+                    crate::sanitize::truncate(&event.title, 120),
+                    crate::sanitize::truncate(&event.body, 300)
+                );
+            }
+            // Whole groups only: a group cut in half invites exactly the
+            // cross-group citation the clustering exists to prevent.
+            if spent + lines.len() > CORRECTIONS_BUDGET {
+                break;
+            }
+            spent += lines.len();
+            prompt.push_str(&lines);
         }
         prompt.push('\n');
     }
@@ -2386,7 +2527,7 @@ mod tests {
     #[test]
     fn the_synthesis_prompt_teaches_exactly_the_kinds_it_accepts() {
         let events = vec![event("1", "consolidate", "t", "did a thing")];
-        let prompt = knowledge_prompt(&events, &[]);
+        let prompt = knowledge_prompt(&events, &[], &[]);
         for kind in KNOWLEDGE_KINDS {
             assert!(prompt.contains(kind), "prompt never mentions `{kind}`");
             assert!(normalize_knowledge_kind(kind).is_some(), "parser rejects `{kind}`");
@@ -2396,6 +2537,50 @@ mod tests {
         // The prompt must warn about the filter that will actually run, or a
         // model cites one summary and its entry is silently discarded.
         assert!(prompt.contains("fewer than two is discarded"), "provenance must be demanded");
+    }
+
+    #[test]
+    fn only_grouped_corrections_reach_the_prompt() {
+        // Clustering happens before the model sees anything; an empty
+        // clustering omits the section along with the temptation to invent
+        // a pair, and a group is rendered whole with its membership rule.
+        let summaries = vec![event("1", "consolidate", "t", "did a thing")];
+        let prompt = knowledge_prompt(&summaries, &[], &[]);
+        assert!(!prompt.contains("--- CORRECTIONS ---"), "no groups, yet the section opened");
+
+        let a = event("2", "correct", "use rtk grep", "raw grep wastes tokens");
+        let b = event("3", "correct", "use rtk grep here too", "same mistake again");
+        let clusters = vec![vec![&a, &b]];
+        let prompt = knowledge_prompt(&summaries, &clusters, &[]);
+        assert!(prompt.contains("--- CORRECTIONS ---"), "a group must be shown");
+        assert!(prompt.contains("group 1:"), "groups must be visibly grouped");
+        assert!(prompt.contains("use rtk grep"), "the correction wording must be carried");
+        assert!(prompt.contains("Never mix ids across groups"), "the membership rule is unstated");
+    }
+
+    #[test]
+    fn a_rule_must_be_backed_by_one_whole_group() {
+        // The count gate alone would pass two UNRELATED corrections - a
+        // rule with fake provenance. Membership is the other half.
+        let a = event("2", "correct", "use rtk grep", "raw grep wastes tokens");
+        let b = event("3", "correct", "use rtk grep here too", "same mistake again");
+        let c = event("4", "correct", "deploy needs a re-sign", "plain cp exits 137");
+        let d = event("5", "correct", "codesign after copying", "same 137 again");
+        let clusters = vec![vec![&a, &b], vec![&c, &d]];
+
+        assert!(one_cluster_backs_the_rule(&[&a, &b], &clusters), "a real pair was refused");
+        assert!(
+            !one_cluster_backs_the_rule(&[&a, &c], &clusters),
+            "two unrelated corrections minted a rule"
+        );
+        assert!(!one_cluster_backs_the_rule(&[&a], &clusters), "one correction is an edit");
+        assert!(one_cluster_backs_the_rule(&[&c, &d], &clusters), "the second group must count");
+    }
+
+    #[test]
+    fn a_lesson_normalizes_into_the_rule_kind() {
+        assert_eq!(normalize_knowledge_kind("rule"), Some("rule"));
+        assert_eq!(normalize_knowledge_kind("Lessons"), Some("rule"));
     }
 
     #[test]
@@ -2697,7 +2882,7 @@ mod tests {
         let events = vec![event("1", "consolidate", "t", "did a thing")];
 
         let known = vec!["FTS5 shatters Thai text on tone marks".to_string()];
-        let prompt = knowledge_prompt(&events, &known);
+        let prompt = knowledge_prompt(&events, &[], &known);
         assert!(prompt.contains("ALREADY RECORDED"), "the section is missing");
         assert!(prompt.contains("- FTS5 shatters Thai text"), "the known claim is not listed");
         assert!(
@@ -2706,14 +2891,14 @@ mod tests {
         );
 
         // Nothing known, nothing said - the empty section would only be noise.
-        assert!(!knowledge_prompt(&events, &[]).contains("ALREADY RECORDED"));
+        assert!(!knowledge_prompt(&events, &[], &[]).contains("ALREADY RECORDED"));
 
         // The summaries are the payload; a long history may not crowd them
         // out. Newest titles first, because those are the likeliest to be
         // re-derived.
         let many: Vec<String> =
             (0..200).map(|index| format!("claim number {index} {}", "x".repeat(80))).collect();
-        let prompt = knowledge_prompt(&events, &many);
+        let prompt = knowledge_prompt(&events, &[], &many);
         assert!(prompt.contains("claim number 199"), "the newest claim was dropped");
         assert!(!prompt.contains("claim number 0 "), "the whole history was inlined");
         assert!(prompt.contains("did a thing"), "the summaries were crowded out");

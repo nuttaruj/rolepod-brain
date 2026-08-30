@@ -118,6 +118,23 @@ enum Commands {
         #[arg(long)]
         topic: Option<String>,
     },
+    /// Drop the bodies of old, never-surfaced observations; keep every title and link.
+    Retire {
+        /// Only observations older than this many months.
+        #[arg(long = "older-than-months", default_value_t = 6)]
+        older_than_months: u32,
+        /// Actually retire. Without it, measure and report only.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// One compact block to seed a subagent: lessons, then task-relevant pointers.
+    Seed {
+        /// What the subagent will work on, in a phrase.
+        task: String,
+        /// Maximum bytes for the block.
+        #[arg(long, default_value_t = inject::SEED_BUDGET)]
+        budget: usize,
+    },
     /// What this brain has actually done. Local counters; nothing is sent anywhere.
     Stats,
     /// Write this brain to an archive, for moving it to another machine.
@@ -281,6 +298,46 @@ fn run(command: Commands) -> Result<()> {
         Commands::Reindex => reindex(),
         Commands::Search { query, limit, topic } => search(&query, limit, topic.as_deref()),
         Commands::History { query, diff } => history::report(&query, diff),
+        Commands::Retire { older_than_months, apply } => {
+            let outcome = revise::retire(older_than_months, apply)?;
+            let kb = outcome.bytes / 1024;
+            if outcome.count == 0 {
+                println!(
+                    "Nothing to retire: no consolidated observation older than \
+                     {older_than_months} month(s) has gone unseen."
+                );
+            } else if apply {
+                println!(
+                    "Retired {} observation bodies; {kb} KB left the index.",
+                    outcome.count
+                );
+                println!("Titles, topics, files and links kept; the log keeps everything.");
+            } else {
+                println!(
+                    "Would retire {} observation bodies, freeing {kb} KB from the index.",
+                    outcome.count
+                );
+                println!(
+                    "Kept either way: id, timestamp, title, topic, files, links. \
+                     The log is untouched."
+                );
+                println!("Re-run with --apply to retire them.");
+            }
+            Ok(())
+        }
+        Commands::Seed { task, budget } => {
+            let paths = Paths::resolve()?;
+            let store = Store::open(&paths.db())?;
+            let scope = ids::resolve_scope(&std::env::current_dir().unwrap_or_default());
+            let seed =
+                inject::seed(&store, &scope.project_id.to_string(), &task, budget.clamp(256, 8192))?;
+            if seed.text.is_empty() {
+                println!("Nothing to seed yet - no lessons and no matches for the task.");
+            } else {
+                print!("{}", seed.text);
+            }
+            Ok(())
+        }
         Commands::Stats => stats(),
         Commands::Export { file } => {
             let path = file.map_or_else(portable::default_archive, std::path::PathBuf::from);

@@ -40,6 +40,10 @@ pub enum EventKind {
     /// A deletion. Append-only holds: removal is an event, and compaction
     /// honours it. Required for the future sync contract.
     Tombstone,
+    /// A retirement: the named events keep their identity - id, timestamp,
+    /// title, topic, files, links - and lose their bodies from the index.
+    /// The log keeps everything; replaying reproduces the drop.
+    Retire,
 }
 
 impl EventKind {
@@ -52,6 +56,7 @@ impl EventKind {
             Self::Note => "note",
             Self::Knowledge => "knowledge",
             Self::Tombstone => "tombstone",
+            Self::Retire => "retire",
         }
     }
 }

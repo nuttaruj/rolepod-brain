@@ -176,6 +176,27 @@ fn tool_definitions(local_rerank: bool) -> Value {
             },
         },
         {
+            "name": "brain_seed",
+            "description": "One compact block to seed a subagent or a fresh task: the \
+                            project's standing lessons first, then pointers relevant \
+                            to the task. Paste it into the subagent's prompt; the ids \
+                            let it pull full entries with brain_get.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "What the subagent will work on, in a phrase.",
+                    },
+                    "budget": {
+                        "type": "integer",
+                        "description": "Maximum bytes for the block (default 2048, max 8192).",
+                    },
+                },
+                "required": ["task"],
+            },
+        },
+        {
             "name": "brain_get",
             "description": "Fetch full observations by id. Ids come from brain_search \
                             results or from injected memory pointers.",
@@ -449,6 +470,25 @@ fn call_tool(paths: &Paths, project: &str, session: &str, params: &Value) -> Res
             store.record_recalled(session, hits.iter().map(|hit| hit.id.as_str()))?;
             json!({ "hits": hits, "count": hits.len() })
         }
+        "brain_seed" => {
+            let task = arguments
+                .get("task")
+                .and_then(Value::as_str)
+                .filter(|t| !t.trim().is_empty())
+                .context("brain_seed requires a non-empty `task`")?;
+            let budget = arguments
+                .get("budget")
+                .and_then(Value::as_u64)
+                .map_or(crate::inject::SEED_BUDGET, |b| {
+                    usize::try_from(b).unwrap_or(crate::inject::SEED_BUDGET).clamp(256, 8192)
+                });
+            let seed = crate::inject::seed(&store, project, task, budget)?;
+            // Seeded ids were surfaced to this session the same as a search
+            // hit: the correction gate and the uptake record both need to
+            // know that.
+            store.record_recalled(session, seed.ids.iter().map(String::as_str))?;
+            json!({ "seed_text": seed.text, "ids": seed.ids, "count": seed.ids.len() })
+        }
         "brain_get" => {
             let ids: Vec<String> = arguments
                 .get("ids")
@@ -696,7 +736,7 @@ mod tests {
         for local_rerank in [false, true] {
             let tools = tool_definitions(local_rerank);
             let tools = tools.as_array().unwrap();
-            assert_eq!(tools.len(), 11, "a tool was added or lost");
+            assert_eq!(tools.len(), 12, "a tool was added or lost");
             for tool in tools {
                 assert!(tool.get("name").and_then(Value::as_str).is_some());
                 let description = tool.get("description").and_then(Value::as_str).unwrap();

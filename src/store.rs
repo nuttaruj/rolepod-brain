@@ -280,6 +280,10 @@ impl Store {
                     -- pointer to it. The only evidence we have that a memory
                     -- was worth keeping, as opposed to merely present.
                     read_count   INTEGER NOT NULL DEFAULT 0,
+                    -- How often a primer or file pointer pushed this line.
+                    -- Paired with read_count: offered many sessions and never
+                    -- pulled means the line spends budget and buys nothing.
+                    injected_count INTEGER NOT NULL DEFAULT 0,
                     -- Lowered when a human says an entry is stale or wrong.
                     -- Nothing is destroyed; it just stops crowding the primer.
                     confidence   INTEGER NOT NULL DEFAULT 0,
@@ -547,6 +551,7 @@ impl Store {
                 ("events", "forgotten", "INTEGER NOT NULL DEFAULT 0"),
                 ("events", "corrected_by", "TEXT"),
                 ("events", "read_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("events", "injected_count", "INTEGER NOT NULL DEFAULT 0"),
                 ("events", "confidence", "INTEGER NOT NULL DEFAULT 0"),
                 ("summarizer_health", "last_failed_at", "TEXT"),
                 ("session_state", "claimed_at", "TEXT"),
@@ -626,6 +631,18 @@ impl Store {
         // ordinary appended lines - nothing is deleted or edited in the log -
         // and what they change is the derived row they point at.
         match event.kind {
+            EventKind::Retire => {
+                // Body only: title, topic, files and links stay, so the
+                // pointer remains findable and the provenance intact. The
+                // external-content FTS sees the UPDATE through its triggers
+                // and drops the body text itself; the trigram index holds
+                // titles only and never carried it.
+                for target in &event.links {
+                    self.conn
+                        .execute("UPDATE events SET body = '' WHERE id = ?1", params![target])
+                        .context("apply retirement")?;
+                }
+            }
             EventKind::Tombstone => {
                 for target in &event.links {
                     self.conn
@@ -702,6 +719,25 @@ impl Store {
                         params![event.id, reads],
                     )
                     .context("restore read count")?;
+            }
+        }
+
+        // Same disease, other counter: how often a pointer was offered lives
+        // on the row too, and a replay resets it while `injected` (also
+        // spared by `clear()`) keeps the truth. Without this, every rebuild
+        // hands each stale pointer a fresh five-session decay budget.
+        if let Ok(times) = self.conn.query_row(
+            "SELECT COUNT(*) FROM injected WHERE event_id = ?1",
+            params![event.id],
+            |row| row.get::<_, i64>(0),
+        ) {
+            if times > 0 {
+                self.conn
+                    .execute(
+                        "UPDATE events SET injected_count = ?2 WHERE id = ?1",
+                        params![event.id, times],
+                    )
+                    .context("restore injected count")?;
             }
         }
 
@@ -826,7 +862,7 @@ impl Store {
                      FROM events_fts
                      JOIN events e ON e.rowid = events_fts.rowid
                      WHERE events_fts MATCH ?1 AND e.project = ?2 AND e.forgotten = 0
-                           AND e.kind != 'tombstone'
+                           AND e.kind NOT IN ('tombstone', 'retire')
                                  AND e.hook NOT IN ('correct', 'feedback')
                            AND (?5 IS NULL OR e.topic = ?5)
                  )
@@ -1060,7 +1096,7 @@ impl Store {
                  JOIN entities n ON n.session = e.session AND n.project = e.project
                  WHERE n.name IN (SELECT name FROM subject)
                        AND e.project = ?2 AND e.id != ?1
-                       AND e.forgotten = 0 AND e.kind != 'tombstone'
+                       AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
                        AND e.hook NOT IN ('correct', 'feedback')
                  GROUP BY e.id
                  ORDER BY shared DESC,
@@ -1121,7 +1157,7 @@ impl Store {
                  FROM events_tri
                  JOIN events e ON e.rowid = events_tri.rowid
                  WHERE events_tri MATCH ?1 AND e.project = ?2 AND e.forgotten = 0
-                       AND e.kind != 'tombstone' AND e.hook NOT IN ('correct', 'feedback')
+                       AND e.kind NOT IN ('tombstone', 'retire') AND e.hook NOT IN ('correct', 'feedback')
                        AND (?4 IS NULL OR e.topic = ?4)
                  ORDER BY CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END, rank
                  LIMIT ?3",
@@ -1213,7 +1249,7 @@ impl Store {
                         ) AS per_session
                  FROM events e
                  JOIN matched m ON m.session = e.session
-                 WHERE e.project = ?1 AND e.forgotten = 0 AND e.kind != 'tombstone'
+                 WHERE e.project = ?1 AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
                        AND e.hook NOT IN ('correct', 'feedback')
                        AND (?2 IS NULL OR e.topic = ?2)
              )
@@ -1312,7 +1348,7 @@ impl Store {
              FROM events e
              JOIN shared s ON s.session = e.session
              WHERE e.project = ?1
-                   AND e.forgotten = 0 AND e.kind != 'tombstone'
+                   AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
                    AND e.hook NOT IN ('correct', 'feedback')
                    AND (?2 IS NULL OR e.topic = ?2)
              ORDER BY s.shared DESC,
@@ -1362,7 +1398,7 @@ impl Store {
     /// # Errors
     /// Returns an error when a query fails.
     pub fn outline(&self, project: &str, limit: usize) -> Result<Outline> {
-        let live = "forgotten = 0 AND kind != 'tombstone' AND hook NOT IN ('correct', 'feedback')";
+        let live = "forgotten = 0 AND kind NOT IN ('tombstone', 'retire') AND hook NOT IN ('correct', 'feedback')";
         let count = |extra: &str| -> Result<i64> {
             self.conn
                 .query_row(
@@ -1425,7 +1461,7 @@ impl Store {
                 // graph staying the shape it is today is not a withdrawal.
                 "SELECT id, ts, cli, kind, title, substr(COALESCE(body, ''), 1, 160), session
                  FROM events
-                 WHERE id = ?1 AND forgotten = 0 AND kind != 'tombstone'
+                 WHERE id = ?1 AND forgotten = 0 AND kind NOT IN ('tombstone', 'retire')
                        AND hook NOT IN ('correct', 'feedback')",
             )
             .context("prepare hits by id")?;
@@ -1506,7 +1542,7 @@ impl Store {
                  FROM events e
                  LEFT JOIN event_vec v ON v.event_id = e.id
                  WHERE (v.event_id IS NULL OR length(v.vec) != ?3)
-                       AND e.kind != 'tombstone' AND e.project = ?1
+                       AND e.kind NOT IN ('tombstone', 'retire') AND e.project = ?1
                  ORDER BY e.id DESC
                  LIMIT ?2",
             )
@@ -1538,7 +1574,7 @@ impl Store {
             .context("count vectors")?;
         let total: i64 = self
             .conn
-            .query_row("SELECT COUNT(*) FROM events WHERE kind != 'tombstone'", [], |row| {
+            .query_row("SELECT COUNT(*) FROM events WHERE kind NOT IN ('tombstone', 'retire')", [], |row| {
                 row.get(0)
             })
             .context("count events")?;
@@ -1579,7 +1615,7 @@ impl Store {
                 "SELECT v.event_id, v.vec, e.confidence
                  FROM event_vec v
                  JOIN events e ON e.id = v.event_id
-                 WHERE e.project = ?1 AND e.forgotten = 0 AND e.kind != 'tombstone'
+                 WHERE e.project = ?1 AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
                        AND e.hook NOT IN ('correct', 'feedback')
                        AND (?2 IS NULL OR e.topic = ?2)",
             )
@@ -1692,7 +1728,7 @@ impl Store {
             .conn
             .prepare(
                 "SELECT id, ts, cli, kind, title, session
-                 FROM events WHERE project = ?1 AND forgotten = 0 AND kind != 'tombstone'
+                 FROM events WHERE project = ?1 AND forgotten = 0 AND kind NOT IN ('tombstone', 'retire')
                        AND hook NOT IN ('correct', 'feedback')
                        AND (?3 IS NULL OR cli = ?3)
                        AND (?4 IS NULL OR kind = ?4)
@@ -2110,6 +2146,79 @@ impl Store {
         self.get(&ids)
     }
 
+    /// Corrections and flags a person made, newest first.
+    ///
+    /// The one reader of `hook IN ('correct','feedback')` events: every other
+    /// query filters them out because they mutate their target and then have
+    /// nothing left to say. Synthesis reads them because a correction the
+    /// user had to make twice IS the durable fact - a standing rule this
+    /// project keeps violating.
+    ///
+    /// Machine rewordings are excluded: `supersede_knowledge` writes the same
+    /// `hook = 'correct'` shape when it lands newer wording on an existing
+    /// knowledge page, and a rule distilled from rewordings would be a rule
+    /// about our own bookkeeping. Those are exactly the corrections whose id
+    /// a knowledge row carries in `corrected_by`.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn recent_corrections(&self, project: &str, limit: usize) -> Result<Vec<Event>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id FROM events
+                 WHERE project = ?1 AND kind = 'note'
+                   AND hook IN ('correct','feedback') AND forgotten = 0
+                   AND NOT EXISTS (SELECT 1 FROM events t
+                                   WHERE t.corrected_by = events.id
+                                     AND t.kind = 'knowledge')
+                 ORDER BY id DESC LIMIT ?2",
+            )
+            .context("prepare recent corrections")?;
+        let ids = stmt
+            .query_map(params![project, limit as i64], |row| row.get::<_, String>(0))
+            .context("run recent corrections")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("read correction ids")?;
+        self.get(&ids)
+    }
+
+    /// Consolidated observation bodies older than `cutoff` that were never
+    /// surfaced: not injected, not recalled, no read to their name. Usage
+    /// beats age - anything anyone ever saw survives - the storage study's
+    /// rule, checked against the tables that survive a rebuild rather than
+    /// the counter a rebuild used to flatten.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn retirable(&self, project: &str, cutoff: &str) -> Result<(Vec<String>, i64)> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, LENGTH(body) FROM events
+                 WHERE project = ?1 AND kind = 'observation' AND consolidated = 1
+                   AND forgotten = 0 AND body != '' AND read_count = 0
+                   AND ts < ?2
+                   AND id NOT IN (SELECT event_id FROM injected)
+                   AND id NOT IN (SELECT event_id FROM recalled)
+                 ORDER BY id",
+            )
+            .context("prepare retirable")?;
+        let rows = stmt
+            .query_map(params![project, cutoff], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .context("run retirable")?;
+        let mut ids = Vec::new();
+        let mut bytes = 0i64;
+        for row in rows {
+            let (id, len) = row.context("read retirable row")?;
+            ids.push(id);
+            bytes += len;
+        }
+        Ok((ids, bytes))
+    }
+
     /// Record what a session was about.
     ///
     /// # Errors
@@ -2176,7 +2285,7 @@ impl Store {
                  FROM events e
                  JOIN entities n ON n.session = e.session AND n.project = e.project
                  WHERE e.project = ?1 AND n.name = ?2 AND e.forgotten = 0
-                       AND e.kind != 'tombstone'
+                       AND e.kind NOT IN ('tombstone', 'retire')
                              AND e.hook NOT IN ('correct', 'feedback')
                  ORDER BY CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END, e.id DESC
                  LIMIT ?3",
@@ -2689,10 +2798,16 @@ impl Store {
     /// This ordering is what makes a byte budget safe to enforce by simply
     /// stopping: whatever gets cut is, by construction, the least useful thing
     /// left.
+    /// Offers a pointer may spend unread before it stops outranking fresh
+    /// material. Five sessions of being pushed and never once pulled is the
+    /// budget talking: the line buys nothing where it is.
+    const INJECTIONS_BEFORE_DECAY: i64 = 5;
+
     fn rank(prefix: &str) -> String {
         format!(
             // Knowledge outranks a session summary because it is what
             // survived several of them.
+            // {decay} = INJECTIONS_BEFORE_DECAY.
             "CASE {prefix}kind
                  WHEN 'knowledge' THEN 0
                  WHEN 'session_summary' THEN 1
@@ -2700,12 +2815,25 @@ impl Store {
                  WHEN 'page_update' THEN 3
                  ELSE 4
              END,
+             -- A standing rule first among lessons: it was distilled from
+             -- corrections a person made more than once, which is the
+             -- strongest evidence this table holds. Only knowledge rows
+             -- carry hook = 'rule', so nothing else moves.
+             CASE WHEN {prefix}hook = 'rule' THEN 0 ELSE 1 END,
              CASE WHEN {prefix}invocation = 'headless' THEN 1 ELSE 0 END,
              -- Evidence beats heuristics: something an agent went back and
              -- read is worth more than something we merely guessed at, and a
              -- human calling an entry stale outranks both.
              -{prefix}confidence,
              CASE WHEN {prefix}read_count > 0 THEN 0 ELSE 1 END,
+             -- Decay on the push side: offered this many sessions and never
+             -- once pulled, a pointer stops crowding out fresh lines.
+             -- Knowledge is exempt - its worth is the line itself (83% of it
+             -- ever surfaced), not a body nobody needs to pull.
+             CASE WHEN {prefix}kind != 'knowledge'
+                       AND {prefix}injected_count >= {decay}
+                       AND {prefix}read_count = 0
+                  THEN 1 ELSE 0 END,
              CASE {prefix}topic
                  WHEN 'decision' THEN 0
                  WHEN 'discovery' THEN 1
@@ -2714,7 +2842,8 @@ impl Store {
                  WHEN 'config' THEN 4
                  WHEN 'test' THEN 5
                  ELSE 6
-             END"
+             END",
+            decay = Self::INJECTIONS_BEFORE_DECAY
         )
     }
 
@@ -2763,7 +2892,7 @@ impl Store {
             // future session whether or not anyone asked. A withdrawn memory
             // that only disappears from search has not been withdrawn.
             "SELECT id, ts, kind, title, topic, files, hook FROM events
-             WHERE project = ?1 AND forgotten = 0 AND kind != 'tombstone'
+             WHERE project = ?1 AND forgotten = 0 AND kind NOT IN ('tombstone', 'retire')
                    AND hook NOT IN ('correct', 'feedback')
                    AND (?3 IS NULL OR kind = ?3)
              ORDER BY {}, id DESC
@@ -2818,7 +2947,7 @@ impl Store {
                 // first, and what a real event store showed within minutes.
                 "SELECT id, ts, kind, title, topic, files, hook FROM events
                  WHERE project = ?1 AND consolidated = 0 AND forgotten = 0
-                       AND kind != 'tombstone' AND hook NOT IN ('correct', 'feedback')
+                       AND kind NOT IN ('tombstone', 'retire') AND hook NOT IN ('correct', 'feedback')
                        AND (topic IS NOT NULL
                             OR kind != 'observation'
                             OR files != '[]'
@@ -2862,7 +2991,7 @@ impl Store {
              FROM event_files f
              JOIN events e ON e.id = f.event_id
              WHERE f.project = ?1 AND f.path = ?2 AND e.forgotten = 0
-                   AND e.kind != 'tombstone'
+                   AND e.kind NOT IN ('tombstone', 'retire')
                          AND e.hook NOT IN ('correct', 'feedback')
              ORDER BY {}, e.id DESC
              LIMIT ?3",
@@ -2894,7 +3023,7 @@ impl Store {
             .conn
             .prepare(
                 "SELECT id, ts, cli, kind, title, session FROM events
-                 WHERE project = ?1 AND ts >= ?2 AND forgotten = 0 AND kind != 'tombstone'
+                 WHERE project = ?1 AND ts >= ?2 AND forgotten = 0 AND kind NOT IN ('tombstone', 'retire')
                        AND hook NOT IN ('correct', 'feedback')
                  ORDER BY id
                  LIMIT ?3",
@@ -2979,6 +3108,26 @@ impl Store {
         bytes: usize,
     ) -> Result<()> {
         for (at, id) in ids.iter().enumerate() {
+            // Counted once per session, matching read_count: re-pushing the
+            // same pointer inside one conversation says nothing new about
+            // how often it gets offered.
+            let seen: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM injected WHERE session = ?1 AND event_id = ?2",
+                    params![session, id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("read injected row")?;
+            if seen.is_none() {
+                self.conn
+                    .execute(
+                        "UPDATE events SET injected_count = injected_count + 1 WHERE id = ?1",
+                        params![id],
+                    )
+                    .context("count injection")?;
+            }
             self.conn
                 .execute(
                     // Re-arms a row a compaction deactivated: after a reset the
@@ -3210,6 +3359,7 @@ fn parse_kind(raw: &str) -> EventKind {
         "note" => EventKind::Note,
         "knowledge" => EventKind::Knowledge,
         "tombstone" => EventKind::Tombstone,
+        "retire" => EventKind::Retire,
         _ => EventKind::Observation,
     }
 }
@@ -3921,6 +4071,177 @@ mod tests {
             .query_row("SELECT read_count FROM events WHERE id = ?1", [&event.id], |r| r.get(0))
             .unwrap();
         assert_eq!(after, before, "the rebuild forgot that this entry had been read");
+    }
+
+    #[test]
+    fn a_pointer_pushed_five_sessions_unread_stops_outranking_fresh_lines() {
+        // The push-side twin of read_count: `injected` records every offer,
+        // and five sessions of offers with zero pulls is the budget saying
+        // the line buys nothing. The stale entry is created second so the
+        // id DESC tie-break puts it first until decay - the flip below is
+        // the decay bit and nothing else.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let mut fresh = event("never offered", "body", project);
+        fresh.kind = EventKind::SessionSummary;
+        fresh.id = "01TESTFRESH00000000000000A".to_string();
+        let mut stale = event("offered forever", "body", project);
+        stale.kind = EventKind::SessionSummary;
+        // The larger id: wins the id DESC tie-break until decay flips it.
+        stale.id = "01TESTSTALE00000000000000B".to_string();
+        store.index(&fresh).unwrap();
+        store.index(&stale).unwrap();
+
+        for n in 0..4 {
+            store.record_injected(&format!("s{n}"), std::slice::from_ref(&stale.id), 0, 10).unwrap();
+        }
+        let before = store.pointers_of_kind(&project.to_string(), "session_summary", 10).unwrap();
+        assert_eq!(before[0].id, stale.id, "four offers are not yet decay");
+
+        store.record_injected("s4", std::slice::from_ref(&stale.id), 0, 10).unwrap();
+        let after = store.pointers_of_kind(&project.to_string(), "session_summary", 10).unwrap();
+        assert_eq!(after[0].id, fresh.id, "the fifth unread offer must sink the pointer");
+    }
+
+    #[test]
+    fn knowledge_is_exempt_from_push_decay() {
+        // Knowledge earns its place as the line itself - 83% of it ever
+        // surfaced against 2% of observations - and it is never pulled via
+        // brain_get, so zero reads there is not evidence of uselessness.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let mut fresh = event("young lesson", "body", project);
+        fresh.kind = EventKind::Knowledge;
+        fresh.id = "01TESTFRESH00000000000000A".to_string();
+        let mut stale = event("old lesson", "body", project);
+        stale.kind = EventKind::Knowledge;
+        stale.id = "01TESTSTALE00000000000000B".to_string();
+        store.index(&fresh).unwrap();
+        store.index(&stale).unwrap();
+
+        for n in 0..6 {
+            store.record_injected(&format!("s{n}"), std::slice::from_ref(&stale.id), 0, 10).unwrap();
+        }
+        let pointers = store.pointers_of_kind(&project.to_string(), "knowledge", 10).unwrap();
+        assert_eq!(pointers[0].id, stale.id, "a lesson must not decay for being shown");
+    }
+
+    #[test]
+    fn a_standing_rule_outranks_every_other_lesson() {
+        // hook = 'rule' marks knowledge distilled from corrections a person
+        // made more than once - the strongest evidence in the table, so it
+        // reads out first. The rule is created FIRST (older id) so only the
+        // rank bit, not the id tie-break, can put it on top.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let mut rule = event("Never test against the real store", "body", project);
+        rule.kind = EventKind::Knowledge;
+        rule.source.hook = "rule".to_string();
+        // The smaller id: the id DESC tie-break would bury it, so only the
+        // rank bit can put it first.
+        rule.id = "01TESTRULE000000000000000A".to_string();
+        let mut gotcha = event("The fixture leaks between files", "body", project);
+        gotcha.kind = EventKind::Knowledge;
+        gotcha.source.hook = "gotcha".to_string();
+        gotcha.id = "01TESTGOTCHA0000000000000B".to_string();
+        store.index(&rule).unwrap();
+        store.index(&gotcha).unwrap();
+
+        let pointers = store.pointers_of_kind(&project.to_string(), "knowledge", 10).unwrap();
+        assert_eq!(pointers[0].id, rule.id, "a rule must read out before other knowledge");
+    }
+
+    #[test]
+    fn a_rebuild_remembers_how_often_a_pointer_was_offered() {
+        // injected_count sits on the row like read_count did, and the same
+        // rebuild that flattened read_count would hand every stale pointer a
+        // fresh decay budget. `injected` survives `clear()`; restore from it.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let event = event("offered twice", "body", project);
+        store.index(&event).unwrap();
+        store.record_injected("session-a", std::slice::from_ref(&event.id), 0, 10).unwrap();
+        store.record_injected("session-b", std::slice::from_ref(&event.id), 0, 10).unwrap();
+
+        store.clear().unwrap();
+        store.index(&event).unwrap();
+
+        let count: i64 = store
+            .conn
+            .query_row("SELECT injected_count FROM events WHERE id = ?1", [&event.id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 2, "the rebuild forgot how often this pointer was offered");
+    }
+
+    #[test]
+    fn retirable_spares_anything_ever_offered_or_read() {
+        // Usage beats age, and "used" has two faces the counters split:
+        // a read bumps read_count, but a pointer merely OFFERED by a primer
+        // leaves only an `injected` row - read_count stays zero, and only
+        // the NOT IN guard keeps it alive.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let make = |id: &str, title: &str| {
+            let mut e = event(title, "an old body", project);
+            e.id = id.to_string();
+            e.consolidated = true;
+            store.index(&e).unwrap();
+            e
+        };
+        let unseen = make("01TESTUNSEEN000000000000AA", "nobody ever needed this");
+        let offered = make("01TESTOFFERED00000000000BB", "offered but never read");
+        let read = make("01TESTREAD00000000000000CC", "actually read");
+        let raw = {
+            let mut e = event("still in flight", "an old body", project);
+            e.id = "01TESTRAW000000000000000DD".to_string();
+            store.index(&e).unwrap();
+            e
+        };
+
+        store.record_injected("s1", std::slice::from_ref(&offered.id), 0, 10).unwrap();
+        store.record_recalled("s1", std::iter::once(read.id.as_str())).unwrap();
+
+        let (ids, bytes) =
+            store.retirable(&project.to_string(), "9999-01-01T00:00:00Z").unwrap();
+        assert_eq!(ids, vec![unseen.id.clone()], "only the never-surfaced body retires");
+        assert!(bytes > 0, "the measurement must count the body it would drop");
+        let _ = raw;
+    }
+
+    #[test]
+    fn a_retirement_drops_the_body_and_keeps_the_pointer() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let target = event("Investigated the cache", "the zeta cipher payload", project);
+        store.index(&target).unwrap();
+        assert_eq!(
+            store.search(&project.to_string(), "zeta", None, 10, Recall::Fused).unwrap().len(),
+            1,
+            "precondition: the body is searchable"
+        );
+
+        let mut retire = event("Retired 1 observation body", "", project);
+        retire.kind = EventKind::Retire;
+        retire.source.hook = "retire".to_string();
+        retire.links = vec![target.id.clone()];
+        store.index(&retire).unwrap();
+
+        assert!(
+            store.search(&project.to_string(), "zeta", None, 10, Recall::Fused).unwrap().is_empty(),
+            "a retired body still matched"
+        );
+        let hits = store.search(&project.to_string(), "cache", None, 10, Recall::Fused).unwrap();
+        assert_eq!(hits.len(), 1, "the title must stay findable");
+        assert_eq!(hits[0].id, target.id);
+        let body = store.get(std::slice::from_ref(&target.id)).unwrap().remove(0).body;
+        assert!(body.is_empty(), "the body survived retirement: {body}");
+        // The retire event itself is bookkeeping, not memory.
+        assert!(
+            store.search(&project.to_string(), "Retired", None, 10, Recall::Fused).unwrap().is_empty(),
+            "the retire event leaked into search"
+        );
     }
 
     #[test]
