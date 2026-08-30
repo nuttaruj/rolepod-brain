@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".github/banner.png" alt="Rolepod brain — project memory" width="100%">
+</p>
+
 # rolepod-brain
 
 Persistent memory for AI coding agents. One binary, one SQLite index, a
