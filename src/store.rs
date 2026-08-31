@@ -599,7 +599,7 @@ impl Store {
         // the event's own text, so a replay reproduces it; set only at
         // insert, so feedback demotes survive re-indexing.
         let intent = event.kind == EventKind::Observation
-            && event.source.hook == "user_prompt_submit"
+            && crate::event::is_user_prompt(&event.source.hook)
             && (crate::event::carries_memory_intent(&event.title)
                 || crate::event::carries_memory_intent(&event.body));
         self.conn
@@ -4312,6 +4312,23 @@ mod tests {
             pointers[0].id, order.id,
             "an explicit order to remember must outrank ordinary prompts"
         );
+
+        // The same order typed into Cursor - a differently spelled prompt
+        // hook - must get the same boost, or the rule is Claude-only.
+        let mut cursor = event(
+            "Asked: from now on, always use pnpm",
+            "from now on, always use pnpm",
+            project,
+        );
+        cursor.source.cli = "cursor".to_string();
+        cursor.source.hook = "before_submit_prompt".to_string();
+        cursor.id = "01TESTCURSOR000000000000AB".to_string();
+        store.index(&cursor).unwrap();
+        let confidence: i64 = store
+            .conn
+            .query_row("SELECT confidence FROM events WHERE id = ?1", [&cursor.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(confidence, 1, "an order typed into Cursor was not heard");
     }
 
     #[test]

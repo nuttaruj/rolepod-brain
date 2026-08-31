@@ -429,7 +429,7 @@ fn worth_injecting(pointer: &Pointer) -> bool {
     pointer.topic.is_some()
         || pointer.kind != "observation"
         || pointer.has_files
-        || pointer.hook == "user_prompt_submit"
+        || crate::event::is_user_prompt(&pointer.hook)
         // A turn that ended with the model saying something. `stop` used to
         // be a bare "Turn finished" marker and was padding; it now carries
         // the answer's opening, and an answer already given is the one thing

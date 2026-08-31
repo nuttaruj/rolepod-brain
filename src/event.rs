@@ -104,6 +104,18 @@ pub struct Source {
     pub hook: String,
 }
 
+/// Is this hook the moment a human typed something at the agent?
+///
+/// Every CLI spells it differently and two do not have it at all:
+/// `UserPromptSubmit` (Claude Code, Codex), `beforeSubmitPrompt` (Cursor),
+/// `BeforeAgent` (Gemini) - normalized spellings here. Antigravity and
+/// OpenCode expose no prompt event, so nothing to match. Matching only one
+/// spelling quietly made every human-typed-is-signal rule Claude-only.
+#[must_use]
+pub fn is_user_prompt(hook: &str) -> bool {
+    matches!(hook, "user_prompt_submit" | "before_submit_prompt" | "before_agent")
+}
+
 /// Does this text carry an explicit order to remember?
 ///
 /// "จำไว้ว่าให้ใช้ rtk เสมอ" is the strongest signal any prompt can carry,
