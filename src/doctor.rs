@@ -53,8 +53,9 @@ pub fn run() -> Result<Vec<Check>> {
         Ok(config) => checks.push(Check::pass(
             "config",
             format!(
-                "summarizer={} primer_budget={}B session_budget={}B",
+                "summarizer={} rerank={} primer_budget={}B session_budget={}B",
                 config.summarizer.mode,
+                config.search.rerank,
                 config.injection.primer_budget,
                 config.injection.session_budget
             ),

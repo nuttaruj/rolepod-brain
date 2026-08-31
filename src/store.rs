@@ -595,12 +595,19 @@ impl Store {
     pub fn index(&self, event: &Event) -> Result<()> {
         let subject = self.subject_files_for(event)?;
         let files = serde_json::to_string(&subject).unwrap_or_else(|_| "[]".to_string());
+        // A prompt that ORDERS remembering starts one rung up. Derived from
+        // the event's own text, so a replay reproduces it; set only at
+        // insert, so feedback demotes survive re-indexing.
+        let intent = event.kind == EventKind::Observation
+            && event.source.hook == "user_prompt_submit"
+            && (crate::event::carries_memory_intent(&event.title)
+                || crate::event::carries_memory_intent(&event.body));
         self.conn
             .execute(
                 "INSERT INTO events
                     (id, ts, workspace, project, session, cli, hook, kind, title, body,
-                     files, topic, invocation, consolidated)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                     files, topic, invocation, confidence, consolidated)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                  ON CONFLICT(id) DO UPDATE SET
                      title = excluded.title,
                      body = excluded.body,
@@ -622,6 +629,7 @@ impl Store {
                     files,
                     event.topic,
                     event.extra.get("invocation").and_then(serde_json::Value::as_str),
+                    i32::from(intent),
                     i32::from(event.consolidated),
                 ],
             )
@@ -669,6 +677,24 @@ impl Store {
                             params![target],
                         )
                         .context("apply feedback")?;
+                }
+            }
+            // A supersession is the synthesis pass landing newer wording on
+            // a fact it re-derived from NEW summaries. The rewrite is the
+            // same as a correction's; the confidence bump is not - being
+            // derived again is recurrence evidence, the thing this table
+            // ranks on, while a user's fix says the entry was WRONG and
+            // earns nothing.
+            EventKind::Note if event.source.hook == "supersede" => {
+                for target in &event.links {
+                    self.conn
+                        .execute(
+                            "UPDATE events SET title = ?2, body = ?3, corrected_by = ?4,
+                                    confidence = confidence + 1
+                             WHERE id = ?1",
+                            params![target, event.title, event.body, event.id],
+                        )
+                        .context("apply supersession")?;
                 }
             }
             EventKind::Note if event.source.hook == "correct" => {
@@ -863,7 +889,7 @@ impl Store {
                      JOIN events e ON e.rowid = events_fts.rowid
                      WHERE events_fts MATCH ?1 AND e.project = ?2 AND e.forgotten = 0
                            AND e.kind NOT IN ('tombstone', 'retire')
-                                 AND e.hook NOT IN ('correct', 'feedback')
+                                 AND e.hook NOT IN ('correct', 'feedback', 'supersede')
                            AND (?5 IS NULL OR e.topic = ?5)
                  )
                  SELECT id, ts, cli, kind, title, snip, session FROM (
@@ -1097,7 +1123,7 @@ impl Store {
                  WHERE n.name IN (SELECT name FROM subject)
                        AND e.project = ?2 AND e.id != ?1
                        AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
-                       AND e.hook NOT IN ('correct', 'feedback')
+                       AND e.hook NOT IN ('correct', 'feedback', 'supersede')
                  GROUP BY e.id
                  ORDER BY shared DESC,
                           CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END,
@@ -1157,7 +1183,7 @@ impl Store {
                  FROM events_tri
                  JOIN events e ON e.rowid = events_tri.rowid
                  WHERE events_tri MATCH ?1 AND e.project = ?2 AND e.forgotten = 0
-                       AND e.kind NOT IN ('tombstone', 'retire') AND e.hook NOT IN ('correct', 'feedback')
+                       AND e.kind NOT IN ('tombstone', 'retire') AND e.hook NOT IN ('correct', 'feedback', 'supersede')
                        AND (?4 IS NULL OR e.topic = ?4)
                  ORDER BY CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END, rank
                  LIMIT ?3",
@@ -1250,7 +1276,7 @@ impl Store {
                  FROM events e
                  JOIN matched m ON m.session = e.session
                  WHERE e.project = ?1 AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
-                       AND e.hook NOT IN ('correct', 'feedback')
+                       AND e.hook NOT IN ('correct', 'feedback', 'supersede')
                        AND (?2 IS NULL OR e.topic = ?2)
              )
              SELECT id, ts, cli, kind, title, snip, session FROM candidates
@@ -1349,7 +1375,7 @@ impl Store {
              JOIN shared s ON s.session = e.session
              WHERE e.project = ?1
                    AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
-                   AND e.hook NOT IN ('correct', 'feedback')
+                   AND e.hook NOT IN ('correct', 'feedback', 'supersede')
                    AND (?2 IS NULL OR e.topic = ?2)
              ORDER BY s.shared DESC,
                       CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END,
@@ -1398,7 +1424,7 @@ impl Store {
     /// # Errors
     /// Returns an error when a query fails.
     pub fn outline(&self, project: &str, limit: usize) -> Result<Outline> {
-        let live = "forgotten = 0 AND kind NOT IN ('tombstone', 'retire') AND hook NOT IN ('correct', 'feedback')";
+        let live = "forgotten = 0 AND kind NOT IN ('tombstone', 'retire') AND hook NOT IN ('correct', 'feedback', 'supersede')";
         let count = |extra: &str| -> Result<i64> {
             self.conn
                 .query_row(
@@ -1462,7 +1488,7 @@ impl Store {
                 "SELECT id, ts, cli, kind, title, substr(COALESCE(body, ''), 1, 160), session
                  FROM events
                  WHERE id = ?1 AND forgotten = 0 AND kind NOT IN ('tombstone', 'retire')
-                       AND hook NOT IN ('correct', 'feedback')",
+                       AND hook NOT IN ('correct', 'feedback', 'supersede')",
             )
             .context("prepare hits by id")?;
         for id in ids {
@@ -1616,7 +1642,7 @@ impl Store {
                  FROM event_vec v
                  JOIN events e ON e.id = v.event_id
                  WHERE e.project = ?1 AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
-                       AND e.hook NOT IN ('correct', 'feedback')
+                       AND e.hook NOT IN ('correct', 'feedback', 'supersede')
                        AND (?2 IS NULL OR e.topic = ?2)",
             )
             .context("prepare nearest")?;
@@ -1730,7 +1756,7 @@ impl Store {
             .prepare(
                 "SELECT id, ts, cli, kind, title, session
                  FROM events WHERE project = ?1 AND forgotten = 0 AND kind NOT IN ('tombstone', 'retire')
-                       AND hook NOT IN ('correct', 'feedback')
+                       AND hook NOT IN ('correct', 'feedback', 'supersede')
                        AND (?3 IS NULL OR cli = ?3)
                        AND (?4 IS NULL OR kind = ?4)
                        AND (?5 IS NULL OR session = ?5)
@@ -2155,11 +2181,11 @@ impl Store {
     /// user had to make twice IS the durable fact - a standing rule this
     /// project keeps violating.
     ///
-    /// Machine rewordings are excluded: `supersede_knowledge` writes the same
-    /// `hook = 'correct'` shape when it lands newer wording on an existing
-    /// knowledge page, and a rule distilled from rewordings would be a rule
-    /// about our own bookkeeping. Those are exactly the corrections whose id
-    /// a knowledge row carries in `corrected_by`.
+    /// Machine rewordings are excluded twice over: `supersede_knowledge`
+    /// now writes its own `hook = 'supersede'` (not matched here), and the
+    /// `corrected_by` guard below still catches the pre-rename shape in old
+    /// logs - a rule distilled from our own rewordings would be a rule
+    /// about bookkeeping.
     ///
     /// # Errors
     /// Returns an error when the query fails.
@@ -2287,7 +2313,7 @@ impl Store {
                  JOIN entities n ON n.session = e.session AND n.project = e.project
                  WHERE e.project = ?1 AND n.name = ?2 AND e.forgotten = 0
                        AND e.kind NOT IN ('tombstone', 'retire')
-                             AND e.hook NOT IN ('correct', 'feedback')
+                             AND e.hook NOT IN ('correct', 'feedback', 'supersede')
                  ORDER BY CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END, e.id DESC
                  LIMIT ?3",
             )
@@ -2894,7 +2920,7 @@ impl Store {
             // that only disappears from search has not been withdrawn.
             "SELECT id, ts, kind, title, topic, files, hook FROM events
              WHERE project = ?1 AND forgotten = 0 AND kind NOT IN ('tombstone', 'retire')
-                   AND hook NOT IN ('correct', 'feedback')
+                   AND hook NOT IN ('correct', 'feedback', 'supersede')
                    AND (?3 IS NULL OR kind = ?3)
              ORDER BY {}, id DESC
              LIMIT ?2",
@@ -2948,7 +2974,7 @@ impl Store {
                 // first, and what a real event store showed within minutes.
                 "SELECT id, ts, kind, title, topic, files, hook FROM events
                  WHERE project = ?1 AND consolidated = 0 AND forgotten = 0
-                       AND kind NOT IN ('tombstone', 'retire') AND hook NOT IN ('correct', 'feedback')
+                       AND kind NOT IN ('tombstone', 'retire') AND hook NOT IN ('correct', 'feedback', 'supersede')
                        AND (topic IS NOT NULL
                             OR kind != 'observation'
                             OR files != '[]'
@@ -2993,7 +3019,7 @@ impl Store {
              JOIN events e ON e.id = f.event_id
              WHERE f.project = ?1 AND f.path = ?2 AND e.forgotten = 0
                    AND e.kind NOT IN ('tombstone', 'retire')
-                         AND e.hook NOT IN ('correct', 'feedback')
+                         AND e.hook NOT IN ('correct', 'feedback', 'supersede')
              ORDER BY {}, e.id DESC
              LIMIT ?3",
             Self::rank("e.")
@@ -3025,7 +3051,7 @@ impl Store {
             .prepare(
                 "SELECT id, ts, cli, kind, title, session FROM events
                  WHERE project = ?1 AND ts >= ?2 AND forgotten = 0 AND kind NOT IN ('tombstone', 'retire')
-                       AND hook NOT IN ('correct', 'feedback')
+                       AND hook NOT IN ('correct', 'feedback', 'supersede')
                  ORDER BY id
                  LIMIT ?3",
             )
@@ -4209,6 +4235,83 @@ mod tests {
         assert_eq!(ids, vec![unseen.id.clone()], "only the never-surfaced body retires");
         assert!(bytes > 0, "the measurement must count the body it would drop");
         let _ = raw;
+    }
+
+    #[test]
+    fn a_rederived_fact_gains_confidence_and_a_user_fix_does_not() {
+        // Being derived again from NEW summaries is recurrence evidence;
+        // a user's correction says the entry was WRONG and earns nothing.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let mut fact = event("vitest runs file-by-file here", "body", project);
+        fact.kind = EventKind::Knowledge;
+        store.index(&fact).unwrap();
+
+        let mut supersede = event("vitest must run file-by-file", "newer body", project);
+        supersede.kind = EventKind::Note;
+        supersede.source.hook = "supersede".to_string();
+        supersede.links = vec![fact.id.clone()];
+        store.index(&supersede).unwrap();
+
+        let confidence: i64 = store
+            .conn
+            .query_row("SELECT confidence FROM events WHERE id = ?1", [&fact.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(confidence, 1, "a re-derivation must count as recurrence");
+
+        let mut fix = event("actually it is per-directory", "fixed body", project);
+        fix.kind = EventKind::Note;
+        fix.source.hook = "correct".to_string();
+        fix.links = vec![fact.id.clone()];
+        store.index(&fix).unwrap();
+        let confidence: i64 = store
+            .conn
+            .query_row("SELECT confidence FROM events WHERE id = ?1", [&fact.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(confidence, 1, "a user's fix must not be counted as recurrence");
+    }
+
+    #[test]
+    fn a_supersession_note_never_reaches_search() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let mut fact = event("the cache is write-through", "body", project);
+        fact.kind = EventKind::Knowledge;
+        store.index(&fact).unwrap();
+        let mut supersede = event("the zeppelin cache is write-through", "b", project);
+        supersede.kind = EventKind::Note;
+        supersede.source.hook = "supersede".to_string();
+        supersede.links = vec![fact.id.clone()];
+        store.index(&supersede).unwrap();
+
+        let hits = store.search(&project.to_string(), "zeppelin", None, 10, Recall::Fused).unwrap();
+        assert_eq!(hits.len(), 1, "only the fact itself may surface: {hits:?}");
+        assert_eq!(hits[0].id, fact.id, "the bookkeeping note leaked into search");
+    }
+
+    #[test]
+    fn a_prompt_that_orders_remembering_floats_above_the_noise() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let mut plain = event("Asked: what does the scheduler do", "how does it work", project);
+        plain.source.hook = "user_prompt_submit".to_string();
+        plain.id = "01TESTPLAIN0000000000000ZZ".to_string();
+        let mut order = event(
+            "Asked: remember that deploys happen on Fridays only",
+            "remember that deploys happen on Fridays only",
+            project,
+        );
+        order.source.hook = "user_prompt_submit".to_string();
+        // The smaller id: only the intent boost can put it first.
+        order.id = "01TESTORDER0000000000000AA".to_string();
+        store.index(&plain).unwrap();
+        store.index(&order).unwrap();
+
+        let pointers = store.primer_pointers(&project.to_string(), 10).unwrap();
+        assert_eq!(
+            pointers[0].id, order.id,
+            "an explicit order to remember must outrank ordinary prompts"
+        );
     }
 
     #[test]

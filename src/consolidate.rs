@@ -683,7 +683,11 @@ fn supersede_knowledge(
         scope.workspace_id,
         scope.project_id,
         uuid::Uuid::nil(),
-        Source { cli: "brain".to_string(), hook: "correct".to_string() },
+        // Its own hook, not `correct`: a supersession is the model
+        // re-deriving a fact from NEW summaries, which is recurrence
+        // evidence a user's fix is not - and the index treats them
+        // differently for exactly that reason.
+        Source { cli: "brain".to_string(), hook: "supersede".to_string() },
         EventKind::Note,
         title.to_string(),
         body.to_string(),

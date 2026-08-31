@@ -104,6 +104,36 @@ pub struct Source {
     pub hook: String,
 }
 
+/// Does this text carry an explicit order to remember?
+///
+/// "จำไว้ว่าให้ใช้ rtk เสมอ" is the strongest signal any prompt can carry,
+/// and it costs no model call to spot. Deliberately conservative, in both
+/// languages: a phrase must read as an instruction ABOUT remembering or a
+/// standing order, not merely contain "always" - "why does it always
+/// crash" is a question, not a rule. A false negative costs nothing
+/// (consolidation still reads every prompt); a false positive floats one
+/// event it should not.
+#[must_use]
+pub fn carries_memory_intent(text: &str) -> bool {
+    let lowered = text.to_lowercase();
+    const PHRASES: &[&str] = &[
+        "remember that",
+        "remember this",
+        "don't forget",
+        "from now on",
+        "always use",
+        "never use",
+        "make it a rule",
+        "\u{e08}\u{e33}\u{e44}\u{e27}\u{e49}",           // จำไว้
+        "\u{e2d}\u{e22}\u{e48}\u{e32}\u{e25}\u{e37}\u{e21}", // อย่าลืม
+        "\u{e2b}\u{e49}\u{e32}\u{e21}\u{e43}\u{e0a}\u{e49}", // ห้ามใช้
+        "\u{e15}\u{e49}\u{e2d}\u{e07}\u{e43}\u{e0a}\u{e49}", // ต้องใช้
+        "\u{e17}\u{e38}\u{e01}\u{e04}\u{e23}\u{e31}\u{e49}\u{e07}\u{e17}\u{e35}\u{e48}", // ทุกครั้งที่
+        "\u{e15}\u{e48}\u{e2d}\u{e44}\u{e1b}\u{e19}\u{e35}\u{e49}\u{e43}\u{e2b}\u{e49}", // ต่อไปนี้ให้
+    ];
+    PHRASES.iter().any(|phrase| lowered.contains(phrase))
+}
+
 /// One line of the log.
 ///
 /// `#[serde(default)]` on the optional fields plus `flatten`ed `extra` is what
@@ -196,7 +226,7 @@ impl Event {
     pub fn is_revision(&self) -> bool {
         matches!(self.kind, EventKind::Tombstone | EventKind::Retire)
             || (self.kind == EventKind::Note
-                && matches!(self.source.hook.as_str(), "correct" | "feedback"))
+                && matches!(self.source.hook.as_str(), "correct" | "feedback" | "supersede"))
     }
 
     /// Month bucket this event belongs to, from its own timestamp.
@@ -353,6 +383,35 @@ mod tests {
             "a revision must replay after anything it could target"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_order_to_remember_is_heard_and_a_question_is_not() {
+        for yes in [
+            "Remember that we deploy on Fridays only",
+            "from now on, always use rtk grep",
+            "\u{e08}\u{e33}\u{e44}\u{e27}\u{e49}\u{e27}\u{e48}\u{e32}\u{e43}\u{e2b}\u{e49}\u{e43}\u{e0a}\u{e49} rtk", // จำไว้ว่าให้ใช้ rtk
+            "\u{e2d}\u{e22}\u{e48}\u{e32}\u{e25}\u{e37}\u{e21} run lint", // อย่าลืม run lint
+        ] {
+            assert!(carries_memory_intent(yes), "missed an order: {yes}");
+        }
+        for no in [
+            "why does it always crash on startup",
+            "I never understood this part of the code",
+            "fix the login bug",
+        ] {
+            assert!(!carries_memory_intent(no), "a question read as an order: {no}");
+        }
+    }
+
+    #[test]
+    fn a_supersession_is_a_revision_for_replay_purposes() {
+        // It rewrites another event, so a fast clock elsewhere must not be
+        // able to replay it into nothing.
+        let mut note = sample();
+        note.kind = EventKind::Note;
+        note.source.hook = "supersede".to_string();
+        assert!(note.is_revision());
     }
 
     fn sample() -> Event {
