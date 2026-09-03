@@ -463,7 +463,11 @@ fn call_tool(paths: &Paths, project: &str, session: &str, params: &Value) -> Res
                 // Borrow the cheap tier of whichever CLI works here.
                 let cli = store.project_cli(project)?.unwrap_or_default();
                 let model_dir = paths.model_dir_for(crate::rerank::LOCAL_MODEL);
-                hits = crate::rerank::rerank(&ladder, &cli, query, &model_dir, hits);
+                let (reranked, outcome) =
+                    crate::rerank::rerank(&ladder, &cli, query, &model_dir, hits);
+                hits = reranked;
+                // Telemetry, never a reason to fail the search.
+                let _ = store.record_rerank(outcome.engine, outcome.reason, outcome.ms, outcome.cold);
             }
             hits.truncate(limit);
 

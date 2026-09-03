@@ -66,6 +66,14 @@ const MAX_TOKENS: usize = 320;
 /// not `Clone`.
 static CELL: OnceLock<Result<Reranker, String>> = OnceLock::new();
 
+/// Has this process paid the model load yet? The first rerank carries it -
+/// about a second - and the difference is the cold/warm split `brain stats`
+/// reports, which a single latency figure would blur.
+#[must_use]
+pub fn is_loaded() -> bool {
+    CELL.get().is_some()
+}
+
 struct Reranker {
     /// `Session::run` needs `&mut`, and this lives in a `OnceLock` that hands
     /// out shared references. One lock per search, uncontended in practice:

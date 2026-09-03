@@ -539,7 +539,9 @@ fn search(query: &str, limit: usize, topic: Option<&str>, rerank: Option<bool>) 
         let ladder = summarizer::Ladder::new(&store, &config.summarizer);
         let cli = store.project_cli(&project)?.unwrap_or_default();
         let model_dir = paths.model_dir_for(rerank::LOCAL_MODEL);
-        hits = rerank::rerank(&ladder, &cli, query, &model_dir, hits);
+        let (reranked, outcome) = rerank::rerank(&ladder, &cli, query, &model_dir, hits);
+        hits = reranked;
+        let _ = store.record_rerank(outcome.engine, outcome.reason, outcome.ms, outcome.cold);
     }
     hits.truncate(limit);
 
@@ -675,8 +677,77 @@ fn stats() -> Result<()> {
         println!("  {recalls} recall result(s) handed to agents");
     }
 
+    println!("\nRerank");
+    let runs = store.rerank_runs().unwrap_or_default();
+    if runs.is_empty() {
+        println!("  no reranked search recorded yet");
+        println!("  (counting started when this brain was upgraded to 0.47.0)");
+    } else {
+        for line in rerank_lines(&runs) {
+            println!("  {line}");
+        }
+    }
+
     println!("\nNothing above leaves this machine.");
     Ok(())
+}
+
+/// The rerank section of `brain stats`: per engine, how often it answered
+/// and what that cost, with the local model's first-of-process loads apart
+/// from the rest; then every reason the faster engine did not answer.
+///
+/// This is the evidence the fallback policy waits on. "CLI reranks take 12
+/// seconds" was measured once on one machine; this is what they take here.
+fn rerank_lines(runs: &[store::RerankRun]) -> Vec<String> {
+    fn seconds(ms: u64) -> String {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    }
+    fn percentile(sorted: &[u64], p: usize) -> u64 {
+        sorted[(sorted.len() - 1) * p / 100]
+    }
+    let mut lines = Vec::new();
+    for engine in ["local", "cli", "none"] {
+        let mine: Vec<&store::RerankRun> = runs.iter().filter(|run| run.engine == engine).collect();
+        if mine.is_empty() {
+            continue;
+        }
+        let mut sorted: Vec<u64> = mine.iter().map(|run| run.ms).collect();
+        sorted.sort_unstable();
+        let verb = if engine == "none" { "left the index's order" } else { "answered" };
+        let mut line = format!(
+            "{engine:<6} {} {verb}, p50 {}, p95 {}",
+            mine.len(),
+            seconds(percentile(&sorted, 50)),
+            seconds(percentile(&sorted, 95))
+        );
+        if engine == "local" {
+            let mut cold: Vec<u64> = mine.iter().filter(|run| run.cold).map(|run| run.ms).collect();
+            let mut warm: Vec<u64> = mine.iter().filter(|run| !run.cold).map(|run| run.ms).collect();
+            cold.sort_unstable();
+            warm.sort_unstable();
+            match (cold.is_empty(), warm.is_empty()) {
+                (false, false) => line.push_str(&format!(
+                    " (cold {} over {}, warm {} over {})",
+                    seconds(percentile(&cold, 50)),
+                    cold.len(),
+                    seconds(percentile(&warm, 50)),
+                    warm.len()
+                )),
+                (false, true) => line.push_str(" (every one a cold start: a fresh process per search)"),
+                _ => {}
+            }
+        }
+        lines.push(line);
+    }
+    let mut reasons: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for run in runs.iter().filter(|run| !run.reason.is_empty()) {
+        *reasons.entry(run.reason.as_str()).or_default() += 1;
+    }
+    if !reasons.is_empty() {
+        let listed: Vec<String> = reasons.iter().map(|(reason, n)| format!("{reason} {n}")).collect();
+        lines.push(format!("why not faster: {}", listed.join(", ")));
+    }
+    lines
 }
 
 fn where_am_i(models_only: bool, reranker_only: bool) -> Result<()> {
@@ -698,4 +769,40 @@ fn where_am_i(models_only: bool, reranker_only: bool) -> Result<()> {
     println!("model      {}", paths.model_dir().display());
     println!("reranker   {}", paths.model_dir_for(rerank::LOCAL_MODEL).display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(engine: &str, reason: &str, ms: u64, cold: bool) -> store::RerankRun {
+        store::RerankRun { engine: engine.into(), reason: reason.into(), ms, cold }
+    }
+
+    /// The section reads per engine, splits the local model's cold starts
+    /// from its warm answers, and ends with why the faster engine did not
+    /// answer - the three things the fallback policy is decided on.
+    #[test]
+    fn the_rerank_section_names_engines_cold_starts_and_reasons() {
+        let lines = rerank_lines(&[
+            run("local", "", 2400, true),
+            run("local", "", 1800, false),
+            run("local", "", 1700, false),
+            run("cli", "local-not-ready", 12_200, false),
+            run("none", "cli-no-answer", 20_000, false),
+        ]);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[0].starts_with("local  3 answered, p50 1.8s"), "{}", lines[0]);
+        assert!(lines[0].contains("cold 2.4s over 1, warm 1.7s over 2"), "{}", lines[0]);
+        assert!(lines[1].starts_with("cli    1 answered, p50 12.2s"), "{}", lines[1]);
+        assert!(lines[2].starts_with("none   1 left the index's order"), "{}", lines[2]);
+        assert_eq!(lines[3], "why not faster: cli-no-answer 1, local-not-ready 1");
+    }
+
+    #[test]
+    fn an_engine_that_never_ran_has_no_line() {
+        let lines = rerank_lines(&[run("local", "", 1800, false)]);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(!lines[0].contains("every one a cold start"), "{}", lines[0]);
+    }
 }

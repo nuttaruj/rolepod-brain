@@ -176,6 +176,15 @@ pub struct Outline {
 }
 
 /// One search hit.
+/// One recorded rerank, as `brain stats` reads it back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RerankRun {
+    pub engine: String,
+    pub reason: String,
+    pub ms: u64,
+    pub cold: bool,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Hit {
     pub id: String,
@@ -464,6 +473,18 @@ impl Store {
                     session TEXT NOT NULL,
                     path    TEXT NOT NULL,
                     PRIMARY KEY (session, path)
+                );
+
+                -- What each rerank did: which engine answered, how long it
+                -- took, and why the faster engine did not. Local counters for
+                -- `brain stats`; whether a machine without a local model
+                -- should wait on a CLI at all cannot be decided without them.
+                CREATE TABLE IF NOT EXISTS rerank_runs (
+                    ts     TEXT NOT NULL,
+                    engine TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    ms     INTEGER NOT NULL,
+                    cold   INTEGER NOT NULL DEFAULT 0
                 );
 
                 -- What consolidation has already done for a session, so a
@@ -2399,6 +2420,54 @@ impl Store {
     ///
     /// # Errors
     /// Returns an error when the query fails.
+    /// Write down what one rerank did. See `rerank::Outcome`.
+    ///
+    /// # Errors
+    /// Returns an error when the write fails.
+    pub fn record_rerank(&self, engine: &str, reason: &str, ms: u64, cold: bool) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO rerank_runs (ts, engine, reason, ms, cold) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    jiff::Timestamp::now().to_string(),
+                    engine,
+                    reason,
+                    i64::try_from(ms).unwrap_or(i64::MAX),
+                    i32::from(cold)
+                ],
+            )
+            .context("record rerank")?;
+        Ok(())
+    }
+
+    /// What reranking has cost, per engine: every run's latency, warm and
+    /// cold apart, and the reasons the engine above did not answer.
+    ///
+    /// Percentiles are left to the caller: the rows are few (one per
+    /// reranked search) and a median over them is one sort.
+    ///
+    /// # Errors
+    /// Returns an error when the read fails.
+    pub fn rerank_runs(&self) -> Result<Vec<RerankRun>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT engine, reason, ms, cold FROM rerank_runs ORDER BY ts")
+            .context("prepare rerank runs")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(RerankRun {
+                    engine: row.get(0)?,
+                    reason: row.get(1)?,
+                    ms: row.get::<_, i64>(2)?.max(0).unsigned_abs(),
+                    cold: row.get::<_, i32>(3)? != 0,
+                })
+            })
+            .context("read rerank runs")?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("read rerank runs")?;
+        Ok(rows)
+    }
+
     pub fn revision_counts(&self) -> Result<(i64, i64)> {
         self.conn
             .query_row(
@@ -3393,6 +3462,21 @@ fn parse_kind(raw: &str) -> EventKind {
 
 #[cfg(test)]
 mod tests {
+    /// Every rerank is written down with what answered and why the faster
+    /// engine did not, and comes back in the order it happened.
+    #[test]
+    fn rerank_runs_are_recorded_and_read_back_in_order() {
+        let store = super::Store::open_memory().unwrap();
+        store.record_rerank("local", "", 2400, true).unwrap();
+        store.record_rerank("local", "", 1800, false).unwrap();
+        store.record_rerank("none", "cli-no-answer", 20_000, false).unwrap();
+        let runs = store.rerank_runs().unwrap();
+        assert_eq!(runs.len(), 3);
+        assert_eq!((runs[0].engine.as_str(), runs[0].ms, runs[0].cold), ("local", 2400, true));
+        assert_eq!((runs[1].engine.as_str(), runs[1].ms, runs[1].cold), ("local", 1800, false));
+        assert_eq!((runs[2].engine.as_str(), runs[2].reason.as_str()), ("none", "cli-no-answer"));
+    }
+
     use super::*;
 
     fn hit(id: &str, session: &str) -> Hit {

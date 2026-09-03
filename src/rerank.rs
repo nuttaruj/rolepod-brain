@@ -18,7 +18,7 @@
 //! detached, with three minutes to spend, and was never the thing in a
 //! hurry. Advisory calls now leave no mark; see [`Ladder::while_waiting`].
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::store::Hit;
 use crate::summarizer::{Ladder, Tier};
@@ -73,11 +73,33 @@ pub const LOCAL_MODEL: &str = "bge-reranker-v2-m3-int8";
 /// wait for the slowest.
 const TIMEOUT: Duration = Duration::from_secs(20);
 
+/// What one rerank did, for `brain stats`.
+///
+/// The fallback policy - whether a machine without a local model should
+/// wait on a host CLI or take the index's order - cannot be argued about
+/// without knowing how often each engine actually answers and what it
+/// costs when it does. This is that record; the caller writes it down.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outcome {
+    /// `local`, `cli`, or `none`.
+    pub engine: &'static str,
+    /// Why the engine above this one did not answer: `local-not-ready`,
+    /// `no-local-build`, `cli-no-answer`, `too-few-hits`. Empty when the
+    /// local model answered - there is nothing above it.
+    pub reason: &'static str,
+    /// Wall time of the whole rerank, model load included.
+    pub ms: u64,
+    /// The first local rerank of a process pays the model load; the ones
+    /// after it do not. Stats reports the two apart for that reason.
+    pub cold: bool,
+}
+
 /// Reorder `hits` by what a cheap model thinks answers `query`.
 ///
 /// Returns the original order unchanged when reranking is unavailable,
 /// times out, or answers with anything unusable. There is no error case by
-/// design: a failed rerank is a no-op, never a failed search.
+/// design: a failed rerank is a no-op, never a failed search. The
+/// [`Outcome`] beside the hits says which of those happened.
 #[must_use]
 pub fn rerank(
     ladder: &Ladder<'_>,
@@ -85,15 +107,20 @@ pub fn rerank(
     query: &str,
     model_dir: &std::path::Path,
     hits: Vec<Hit>,
-) -> Vec<Hit> {
+) -> (Vec<Hit>, Outcome) {
+    let started = Instant::now();
+    let elapsed = |started: Instant| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     if hits.len() < 2 {
-        return hits;
+        return (hits, Outcome { engine: "none", reason: "too-few-hits", ms: 0, cold: false });
     }
     // The local model first, when this build has one and the weights are on
     // disk: same judgement, 1.6s instead of 12.2s, no subscription spent.
+    let cold = !local_loaded();
     if let Some(order) = local_order(model_dir, query, &hits) {
-        return apply_order(&order, hits);
+        let ms = elapsed(started);
+        return (apply_order(&order, hits), Outcome { engine: "local", reason: "", ms, cold });
     }
+    let why_not_local = if cfg!(feature = "local-rerank") { "local-not-ready" } else { "no-local-build" };
     // Not there yet. Start fetching it for next time and answer this search
     // the way every machine answers it today - through the CLI. The download
     // is detached and silent: a search is not the place to learn that 568 MB
@@ -104,9 +131,23 @@ pub fn rerank(
     let prompt = prompt_for(query, &offered);
     let ladder = ladder.while_waiting(TIMEOUT);
     let Ok((Tier::Cli(_), answer)) = ladder.run(&prompt, cli, usable) else {
-        return hits;
+        let ms = elapsed(started);
+        return (hits, Outcome { engine: "none", reason: "cli-no-answer", ms, cold: false });
     };
-    apply(order_in(&answer), hits)
+    let ms = elapsed(started);
+    (apply(order_in(&answer), hits), Outcome { engine: "cli", reason: why_not_local, ms, cold: false })
+}
+
+/// Has this process loaded the local model already?
+#[cfg(feature = "local-rerank")]
+fn local_loaded() -> bool {
+    crate::xencoder::is_loaded()
+}
+
+/// A build without the feature never loads one.
+#[cfg(not(feature = "local-rerank"))]
+fn local_loaded() -> bool {
+    false
 }
 
 /// Ask the installer to fetch the reranker, once, without waiting for it.
@@ -362,6 +403,18 @@ mod tests {
         assert!(!local_is_ready(path), "weights without a runtime are not ready");
 
         std::fs::remove_dir_all(path).ok();
+    }
+
+    /// One hit has no order to improve. The outcome says so rather than
+    /// leaving stats to count a rerank that never ran.
+    #[test]
+    fn one_hit_is_not_reranked_and_the_outcome_says_why() {
+        let store = crate::store::Store::open_memory().unwrap();
+        let ladder = Ladder::new(&store, &crate::config::SummarizerConfig::default());
+        let (hits, outcome) =
+            rerank(&ladder, "claude-code", "q", std::path::Path::new("/nonexistent"), vec![hit("a", "A")]);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(outcome, Outcome { engine: "none", reason: "too-few-hits", ms: 0, cold: false });
     }
 
     fn hit(id: &str, title: &str) -> Hit {
