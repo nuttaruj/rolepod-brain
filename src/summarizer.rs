@@ -116,7 +116,25 @@ pub const SPECS: &[CliSpec] = &[
         output: OutputMode::File,
         // stdout carries hook chatter and a token counter, so the answer is
         // read from the file rather than scraped out of the stream.
-        args: &["exec", "-m", "{model}", "--skip-git-repo-check", "-o", "{out}"],
+        //
+        // The two `-c`/`-s` overrides exist because `codex exec` inherits the
+        // user's config.toml: one machine's default was effort `max` with a
+        // full-access sandbox, and a JSON summary of 3 KB of events ran
+        // 38-77s there, spending up to 3.6k reasoning tokens per call.
+        // Summarising is not a reasoning task, and a worker that calls no
+        // tool needs no sandbox wider than read-only.
+        args: &[
+            "exec",
+            "-m",
+            "{model}",
+            "-c",
+            "model_reasoning_effort=\"low\"",
+            "-s",
+            "read-only",
+            "--skip-git-repo-check",
+            "-o",
+            "{out}",
+        ],
     },
     CliSpec {
         // Google's replacement for Gemini CLI, and the reason that entry is
@@ -831,6 +849,20 @@ mod tests {
         let codex = SPECS.iter().find(|spec| spec.cli == "codex").unwrap();
         assert_eq!(ladder.model_for(claude), "sonnet");
         assert_eq!(ladder.model_for(codex), "gpt-5.6-luna", "an unnamed CLI keeps its default");
+    }
+
+    /// `codex exec` inherits the user's config.toml. Measured on one machine
+    /// whose default is effort `max` and a full-access sandbox: a 3 KB
+    /// summary ran 38-77s and spent up to 3.6k reasoning tokens. The worker
+    /// pins what it actually needs instead of inheriting what the user set
+    /// for themselves.
+    #[test]
+    fn the_codex_worker_pins_low_effort_and_a_read_only_sandbox() {
+        let spec = SPECS.iter().find(|spec| spec.cli == "codex").unwrap();
+        let args = spec.args.join(" ");
+        assert!(args.contains("-c model_reasoning_effort=\"low\""), "{args}");
+        assert!(args.contains("-s read-only"), "{args}");
+        assert!(args.contains("--skip-git-repo-check"), "{args}");
     }
 
     /// A worker must not be able to raise a permission prompt.

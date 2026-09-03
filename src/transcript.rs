@@ -144,6 +144,13 @@ pub fn read_span(path: &Path, cli: &str, sanitizer: &Sanitizer) -> Option<String
     for line in lines.iter().rev() {
         let rendered = format!("{}: {}\n", line.speaker, line.text.trim());
         if size + rendered.len() > SPAN_MAX_BYTES {
+            // The newest line alone can be over budget - an 8k-character
+            // answer in a three-byte script is 13 KB - and it is the line the
+            // span exists for. Its head is kept, cut to the budget, rather
+            // than the whole span given up.
+            if kept.is_empty() {
+                kept.push(crate::sanitize::truncate(&rendered, SPAN_MAX_BYTES));
+            }
             break;
         }
         size += rendered.len();
@@ -198,7 +205,19 @@ fn extract_claude(value: &serde_json::Value, out: &mut Vec<Line>) {
 fn extract_codex(value: &serde_json::Value, out: &mut Vec<Line>) {
     let payload = &value["payload"];
     let speaker = match payload.get("type").and_then(serde_json::Value::as_str) {
-        Some("message") => "user",
+        // A `message` is whoever its `role` says. The rollout Codex writes
+        // from its app server (VS Code, Codex Desktop) carries the model's
+        // answers only this way - no `agent_message` event at all, 0 in a 9 MB
+        // session - so reading every message as the user's left those
+        // sessions with no assistant prose: every `stop` a bare "Turn
+        // finished", and the final verdict of a comparison missing from the
+        // span that was meant to carry it. `developer` messages are the host's
+        // own injections (a memory block, hook output), not the session.
+        Some("message") => match payload.get("role").and_then(serde_json::Value::as_str) {
+            Some("assistant") => "assistant",
+            Some("developer" | "system") => return,
+            _ => "user",
+        },
         Some("agent_message") => "assistant",
         Some("reasoning") => "reasoning",
         _ => return,
@@ -224,9 +243,15 @@ fn extract_codex(value: &serde_json::Value, out: &mut Vec<Line>) {
 
 fn push_line(out: &mut Vec<Line>, speaker: &'static str, text: &str) {
     let text = text.trim();
-    if !text.is_empty() {
-        out.push(Line { speaker, text: text.to_string() });
+    if text.is_empty() {
+        return;
     }
+    // `codex exec` writes each answer twice - once as the `message` item and
+    // once as the `agent_message` event - and both now read as the assistant.
+    if out.last().is_some_and(|last| last.speaker == speaker && last.text == text) {
+        return;
+    }
+    out.push(Line { speaker, text: text.to_string() });
 }
 
 #[cfg(test)]
@@ -296,6 +321,72 @@ mod tests {
         let span = read_span(&path, "codex", &Sanitizer::builtin()).unwrap();
         assert!(span.contains("reasoning: Chose SQLite"), "reasoning is the point: {span}");
         assert!(span.contains("assistant: Done."));
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// The app-server rollout (VS Code, Codex Desktop) has no `agent_message`
+    /// event; the answer is a `message` item whose role is `assistant`.
+    #[test]
+    fn codex_app_server_answers_are_the_assistants_not_the_users() {
+        let path = write(
+            "app.jsonl",
+            concat!(
+                r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"MEMORY BLOCK"}]}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"compare them"}]}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Verdict: keep local."}]}}"#,
+                "\n"
+            ),
+        );
+        let sanitizer = Sanitizer::builtin();
+        let span = read_span(&path, "codex", &sanitizer).unwrap();
+        assert!(span.contains("user: compare them"), "{span}");
+        assert!(span.contains("assistant: Verdict: keep local."), "{span}");
+        assert!(!span.contains("MEMORY BLOCK"), "host injections are not the session: {span}");
+        assert_eq!(last_answer(&path, "codex", &sanitizer).as_deref(), Some("Verdict: keep local."));
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// `codex exec` writes the same answer as a `message` item and an
+    /// `agent_message` event. One line, not two.
+    #[test]
+    fn a_codex_exec_answer_written_twice_is_read_once() {
+        let path = write(
+            "exec.jsonl",
+            concat!(
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done."}]}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"agent_message","message":"Done."}}"#,
+                "\n"
+            ),
+        );
+        let span = read_span(&path, "codex", &Sanitizer::builtin()).unwrap();
+        assert_eq!(span.matches("assistant: Done.").count(), 1, "{span}");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// A final answer larger than the whole span budget is the case the span
+    /// exists for; it is kept cut, never dropped with everything before it.
+    #[test]
+    fn an_oversized_newest_line_is_kept_cut_rather_than_dropping_the_span() {
+        let long = "ก".repeat(SPAN_MAX_BYTES); // three bytes each: 3x the budget
+        let path = write(
+            "big.jsonl",
+            &format!(
+                concat!(
+                    r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Earlier."}}]}}}}"#,
+                    "\n",
+                    r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Verdict {}"}}]}}}}"#,
+                    "\n"
+                ),
+                long
+            ),
+        );
+        let span = read_span(&path, "claude-code", &Sanitizer::builtin()).unwrap();
+        assert!(span.len() <= SPAN_MAX_BYTES, "{} bytes", span.len());
+        assert!(span.starts_with("assistant: Verdict"), "the newest line's head survives: {}", &span[..40]);
+        assert!(!span.contains("Earlier."), "there was no room left for older lines");
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 

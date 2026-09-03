@@ -117,6 +117,13 @@ enum Commands {
         /// Narrow to one kind: decision, bugfix, feature, discovery, config, test.
         #[arg(long)]
         topic: Option<String>,
+        /// Rerank the hits by a small model, the way `brain_search` over MCP does.
+        /// Default follows `[search] rerank` in config.
+        #[arg(long, overrides_with = "no_rerank")]
+        rerank: bool,
+        /// Keep the index's own order even when config says rerank.
+        #[arg(long)]
+        no_rerank: bool,
     },
     /// Sync this brain with your other machines through a folder you own.
     Sync {
@@ -308,7 +315,16 @@ fn run(command: Commands) -> Result<()> {
         }
         Commands::Uninstall { apply, wipe } => uninstall(apply, wipe),
         Commands::Reindex => reindex(),
-        Commands::Search { query, limit, topic } => search(&query, limit, topic.as_deref()),
+        Commands::Search { query, limit, topic, rerank, no_rerank } => {
+            let rerank = if rerank {
+                Some(true)
+            } else if no_rerank {
+                Some(false)
+            } else {
+                None
+            };
+            search(&query, limit, topic.as_deref(), rerank)
+        }
         Commands::History { query, diff } => history::report(&query, diff),
         Commands::Sync { action } => match action {
             Some(SyncAction::Init { dir }) => {
@@ -497,10 +513,15 @@ fn reindex() -> Result<()> {
     Ok(())
 }
 
-fn search(query: &str, limit: usize, topic: Option<&str>) -> Result<()> {
+fn search(query: &str, limit: usize, topic: Option<&str>, rerank: Option<bool>) -> Result<()> {
     let paths = Paths::resolve()?;
     let scope = ids::resolve_scope(&std::env::current_dir().unwrap_or_default());
     let store = Store::open(&paths.db())?;
+    let config = config::Config::load(&paths.config_file())?;
+    // The same default as `brain_search` over MCP: a terminal and an agent
+    // asking the same question get the same order, or the terminal is the
+    // place a reranked answer cannot be reproduced.
+    let rerank = rerank.unwrap_or(config.search.rerank);
     // A typo'd topic must not read as "nothing remembered": say so and search
     // everything, rather than returning an empty page the user cannot explain.
     let scoped = topic.and_then(event::normalize_topic);
@@ -510,7 +531,17 @@ fn search(query: &str, limit: usize, topic: Option<&str>) -> Result<()> {
             event::TOPICS.join(", ")
         );
     }
-    let hits = store.search(&scope.project_id.to_string(), query, scoped, limit, store::Recall::Fused)?;
+    let project = scope.project_id.to_string();
+    // A reranker is worth a wider pool to choose from, as over MCP.
+    let pool = if rerank { rerank::LOCAL_POOL.max(limit) } else { limit };
+    let mut hits = store.search(&project, query, scoped, pool, store::Recall::Fused)?;
+    if rerank {
+        let ladder = summarizer::Ladder::new(&store, &config.summarizer);
+        let cli = store.project_cli(&project)?.unwrap_or_default();
+        let model_dir = paths.model_dir_for(rerank::LOCAL_MODEL);
+        hits = rerank::rerank(&ladder, &cli, query, &model_dir, hits);
+    }
+    hits.truncate(limit);
 
     if hits.is_empty() {
         let where_ = scoped.map_or(String::new(), |topic| format!(" under topic `{topic}`"));
