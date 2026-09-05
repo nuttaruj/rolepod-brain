@@ -474,7 +474,6 @@ fn strip_hooks(target: &Target, apply: bool) -> Result<Vec<Change>> {
         return Ok(Vec::new());
     }
     if apply {
-        let _ = backup(&target.hooks_file)?;
         write_json(&target.hooks_file, &root)?;
     }
     Ok(vec![Change {
@@ -504,7 +503,6 @@ fn strip_mcp(target: &Target, apply: bool) -> Vec<Change> {
             if let Some(servers) = root.get_mut("mcpServers").and_then(Value::as_object_mut) {
                 servers.remove(MCP_SERVER_NAME);
             }
-            let _ = backup(path);
             let _ = write_json(path, &root);
         }
         return vec![Change {
@@ -801,22 +799,24 @@ fn install_plugin(target: &Target, exe: &Path, apply: bool) -> Result<Vec<Change
     }
 
     let mut changes = Vec::new();
-    if let Some(backup) = backup(&target.hooks_file)? {
-        changes.push(Change {
+    match write_text(&target.hooks_file, &source)? {
+        Written::Unchanged => changes.push(Change {
             target: target.kind.as_str().to_string(),
-            detail: format!("backed up to {}", backup.display()),
-        });
+            detail: format!("plugin {} already current", target.hooks_file.display()),
+        }),
+        Written::Wrote(backup) => {
+            if let Some(backup) = backup {
+                changes.push(Change {
+                    target: target.kind.as_str().to_string(),
+                    detail: format!("backed up to {}", backup.display()),
+                });
+            }
+            changes.push(Change {
+                target: target.kind.as_str().to_string(),
+                detail: format!("wrote plugin {}", target.hooks_file.display()),
+            });
+        }
     }
-    if let Some(parent) = target.hooks_file.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
-    }
-    std::fs::write(&target.hooks_file, source)
-        .with_context(|| format!("write {}", target.hooks_file.display()))?;
-    changes.push(Change {
-        target: target.kind.as_str().to_string(),
-        detail: format!("wrote plugin {}", target.hooks_file.display()),
-    });
     Ok(changes)
 }
 
@@ -847,7 +847,6 @@ fn defer_to_plugin_flow(target: &Target, apply: bool) -> Result<Vec<Change>> {
 
     if removed > 0 {
         if apply {
-            let _ = backup(&target.hooks_file)?;
             write_json(&target.hooks_file, &root)?;
             changes.push(Change {
                 target: label.clone(),
@@ -1021,14 +1020,20 @@ fn wire_hooks(target: &Target, exe: &Path, apply: bool) -> Result<Vec<Change>> {
     }
 
     if apply {
-        let backup = backup(&target.hooks_file)?;
-        if let Some(backup) = backup {
-            changes.push(Change {
+        match write_json(&target.hooks_file, &root)? {
+            Written::Unchanged => {
+                changes[0].detail = format!(
+                    "{} hook(s) in {} already current",
+                    planned.len(),
+                    target.hooks_file.display()
+                );
+            }
+            Written::Wrote(Some(backup)) => changes.push(Change {
                 target: target.kind.as_str().to_string(),
                 detail: format!("backed up to {}", backup.display()),
-            });
+            }),
+            Written::Wrote(None) => {}
         }
-        write_json(&target.hooks_file, &root)?;
     }
     Ok(changes)
 }
@@ -1127,8 +1132,7 @@ fn register_mcp_file(target: &Target, path: &Path, apply: bool) -> Vec<Change> {
             MCP_SERVER_NAME.to_string(),
             json!({ "command": exe, "args": ["mcp"] }),
         );
-        let _ = backup(path)?;
-        write_json(path, &root)
+        write_json(path, &root).map(drop)
     })();
 
     match result {
@@ -1246,7 +1250,6 @@ fn sweep_ours(target: &Target, apply: bool) -> Vec<Change> {
         }];
     }
     if apply {
-        let _ = backup(&target.hooks_file);
         let _ = write_json(&target.hooks_file, &root);
     }
     vec![Change {
@@ -1343,7 +1346,6 @@ fn withdraw_mcp(target: &Target, apply: bool) -> Vec<Change> {
             if servers.remove(MCP_SERVER_NAME).is_none() {
                 return Ok(false);
             }
-            let _ = backup(path)?;
             write_json(path, &root)?;
             Ok(true)
         })();
@@ -1438,14 +1440,46 @@ fn read_json(path: &Path) -> Result<Value> {
     })
 }
 
-fn write_json(path: &Path, value: &Value) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
-    }
+/// What a write did: nothing, because the file already said exactly this,
+/// or a real write, with the backup it took first (none when the file was
+/// new).
+#[derive(Debug, PartialEq, Eq)]
+enum Written {
+    Unchanged,
+    Wrote(Option<PathBuf>),
+}
+
+/// How many backups of one config stay behind. Every `setup --apply` used to
+/// leave another dated copy, and a machine that upgrades often ended up with
+/// dozens of identical ones beside each config - the newest two are enough
+/// to undo the last change and the one before it.
+const BACKUPS_KEPT: usize = 2;
+
+fn write_json(path: &Path, value: &Value) -> Result<Written> {
     let mut text = serde_json::to_string_pretty(value).context("serialize config")?;
     text.push('\n');
-    std::fs::write(path, text).with_context(|| format!("write {}", path.display()))
+    write_text(path, &text)
+}
+
+/// Write a file, backing up what was there first - unless it already holds
+/// exactly this text, in which case nothing is written and no backup is
+/// taken: a re-run that changes nothing should add nothing. Either way the
+/// pile of older backups is trimmed, so a machine that already has dozens
+/// is tidied by its next `setup --apply` rather than its next real change.
+fn write_text(path: &Path, text: &str) -> Result<Written> {
+    let written = if std::fs::read_to_string(path).is_ok_and(|current| current == text) {
+        Written::Unchanged
+    } else {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        let backup = backup(path)?;
+        std::fs::write(path, text).with_context(|| format!("write {}", path.display()))?;
+        Written::Wrote(backup)
+    };
+    prune_backups(path);
+    Ok(written)
 }
 
 /// Copy a config aside before modifying it. Returns the backup path, or
@@ -1455,13 +1489,38 @@ fn backup(path: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     let stamp = jiff::Zoned::now().strftime("%Y%m%d-%H%M%S").to_string();
-    let backup = path.with_extension(format!(
-        "{}.brain-bak.{stamp}",
-        path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default()
-    ));
+    let backup = path.with_file_name(format!("{}{stamp}", backup_prefix(path)));
     std::fs::copy(path, &backup)
         .with_context(|| format!("back up {} to {}", path.display(), backup.display()))?;
     Ok(Some(backup))
+}
+
+/// `settings.json.brain-bak.` - every backup of `path` starts with this.
+fn backup_prefix(path: &Path) -> String {
+    format!("{}.brain-bak.", path.file_name().unwrap_or_default().to_string_lossy())
+}
+
+/// Remove every backup of `path` but the newest `BACKUPS_KEPT`. The stamp
+/// sorts as text, so name order is age order. Best effort: a backup that
+/// will not delete is not worth failing the install over.
+fn prune_backups(path: &Path) {
+    let Some(parent) = path.parent() else { return };
+    let prefix = backup_prefix(path);
+    let Ok(entries) = std::fs::read_dir(parent) else { return };
+    let mut backups: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|candidate| {
+            candidate.is_file()
+                && candidate
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+        })
+        .collect();
+    backups.sort();
+    for stale in backups.iter().rev().skip(BACKUPS_KEPT) {
+        let _ = std::fs::remove_file(stale);
+    }
 }
 
 /// Quote a path for `/bin/sh` only when it needs it.
@@ -2484,5 +2543,71 @@ mod tests {
         );
         // The consolidation boundary is the other side of the same event.
         assert!(claude.events.contains(&"PreCompact"));
+    }
+
+    fn backups_of(path: &Path) -> Vec<String> {
+        let prefix = backup_prefix(path);
+        let mut names: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(&prefix))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_rerun_that_changes_nothing_writes_nothing_and_backs_up_nothing() {
+        let dir = std::env::temp_dir().join(format!("brain-bak-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        assert_eq!(write_text(&path, "one\n").unwrap(), Written::Wrote(None));
+        assert!(backups_of(&path).is_empty(), "a new file has nothing to back up");
+
+        assert_eq!(write_text(&path, "one\n").unwrap(), Written::Unchanged);
+        assert!(backups_of(&path).is_empty(), "an identical rewrite must not add a backup");
+
+        let Written::Wrote(Some(backup)) = write_text(&path, "two\n").unwrap() else {
+            panic!("a real change backs the old file up");
+        };
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "one\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "two\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_the_newest_backups_survive_even_when_nothing_changed() {
+        let dir = std::env::temp_dir().join(format!("brain-bak-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hooks.json");
+        std::fs::write(&path, "{}\n").unwrap();
+        for stamp in ["20200101-000000", "20200102-000000", "20200103-000000"] {
+            std::fs::write(dir.join(format!("hooks.json.brain-bak.{stamp}")), "old").unwrap();
+        }
+        // Another config's backups are not ours to touch.
+        let other = dir.join("mcp.json.brain-bak.20200101-000000");
+        std::fs::write(&other, "theirs").unwrap();
+
+        assert_eq!(write_text(&path, "{}\n").unwrap(), Written::Unchanged);
+        assert_eq!(
+            backups_of(&path),
+            vec![
+                "hooks.json.brain-bak.20200102-000000".to_string(),
+                "hooks.json.brain-bak.20200103-000000".to_string(),
+            ],
+            "an unchanged rerun still trims the pile to the newest {BACKUPS_KEPT}"
+        );
+        assert!(other.is_file());
+
+        let Written::Wrote(Some(fresh)) = write_text(&path, "{\"v\":1}\n").unwrap() else {
+            panic!("a real change backs up");
+        };
+        let kept = backups_of(&path);
+        assert_eq!(kept.len(), BACKUPS_KEPT);
+        assert_eq!(kept[0], "hooks.json.brain-bak.20200103-000000");
+        assert_eq!(dir.join(&kept[1]), fresh, "the copy just taken is the newest");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
