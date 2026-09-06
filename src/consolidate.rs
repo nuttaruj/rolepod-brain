@@ -1677,18 +1677,48 @@ fn write_entity_pages(
     // sessions that happened to link it. Two thirds of entity pages on a
     // real vault had none: their sessions predated the page, or fell past
     // the twelve a session page names.
+    //
+    // Read from the directory rather than from `recurring`, which is capped
+    // and is only what this round rewrote. A project past the cap keeps the
+    // pages earlier rounds wrote - 414 of them against a cap of 200 on one
+    // real project - and listing only the current 200 left the rest exactly
+    // as unreachable as having no index at all.
+    let counted: std::collections::HashMap<String, i64> = recurring
+        .iter()
+        .map(|(name, count)| (entity_stem(name), *count))
+        .collect();
+    let mut listed: Vec<(i64, String, String)> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+        .filter_map(|path| {
+            let meta = page_meta(&path)?;
+            let count = counted.get(&meta.stem).copied().unwrap_or(0);
+            Some((count, meta.title, meta.stem))
+        })
+        .collect();
+    // Most touched first, and whatever this round did not count after them,
+    // by name - a stable order, so an unchanged project rewrites the same file.
+    listed.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
     let mut index = String::new();
     let _ = writeln!(index, "---\ntitle: entities\ntags: [entities]\n---\n");
     let _ = writeln!(index, "# Entities of {}\n", scope.project);
     let _ = writeln!(
         index,
-        "{} thing(s) that more than one session of [[{}|{}]] was about, most touched first.\n",
-        recurring.len(),
+        "{} thing(s) more than one session of [[{}|{}]] was about, most touched first.\n",
+        listed.len(),
         hub_stem(scope),
         scope.project
     );
-    for (name, count) in &recurring {
-        let _ = writeln!(index, "- [[entities/{}|{name}]] ({count})", entity_stem(name));
+    for (count, title, stem) in &listed {
+        if *count > 0 {
+            let _ = writeln!(index, "- [[entities/{stem}|{title}]] ({count})");
+        } else {
+            let _ = writeln!(index, "- [[entities/{stem}|{title}]]");
+        }
     }
     let index_path = project_dir.join("entities.md");
     std::fs::write(&index_path, index)
@@ -3844,6 +3874,21 @@ mod tests {
         let entities = std::fs::read_to_string(dir.join("entities.md")).unwrap();
         assert!(entities.contains("[[entities/billing|billing]] (2)"), "{entities}");
         assert!(!entities.contains("once"), "a thing touched once has no page to index");
+
+        // A page an earlier round wrote, past this round's cap: still on
+        // disk, so still indexed - unlisted is the same as unreachable.
+        std::fs::write(
+            dir.join("entities/older.md"),
+            "---\ntitle: older\ntags: [entity]\n---\n",
+        )
+        .unwrap();
+        write_hubs(&dir, &scope, &store).unwrap();
+        let entities = std::fs::read_to_string(dir.join("entities.md")).unwrap();
+        assert!(entities.contains("[[entities/older|older]]\n"), "an earlier round's page was dropped:\n{entities}");
+        assert!(entities.contains("2 thing(s) more than one session"), "{entities}");
+        let billing = entities.find("billing").unwrap();
+        let older = entities.find("older").unwrap();
+        assert!(billing < older, "counted entities lead:\n{entities}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
