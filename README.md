@@ -631,7 +631,9 @@ brain sync init ~/Library/Mobile\ Documents/com~apple~CloudDocs/brain-sync
 brain sync            # pull what the other machines said, push your own
 ```
 
-The folder — iCloud, Dropbox, a NAS, a USB stick — only ever holds
+A bundle carries the log and the pages, never the vault's own git history:
+that history is different on every machine and belongs to the one that made
+it. The folder — iCloud, Dropbox, a NAS, a USB stick — only ever holds
 ciphertext bundles named by opaque store ids. Whoever hosts it learns
 nothing. Each machine writes only its own bundle, so there is nothing to
 conflict; merging is by event id, a repeat sync adds nothing, and a

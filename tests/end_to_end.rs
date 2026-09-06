@@ -3249,6 +3249,17 @@ fn two_machines_one_brain_through_an_encrypted_folder() {
     let stdout = String::from_utf8_lossy(&again.stdout).to_string();
     assert!(stdout.contains("0 new event(s)"), "a repeat sync must gain nothing: {stdout}");
 
+    // A bundle carries memory, not the machine's own history: shipping
+    // `.git` grafts one history over another, and its objects are read-only.
+    let export = a.home.parent().unwrap().join("check.tar.gz");
+    assert!(a.brain(&["export", export.to_str().unwrap()]).status.success());
+    let listing = String::from_utf8_lossy(
+        &Command::new("tar").args(["-tzf", export.to_str().unwrap()]).output().expect("tar").stdout,
+    )
+    .into_owned();
+    assert!(!listing.contains("/.git/"), "the vault's history was exported:\n{listing}");
+    assert!(listing.contains("events/"), "the log must travel: {listing}");
+
     // The folder holds ciphertext only - no title, no id, no JSON.
     for entry in std::fs::read_dir(&shared).unwrap().flatten() {
         let bytes = std::fs::read(entry.path()).unwrap();
@@ -5561,4 +5572,66 @@ fn a_team_is_off_and_needs_a_name_before_anything_is_shared() {
     let empty = fixture.brain(&["team", "init", dir.to_str().unwrap(), "--name", "  "]);
     assert!(!empty.status.success(), "a team without a name must be refused");
     assert!(String::from_utf8_lossy(&empty.stderr).contains("name to sign"), "{empty:?}");
+}
+
+#[test]
+fn a_rebuild_lands_in_the_vaults_history_and_leaves_a_persons_own_notes_alone() {
+    let fixture = Fixture::new("reindex-commit");
+    fixture.seed_session(3);
+    let bin = fixture.fake_cli("claude", "echo '{\"summary\":\"Edited three files.\",\"titles\":[]}'");
+    assert!(fixture.brain_with_path(&["consolidate", "--force"], Some(&bin)).status.success());
+
+    let git = |args: &[&str]| -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(fixture.wiki())
+            .output()
+            .expect("git");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // A hub an older version wrote and committed: the rebuild's whole job,
+    // and what makes this a real rewrite rather than a no-op.
+    let hub = fixture
+        .project_dirs()
+        .into_iter()
+        .map(|dir| dir.join("checkout.md"))
+        .find(|path| path.is_file())
+        .expect("a project hub");
+    std::fs::write(&hub, "# checkout\n\nwritten by an older version\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "an older version's hub"]);
+
+    // Something a person keeps beside their memory, which brain never writes
+    // and must never take over.
+    let mine = fixture.wiki().join("my-notes.md");
+    std::fs::write(&mine, "# mine\n").unwrap();
+
+    let out = fixture.brain(&["reindex"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "reindex failed: {out:?}");
+    assert!(stdout.contains("Committed the rebuild"), "{stdout}");
+
+    // Nothing brain wrote is left outside the history.
+    let status = git;
+    let tracked_dirty = status(&["status", "--short", "--untracked-files=no"]);
+    assert!(tracked_dirty.trim().is_empty(), "a rebuild left pages uncommitted:\n{tracked_dirty}");
+    let log = status(&["log", "--oneline", "-1"]);
+    assert!(log.contains("reindex: rebuilt"), "{log}");
+    assert!(
+        std::fs::read_to_string(&hub).unwrap().contains("## Sessions"),
+        "the stale hub was not rebuilt"
+    );
+
+    // And the person's file is still theirs: on disk, out of the history.
+    assert!(mine.is_file());
+    let all = status(&["status", "--short"]);
+    assert!(all.contains("my-notes.md"), "a file brain does not write was committed:\n{all}");
+
+    // A second rebuild changes nothing, so it commits nothing.
+    let again = fixture.brain(&["reindex"]);
+    assert!(
+        !String::from_utf8_lossy(&again.stdout).contains("Committed the rebuild"),
+        "an unchanged rebuild made an empty commit"
+    );
 }

@@ -577,14 +577,28 @@ fn reindex() -> Result<()> {
 
     let mut hubs = 0usize;
     let mut relinked = 0usize;
+    let mut written: Vec<std::path::PathBuf> = Vec::new();
     for (scope, dir) in consolidate::known_projects(&paths).unwrap_or_default() {
-        if consolidate::write_hubs(&dir, &scope, &store).is_ok() {
+        if let Ok(paths) = consolidate::write_hubs(&dir, &scope, &store) {
             hubs += 1;
+            written.extend(paths);
         }
         // After the hubs, so the entity pages a link can resolve to exist.
         relinked += consolidate::relink_session_pages(&dir, &store).unwrap_or(0);
     }
     let root = consolidate::write_root(&paths)?;
+    written.extend(root.iter().cloned());
+
+    // One commit for the whole rebuild. Consolidation commits each page as
+    // it writes it; a rebuild rewrites the vault in one pass, and without
+    // this the newest wording of every page it touched stayed outside the
+    // history `brain history` reads.
+    let committed = consolidate::commit_rebuild(
+        &paths.wiki(),
+        &written,
+        &format!("reindex: rebuilt {hubs} project(s) from the log"),
+    )
+    .unwrap_or(false);
 
     println!("Reindexed {indexed} event(s) from {projects} project(s).");
     println!("Rebuilt hub notes for {hubs} project(s) and the vault index ({} file(s) changed).", root.len());
@@ -593,6 +607,9 @@ fn reindex() -> Result<()> {
     }
     if team > 0 {
         println!("Re-read {team} lesson(s) teammates published.");
+    }
+    if committed {
+        println!("Committed the rebuild to the vault's history.");
     }
     if skipped > 0 {
         println!("Skipped {skipped} unreadable line(s); the rest of the log was unaffected.");

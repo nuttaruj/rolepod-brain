@@ -2145,6 +2145,59 @@ pub(crate) fn commit_wiki(wiki: &Path, page: &Path, tier: &str) -> Result<()> {
     )
 }
 
+/// Commit a whole rebuild at once: every tracked page this run rewrote or
+/// removed, plus the files it created.
+///
+/// [`commit_wiki`] names one path because consolidation writes one page at a
+/// time and each deserves its own line of history. A rebuild rewrites the
+/// vault - hundreds of pages in one pass - and leaving that uncommitted put
+/// the newest wording of every one of them outside the history
+/// `brain history` reads, on every machine where anyone ran `brain reindex`.
+///
+/// `git add -u` rather than `-A`: tracked files only. A person may keep
+/// their own notes beside their memory - the README says they may - and
+/// sweeping those into brain's history would be brain taking ownership of
+/// files it does not write.
+///
+/// Returns whether anything was committed.
+///
+/// # Errors
+/// Returns an error when git cannot be run.
+pub fn commit_rebuild(wiki: &Path, created: &[PathBuf], message: &str) -> Result<bool> {
+    if !wiki.is_dir() {
+        return Ok(false);
+    }
+    let _guard = LockFile::acquire(&wiki.join(".brain-git.lock"))?;
+    if !wiki.join(".git").exists() {
+        run_git(wiki, &["init", "-q"])?;
+        run_git(wiki, &["config", "user.name", "rolepod-brain"])?;
+        run_git(wiki, &["config", "user.email", "brain@localhost"])?;
+    }
+    ensure_repo_policy(wiki)?;
+
+    run_git(wiki, &["add", "-u"])?;
+    for path in created {
+        let relative = path.strip_prefix(wiki).unwrap_or(path);
+        run_git(wiki, &["add", "--", &relative.to_string_lossy()])?;
+    }
+    for policy in [".gitattributes", ".gitignore"] {
+        if wiki.join(policy).is_file() {
+            run_git(wiki, &["add", "--", policy])?;
+        }
+    }
+
+    let status = std::process::Command::new("git")
+        .args(["diff", "--cached", "--quiet"])
+        .current_dir(wiki)
+        .status()
+        .context("check staged changes")?;
+    if status.success() {
+        return Ok(false);
+    }
+    run_git(wiki, &["commit", "-q", "-m", message])?;
+    Ok(true)
+}
+
 /// Policy files the wiki repository needs, written idempotently.
 ///
 /// `.gitattributes`: the logs are append-only and ULID-keyed, so two copies of

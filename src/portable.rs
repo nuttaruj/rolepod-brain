@@ -59,14 +59,30 @@ fn export_members(archive: &Path, include_config: bool) -> Result<String> {
         members.push("config.toml".to_string());
     }
 
-    let mut args = vec!["-czf".to_string(), archive.display().to_string(), "-C".to_string(),
-                        paths.data_dir.display().to_string()];
+    // The vault's git history and the editor's UI state never travel. Both
+    // belong to the machine that made them: a history is a different one on
+    // every machine, and grafting one over another writes into `.git/objects`,
+    // whose files are read-only - a sync between two machines that had both
+    // committed anything failed there with `Permission denied`. Size says the
+    // same thing more plainly: one real vault's `.git` is 109 MB against 250 MB
+    // of memory, and it would ride in every bundle, every sync.
+    let mut args = vec![
+        "-czf".to_string(),
+        archive.display().to_string(),
+        "--exclude".to_string(),
+        ".git".to_string(),
+        "--exclude".to_string(),
+        ".obsidian".to_string(),
+        "-C".to_string(),
+        paths.data_dir.display().to_string(),
+    ];
     args.extend(members.iter().cloned());
     run("tar", &args).context("write the archive")?;
 
     let size = std::fs::metadata(archive).map(|meta| meta.len()).unwrap_or(0);
     Ok(format!(
-        "Exported {} ({} KB). Contains the log and pages; the index is rebuilt on import.",
+        "Exported {} ({} KB). Contains the log and pages; the index is rebuilt on \
+         import, and the vault's git history stays with this machine.",
         archive.display(),
         size / 1024
     ))
@@ -323,6 +339,19 @@ mod tests {
         // index and a log that disagree.
         let source = std::fs::read_to_string("src/portable.rs").unwrap();
         assert!(!source.contains("\"brain.db\""), "the index must not be in the archive");
+    }
+
+    #[test]
+    fn neither_the_history_nor_the_editors_state_is_ever_exported() {
+        // Both are per-machine derived state, and grafting a history over
+        // another machine's writes into read-only `.git/objects`.
+        let source = std::fs::read_to_string("src/portable.rs").unwrap();
+        for excluded in ["\".git\"", "\".obsidian\""] {
+            assert!(
+                source.contains(&format!("{excluded}.to_string()")),
+                "{excluded} is not excluded from the archive"
+            );
+        }
     }
 
     #[test]
