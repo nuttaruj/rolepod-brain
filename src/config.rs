@@ -32,6 +32,7 @@ pub struct Config {
     pub sanitize: SanitizeConfig,
     pub search: SearchConfig,
     pub sync: SyncConfig,
+    pub team: TeamConfig,
 }
 
 /// What happens after the index has answered.
@@ -53,6 +54,20 @@ pub struct SearchConfig {
 #[serde(default)]
 pub struct SyncConfig {
     pub dir: Option<std::path::PathBuf>,
+}
+
+/// A team's shared folder, and the name published work is signed with.
+///
+/// Off by default, like [`SyncConfig`] and for the same reason. What crosses
+/// here is narrower than what crosses between a person's own machines: only
+/// distilled knowledge, never a session, never a capture.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TeamConfig {
+    pub dir: Option<std::path::PathBuf>,
+    /// Who published an entry. Required to join: an entry nobody can be
+    /// asked about is a rule with no author to explain it.
+    pub author: Option<String>,
 }
 
 /// Which model tier consolidates, if any.

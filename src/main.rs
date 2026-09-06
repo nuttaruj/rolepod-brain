@@ -16,6 +16,7 @@ mod event;
 mod history;
 mod hook;
 mod ids;
+mod ingest;
 mod inject;
 mod invocation;
 mod mcp;
@@ -30,6 +31,7 @@ mod store;
 mod tokenize;
 mod transcript;
 mod sync;
+mod team;
 mod summarizer;
 
 use std::io::Write;
@@ -107,6 +109,15 @@ enum Commands {
     },
     /// Rebuild the SQLite index from the event log.
     Reindex,
+    /// Read a markdown or text document into this project's memory.
+    Ingest {
+        /// The file to read. Markdown or plain text; it is copied unchanged
+        /// beside the page written about it.
+        file: std::path::PathBuf,
+        /// Read it again even if the same bytes are already in memory.
+        #[arg(long)]
+        force: bool,
+    },
     /// Search this project's memory from the terminal.
     Search {
         /// FTS5 query.
@@ -129,6 +140,11 @@ enum Commands {
     Sync {
         #[command(subcommand)]
         action: Option<SyncAction>,
+    },
+    /// Share distilled lessons with a team through a folder you all trust.
+    Team {
+        #[command(subcommand)]
+        action: Option<TeamAction>,
     },
     /// Drop the bodies of old, never-surfaced observations; keep every title and link.
     Retire {
@@ -203,6 +219,18 @@ enum Commands {
 }
 
 #[derive(clap::Subcommand)]
+enum TeamAction {
+    /// Join or start a team: a shared folder, a key, and your name.
+    Init {
+        /// A folder your team already shares (Drive, Dropbox, a NAS...).
+        dir: String,
+        /// The name your published lessons are signed with.
+        #[arg(long)]
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum SyncAction {
     /// Point this brain at a shared folder and mint the key.
     Init {
@@ -287,6 +315,12 @@ fn run(command: Commands) -> Result<()> {
                     outcome.events,
                     outcome.tiers.join(", ")
                 );
+                if outcome.quiet > 0 {
+                    println!(
+                        "{} of them quiet: settled without a model call, a page, or a summary.",
+                        outcome.quiet
+                    );
+                }
             }
             Ok(())
         }
@@ -315,6 +349,24 @@ fn run(command: Commands) -> Result<()> {
         }
         Commands::Uninstall { apply, wipe } => uninstall(apply, wipe),
         Commands::Reindex => reindex(),
+        Commands::Ingest { file, force } => {
+            let done = ingest::run(&file, force)?;
+            if done.unchanged {
+                println!(
+                    "Already in memory, unchanged: {} (pass --force to read it again).",
+                    done.page.display()
+                );
+            } else {
+                println!("Read \"{}\" into {} (via {}).", done.title, done.page.display(), done.tier);
+                if done.tier == "rule-based" {
+                    println!(
+                        "No model was reachable, so the page carries the document's opening; \
+                         `brain ingest --force` once one is."
+                    );
+                }
+            }
+            Ok(())
+        }
         Commands::Search { query, limit, topic, rerank, no_rerank } => {
             let rerank = if rerank {
                 Some(true)
@@ -345,6 +397,27 @@ fn run(command: Commands) -> Result<()> {
                     println!("skipped {name} - wrong key or corrupt (not fatal)");
                 }
                 println!("pushed {} KB, encrypted", outcome.pushed_bytes / 1024);
+                Ok(())
+            }
+        },
+        Commands::Team { action } => match action {
+            Some(TeamAction::Init { dir, name }) => {
+                println!("{}", team::init(&dir, &name)?);
+                Ok(())
+            }
+            None => {
+                let outcome = team::run()?;
+                println!(
+                    "pulled {} bundle(s), {} new lesson(s); published {} of yours ({} KB, encrypted)",
+                    outcome.pulled,
+                    outcome.gained,
+                    outcome.published,
+                    outcome.pushed_bytes / 1024
+                );
+                for name in &outcome.skipped {
+                    println!("skipped {name} - wrong key or corrupt (not fatal)");
+                }
+                println!("Sessions, prompts and notes stayed on this machine.");
                 Ok(())
             }
         },
@@ -498,15 +571,29 @@ fn reindex() -> Result<()> {
     // whatever hub state it had - or none at all, if its last consolidation
     // predated hubs existing. Rebuilding derived state is what this command is
     // for, so it rebuilds these too.
+    // The team shelf is derived state too: its logs are read back into the
+    // index and its pages rewritten, before the hubs that list them.
+    let team = team::index_team_logs(&paths, &store).unwrap_or(0);
+
     let mut hubs = 0usize;
+    let mut relinked = 0usize;
     for (scope, dir) in consolidate::known_projects(&paths).unwrap_or_default() {
         if consolidate::write_hubs(&dir, &scope, &store).is_ok() {
             hubs += 1;
         }
+        // After the hubs, so the entity pages a link can resolve to exist.
+        relinked += consolidate::relink_session_pages(&dir, &store).unwrap_or(0);
     }
+    let root = consolidate::write_root(&paths)?;
 
     println!("Reindexed {indexed} event(s) from {projects} project(s).");
-    println!("Rebuilt hub notes for {hubs} project(s).");
+    println!("Rebuilt hub notes for {hubs} project(s) and the vault index ({} file(s) changed).", root.len());
+    if relinked > 0 {
+        println!("Re-pointed the entity links of {relinked} session page(s) at pages that exist.");
+    }
+    if team > 0 {
+        println!("Re-read {team} lesson(s) teammates published.");
+    }
     if skipped > 0 {
         println!("Skipped {skipped} unreadable line(s); the rest of the log was unaffected.");
     }

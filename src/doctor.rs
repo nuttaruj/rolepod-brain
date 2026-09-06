@@ -95,6 +95,8 @@ pub fn run() -> Result<Vec<Check>> {
     checks.push(timer_check());
     checks.push(resident_check());
     checks.push(sync_check(&paths));
+    checks.push(team_check(&paths));
+    checks.push(wiki_check(&paths));
     checks.push(error_log_check(&paths.log_file()));
 
     Ok(checks)
@@ -734,6 +736,64 @@ fn sync_check(paths: &Paths) -> Check {
         })
         .unwrap_or(0);
     Check::pass("sync", format!("{} - {bundles} bundle(s), key present", dir.display()))
+}
+
+/// A team, when there is one: where it publishes and who this machine signs as.
+fn team_check(paths: &Paths) -> Check {
+    let config = Config::load(&paths.config_file()).unwrap_or_default();
+    let Some(dir) = config.team.dir else {
+        return Check::pass("team", "none - lessons stay on this machine (`brain team init` to share)");
+    };
+    let Some(author) = config.team.author.filter(|name| !name.trim().is_empty()) else {
+        return Check::fail("team", "configured without a name - run `brain team init <dir> --name \"…\"`");
+    };
+    if !paths.data_dir.join("team.key").is_file() {
+        return Check::fail(
+            "team",
+            format!("{} configured but team.key is missing - run `brain team init`", dir.display()),
+        );
+    }
+    if !dir.is_dir() {
+        return Check::fail("team", format!("folder {} does not exist", dir.display()));
+    }
+    let bundles = std::fs::read_dir(&dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".team.enc"))
+                .count()
+        })
+        .unwrap_or(0);
+    Check::pass(
+        "team",
+        format!("{} - {bundles} bundle(s), signing as {author}; lessons only", dir.display()),
+    )
+}
+
+/// The vault as a wiki: does every link land, and can every page be reached?
+///
+/// The lint a wiki needs and the one thing search cannot tell you: a page
+/// with no way in is invisible to a person even when an agent finds it.
+/// Links are resolved the way the pages write them - relative to the
+/// project directory - and then the way Obsidian falls back, by a unique
+/// file name anywhere in the vault.
+fn wiki_check(paths: &Paths) -> Check {
+    let wiki = paths.wiki();
+    if !wiki.is_dir() {
+        return Check::pass("wiki", "nothing consolidated yet");
+    }
+    let Some(lint) = crate::consolidate::lint_wiki(&wiki) else {
+        return Check::fail("wiki", format!("{} could not be read", wiki.display()));
+    };
+    let detail = format!(
+        "{} page(s), {} unresolved link(s), {} orphan(s) - `brain reindex` re-points old links",
+        lint.pages, lint.unresolved, lint.orphans
+    );
+    if lint.unresolved == 0 && lint.orphans == 0 {
+        Check::pass("wiki", format!("{} page(s), every link resolves, every page reachable", lint.pages))
+    } else {
+        Check::pass("wiki", detail)
+    }
 }
 
 /// Recent capture failures. Hooks never print to the host CLI, so this file is

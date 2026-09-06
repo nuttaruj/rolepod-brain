@@ -388,7 +388,8 @@ fn tool_definitions(local_rerank: bool) -> Value {
                         "description": "`session_summary` — one finished session \
                                         per line. `raw` — live work not yet \
                                         summarized. Also `knowledge`, `note`, \
-                                        `page_update`. Omit for all of them mixed, \
+                                        `page_update`, `source` (a document read \
+                                        in with `brain ingest`). Omit for all of them mixed, \
                                         which is only readable one session at a \
                                         time: every entry carries `session`.",
                     },
@@ -702,9 +703,10 @@ fn normalize_kind(asked: &str) -> Result<&'static str> {
         "knowledge" => Ok("knowledge"),
         "note" => Ok("note"),
         "page_update" => Ok("page_update"),
+        "source" | "document" => Ok("source"),
         other => anyhow::bail!(
             "unknown kind `{other}`; known: raw (an untyped observation), \
-             session_summary, knowledge, note, page_update"
+             session_summary, knowledge, note, page_update, source (a document read in)"
         ),
     }
 }

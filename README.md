@@ -333,12 +333,14 @@ never injected.
 ~/.rolepod-brain/
   brain.db                       # derived index (FTS5) - disposable
   Rolepod Brain/                 # git repository - the durable memory
+    index.md                     # every project, most recently active first
+    AGENTS.md, CLAUDE.md         # what an agent opened on the vault needs to know
     <project>/
       events/YYYY-MM.jsonl       # append-only log - the source of truth
       pages/sessions/*.md        # one page per consolidated session
       knowledge/gotchas/*.md     # what stayed true across many sessions
-      entities/*.md              # the things sessions kept being about
-      <project>.md, <topic>.md   # hub notes linking the rest together
+      entities/*.md, entities.md # the things sessions kept being about, indexed
+      <project>.md, <topic>.md   # hub notes: lessons first, then sessions
   config.toml                    # optional; defaults are deliberately light
 ```
 
@@ -521,6 +523,11 @@ boundary differs per CLI, because their lifecycle surfaces differ:
 `brain doctor` prints this for the CLIs you actually have installed. Whatever a
 boundary misses, the backstop below finishes when the next session opens.
 
+A session that opened, ran a command or two that touched nothing, and closed
+is settled without a call at all: no page, no summary, nothing for the primer
+to carry. Measured before this existed, one consolidation in five was a model
+being asked to say that nothing happened.
+
 ## Nothing runs in the background
 
 There is no launchd agent, no login item, no timer — not off by default,
@@ -586,6 +593,31 @@ summaries. Without a reachable CLI, synthesis simply does not run — deciding
 what recurs is a judgement, and a rule-based stand-in would produce confident
 nonsense.
 
+## Reading documents into memory
+
+Everything above is captured from sessions. A document - a design note, a
+vendor's guide, a meeting transcript - goes in by hand:
+
+```sh
+brain ingest docs/rate-limiter.md
+```
+
+It is summarized by the same ladder a session is, filed as one entry whose
+body is the summary (so `brain_search`, `brain_recent kind=source` and the
+primer's `SRC` lines all see it), and rendered as `sources/<name>.md` in the
+project's directory, with the file copied unchanged to `raw/` beside it. The
+project's hub lists documents between its lessons and its sessions.
+Documents join session summaries in the pool knowledge is distilled from, so
+a fact a document and a session agree on can become a durable page with
+both cited.
+
+Markdown and plain text, from a path. The same file again is a no-op;
+`--force` reads it again and withdraws the earlier reading. Without a
+reachable model the page carries the document's opening and says so. For a
+second brain that is not tied to one repository, make a directory for it
+with a `.rolepod-brain.toml` naming the project (see "Where things live") and
+ingest from there.
+
 ## Sync between your machines
 
 Off by default, forever — until you opt in, memory never leaves the machine.
@@ -605,6 +637,46 @@ nothing. Each machine writes only its own bundle, so there is nothing to
 conflict; merging is by event id, a repeat sync adds nothing, and a
 correction made on one machine lands on the others. A bundle written under
 a different key is reported and skipped, never absorbed.
+
+## Sharing lessons with a team
+
+A second, narrower channel, off until you open it. Where `brain sync` moves
+your whole brain between your own machines, a team moves only the
+distillate: the rules, gotchas, decisions and procedures under `knowledge/`
+that already had to recur across several sessions to exist. Your sessions,
+prompts, notes and documents never cross, and there is no setting that makes
+them.
+
+```sh
+brain team init ~/Team\ Drive/brain --name "Alex"
+# share ~/.rolepod-brain/team.key with your teammates (that IS the pairing)
+brain team            # read what they published, publish yours
+```
+
+Three properties are structural rather than configured:
+
+- **Only lessons leave**, and each is scrubbed twice on the way out - the
+  capture sanitizer again, then a boundary scrub that takes home directories
+  and email addresses out of text that was distilled from sessions full of
+  them.
+- **Every entry is signed.** Joining asks for a name, and a lesson nobody can
+  be asked about is one nobody can retire.
+- **Nobody edits anyone else's memory.** Only additive knowledge is ever
+  published - no withdrawals, no corrections - so no bundle can delete or
+  rewrite what a teammate wrote, and anything arriving that is not a lesson
+  is dropped on the way in. What lands is indexed as a teammate's, which
+  every path that rewrites knowledge skips. Disagree by publishing your own
+  better lesson; the ranking sorts it out.
+
+Published lessons are searched, recalled and injected exactly like your own -
+a teammate's gotcha reaches your agent as a `KNW` line - and are readable
+under `_team/<project id>/` in the vault, each page naming its author. Two
+people share a team brain for a repository because the project id is derived
+from its root commit: same repository, same memory, whatever either of you
+called the directory.
+
+The folder holds ciphertext under a key that never enters it, exactly as
+`brain sync` does. There is no server here either.
 
 ## Retiring what nobody ever needed
 
@@ -747,6 +819,16 @@ There is no sync step, because none is needed:
    into the location bar.)
 3. Open it. That is the whole setup.
 
+Open `index.md` first: one line per project, most recently active on top,
+each a link to that project's hub. A hub lists the project's lessons - rules,
+gotchas, decisions, procedures - before its sessions, and the sessions link
+the things they were about. `AGENTS.md` beside it tells an agent opened on the
+vault itself (Claude Code, Codex, anything that reads the file) what is derived,
+what may be edited, and how to ask memory a question; `CLAUDE.md` just imports
+it. `brain doctor` reports the vault's health as a wiki: unresolved links and
+pages nothing links to. A vault written by an earlier version has both; `brain
+reindex` rebuilds the hubs and re-points old links at pages that exist.
+
 Obsidian reads the markdown in place, new pages appear as consolidation
 writes them, and the vault shows up in the switcher under the product's name
 — the directory is named for exactly that reason, because Obsidian names a
@@ -770,8 +852,8 @@ simply rewritten. Hub notes, entity pages and `index.md` are regenerated
 whole.
 
 **Write alongside instead.** Consolidation writes `pages/`, `knowledge/`,
-`entities/`, the hub notes at the top of a project directory, and `index.md`.
-Anything outside those is left alone — a `notes/` folder inside a project's
+`entities/`, the hub notes at the top of a project directory, and the vault's
+`index.md`, `AGENTS.md` and `CLAUDE.md`. Anything outside those is left alone — a `notes/` folder inside a project's
 directory is never touched. For notes you want the *agent* to see later, use
 `brain_note`, which puts them in memory proper rather than beside it.
 

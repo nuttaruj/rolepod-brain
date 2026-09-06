@@ -296,7 +296,12 @@ impl Store {
                     -- Lowered when a human says an entry is stale or wrong.
                     -- Nothing is destroyed; it just stops crowding the primer.
                     confidence   INTEGER NOT NULL DEFAULT 0,
-                    consolidated INTEGER NOT NULL DEFAULT 0
+                    consolidated INTEGER NOT NULL DEFAULT 0,
+                    -- Published by a teammate rather than derived here.
+                    -- Searchable and injectable like any other lesson, and
+                    -- excluded from everything that REWRITES knowledge:
+                    -- nobody edits another person's entry.
+                    team         INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE INDEX IF NOT EXISTS events_project_ts ON events(project, ts);
@@ -574,6 +579,7 @@ impl Store {
                 ("events", "read_count", "INTEGER NOT NULL DEFAULT 0"),
                 ("events", "injected_count", "INTEGER NOT NULL DEFAULT 0"),
                 ("events", "confidence", "INTEGER NOT NULL DEFAULT 0"),
+                ("events", "team", "INTEGER NOT NULL DEFAULT 0"),
                 ("summarizer_health", "last_failed_at", "TEXT"),
                 ("session_state", "claimed_at", "TEXT"),
                 ("injected", "active", "INTEGER NOT NULL DEFAULT 1"),
@@ -603,6 +609,22 @@ impl Store {
             }
         }
         Ok(false)
+    }
+
+    /// Index one event published by a teammate.
+    ///
+    /// The same row as any other, flagged so the rewriting paths skip it.
+    /// Searchable, recallable and injectable exactly like a lesson derived
+    /// here, because a lesson's worth does not depend on who wrote it.
+    ///
+    /// # Errors
+    /// Returns an error when the row cannot be written.
+    pub fn index_team_event(&self, event: &Event) -> Result<()> {
+        self.index(event)?;
+        self.conn
+            .execute("UPDATE events SET team = 1 WHERE id = ?1", params![event.id])
+            .context("flag team event")?;
+        Ok(())
     }
 
     /// Index one event.
@@ -1151,6 +1173,7 @@ impl Store {
                           CASE e.kind
                               WHEN 'knowledge' THEN 0
                               WHEN 'session_summary' THEN 1
+                              WHEN 'source' THEN 1
                               ELSE 2
                           END,
                           e.id DESC
@@ -1282,6 +1305,7 @@ impl Store {
                         CASE e.kind
                             WHEN 'knowledge' THEN 0
                             WHEN 'session_summary' THEN 1
+                            WHEN 'source' THEN 1
                             ELSE 2
                         END AS authority,
                         ROW_NUMBER() OVER (
@@ -1290,6 +1314,7 @@ impl Store {
                                      CASE e.kind
                                          WHEN 'knowledge' THEN 0
                                          WHEN 'session_summary' THEN 1
+                                         WHEN 'source' THEN 1
                                          ELSE 2
                                      END,
                                      e.id DESC
@@ -1403,6 +1428,7 @@ impl Store {
                       CASE e.kind
                           WHEN 'knowledge' THEN 0
                           WHEN 'session_summary' THEN 1
+                          WHEN 'source' THEN 1
                           ELSE 2
                       END,
                       e.id DESC
@@ -2162,8 +2188,13 @@ impl Store {
     /// one entry per run until the primer said little else.
     pub fn knowledge_entries(&self, project: &str) -> Result<Vec<(String, String)>> {
         let mut stmt = self.conn.prepare(
+            // `team = 0`: this list is what folding, superseding and
+            // dedup work from, and all three REWRITE what they find. A
+            // teammate's entry is read here and rewritten nowhere - the
+            // one mechanical guarantee behind "nobody edits another
+            // person's memory".
             "SELECT id, title FROM events
-             WHERE project = ?1 AND kind = 'knowledge' AND forgotten = 0",
+             WHERE project = ?1 AND kind = 'knowledge' AND forgotten = 0 AND team = 0",
         )?;
         let rows = stmt
             .query_map([project], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
@@ -2181,8 +2212,10 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
+                // Documents read in sit beside session summaries: both are
+                // one episode's account, and a claim they agree on recurs.
                 "SELECT id FROM events
-                 WHERE project = ?1 AND kind = 'session_summary' AND forgotten = 0
+                 WHERE project = ?1 AND kind IN ('session_summary', 'source') AND forgotten = 0
                  ORDER BY id DESC LIMIT ?2",
             )
             .context("prepare recent summaries")?;
@@ -2905,6 +2938,7 @@ impl Store {
             "CASE {prefix}kind
                  WHEN 'knowledge' THEN 0
                  WHEN 'session_summary' THEN 1
+                 WHEN 'source' THEN 1
                  WHEN 'note' THEN 2
                  WHEN 'page_update' THEN 3
                  ELSE 4
@@ -3448,6 +3482,7 @@ fn parse_kind(raw: &str) -> EventKind {
         "knowledge" => EventKind::Knowledge,
         "tombstone" => EventKind::Tombstone,
         "retire" => EventKind::Retire,
+        "source" => EventKind::Source,
         _ => EventKind::Observation,
     }
 }
@@ -4542,5 +4577,78 @@ mod tests {
         assert_eq!(flight[0].cli, "codex");
         assert_eq!(flight[0].captures, 2, "bare commands must not be counted");
         assert_eq!(flight[0].newest_id, newest, "the line is keyed by the newest capture");
+    }
+
+    #[test]
+    fn a_document_read_in_joins_the_pool_knowledge_is_distilled_from() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let make = |kind: crate::event::EventKind, hook: &str, title: &str, id: &str| {
+            let mut event = crate::event::Event::new(
+                Uuid::nil(),
+                project,
+                Uuid::nil(),
+                crate::event::Source { cli: "brain".into(), hook: hook.into() },
+                kind,
+                title.into(),
+                "body".into(),
+            );
+            event.id = id.to_string();
+            event.consolidated = true;
+            store.index(&event).unwrap();
+        };
+        make(crate::event::EventKind::SessionSummary, "consolidate", "A session", "01POOL0000000000000000001");
+        make(crate::event::EventKind::Source, "ingest", "A document", "01POOL0000000000000000002");
+        make(crate::event::EventKind::Note, "note", "A note", "01POOL0000000000000000003");
+
+        let titles: Vec<String> = store
+            .recent_summaries(&project.to_string(), 10)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.title)
+            .collect();
+        assert_eq!(titles, vec!["A document", "A session"], "a source recurs like a summary; a note does not");
+    }
+
+    #[test]
+    fn a_teammates_lesson_is_never_offered_to_the_paths_that_rewrite_knowledge() {
+        // `knowledge_entries` feeds folding, superseding and dedup - all
+        // three REWRITE what they are handed. A teammate's entry must be
+        // searchable and never appear here.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let make = |title: &str, id: &str| {
+            let mut event = crate::event::Event::new(
+                Uuid::nil(),
+                project,
+                Uuid::nil(),
+                crate::event::Source { cli: "brain".into(), hook: "gotcha".into() },
+                crate::event::EventKind::Knowledge,
+                title.into(),
+                "body".into(),
+            );
+            event.id = id.to_string();
+            event.consolidated = true;
+            event
+        };
+        store.index(&make("ours", "01TEAM0000000000000000001")).unwrap();
+        store.index_team_event(&make("theirs", "01TEAM0000000000000000002")).unwrap();
+
+        let titles: Vec<String> = store
+            .knowledge_entries(&project.to_string())
+            .unwrap()
+            .into_iter()
+            .map(|(_, title)| title)
+            .collect();
+        assert_eq!(titles, vec!["ours"], "a teammate's entry reached a rewriting path");
+
+        // But it is memory like any other: recall still returns it.
+        let recalled: Vec<String> = store
+            .recent(&project.to_string(), None, Some("knowledge"), None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.title)
+            .collect();
+        assert!(recalled.contains(&"theirs".to_string()), "a teammate's lesson is not recallable: {recalled:?}");
     }
 }

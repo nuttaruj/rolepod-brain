@@ -782,15 +782,19 @@ fn a_rerank_that_finds_nothing_costs_one_call_and_no_breaker() {
             .collect()
     };
 
-    let plain = ids(&fixture.mcp(&[search]));
+    // The baseline is the index's own order, taken with the preferred rung
+    // answering NONE - never with this machine's real CLI on PATH, whose
+    // rerank would move it and turn the comparison below into a coin toss
+    // that depends on whether that CLI is rate-limited today.
+    let none = fixture.fake_cli("claude", "echo NONE");
+    let plain = ids(&fixture.mcp_with_path(&[search], Some(&none)));
     assert!(plain.len() >= 3, "need several hits to reorder: {plain:?}");
 
-    // The preferred rung answers NONE. A second rung stands behind it, ready
-    // to promote the last hit - so if the ladder cascades, the order moves and
-    // this test sees it. `gemini`, not `codex`: codex reads its answer from a
-    // file rather than stdout, so a stdout stub there would look like a rung
-    // that failed and prove nothing about cascading.
-    fixture.fake_cli("claude", "echo NONE");
+    // A second rung stands behind the NONE, ready to promote the last hit -
+    // so if the ladder cascades, the order moves and this test sees it.
+    // `gemini`, not `codex`: codex reads its answer from a file rather than
+    // stdout, so a stdout stub there would look like a rung that failed and
+    // prove nothing about cascading.
     let bin = fixture.fake_cli("gemini", "echo \"$*\" | grep -oE '[0-9A-Z]{26}' | tail -1");
 
     for _ in 0..4 {
@@ -5254,4 +5258,307 @@ fn the_ladder_reaches_a_cli_the_minimal_path_cannot_see() {
         stdout.contains("codex"),
         "an nvm-installed CLI off PATH should still be reached: {stdout}"
     );
+}
+
+#[test]
+fn a_quiet_session_is_settled_without_a_model_call_or_a_page() {
+    let fixture = Fixture::new("quiet");
+    // A session that opened, ran one command that touched nothing, and went
+    // away. Measured on a real store, one consolidation in five was this.
+    let session = "0199c000-0000-7000-8000-000000000000";
+    fixture.hook("claude-code", "SessionStart", &start_payload(&fixture.project, session, "startup"));
+    let payload = serde_json::json!({
+        "session_id": session,
+        "cwd": fixture.project,
+        "tool_name": "Bash",
+        "tool_input": {"command": "ls"}
+    })
+    .to_string();
+    fixture.hook("claude-code", "PostToolUse", &payload);
+
+    let counter = fixture.home.parent().unwrap().join("quiet-calls");
+    let bin = fixture.fake_cli(
+        "claude",
+        &format!(
+            "N=$(cat {c} 2>/dev/null || echo 0); N=$((N+1)); echo $N > {c}\n\
+             echo '{{\"summary\":\"should never be asked\",\"titles\":[]}}'",
+            c = counter.display()
+        ),
+    );
+    let out = fixture.brain_with_path(&["consolidate", "--force"], Some(&bin));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "consolidate failed: {out:?}");
+    assert!(stdout.contains("via quiet"), "not settled as quiet: {stdout}");
+    assert!(stdout.contains("1 of them quiet"), "{stdout}");
+
+    assert!(!counter.exists(), "a quiet session must not cost a model call");
+    assert_eq!(fixture.pending_count(), 0, "its events are settled");
+    assert!(!fixture.page_text().contains("should never be asked"));
+    let mut pages = Vec::new();
+    collect_under(&fixture.wiki(), "sessions", &mut pages);
+    assert!(pages.is_empty(), "a quiet session gets no page: {pages:?}");
+    assert!(!fixture.log_text().contains("session_summary"), "and no summary for the primer");
+    // The vault's front page still exists - it says there is nothing yet.
+    assert!(fixture.wiki().join("index.md").is_file());
+    assert!(fixture.wiki().join("AGENTS.md").is_file());
+}
+
+#[test]
+fn the_vault_has_a_front_page_and_a_schema() {
+    let fixture = Fixture::new("frontpage");
+    fixture.seed_session(3);
+    let bin = fixture.fake_cli(
+        "claude",
+        "echo '{\"summary\":\"Edited three files.\",\"titles\":[]}'",
+    );
+    let out = fixture.brain_with_path(&["consolidate", "--force"], Some(&bin));
+    assert!(out.status.success(), "consolidate failed: {out:?}");
+
+    let index = std::fs::read_to_string(fixture.wiki().join("index.md")).expect("index.md");
+    assert!(index.contains("checkout"), "the project is catalogued: {index}");
+    assert!(index.contains("1 session(s)"), "{index}");
+    let schema = std::fs::read_to_string(fixture.wiki().join("AGENTS.md")).expect("AGENTS.md");
+    assert!(schema.contains("brain_search") && schema.contains("## Summary"), "{schema}");
+    let hub = fixture
+        .project_dirs()
+        .into_iter()
+        .find_map(|dir| std::fs::read_to_string(dir.join("checkout.md")).ok())
+        .expect("a project hub");
+    assert!(hub.contains("## Sessions"), "{hub}");
+    // Every link in the fresh vault resolves, and every page has a way in.
+    let doctor = String::from_utf8_lossy(&fixture.brain(&["doctor"]).stdout).to_string();
+    assert!(
+        doctor.contains("every link resolves, every page reachable"),
+        "a fresh vault should lint clean: {doctor}"
+    );
+}
+
+#[test]
+fn a_document_is_read_once_and_becomes_a_source_page() {
+    let fixture = Fixture::new("ingest");
+    let doc = fixture.project.join("docs/rate-limiter.md");
+    std::fs::create_dir_all(doc.parent().unwrap()).unwrap();
+    std::fs::write(
+        &doc,
+        "# Rate limiter design\n\nRequests are capped per API key with a token bucket.\n\n\
+         The bucket refills at 10 per second and holds 100.\n",
+    )
+    .unwrap();
+
+    let counter = fixture.home.parent().unwrap().join("ingest-calls");
+    let bin = fixture.fake_cli(
+        "claude",
+        &format!(
+            "N=$(cat {c} 2>/dev/null || echo 0); N=$((N+1)); echo $N > {c}\n\
+             echo '{{\"summary\":\"Caps requests per API key with a token bucket that refills at ten per second.\",\"entities\":[\"token bucket\",\"api key\"]}}'",
+            c = counter.display()
+        ),
+    );
+    let calls = || -> usize {
+        std::fs::read_to_string(&counter).unwrap_or_default().trim().parse().unwrap_or(0)
+    };
+
+    let out = fixture.brain_with_path(&["ingest", "docs/rate-limiter.md"], Some(&bin));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "ingest failed: {out:?}");
+    assert!(stdout.contains("Read \"Rate limiter design\" into"), "{stdout}");
+    assert!(stdout.contains("sources/rate-limiter-design.md"), "{stdout}");
+    assert_eq!(calls(), 1, "one call for one short document");
+
+    // The summary page, the untouched copy, and the entry behind them.
+    let project_dir = fixture
+        .project_dirs()
+        .into_iter()
+        .find(|dir| dir.join("sources/rate-limiter-design.md").is_file())
+        .expect("a project dir with the source page");
+    let page = std::fs::read_to_string(project_dir.join("sources/rate-limiter-design.md")).unwrap();
+    assert!(page.contains("tags: [source]"), "{page}");
+    assert!(page.contains("## Summary\n\nCaps requests per API key"), "{page}");
+    assert!(page.contains("[[raw/rate-limiter-design|rate-limiter.md]]"), "{page}");
+    let raw = std::fs::read(project_dir.join("raw/rate-limiter-design.md")).unwrap();
+    assert_eq!(raw, std::fs::read(&doc).unwrap(), "the raw copy is byte-identical");
+    let log = fixture.log_text();
+    assert_eq!(log.matches("\"kind\":\"source\"").count(), 1, "{log}");
+    assert!(!log.contains("token bucket that refills at 10 per second and holds 100"), "the body is the summary, not the document");
+
+    // Reachable the way every other memory is.
+    let search = String::from_utf8_lossy(&fixture.brain(&["search", "token bucket"]).stdout).to_string();
+    assert!(search.contains("Rate limiter design"), "not searchable: {search}");
+    let hub = std::fs::read_to_string(project_dir.join("checkout.md")).unwrap();
+    assert!(hub.contains("## Sources") && hub.contains("[[sources/rate-limiter-design|Rate limiter design]]"), "{hub}");
+    assert!(hub.contains("1 document(s) read"), "{hub}");
+
+    // The same bytes again cost nothing and add nothing.
+    let again = fixture.brain_with_path(&["ingest", "docs/rate-limiter.md"], Some(&bin));
+    let stdout = String::from_utf8_lossy(&again.stdout);
+    assert!(stdout.contains("Already in memory, unchanged"), "{stdout}");
+    assert_eq!(calls(), 1, "an unchanged document must not be re-summarized");
+    assert_eq!(fixture.log_text().matches("\"kind\":\"source\"").count(), 1);
+
+    // --force reads it again and withdraws the earlier reading, so search
+    // still returns one entry for the document.
+    let forced = fixture.brain_with_path(&["ingest", "docs/rate-limiter.md", "--force"], Some(&bin));
+    assert!(String::from_utf8_lossy(&forced.stdout).contains("Read \"Rate limiter design\""));
+    assert_eq!(calls(), 2);
+    let log = fixture.log_text();
+    assert_eq!(log.matches("\"kind\":\"source\"").count(), 2, "{log}");
+    assert!(log.contains("\"kind\":\"tombstone\""), "the earlier reading was not withdrawn: {log}");
+    let search = String::from_utf8_lossy(&fixture.brain(&["search", "token bucket"]).stdout).to_string();
+    assert_eq!(
+        search.lines().filter(|line| line.contains("Rate limiter design")).count(),
+        1,
+        "two readings of one document are being served: {search}"
+    );
+
+    // A document that is not text is refused with a reason, not read as garbage.
+    std::fs::write(fixture.project.join("docs/blob.bin"), [0u8, 159, 146, 150, 0]).unwrap();
+    let refused = fixture.brain(&["ingest", "docs/blob.bin"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("not UTF-8 text"), "{refused:?}");
+}
+
+#[test]
+fn a_document_is_kept_even_when_no_model_is_reachable() {
+    let fixture = Fixture::new("ingest-nomodel");
+    let doc = fixture.project.join("notes.txt");
+    std::fs::write(&doc, "Deploys happen on Fridays only, after the 4pm freeze lifts.\n").unwrap();
+
+    // No CLI on PATH at all.
+    let out = fixture.brain(&["ingest", "notes.txt"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(stdout.contains("(via rule-based)") && stdout.contains("No model was reachable"), "{stdout}");
+
+    let project_dir = fixture
+        .project_dirs()
+        .into_iter()
+        .find(|dir| dir.join("sources/notes.md").is_file())
+        .expect("a page even without a model");
+    let page = std::fs::read_to_string(project_dir.join("sources/notes.md")).unwrap();
+    assert!(page.contains("Deploys happen on Fridays only"), "the opening stands in: {page}");
+    assert!(page.contains("`raw/notes.txt` (notes.txt)"), "a non-markdown copy is named, not wikilinked: {page}");
+    assert!(project_dir.join("raw/notes.txt").is_file());
+    let search = String::from_utf8_lossy(&fixture.brain(&["search", "Fridays"]).stdout).to_string();
+    assert!(search.contains("notes"), "{search}");
+}
+
+#[test]
+fn a_team_shares_lessons_and_nothing_else() {
+    // Two people, one repository, one shared folder. What crosses is the
+    // distillate; what must never cross is everything else.
+    let marker = "[project]\nname = \"teamprop\"\n";
+    let a = Fixture::new("team-a");
+    let b = Fixture::new("team-b");
+    std::fs::write(a.project.join(".rolepod-brain.toml"), marker).unwrap();
+    std::fs::write(b.project.join(".rolepod-brain.toml"), marker).unwrap();
+    let shared = a.home.parent().unwrap().join("team-folder");
+
+    // A works, five sessions, and a lesson is distilled from them. The
+    // lesson deliberately carries what a lesson picks up from the sessions
+    // it was written over: a home directory and an address.
+    let leaky = r#"
+case "$*" in
+  *"SESSION SUMMARIES"*)
+    IDS=$(echo "$*" | grep -oE 'id=[0-9A-Z]{26}' | cut -d= -f2)
+    ID=$(echo "$IDS" | head -1)
+    ID2=$(echo "$IDS" | head -2 | tail -1)
+    echo "{\"knowledge\":[{\"kind\":\"gotcha\",\"title\":\"vitest must run file-by-file here\",\"body\":\"Set under /Users/someone/dev/app by sam@example.com.\",\"sources\":[\"$ID\",\"$ID2\"]}]}" ;;
+  *) echo '{"summary":"Reworked the auth path.","titles":[]}' ;;
+esac
+"#;
+    let bin = a.fake_cli("claude", leaky);
+    for session in 0..5 {
+        let payload = serde_json::json!({
+            "session_id": format!("0199a1f2-3c4d-7e8f-9012-34567890000{session}"),
+            "cwd": a.project,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": a.project.join("src/auth.rs")}
+        })
+        .to_string();
+        a.hook("claude-code", "PostToolUse", &payload);
+        assert!(a.brain_with_path(&["consolidate", "--force"], Some(&bin)).status.success());
+    }
+    assert!(!a.knowledge_pages().is_empty(), "no lesson to share");
+
+    let init_a = a.brain(&["team", "init", shared.to_str().unwrap(), "--name", "Alex"]);
+    assert!(init_a.status.success(), "init A failed: {init_a:?}");
+    let init_b = b.brain(&["team", "init", shared.to_str().unwrap(), "--name", "Sam"]);
+    assert!(init_b.status.success(), "init B failed: {init_b:?}");
+    std::fs::copy(a.home.join("team.key"), b.home.join("team.key")).unwrap();
+
+    let published = a.brain(&["team"]);
+    let stdout = String::from_utf8_lossy(&published.stdout);
+    assert!(published.status.success(), "publish failed: {published:?}");
+    assert!(stdout.contains("published 1 of yours"), "{stdout}");
+
+    let pulled = b.brain(&["team"]);
+    assert!(pulled.status.success(), "pull failed: {pulled:?}");
+    let stdout = String::from_utf8_lossy(&pulled.stdout).to_string();
+    assert!(stdout.contains("1 new lesson(s)"), "{stdout}");
+
+    // B's agent can recall A's lesson.
+    let hits = String::from_utf8_lossy(&b.brain(&["search", "vitest"]).stdout).to_string();
+    assert!(hits.contains("vitest must run file-by-file"), "the lesson never arrived: {hits}");
+
+    // And nothing else did. Not the session, not the summary, not the prompt.
+    let shelf = b.page_text() + &b.log_text();
+    assert!(!shelf.contains("Reworked the auth path"), "a session summary crossed: {shelf}");
+    assert!(!shelf.contains("src/auth.rs"), "a capture crossed");
+    // The two things a lesson carries out of a person's sessions.
+    assert!(!shelf.contains("/Users/someone"), "a home directory crossed");
+    assert!(!shelf.contains("sam@example.com"), "an address crossed");
+
+    // The bundle itself is ciphertext.
+    for entry in std::fs::read_dir(&shared).unwrap().flatten() {
+        let text = String::from_utf8_lossy(&std::fs::read(entry.path()).unwrap()).into_owned();
+        assert!(!text.contains("vitest") && !text.contains("\"kind\""), "plaintext in the team folder");
+    }
+
+    // B reads it as a signed page it does not own, and a second pull is a no-op.
+    let page = b
+        .project_dirs()
+        .into_iter()
+        .chain(std::iter::once(b.wiki()))
+        .find_map(|dir| {
+            let mut found = Vec::new();
+            collect_under(&dir, "_team", &mut found);
+            found.into_iter().find(|path| path.extension().is_some_and(|ext| ext == "md"))
+        })
+        .expect("a team page");
+    let text = std::fs::read_to_string(&page).unwrap();
+    assert!(text.contains("author: Alex"), "{text}");
+    assert!(text.contains("publish your own rather than editing theirs"), "{text}");
+    let again = b.brain(&["team"]);
+    assert!(String::from_utf8_lossy(&again.stdout).contains("0 new lesson(s)"), "a repeat pull gained something");
+
+    // A teammate's lesson is never republished as B's own work.
+    assert!(
+        String::from_utf8_lossy(&again.stdout).contains("published 0 of yours"),
+        "B republished A's lesson as its own: {}",
+        String::from_utf8_lossy(&again.stdout)
+    );
+
+    // A survives a rebuild on B: the team shelf is derived state like the rest.
+    assert!(b.brain(&["reindex"]).status.success());
+    let hits = String::from_utf8_lossy(&b.brain(&["search", "vitest"]).stdout).to_string();
+    assert!(hits.contains("vitest must run file-by-file"), "a rebuild lost the team shelf: {hits}");
+
+    let doctor = String::from_utf8_lossy(&b.brain(&["doctor"]).stdout).to_string();
+    assert!(doctor.contains("signing as Sam"), "{doctor}");
+}
+
+#[test]
+fn a_team_is_off_and_needs_a_name_before_anything_is_shared() {
+    let fixture = Fixture::new("team-off");
+    let doctor = String::from_utf8_lossy(&fixture.brain(&["doctor"]).stdout).to_string();
+    assert!(doctor.contains("lessons stay on this machine"), "{doctor}");
+
+    let out = fixture.brain(&["team"]);
+    assert!(!out.status.success(), "an unconfigured team must fail loudly");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("brain team init"), "{out:?}");
+
+    let dir = fixture.home.parent().unwrap().join("t");
+    let empty = fixture.brain(&["team", "init", dir.to_str().unwrap(), "--name", "  "]);
+    assert!(!empty.status.success(), "a team without a name must be refused");
+    assert!(String::from_utf8_lossy(&empty.stderr).contains("name to sign"), "{empty:?}");
 }

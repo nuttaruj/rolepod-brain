@@ -65,20 +65,7 @@ pub fn init(dir: &str) -> Result<String> {
     std::fs::write(paths.config_file(), rendered).context("write config")?;
 
     let key_path = paths.data_dir.join("sync.key");
-    let minted = if key_path.is_file() {
-        false
-    } else {
-        let mut key = [0u8; 32];
-        getrandom::fill(&mut key).map_err(|error| anyhow::anyhow!("no randomness: {error}"))?;
-        let hex: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
-        std::fs::write(&key_path, hex).context("write sync.key")?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
-        }
-        true
-    };
+    let minted = mint_key(&key_path)?;
 
     Ok(format!(
         "sync dir: {}\nkey: {} ({})\n\n\
@@ -169,15 +156,37 @@ pub fn run() -> Result<Outcome> {
 
 /// The shared key, 32 bytes as hex on disk.
 fn load_key(paths: &Paths) -> Result<[u8; 32]> {
-    let path = paths.data_dir.join("sync.key");
-    let hex = std::fs::read_to_string(&path)
-        .with_context(|| format!("no sync key at {} - run `brain sync init`", path.display()))?;
+    read_key(&paths.data_dir.join("sync.key"), "brain sync init")
+}
+
+/// Mint a fresh 32-byte key at `path` unless one is already there. Returns
+/// whether it was minted now.
+pub(crate) fn mint_key(path: &std::path::Path) -> Result<bool> {
+    if path.is_file() {
+        return Ok(false);
+    }
+    let mut key = [0u8; 32];
+    getrandom::fill(&mut key).map_err(|error| anyhow::anyhow!("no randomness: {error}"))?;
+    let hex: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
+    std::fs::write(path, hex).with_context(|| format!("write {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(true)
+}
+
+/// Read a 32-byte hex key written by [`mint_key`].
+pub(crate) fn read_key(path: &std::path::Path, how: &str) -> Result<[u8; 32]> {
+    let hex = std::fs::read_to_string(path)
+        .with_context(|| format!("no key at {} - run `{how}`", path.display()))?;
     let hex = hex.trim();
-    anyhow::ensure!(hex.len() == 64, "sync.key is not a 32-byte hex key");
+    anyhow::ensure!(hex.len() == 64, "{} is not a 32-byte hex key", path.display());
     let mut key = [0u8; 32];
     for (index, byte) in key.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16)
-            .context("sync.key is not valid hex")?;
+            .with_context(|| format!("{} is not valid hex", path.display()))?;
     }
     Ok(key)
 }
@@ -185,7 +194,7 @@ fn load_key(paths: &Paths) -> Result<[u8; 32]> {
 /// `[24-byte nonce][ciphertext]`. A fresh random nonce per seal: XChaCha's
 /// nonce is wide enough that random never collides in practice, which is
 /// the property that makes "no counter state to sync" safe.
-fn seal_bundle(key: &[u8; 32], plain: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn seal_bundle(key: &[u8; 32], plain: &[u8]) -> Result<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new(key.into());
     let mut nonce = [0u8; 24];
     getrandom::fill(&mut nonce).map_err(|error| anyhow::anyhow!("no randomness: {error}"))?;
@@ -199,7 +208,7 @@ fn seal_bundle(key: &[u8; 32], plain: &[u8]) -> Result<Vec<u8>> {
 
 /// The inverse of [`seal_bundle`]. Fails on a wrong key, a truncated file,
 /// or any tampering - the AEAD tag covers all of it.
-fn open_bundle(key: &[u8; 32], sealed: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn open_bundle(key: &[u8; 32], sealed: &[u8]) -> Result<Vec<u8>> {
     anyhow::ensure!(sealed.len() > 24, "bundle too short to hold a nonce");
     let cipher = XChaCha20Poly1305::new(key.into());
     cipher

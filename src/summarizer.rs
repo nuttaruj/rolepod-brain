@@ -224,6 +224,10 @@ pub enum Tier {
     Cli(String),
     /// No model was reachable; the caller must produce rule-based output.
     RuleBased,
+    /// Nothing worth a model's time happened: the session opened, ran a
+    /// command or two that touched nothing, and closed. Settled without a
+    /// call, without a page, and without a summary for the primer to carry.
+    Quiet,
 }
 
 /// Picks a rung and runs it.

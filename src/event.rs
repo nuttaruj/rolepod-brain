@@ -44,6 +44,12 @@ pub enum EventKind {
     /// title, topic, files, links - and lose their bodies from the index.
     /// The log keeps everything; replaying reproduces the drop.
     Retire,
+    /// A document read into memory by `brain ingest`: its summary is the
+    /// body, the immutable copy sits under the project's `raw/`. Episodic
+    /// like a session summary - what one document said - and pooled with
+    /// them when knowledge is synthesized, so a fact a document and a
+    /// session agree on can become durable.
+    Source,
 }
 
 impl EventKind {
@@ -57,6 +63,7 @@ impl EventKind {
             Self::Knowledge => "knowledge",
             Self::Tombstone => "tombstone",
             Self::Retire => "retire",
+            Self::Source => "source",
         }
     }
 }
