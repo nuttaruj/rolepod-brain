@@ -3883,7 +3883,9 @@ mod tests {
         std::fs::create_dir_all(dir.join("pages/sessions")).unwrap();
         std::fs::create_dir_all(dir.join("entities")).unwrap();
         std::fs::write(dir.join("entities/billing.md"), "---\ntitle: billing\n---\n").unwrap();
-        let page = dir.join("pages/sessions/2026-08-23 old.md");
+        // Built the way `read_dir` reports it, so the recorded path below
+        // compares equal on a platform whose separator is not `/`.
+        let page = dir.join("pages").join("sessions").join("2026-08-23 old.md");
         std::fs::write(
             &page,
             "---\ntitle: old\ndate: 2026-08-23\nsession: s1\n---\n\n# old\n\nAbout: [[billing|billing]] · [[once|once]]\n\n## Summary\n\nold\n",
@@ -3901,9 +3903,10 @@ mod tests {
         let recorded = store.pages_edited_by_hand().unwrap();
         assert!(
             recorded.iter().any(|(path, hash, session)| {
-                path == &page.to_string_lossy() && hash == &page_hash(&text) && session == "s1"
+                Path::new(path) == page && hash == &page_hash(&text) && session == "s1"
             }),
-            "fingerprint not recorded: {recorded:?}"
+            "fingerprint not recorded: {recorded:?} (page {})",
+            page.display()
         );
         std::fs::remove_dir_all(&dir).ok();
     }
