@@ -2363,7 +2363,7 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, ts, kind, title, topic, hook FROM events
+                "SELECT id, ts, kind, title, topic FROM events
                  WHERE project = ?1 AND confidence < 0 AND forgotten = 0
                  ORDER BY confidence, id DESC LIMIT 100",
             )
@@ -2376,8 +2376,6 @@ impl Store {
                     kind: row.get(2)?,
                     title: row.get(3)?,
                     topic: row.get(4)?,
-                    has_files: false,
-                    hook: row.get(5)?,
                 })
             })
             .context("run flagged")?;
@@ -2451,7 +2449,7 @@ impl Store {
     pub fn rerank_runs(&self) -> Result<Vec<RerankRun>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT engine, reason, ms, cold FROM rerank_runs ORDER BY ts")
+            .prepare("SELECT engine, reason, ms, cold FROM rerank_runs ORDER BY rowid")
             .context("prepare rerank runs")?;
         let rows = stmt
             .query_map([], |row| {
@@ -2987,7 +2985,7 @@ impl Store {
             // too - and the costlier half, because it spends bytes in every
             // future session whether or not anyone asked. A withdrawn memory
             // that only disappears from search has not been withdrawn.
-            "SELECT id, ts, kind, title, topic, files, hook FROM events
+            "SELECT id, ts, kind, title, topic FROM events
              WHERE project = ?1 AND forgotten = 0 AND kind NOT IN ('tombstone', 'retire')
                    AND hook NOT IN ('correct', 'feedback', 'supersede')
                    AND (?3 IS NULL OR kind = ?3)
@@ -3004,72 +3002,63 @@ impl Store {
                     kind: row.get(2)?,
                     title: row.get(3)?,
                     topic: row.get(4)?,
-                    has_files: row
-                        .get::<_, String>(5)
-                        .map(|files| files.len() > 2)
-                        .unwrap_or(false),
-                    hook: row.get(6)?,
                 })
             })
             .context("run primer pointers")?;
         rows.collect::<rusqlite::Result<Vec<_>>>().context("read primer pointers")
     }
 
-    /// The newest captures nothing has summarized yet.
+    /// Sessions whose captures nothing has summarized yet, newest first.
     ///
-    /// Deliberately not part of [`Self::primer_pointers`]'s ranking, which
-    /// puts kind before recency and is right to: a consolidated summary
-    /// really is worth more than a raw capture, nearly always. The exception
-    /// is the one this answers - a session killed mid-task leaves captures
-    /// that no summary covers, and they lose to every summary ever written.
+    /// One row per session, not one per capture. The primer used to push the
+    /// newest unsummarized captures themselves, four or five lines at a time,
+    /// and a real store showed what that bought: of 476 such lines, two were
+    /// ever opened. Forty percent were the reader's own captures echoed back
+    /// after a compaction, and half the rest were a finished session the
+    /// backstop had not reached - not work killed mid-task at all.
     ///
-    /// Worse than merely missing: the newest captures are often ABOUT
-    /// something already summarized. The summary says the subject was
-    /// handled, and the capture saying it is half-finished is the part left
-    /// out - so the next session reads "done" and redoes the rest.
+    /// What the next session needs is not the captures, it is to know that a
+    /// session is still unsummarized and how to read it. One line carries
+    /// that; `brain_recent` with the session id carries the rest, on demand.
+    ///
+    /// A session counts only through captures that mean something - a
+    /// prompt, an answer, a file touched, a classification - so a session
+    /// that only opened and ran a few commands is not "in flight". The
+    /// newest such capture's id names the line, which is what dedup and
+    /// uptake are keyed by: a resume shows the line again only when new work
+    /// arrived, and the line counts as pulled when that session is read.
     ///
     /// # Errors
     /// Returns an error when the query fails.
-    pub fn unconsolidated_pointers(&self, project: &str, limit: usize) -> Result<Vec<Pointer>> {
+    pub fn unconsolidated_sessions(&self, project: &str, limit: usize) -> Result<Vec<InFlight>> {
         let mut stmt = self
             .conn
             .prepare(
-                // The same test `inject::worth_injecting` applies, pushed into
-                // the query so the limit counts lines that will survive it.
-                // Taking the newest five rows instead spends the reserve on
-                // whatever ran last - a session_start, a stop - and the
-                // caller drops all five, leaving the seats empty and the
-                // in-flight work still invisible. Which is what shipped
-                // first, and what a real event store showed within minutes.
-                "SELECT id, ts, kind, title, topic, files, hook FROM events
+                "SELECT session, MIN(cli), COUNT(*), MAX(id), MAX(ts) FROM events
                  WHERE project = ?1 AND consolidated = 0 AND forgotten = 0
-                       AND kind NOT IN ('tombstone', 'retire') AND hook NOT IN ('correct', 'feedback', 'supersede')
+                       AND kind = 'observation'
+                       AND hook NOT IN ('correct', 'feedback', 'supersede')
                        AND (topic IS NOT NULL
-                            OR kind != 'observation'
                             OR files != '[]'
-                            OR hook = 'user_prompt_submit'
+                            OR hook IN ('user_prompt_submit', 'before_submit_prompt', 'before_agent')
                             OR (hook = 'stop' AND title != 'Turn finished'))
-                 ORDER BY id DESC
+                 GROUP BY session
+                 ORDER BY MAX(id) DESC
                  LIMIT ?2",
             )
-            .context("prepare unconsolidated pointers")?;
+            .context("prepare unconsolidated sessions")?;
         let rows = stmt
             .query_map(params![project, limit as i64], |row| {
-                Ok(Pointer {
-                    id: row.get(0)?,
-                    ts: row.get(1)?,
-                    kind: row.get(2)?,
-                    title: row.get(3)?,
-                    topic: row.get(4)?,
-                    has_files: row
-                        .get::<_, String>(5)
-                        .map(|files| files.len() > 2)
-                        .unwrap_or(false),
-                    hook: row.get(6)?,
+                Ok(InFlight {
+                    session: row.get(0)?,
+                    cli: row.get(1)?,
+                    captures: row.get(2)?,
+                    newest_id: row.get(3)?,
+                    newest_ts: row.get(4)?,
                 })
             })
-            .context("run unconsolidated pointers")?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().context("read unconsolidated pointers")
+            .context("run unconsolidated sessions")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("read unconsolidated sessions")
     }
 
     /// Pointers for events that touched one file, best first.
@@ -3083,7 +3072,7 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<Pointer>> {
         let sql = format!(
-            "SELECT e.id, e.ts, e.kind, e.title, e.topic, e.hook
+            "SELECT e.id, e.ts, e.kind, e.title, e.topic
              FROM event_files f
              JOIN events e ON e.id = f.event_id
              WHERE f.project = ?1 AND f.path = ?2 AND e.forgotten = 0
@@ -3102,8 +3091,6 @@ impl Store {
                     kind: row.get(2)?,
                     title: row.get(3)?,
                     topic: row.get(4)?,
-                    has_files: true,
-                    hook: row.get(5)?,
                 })
             })
             .context("run file pointers")?;
@@ -3352,6 +3339,19 @@ impl Store {
 }
 
 /// A memory pointer: everything an injection may carry, and nothing more.
+/// A session with captures nothing has summarized yet - see
+/// [`Store::unconsolidated_sessions`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InFlight {
+    pub session: String,
+    pub cli: String,
+    /// Captures that count: prompts, answers, file touches, classified work.
+    pub captures: i64,
+    /// The newest of them; the id the primer line is keyed by.
+    pub newest_id: String,
+    pub newest_ts: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Pointer {
     pub id: String,
@@ -3360,14 +3360,6 @@ pub struct Pointer {
     pub title: String,
     /// What it is about, when something classified it.
     pub topic: Option<String>,
-    /// Lifecycle hook that produced it. The primer's floor needs it: what a
-    /// human typed is signal even with no file attached, while a tool call
-    /// that touched nothing usually is not.
-    pub hook: String,
-    /// Whether the underlying event touched any file. Part of the primer's
-    /// usefulness floor: a capture with no files and no classification is
-    /// almost always a bare command nobody will recall.
-    pub has_files: bool,
 }
 
 /// Health of one summarizer rung.
@@ -4507,5 +4499,48 @@ mod tests {
         store.record_injected(session, &["01AAA".to_string()], 0, 100).unwrap();
         assert!(store.already_injected(session, "01AAA").unwrap());
         assert_eq!(store.injection_uptake().unwrap(), (1, 1));
+    }
+
+    #[test]
+    fn a_session_in_flight_is_counted_by_captures_that_mean_something() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let talking = Uuid::new_v4();
+        let idle = Uuid::new_v4();
+        let mut n = 0;
+        let mut add = |session: Uuid, hook: &str, title: &str, files: Vec<String>, consolidated: bool| {
+            let mut event = Event::new(
+                Uuid::nil(),
+                project,
+                session,
+                Source { cli: "codex".into(), hook: hook.into() },
+                EventKind::Observation,
+                title.into(),
+                String::new(),
+            );
+            n += 1;
+            event.id = format!("01FLIGHT{n:018}");
+            event.files = files;
+            event.consolidated = consolidated;
+            store.index(&event).unwrap();
+            event.id
+        };
+        // Three bare commands and two prompts: only the prompts count.
+        for i in 0..3 {
+            add(talking, "post_tool_use", &format!("Ran: echo {i}"), vec![], false);
+        }
+        add(talking, "user_prompt_submit", "Asked: where were we?", vec![], false);
+        let newest = add(talking, "user_prompt_submit", "Asked: finish it", vec![], false);
+        // A session that only ran bare commands is not in flight.
+        add(idle, "post_tool_use", "Ran: ls", vec![], false);
+        // A summarized capture no longer counts, however recent.
+        add(idle, "user_prompt_submit", "Asked: done already", vec![], true);
+
+        let flight = store.unconsolidated_sessions(&project.to_string(), 5).unwrap();
+        assert_eq!(flight.len(), 1, "only the talking session is in flight: {flight:?}");
+        assert_eq!(flight[0].session, talking.to_string());
+        assert_eq!(flight[0].cli, "codex");
+        assert_eq!(flight[0].captures, 2, "bare commands must not be counted");
+        assert_eq!(flight[0].newest_id, newest, "the line is keyed by the newest capture");
     }
 }

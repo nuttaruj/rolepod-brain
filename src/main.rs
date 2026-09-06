@@ -670,7 +670,7 @@ fn stats() -> Result<()> {
         let (flight_pushed, flight_pulled) = store.in_flight_uptake().unwrap_or((0, 0));
         if flight_pushed > 0 {
             println!(
-                "    of those, {flight_pulled} of {flight_pushed} were work still \
+                "    of those, {flight_pulled} of {flight_pushed} named a session still \
                  unsummarized when it was handed over"
             );
         }

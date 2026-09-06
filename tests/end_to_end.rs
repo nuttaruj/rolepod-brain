@@ -2624,9 +2624,16 @@ fn session_start_injects_pointers_and_never_bodies() {
 
     // Pointers, with ids the agent can pull with.
     assert!(context.contains("brain_get"), "primer should tell the agent how to pull");
-    assert!(context.contains("Asked: why does auth reject valid tokens?"), "title missing");
+    // The unsummarized session is one line naming it and how to read it -
+    // not the capture, whose title stays behind for brain_recent.
+    assert!(
+        context.contains("claude-code session 1 capture(s) not yet summarized")
+            && context.contains("0199a1f2-3c4d-7e8f-9012-3456789abcde"),
+        "the session in flight is not named: {context}"
+    );
+    assert!(!context.contains("Asked: why does auth"), "a capture was pushed line by line: {context}");
 
-    // The rest of that prompt must NOT be here - only its first line was.
+    // The prompt itself must NOT be here.
     assert!(
         !context.contains("SECRET_BODY_MARKER"),
         "full content leaked into the primer: {context}"
@@ -3383,8 +3390,13 @@ fn a_noisy_project_yields_a_short_primer_not_a_padded_one() {
         serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
     let context = parsed["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
 
-    assert!(context.contains("scheduler double-book"), "a real question was cut");
-    assert!(context.contains("where is expiry compared"), "a real question was cut");
+    // The session is in flight through its two real questions - the twenty
+    // bare commands do not count, and nothing is pushed line by line.
+    assert!(
+        context.contains("claude-code session 2 capture(s) not yet summarized"),
+        "the in-flight line miscounted or is missing: {context}"
+    );
+    assert!(!context.contains("scheduler double-book"), "a capture was pushed line by line: {context}");
     assert!(!context.contains("noise-"), "bare commands padded the primer: {context}");
     assert!(
         context.len() < 1200,
@@ -3666,7 +3678,9 @@ fn memory_comes_back_after_a_context_wipe() {
         &start_payload(&fixture.project, session, "startup"),
     );
     let first = injected_context(&first).expect("primer on a normal start");
-    assert!(first.contains("scheduler double-book"));
+    // The earlier session is still unsummarized, so the primer names it.
+    let earlier = "0199aaaa-0000-7000-8000-000000000000";
+    assert!(first.contains(earlier), "the earlier session is not named: {first}");
 
     // Compaction arrives as a `SessionStart` whose source says so - not as
     // `PostCompact`, which Claude Code refuses to accept context from.
@@ -3680,7 +3694,7 @@ fn memory_comes_back_after_a_context_wipe() {
     let after = injected_context(&after)
         .expect("compaction wiped the context; memory must come straight back");
     assert!(
-        after.contains("scheduler double-book"),
+        after.contains(earlier),
         "the pre-wipe memory was suppressed after compaction: {after}"
     );
 
@@ -3691,7 +3705,7 @@ fn memory_comes_back_after_a_context_wipe() {
         &start_payload(&fixture.project, session, "clear"),
     );
     let cleared = injected_context(&cleared).expect("primer after /clear");
-    assert!(cleared.contains("scheduler double-book"));
+    assert!(cleared.contains(earlier), "the pre-wipe memory was suppressed after /clear: {cleared}");
 }
 
 #[test]
@@ -4373,8 +4387,9 @@ fn what_gets_read_rises_and_what_gets_flagged_sinks() {
     assert_eq!(after.len(), 3, "a flagged entry disappeared: {after:?}");
     assert_eq!(after.last().unwrap(), &ids[0], "the flagged entry should sink to last");
 
-    // The primer is ranked by usage, so the entry that was read in full leads
-    // and the flagged one trails.
+    // The primer does not push captures one by one: the session they belong
+    // to is one line, keyed by its newest capture. Flagging shapes search,
+    // and search is where these are reached.
     let start = serde_json::json!({
         "session_id": "0199b000-0000-7000-8000-000000000000",
         "cwd": fixture.project,
@@ -4383,9 +4398,11 @@ fn what_gets_read_rises_and_what_gets_flagged_sinks() {
     .to_string();
     let output = fixture.hook("claude-code", "SessionStart", &start);
     let context = injected_context(&output).expect("a primer");
-    let read_at = context.find(&ids[2]).expect("the read entry should be in the primer");
-    let flagged_at = context.find(&ids[0]).expect("the flagged entry is still present");
-    assert!(read_at < flagged_at, "usage did not outrank a flagged entry in the primer");
+    assert!(
+        context.contains(&ids[2]) && context.contains("3 capture(s) not yet summarized"),
+        "the session in flight should be named once, by its newest capture: {context}"
+    );
+    assert!(!context.contains(&ids[0]), "a capture was pushed line by line: {context}");
 }
 
 #[test]

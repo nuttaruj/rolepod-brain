@@ -386,7 +386,9 @@ session_budget = 8192  # ceiling for ALL automatic injection in one session
 # in EVERY future session, which is the definition of a hidden recurring
 # spend. Lowering them keeps only the top-ranked lines (durable knowledge
 # first, then summaries); the agent can always pull more through
-# brain_search, which has no budget because the agent asked. `brain doctor`
+# brain_search, which has no budget because the agent asked. Raw captures
+# are never pushed line by line: a session nothing has summarized yet is
+# one line naming it, and brain_recent reads it on request. `brain doctor`
 # reports what sessions actually spend against the cap - tune from that
 # number, not from a guess.
 
