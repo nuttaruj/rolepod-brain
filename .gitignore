@@ -3,6 +3,7 @@
 .DS_Store
 .rolepod/
 .claude/agent-memory/
+.codegraph/
 
 # The embedding model is a release asset, not a repository file: 122 MB is
 # past what GitHub accepts and would sit in every clone forever. Fetch it with
