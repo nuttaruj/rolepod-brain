@@ -44,6 +44,11 @@ const INSTRUCTIONS: &str = "You are summarizing one coding session for a develop
          summary: 2-4 sentences on what was actually done and why it mattered. \
          Concrete over generic: name the files, the bug, the decision. Skip \
          routine noise. Write it for someone resuming this work in a week.\n\
+         If something was tried and ruled out, say so and say WHY IT FAILED - \
+         the mechanism, not just the verdict. A session that resumes this work \
+         will otherwise re-attempt it, because a rejected approach is usually \
+         the obvious one. \"Tried X; it Y, so Z instead\" beats \"X did not \
+         work\", which teaches nothing and reads as an untested opinion.\n\
          titles: a better one-line title for each event worth remembering. Use \
          the exact id given. OMIT events not worth recalling — a short list of \
          real findings is worth more than a complete list of routine commands.\n\
@@ -59,7 +64,9 @@ const INSTRUCTIONS: &str = "You are summarizing one coding session for a develop
          {\"id\": \"01H8Y…\", \"title\": \"Injection header was appended after \
          budgeting, so every push overspent by its own length\", \"kind\": \"bugfix\"}\n\
          {\"id\": \"01H8Z…\", \"title\": \"A headless CLI run fires that CLI's own \
-         hooks, so consolidation captured itself\", \"kind\": \"discovery\"}\n\n\
+         hooks, so consolidation captured itself\", \"kind\": \"discovery\"}\n\
+         {\"id\": \"01H90…\", \"title\": \"tract-onnx cannot run the reranker: \
+         it has no QAttention operator and panics on fp32\", \"kind\": \"discovery\"}\n\n\
          Note what those share: each states the thing itself, not the command \
          that produced it. \"Ran cargo test\" is not worth a title.\n\n\
          Never include a credential, token, password, key, or personal datum \
@@ -3297,6 +3304,25 @@ mod tests {
         let prompt = build_prompt(&events, false, None);
         assert!(prompt.contains("Never invent specifics"));
         assert!(prompt.contains("does not appear in the observations"));
+    }
+
+    #[test]
+    fn the_prompt_asks_why_a_rejected_approach_failed() {
+        // A knowledge entry needs two sessions to cite it, so an approach
+        // ruled out ONCE lives only in the summary prose - and a verdict
+        // without its mechanism does not survive being read months later.
+        // The next session re-attempts it, because a rejected approach is
+        // usually the obvious one.
+        let events = vec![event("1", "post_tool_use", "t", "")];
+        let prompt = build_prompt(&events, false, None);
+        assert!(prompt.contains("tried and ruled out"), "the case is never raised");
+        assert!(prompt.contains("WHY IT FAILED"), "a verdict without its mechanism");
+        // A worked specimen, not only the rule: every other standard in this
+        // prompt carries one, and the model follows the examples.
+        assert!(
+            prompt.contains("QAttention") && prompt.contains("panics on fp32"),
+            "no specimen of a failure stated by its mechanism"
+        );
     }
 
     #[test]
