@@ -228,6 +228,12 @@ pub enum Tier {
     /// command or two that touched nothing, and closed. Settled without a
     /// call, without a page, and without a summary for the primer to carry.
     Quiet,
+    /// A one-shot run - `claude -p`, `codex exec`, a codex served to another
+    /// agent's plugin. Its captures stay in the log and answer `brain_recent`
+    /// and search; its outcome already reached memory through the session
+    /// that delegated it. Settled the way a quiet session is: no call, no
+    /// page, no summary, and never a line about work left in flight.
+    Headless,
 }
 
 /// Picks a rung and runs it.

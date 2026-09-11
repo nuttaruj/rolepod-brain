@@ -18,14 +18,22 @@ use std::path::Path;
 /// it must not be renamed for internal convenience.
 pub const SILENT_ENV: &str = "ROLEPOD_BRAIN_SILENT";
 
-/// How far up the process tree to look for the host CLI.
+/// How far up the process tree to walk.
 ///
-/// The CLI is normally our direct parent; a couple of levels of slack covers a
-/// shell wrapper without walking into unrelated ancestors.
+/// The host CLI is normally our direct parent, but who started the CLI matters
+/// too: a codex served to another agent's plugin sits four processes below the
+/// plugin that owns it. The whole chain comes from one `ps`, so walking it to
+/// the root costs nothing more; the bound only guards against a cycle in a
+/// table read mid-change.
 ///
 /// Unix only, because only there is there a process tree to walk.
 #[cfg(unix)]
-const MAX_ANCESTORS: usize = 4;
+const MAX_ANCESTORS: usize = 32;
+
+/// Where Claude Code keeps the plugins it runs. A process started from here
+/// is an agent's plugin - the codex companion's `app-server` broker, say -
+/// and whatever CLI it hosts is working for that agent, not for a person.
+const AGENT_PLUGIN_DIR: &str = "/.claude/plugins/";
 
 /// What kind of run produced this event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,10 +88,42 @@ pub fn silenced() -> bool {
 /// signal that actually differs: `claude` alone versus `claude -p …`.
 #[must_use]
 pub fn classify() -> Invocation {
-    ancestors()
+    classify_chain(&ancestors())
+}
+
+/// The host CLI's own arguments decide first; who started the CLI decides
+/// the rest.
+///
+/// `codex app-server` reads as interactive from its argv - an IDE extension
+/// drives one with a person behind it - and so did every review Claude Code
+/// delegated through the codex plugin on a real machine: eleven sessions,
+/// nearly two thousand captures, each summarized with a model call and each
+/// offered to the next session as "what codex was doing". The plugin's broker
+/// is the server's grandparent, and no environment variable set per run can
+/// reach a server started once at Claude Code's launch. A CLI hosted by
+/// another agent, or by an agent's plugin, is a delegate: headless, however
+/// it was invoked. An unknown host keeps the interactive default, so an IDE
+/// nobody has seen still gets its injection.
+fn classify_chain(chain: &[String]) -> Invocation {
+    let Some((host, verdict)) = chain
         .iter()
-        .find_map(|argv| classify_argv(argv))
-        .unwrap_or(Invocation::Interactive)
+        .enumerate()
+        .find_map(|(index, argv)| classify_argv(argv).map(|verdict| (index, verdict)))
+    else {
+        return Invocation::Interactive;
+    };
+    if verdict.is_headless() || hosted_by_an_agent(&chain[host + 1..]) {
+        Invocation::Headless
+    } else {
+        Invocation::Interactive
+    }
+}
+
+/// Is any of these processes another coding agent, or a plugin of one?
+fn hosted_by_an_agent(above: &[String]) -> bool {
+    above
+        .iter()
+        .any(|argv| classify_argv(argv).is_some() || argv.contains(AGENT_PLUGIN_DIR))
 }
 
 /// Decide from one process's argv, if it is a host CLI we recognize.
@@ -230,6 +270,62 @@ mod tests {
             Some(Invocation::Headless)
         );
         assert_eq!(classify_argv("agy"), Some(Invocation::Interactive));
+    }
+
+    #[test]
+    fn a_codex_served_to_another_agents_plugin_is_a_delegate() {
+        // The chain under a real hook, nearest first: the shell codex runs
+        // hooks in, the codex binary, the npm wrapper, and the broker that
+        // Claude Code's codex plugin starts once at launch.
+        let chain: Vec<String> = [
+            "/opt/codex-resources/zsh/bin/zsh -lc brain hook --cli codex --event SessionStart",
+            "/home/me/.nvm/lib/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex app-server",
+            "node /home/me/.nvm/bin/codex app-server",
+            "/home/me/.nvm/bin/node /home/me/.claude/plugins/cache/openai-codex/codex/1.0.4/scripts/app-server-broker.mjs serve",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(classify_chain(&chain), Invocation::Headless);
+
+        // The same server driven by an IDE has a person behind it.
+        let ide: Vec<String> = [
+            "/opt/codex-resources/zsh/bin/zsh -lc brain hook --cli codex --event SessionStart",
+            "/home/me/.nvm/lib/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex app-server",
+            "/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin) --type=utility",
+            "/Applications/Visual Studio Code.app/Contents/MacOS/Electron",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(classify_chain(&ide), Invocation::Interactive);
+    }
+
+    #[test]
+    fn a_cli_started_by_another_agent_is_a_delegate() {
+        // Claude Code's shell tool starting codex: no `exec`, but a coding
+        // agent is its grandparent.
+        let chain: Vec<String> =
+            ["/bin/sh -c codex app-server", "codex app-server", "claude --model opus"]
+                .map(String::from)
+                .to_vec();
+        assert_eq!(classify_chain(&chain), Invocation::Headless);
+
+        // A person's own terminal above their own CLI is not an agent, and
+        // `login -pf` is not `claude -p`.
+        let person: Vec<String> = [
+            "-zsh",
+            "/usr/local/bin/codex",
+            "login -pf me",
+            "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal",
+            "/sbin/launchd",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(classify_chain(&person), Invocation::Interactive);
+
+        // No host CLI at all - the test runner, a cron job - is not headless
+        // either: that would silence injection for everything unknown.
+        assert_eq!(classify_chain(&["/bin/sh".to_string()]), Invocation::Interactive);
+        assert_eq!(classify_chain(&[]), Invocation::Interactive);
     }
 
     #[test]

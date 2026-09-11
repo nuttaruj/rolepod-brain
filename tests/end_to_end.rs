@@ -1554,9 +1554,23 @@ fn one_agents_parallel_sessions_can_be_read_apart() {
             .collect()
     };
 
+    // The capture that arrived after the summary put the session back in
+    // flight, and the summary list says so before it lists any summary: the
+    // list an agent is told to ask for must not pass an older summary off as
+    // the latest work. The row names the session, so the same id appears
+    // twice - once as work still open, once as what was already written.
     let summaries = kinds(0);
-    assert!(!summaries.is_empty(), "consolidation wrote a summary: {responses:?}");
-    assert!(summaries.iter().all(|kind| kind == "session_summary"), "not summaries: {summaries:?}");
+    let events = responses[0]["result"]["structuredContent"]["events"].as_array().unwrap();
+    assert_eq!(summaries.first().map(String::as_str), Some("observation"), "in flight leads: {summaries:?}");
+    let lead = events[0]["title"].as_str().unwrap();
+    // Two, not one: with no CLI on PATH the run was rule-based, and a
+    // rule-based run leaves its events pending so a model can still write
+    // the real summary later. Both prompts are therefore still open.
+    assert!(lead.contains("2 capture(s) not yet summarized"), "{lead}");
+    assert!(lead.contains(events[0]["session"].as_str().unwrap()), "the row names the session to read: {lead}");
+    assert!(summaries.len() >= 2, "consolidation wrote a summary: {responses:?}");
+    assert!(summaries[1..].iter().all(|kind| kind == "session_summary"), "not summaries: {summaries:?}");
+    assert_eq!(events[0]["session"], events[1]["session"], "the open work and its earlier summary are one session");
 
     // `raw` is the primer's word for an untyped observation. An agent only
     // ever saw that word, so that word has to work.
@@ -5312,6 +5326,100 @@ fn a_quiet_session_is_settled_without_a_model_call_or_a_page() {
     // The vault's front page still exists - it says there is nothing yet.
     assert!(fixture.wiki().join("index.md").is_file());
     assert!(fixture.wiki().join("AGENTS.md").is_file());
+}
+
+/// A run another agent started - `claude -p` from a script, a codex served to
+/// Claude Code's plugin - is a delegate. Its captures are memory; its summary
+/// would be its outcome a second time, paid for with a model call, and its
+/// presence in the in-flight list sends the next session to read a reviewer's
+/// transcript as the latest work.
+#[cfg(unix)]
+#[test]
+fn a_delegated_run_keeps_its_captures_and_never_costs_a_summary() {
+    let fixture = Fixture::new("delegate");
+    // To `ps`, a hook running under a process whose argv reads `claude -p …`
+    // is a hook under a headless Claude. A symlink to bash by that name, in
+    // privileged mode, is exactly that - a symlink rather than a copy, because
+    // macOS kills a copied system binary.
+    let fake = fixture.home.parent().unwrap().join("delegate-bin");
+    std::fs::create_dir_all(&fake).unwrap();
+    let claude = fake.join("claude");
+    std::os::unix::fs::symlink("/bin/bash", &claude).unwrap();
+    let session = "0199d000-0000-7000-8000-00000000d001";
+    let hook_under_headless_claude = |event: &str, payload: &str| {
+        // Two commands, so bash forks for the first instead of exec-ing into
+        // it: the `claude -p` parent has to still exist when brain looks up.
+        let script = format!("'{BRAIN}' hook --cli claude-code --event {event}; exit $?");
+        let mut child = Command::new(&claude)
+            .args(["-p", "-c", &script])
+            .current_dir(&fixture.project)
+            .env("ROLEPOD_BRAIN_HOME", &fixture.home)
+            .env("HOME", fixture.home.parent().unwrap())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the fake claude");
+        child.stdin.as_mut().unwrap().write_all(payload.as_bytes()).unwrap();
+        let out = child.wait_with_output().expect("hook output");
+        assert!(out.status.success(), "hook failed: {out:?}");
+    };
+    hook_under_headless_claude("SessionStart", &start_payload(&fixture.project, session, "startup"));
+    for prompt in ["Review the auth change adversarially", "Now the tests", "Report what you found"] {
+        let payload = serde_json::json!({"session_id": session, "cwd": fixture.project, "prompt": prompt});
+        hook_under_headless_claude("UserPromptSubmit", &payload.to_string());
+    }
+    let payload = serde_json::json!({
+        "session_id": session,
+        "cwd": fixture.project,
+        "tool_name": "Read",
+        "tool_input": {"file_path": fixture.project.join("src/auth.rs")}
+    });
+    hook_under_headless_claude("PostToolUse", &payload.to_string());
+
+    // Before anything consolidates: the captures are reachable, and the
+    // summary list does not offer them as work left in flight.
+    let responses = fixture.mcp(&[
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"brain_recent","arguments":{"kind":"raw"}}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"brain_recent","arguments":{"kind":"session_summary"}}}"#,
+    ]);
+    let raw = responses[0]["result"]["structuredContent"]["count"].as_u64().unwrap_or(0);
+    assert!(raw >= 4, "the delegate's captures are memory: {:?}", responses[0]);
+    assert_eq!(
+        responses[1]["result"]["structuredContent"]["count"],
+        0,
+        "a delegate is not work in flight: {:?}",
+        responses[1]
+    );
+
+    // Consolidation settles it: no model call, no page, no summary.
+    let counter = fixture.home.parent().unwrap().join("delegate-calls");
+    let bin = fixture.fake_cli(
+        "claude",
+        &format!(
+            "N=$(cat {c} 2>/dev/null || echo 0); N=$((N+1)); echo $N > {c}\n\
+             echo '{{\"summary\":\"a delegate summarized\",\"titles\":[]}}'",
+            c = counter.display()
+        ),
+    );
+    let out = fixture.brain_with_path(&["consolidate"], Some(&bin));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "consolidate failed: {out:?}");
+    assert!(stdout.contains("via headless"), "not settled as a delegate: {stdout}");
+    assert!(!counter.exists(), "a delegate must not cost a model call");
+    assert_eq!(fixture.pending_count(), 0, "its events are settled");
+    let mut pages = Vec::new();
+    collect_under(&fixture.wiki(), "sessions", &mut pages);
+    assert!(pages.is_empty(), "a delegate gets no page: {pages:?}");
+    assert!(!fixture.log_text().contains("session_summary"), "and no summary");
+
+    // Asked for by name, with force, the summary is written after all.
+    let out = fixture.brain_with_path(&["consolidate", "--force", "--session", session], Some(&bin));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "forced consolidate failed: {out:?}");
+    assert!(counter.exists(), "force is the one way to ask the model: {stdout}");
+    assert!(fixture.log_text().contains("a delegate summarized"), "{stdout}");
+    assert_eq!(fixture.pending_count(), 0);
 }
 
 #[test]

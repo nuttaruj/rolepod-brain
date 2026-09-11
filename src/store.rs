@@ -119,6 +119,18 @@ const LENGTH_PENALTY: f32 = 0.6;
 /// events, and a busy session must not fill the pool through it.
 const ENTITY_EVENTS_PER_SESSION: usize = 2;
 
+/// Sessions still in flight that lead a list of session summaries.
+///
+/// A session that ended without a summary - the CLI hit its limit, the
+/// machine slept, the backstop has not reached it - is invisible to a list of
+/// summaries, and the summary list is what the tool description tells an
+/// agent to ask for. A real store showed the cost: a codex session with 187
+/// captures ended, a Claude session opened 22 seconds later, and "what was
+/// codex doing" was answered from the previous session's summary because
+/// nothing newer had one. The same in-flight rule the primer uses leads the
+/// list instead; a few is enough, because agents run a few sessions at once.
+const RECENT_IN_FLIGHT: usize = 3;
+
 /// How close a memory has to be before it counts as an answer.
 ///
 /// A floor here is what lets "nothing is close enough" be an outcome rather
@@ -1823,7 +1835,38 @@ impl Store {
                 })
             })
             .context("run recent")?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().context("read recent results")
+        let listed: Vec<Hit> =
+            rows.collect::<rusqlite::Result<Vec<_>>>().context("read recent results")?;
+        drop(stmt);
+
+        // Only the summary list needs this. A list of everything already
+        // leads with the newest captures themselves, and one session's work
+        // is what `session` asks for whole. The row is keyed by the newest
+        // capture, the way the primer's line is, so reading that session
+        // counts as pulling it.
+        if session.is_some() || kind != Some("session_summary") {
+            return Ok(listed);
+        }
+        let mut hits: Vec<Hit> = self
+            .unconsolidated_sessions(project, RECENT_IN_FLIGHT)?
+            .into_iter()
+            .filter(|work| cli.is_none_or(|cli| work.cli == cli))
+            .map(|work| Hit {
+                id: work.newest_id,
+                ts: work.newest_ts,
+                title: format!(
+                    "{} session, {} capture(s) not yet summarized - brain_recent(kind: \"raw\", session: \"{}\") reads them",
+                    work.cli, work.captures, work.session
+                ),
+                cli: work.cli,
+                kind: "observation".to_string(),
+                snippet: String::new(),
+                session: work.session,
+            })
+            .collect();
+        hits.extend(listed);
+        hits.truncate(limit);
+        Ok(hits)
     }
 
     /// Number of indexed events.
@@ -2025,6 +2068,55 @@ impl Store {
     ///
     /// # Errors
     /// Returns an error when the write fails.
+    /// Put a settled session back in front of the summarizer.
+    ///
+    /// Quiet and headless sessions are settled by marking their events done
+    /// without writing anything, which is also what stops the backstop from
+    /// asking about them forever. `--force --session` is the way to say "I
+    /// want the summary after all": the events go back to pending and the
+    /// run record goes, so the next pass treats the session as never seen.
+    /// A session that was summarized by a model is left alone - forcing it
+    /// would write the same narrative twice.
+    ///
+    /// # Errors
+    /// Returns an error when a statement fails.
+    pub fn reopen_settled_session(&self, session: &str) -> Result<bool> {
+        let settled: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT last_tier FROM session_state
+                 WHERE session = ?1 AND last_tier IN ('quiet', 'headless')",
+                params![session],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("read settled session")?;
+        if settled.is_none() {
+            return Ok(false);
+        }
+        self.conn
+            .execute(
+                "UPDATE events SET consolidated = 0
+                 WHERE session = ?1 AND kind = 'observation' AND forgotten = 0",
+                params![session],
+            )
+            .context("reopen settled events")?;
+        self.conn
+            .execute("DELETE FROM session_state WHERE session = ?1", params![session])
+            .context("forget settled run")?;
+        Ok(true)
+    }
+
+    /// Was this session classified as a one-shot run when it opened?
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn session_is_headless(&self, session: &str) -> Result<bool> {
+        Ok(self
+            .session_invocation(session)?
+            .is_some_and(|raw| crate::invocation::parse(&raw).is_headless()))
+    }
+
     pub fn record_session_invocation(&self, session: &str, invocation: &str) -> Result<()> {
         self.conn
             .execute(
@@ -3076,6 +3168,11 @@ impl Store {
                             OR files != '[]'
                             OR hook IN ('user_prompt_submit', 'before_submit_prompt', 'before_agent')
                             OR (hook = 'stop' AND title != 'Turn finished'))
+                       -- A one-shot run is not work someone will come back
+                       -- to; naming it as unfinished sends the next session
+                       -- to read a reviewer's transcript as the latest work.
+                       AND session NOT IN (SELECT session FROM session_invocation
+                                            WHERE invocation = 'headless')
                  GROUP BY session
                  ORDER BY MAX(id) DESC
                  LIMIT ?2",
@@ -4577,6 +4674,111 @@ mod tests {
         assert_eq!(flight[0].cli, "codex");
         assert_eq!(flight[0].captures, 2, "bare commands must not be counted");
         assert_eq!(flight[0].newest_id, newest, "the line is keyed by the newest capture");
+    }
+
+    #[test]
+    fn a_delegated_run_is_never_reported_as_work_in_flight() {
+        // A review Claude Code delegated through the codex plugin: three
+        // prompts, real captures, no summary yet - and none wanted. Naming it
+        // as unfinished sends the next session to read a reviewer's transcript
+        // as "what codex was doing".
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let review = Uuid::new_v4();
+        let person = Uuid::new_v4();
+        let mut n = 0;
+        let mut add = |session: Uuid, title: &str| {
+            let mut event = Event::new(
+                Uuid::nil(),
+                project,
+                session,
+                Source { cli: "codex".into(), hook: "user_prompt_submit".into() },
+                EventKind::Observation,
+                title.into(),
+                String::new(),
+            );
+            n += 1;
+            event.id = format!("01DELEGATE{n:016}");
+            store.index(&event).unwrap();
+        };
+        add(review, "Asked: <role> adversarial review");
+        add(review, "Asked: <task> the diff");
+        add(review, "Asked: report");
+        add(person, "Asked: fix the login redirect");
+        store.record_session_invocation(&review.to_string(), "headless").unwrap();
+        store.record_session_invocation(&person.to_string(), "interactive").unwrap();
+        assert!(store.session_is_headless(&review.to_string()).unwrap());
+        assert!(!store.session_is_headless(&person.to_string()).unwrap());
+
+        let flight = store.unconsolidated_sessions(&project.to_string(), 5).unwrap();
+        assert_eq!(flight.len(), 1, "the delegate must not be listed: {flight:?}");
+        assert_eq!(flight[0].session, person.to_string());
+    }
+
+    #[test]
+    fn a_session_cut_off_before_its_summary_leads_the_summary_list() {
+        // The scenario: codex hit its limit mid-task, and a Claude session
+        // opened seconds later asking what codex had been doing. The list of
+        // summaries an agent is told to ask for must say that a newer session
+        // exists and has none yet - or the previous session's summary passes
+        // for the latest work.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let finished = Uuid::new_v4();
+        let cut_off = Uuid::new_v4();
+        let mut n = 0;
+        let mut add = |session: Uuid, cli: &str, hook: &str, kind: EventKind, title: &str, files: Vec<String>, consolidated: bool| {
+            let mut event = Event::new(
+                Uuid::nil(),
+                project,
+                session,
+                Source { cli: cli.into(), hook: hook.into() },
+                kind,
+                title.into(),
+                String::new(),
+            );
+            n += 1;
+            event.id = format!("01CUTOFF{n:018}");
+            event.files = files;
+            event.consolidated = consolidated;
+            store.index(&event).unwrap();
+            event.id
+        };
+        add(finished, "codex", "user_prompt_submit", EventKind::Observation, "Asked: add the form", vec![], true);
+        add(finished, "codex", "consolidate", EventKind::SessionSummary, "Added the form", vec![], true);
+        add(cut_off, "codex", "user_prompt_submit", EventKind::Observation, "Asked: review it", vec![], false);
+        // A file touched counts; a bare command would not, and the row is
+        // keyed by the newest capture that counts.
+        let newest = add(cut_off, "codex", "post_tool_use", EventKind::Observation, "Edited form.ts", vec!["form.ts".into()], false);
+        let project = project.to_string();
+
+        let summaries = store.recent(&project, Some("codex"), Some("session_summary"), None, 10).unwrap();
+        assert_eq!(summaries.len(), 2, "one in-flight row, one summary: {summaries:?}");
+        assert_eq!(summaries[0].session, cut_off.to_string(), "the cut-off session leads");
+        assert_eq!(summaries[0].id, newest, "keyed by its newest capture, like the primer's line");
+        assert!(summaries[0].title.contains("2 capture(s) not yet summarized"), "{}", summaries[0].title);
+        assert!(summaries[0].title.contains(&cut_off.to_string()), "the row names the session to read");
+        assert_eq!(summaries[1].kind, "session_summary");
+
+        // Another CLI's summary list does not carry codex's unfinished work.
+        let other = store.recent(&project, Some("claude-code"), Some("session_summary"), None, 10).unwrap();
+        assert!(other.is_empty(), "{other:?}");
+
+        // The unfiltered list already leads with the captures themselves;
+        // a synthetic row there would be the same id twice.
+        let everything = store.recent(&project, None, None, None, 10).unwrap();
+        assert_eq!(everything[0].id, newest);
+        assert!(everything.iter().all(|hit| !hit.title.contains("not yet summarized")), "{everything:?}");
+
+        // Reading one session whole is exactly that.
+        let whole = store.recent(&project, None, None, Some(&cut_off.to_string()), 10).unwrap();
+        assert_eq!(whole.len(), 2);
+        assert!(whole.iter().all(|hit| hit.session == cut_off.to_string()));
+
+        // `k` still bounds the answer.
+        let one = store.recent(&project, Some("codex"), Some("session_summary"), None, 1).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].session, cut_off.to_string());
     }
 
     #[test]

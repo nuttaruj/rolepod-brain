@@ -164,6 +164,13 @@ pub fn run(session: Option<&str>, all_projects: bool, force: bool) -> Result<Out
         // Then fold what is already written double. Before synthesis, so the
         // "already recorded" list a model is shown is the clean one.
         outcome.folded += fold_duplicate_knowledge(&project_dir, &scope, &store)?;
+        // Asking for one session by name, with force, is the one way a
+        // settled session gets its summary after all.
+        if force {
+            if let Some(only) = session {
+                store.reopen_settled_session(only)?;
+            }
+        }
         for pending in store.sessions_pending(&project)? {
             if let Some(only) = session {
                 if pending.session != only {
@@ -224,18 +231,19 @@ pub fn run(session: Option<&str>, all_projects: bool, force: bool) -> Result<Out
                 continue;
             }
             let tier =
-                consolidate_session(&paths, &store, &ladder, &scope, &project_dir, &pending);
+                consolidate_session(&paths, &store, &ladder, &scope, &project_dir, &pending, force);
             store.release_session(&pending.session)?;
             let tier = tier?;
             outcome.sessions += 1;
             outcome.events += usize::try_from(pending.pending).unwrap_or(0);
-            if matches!(tier, Tier::Quiet) {
+            if matches!(tier, Tier::Quiet | Tier::Headless) {
                 outcome.quiet += 1;
             }
             outcome.tiers.push(match tier {
                 Tier::Cli(cli) => cli,
                 Tier::RuleBased => "rule-based".to_string(),
                 Tier::Quiet => "quiet".to_string(),
+                Tier::Headless => "headless".to_string(),
             });
         }
     }
@@ -394,6 +402,7 @@ fn consolidate_session(
     scope: &ProjectScope,
     project_dir: &Path,
     pending: &PendingSession,
+    force: bool,
 ) -> Result<Tier> {
     // The guarantee layer. The prompt asks the model not to reproduce
     // credentials, and it will usually comply - but "usually" is not a
@@ -423,6 +432,22 @@ fn consolidate_session(
             "quiet",
         )?;
         return Ok(Tier::Quiet);
+    }
+    // A one-shot run is settled the same way, however much it did. Its
+    // captures are in the log for anyone who asks; what it produced already
+    // reached memory through the session that delegated it, so a summary
+    // here would be that outcome a second time, paid for with a model call.
+    // `--force` is the way to ask for one anyway.
+    if !force && store.session_is_headless(&pending.session)? {
+        let ids: Vec<String> = events.iter().map(|event| event.id.clone()).collect();
+        store.mark_consolidated(&ids)?;
+        store.record_session_run(
+            &pending.session,
+            &scope.project_id.to_string(),
+            &pending.newest_event_id,
+            "headless",
+        )?;
+        return Ok(Tier::Headless);
     }
 
     // The richest material a session produced is the model's own prose, and no
@@ -528,6 +553,7 @@ fn consolidate_session(
         Tier::Cli(cli) => cli.clone(),
         Tier::RuleBased => "rule-based".to_string(),
         Tier::Quiet => "quiet".to_string(),
+        Tier::Headless => "headless".to_string(),
     };
 
     // The summary is itself an event: the log stays the whole story.

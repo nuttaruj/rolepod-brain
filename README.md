@@ -501,11 +501,26 @@ those runs receive **no automatic injection**. Handing a reviewer the author's
 own narrative quietly destroys its independence, and nothing downstream can see
 that it happened.
 
-They still capture, tagged, and a headless run's observations rank below a
-person's in the primer. For a completely clean room — no injection *and* no
-capture — set `ROLEPOD_BRAIN_SILENT=1` in the environment of the process you
-want left alone. That variable is a stable public contract; orchestrators are
-meant to set it directly.
+They still capture: every prompt, tool call and file is in the log, and
+`brain_search`, `brain_timeline` and `brain_recent(kind: "raw")` return them.
+What they do not get is a summary. A one-shot run is settled the way a quiet
+session is — no model call, no page, no line in the primer about work left in
+flight — because what it produced already reached memory through the session
+that delegated it, and a summary would be that outcome a second time. Ask for
+one anyway with `brain consolidate --force --session <id>`.
+
+Who started the CLI counts as much as how. A `codex app-server` reads as
+interactive on its own — an IDE extension drives one with a person behind it —
+but the same server started by another agent's plugin (Claude Code's codex
+companion, for one) is serving that agent, and every session it hosts is a
+delegate. brain walks the process tree to tell the two apart; an unknown host
+keeps the interactive default, so a new IDE still gets its injection.
+
+For a completely clean room — no injection *and* no capture — set
+`ROLEPOD_BRAIN_SILENT=1` in the environment of the process you want left
+alone. That variable is a stable public contract; orchestrators that spawn a
+CLI directly are meant to set it. It cannot reach a server that was started
+before the run existed, which is what the process-tree rule is for.
 
 ## When it calls a model
 
@@ -914,9 +929,22 @@ stays honest. Your agent can do the same through `brain_forget` and
 `brain_correct` when you say something is wrong mid-session — though it may
 only withdraw entries it has actually been shown, not ids it guessed at.
 
+To drop a whole project's memory, delete its log and rebuild:
+
+```sh
+rm -r "$HOME/.rolepod-brain/Rolepod Brain/<project>/events"
+brain reindex
+```
+
+There is no `forget --project` on purpose. The log is append-only, so a
+scope-level reset would be one tombstone per entry — thousands for a busy
+project — replayed by every rebuild and carried by every sync bundle from then
+on. Removing the directory is the honest version: the log is yours, and a
+rebuild then reflects exactly what remains.
+
 ## Moving to another machine
 
-There is no sync, so migration is a command rather than a hope:
+`brain sync` keeps machines together; a one-time move is a command rather than a hope:
 
 ```sh
 brain export brain.tar.gz          # on the old machine

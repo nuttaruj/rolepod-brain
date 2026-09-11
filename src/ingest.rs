@@ -145,7 +145,7 @@ pub fn run(file: &Path, force: bool) -> Result<Ingested> {
     };
     let tier_label = match &tier {
         Tier::Cli(cli) => cli.clone(),
-        Tier::RuleBased | Tier::Quiet => "rule-based".to_string(),
+        Tier::RuleBased | Tier::Quiet | Tier::Headless => "rule-based".to_string(),
     };
     entities.sort();
     entities.dedup();

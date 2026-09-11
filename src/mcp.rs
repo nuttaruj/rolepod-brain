@@ -136,7 +136,8 @@ fn tool_definitions(local_rerank: bool) -> Value {
         {
             "name": "brain_search",
             "description": "Full-text search this project's memory. Returns matching \
-                            observations with their ids, newest-relevant first. Use it \
+                            observations with their ids, most relevant first (ties newest \
+                            first). Use it \
                             before assuming context is lost: prior sessions in any CLI \
                             wrote here. Pass an id to brain_get for the full body.",
             "inputSchema": {
@@ -386,7 +387,10 @@ fn tool_definitions(local_rerank: bool) -> Value {
                     "kind": {
                         "type": "string",
                         "description": "`session_summary` — one finished session \
-                                        per line. `raw` — live work not yet \
+                                        per line, led by any session whose captures \
+                                        have not been summarized yet (a CLI that hit \
+                                        its limit mid-task) with the call that reads \
+                                        them. `raw` — live work not yet \
                                         summarized. Also `knowledge`, `note`, \
                                         `page_update`, `source` (a document read \
                                         in with `brain ingest`). Omit for all of them mixed, \
