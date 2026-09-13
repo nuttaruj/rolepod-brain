@@ -925,7 +925,15 @@ claim the list is complete.
 Neither deletes anything. Both append an entry that is *about* the earlier one,
 and recall stops showing the old version. The log keeps the original wording,
 the withdrawal, and the correction, so the history of what memory believed
-stays honest. Your agent can do the same through `brain_forget` and
+stays honest.
+
+A correction also outlives the machine. When a later session re-derives the
+claim you fixed - the usual way a wrong summary comes back - the page keeps
+your wording and only counts the recurrence; the duplicate fold treats a
+corrected page the same way, never rewording or withdrawing it. A store
+written before 0.53.0 may hold a page where the machine had already put its
+wording back; one `brain reindex` replays the log with the fix and restores
+the correction. Your agent can do the same through `brain_forget` and
 `brain_correct` when you say something is wrong mid-session — though it may
 only withdraw entries it has actually been shown, not ids it guessed at.
 

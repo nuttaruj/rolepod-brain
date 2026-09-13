@@ -740,16 +740,31 @@ impl Store {
             // derived again is recurrence evidence, the thing this table
             // ranks on, while a user's fix says the entry was WRONG and
             // earns nothing.
+            //
+            // Unless a human already rewrote the page. A correction is the
+            // one signal that the model's derivation was WRONG, and a later
+            // session re-deriving the same wrong fact from the same kind of
+            // evidence is exactly the case the correction exists for - so
+            // the human's wording stands, and only the recurrence counts.
+            // Measured shape: the fold picks "newest wording" by id, and a
+            // freshly derived page is always newer than the fix it undoes.
             EventKind::Note if event.source.hook == "supersede" => {
                 for target in &event.links {
                     self.conn
                         .execute(
-                            "UPDATE events SET title = ?2, body = ?3, corrected_by = ?4,
-                                    confidence = confidence + 1
-                             WHERE id = ?1",
-                            params![target, event.title, event.body, event.id],
+                            "UPDATE events SET confidence = confidence + 1 WHERE id = ?1",
+                            params![target],
                         )
-                        .context("apply supersession")?;
+                        .context("count supersession")?;
+                    if self.human_corrected(std::slice::from_ref(target))?.is_empty() {
+                        self.conn
+                            .execute(
+                                "UPDATE events SET title = ?2, body = ?3, corrected_by = ?4
+                                 WHERE id = ?1",
+                                params![target, event.title, event.body, event.id],
+                            )
+                            .context("apply supersession")?;
+                    }
                 }
             }
             EventKind::Note if event.source.hook == "correct" => {
@@ -2027,6 +2042,34 @@ impl Store {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(err) => Err(err.into()),
         }
+    }
+
+    /// Which of these ids a human last rewrote.
+    ///
+    /// The join tells a `brain correct` (hook `correct`) or a vault edit
+    /// (cli `human`) apart from the machine's own `supersede`, which also
+    /// lands in `corrected_by`. Both machine passes that rewrite knowledge -
+    /// the write-time supersede and the duplicate fold - ask this before
+    /// touching a page: a human's wording is never overwritten and never
+    /// withdrawn by a model re-deriving the claim it fixed.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn human_corrected(&self, ids: &[String]) -> Result<Vec<String>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let holes = (0..ids.len()).map(|i| format!("?{}", i + 1)).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT t.id FROM events t
+             JOIN events c ON c.id = t.corrected_by
+             WHERE t.id IN ({holes}) AND (c.hook = 'correct' OR c.cli = 'human')"
+        );
+        let mut stmt = self.conn.prepare(&sql).context("prepare human_corrected")?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(ids.iter()), |row| row.get::<_, String>(0))
+            .context("run human_corrected")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("read human_corrected")
     }
 
     /// Which CLI most recently worked in this project.
@@ -4248,6 +4291,69 @@ mod tests {
         assert_eq!(fetched.len(), 1);
         assert_eq!(fetched[0].body, "the full body text");
         assert_eq!(fetched[0].files, vec!["src/main.rs".to_string()]);
+    }
+
+    #[test]
+    fn a_supersession_never_overwrites_a_human_correction() {
+        // A correction says the derived wording was WRONG. A later session
+        // re-deriving the same claim is the case the correction exists for,
+        // so its wording must not come back; only the recurrence counts.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let page = Event::new(
+            Uuid::nil(),
+            project,
+            Uuid::nil(),
+            Source { cli: "brain".into(), hook: "gotcha".into() },
+            EventKind::Knowledge,
+            "release targets four platforms".into(),
+            "four".into(),
+        );
+        store.index(&page).unwrap();
+        let note = |hook: &str, title: &str, body: &str| {
+            let mut note = Event::new(
+                Uuid::nil(),
+                project,
+                Uuid::nil(),
+                Source { cli: "brain".into(), hook: hook.into() },
+                EventKind::Note,
+                title.into(),
+                body.into(),
+            );
+            note.links = vec![page.id.clone()];
+            note
+        };
+        let row = || store.get(std::slice::from_ref(&page.id)).unwrap().remove(0);
+        let confidence = || -> i64 {
+            store
+                .conn
+                .query_row("SELECT confidence FROM events WHERE id = ?1", [&page.id], |r| r.get(0))
+                .unwrap()
+        };
+
+        // Untouched page: the machine's newer wording lands, as before.
+        store.index(&note("supersede", "release targets five platforms", "five")).unwrap();
+        assert_eq!(row().title, "release targets five platforms");
+        assert!(store.human_corrected(std::slice::from_ref(&page.id)).unwrap().is_empty());
+        let before = confidence();
+
+        // Corrected page: the human's wording stands through another
+        // supersession, and the recurrence is still counted.
+        store
+            .index(&note("correct", "release targets five platforms, Intel macOS excluded", "minus one"))
+            .unwrap();
+        store.index(&note("supersede", "release targets five platforms", "five")).unwrap();
+        let after = row();
+        assert_eq!(
+            after.title, "release targets five platforms, Intel macOS excluded",
+            "the model undid a human fix"
+        );
+        assert_eq!(after.body, "minus one");
+        assert_eq!(confidence(), before + 1, "recurrence on a corrected page went uncounted");
+        assert_eq!(
+            store.human_corrected(std::slice::from_ref(&page.id)).unwrap(),
+            vec![page.id.clone()]
+        );
     }
 
     #[test]

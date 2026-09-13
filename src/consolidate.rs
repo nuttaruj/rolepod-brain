@@ -723,12 +723,37 @@ fn fold_duplicate_knowledge(
         }
         // members are index-ordered, and items are id-ordered: first is the
         // oldest page, last carries the newest wording.
-        let survivor = &items[members[0]];
+        //
+        // Unless a human corrected one of them. That page is the survivor
+        // whatever its age, keeps its own wording, and is never withdrawn;
+        // a second corrected page in the same cluster simply stays, because
+        // two human fixes are not the machine's to reconcile. Without this
+        // the fold undid corrections: a freshly derived page is always
+        // newer than the fix it restates, so "newest wording" was the wrong
+        // wording, put back by the very pass meant to reduce noise.
+        let ids: Vec<String> = members.iter().map(|index| items[*index].0.clone()).collect();
+        let protected = store.human_corrected(&ids)?;
+        let survivor_index = members
+            .iter()
+            .copied()
+            .find(|index| protected.contains(&items[*index].0))
+            .unwrap_or(members[0]);
+        let survivor = &items[survivor_index];
         let newest = &items[*members.last().unwrap()];
-        let redundant: Vec<String> =
-            members[1..].iter().map(|index| items[*index].0.clone()).collect();
+        let redundant: Vec<String> = members
+            .iter()
+            .filter(|index| **index != survivor_index)
+            .map(|index| items[*index].0.clone())
+            .filter(|id| !protected.contains(id))
+            .collect();
+        if redundant.is_empty() {
+            continue;
+        }
         let bodies = store.get(&redundant)?;
 
+        // Always recorded, even onto a corrected survivor: each folded page
+        // was the claim derived once more, and the index counts that while
+        // leaving a human's wording alone.
         let newest_body = bodies
             .iter()
             .find(|event| event.id == newest.0)
@@ -3537,6 +3562,150 @@ mod tests {
         assert_eq!(live.len(), 2, "a rebuild un-folded the store: {live:?}");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_page_a_human_corrected_survives_the_fold_with_its_own_wording() {
+        // The fold takes "oldest page, newest wording", and a page re-derived
+        // after a correction is always newer than the fix - so the fold used
+        // to put the wrong wording back. The corrected page is the survivor
+        // now, whatever its age, keeps what the human wrote, and the machine
+        // pages around it are the ones withdrawn.
+        crate::embed::tests::use_checkout_model();
+        let dir = std::env::temp_dir().join(format!("brain-fold-fix-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let scope = crate::ids::resolve_scope(&dir);
+        let store = Store::open_memory().unwrap();
+        let log = EventLog::open(&dir).unwrap();
+
+        let write = |hook: &str, kind: EventKind, title: &str, body: &str, links: Vec<String>| {
+            let mut event = Event::new(
+                scope.workspace_id,
+                scope.project_id,
+                uuid::Uuid::nil(),
+                Source { cli: "brain".to_string(), hook: hook.to_string() },
+                kind,
+                title.to_string(),
+                body.to_string(),
+            );
+            event.links = links;
+            event.consolidated = true;
+            log.append(&event).unwrap();
+            store.index(&event).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            event.id
+        };
+        // Same real pair as above (0.9394); the third is the first told again.
+        let first = "Worker-heavy /root 641MB is Playwright/Chromium binary, not a memory leak";
+        let second = "Worker-heavy /root footprint ~641 MB is Playwright/Chromium binary, not a leak";
+        let oldest = write("gotcha", EventKind::Knowledge, first, "Machine, first.", vec![]);
+        let corrected = write("gotcha", EventKind::Knowledge, second, "Machine, second.", vec![]);
+        write("correct", EventKind::Note, second, "The human's wording.", vec![corrected.clone()]);
+        let newest = write("gotcha", EventKind::Knowledge, first, "Machine, re-derived.", vec![]);
+
+        let folded = fold_duplicate_knowledge(&dir, &scope, &store).unwrap();
+        assert_eq!(folded, 2, "both machine pages should fold into the corrected one");
+
+        let live = store.knowledge_entries(&scope.project_id.to_string()).unwrap();
+        assert_eq!(live.len(), 1, "one page should stand: {live:?}");
+        assert_eq!(live[0].0, corrected, "the survivor is not the corrected page");
+        let page = store.get(std::slice::from_ref(&corrected)).unwrap().remove(0);
+        assert_eq!(page.title, second, "the fold reworded a human's page");
+        assert_eq!(page.body, "The human's wording.", "the fold undid a human's fix");
+        for gone in [&oldest, &newest] {
+            assert!(live.iter().all(|(id, _)| id != gone), "a machine page still serves");
+        }
+
+        // A rebuild from the log alone lands on the same answer.
+        let rebuilt = Store::open_memory().unwrap();
+        let (events, skipped) = log.read_all().unwrap();
+        assert_eq!(skipped, 0);
+        for event in &events {
+            rebuilt.index(event).unwrap();
+        }
+        let live = rebuilt.knowledge_entries(&scope.project_id.to_string()).unwrap();
+        assert_eq!(live.len(), 1, "a rebuild un-folded the store: {live:?}");
+        let page = rebuilt.get(std::slice::from_ref(&corrected)).unwrap().remove(0);
+        assert_eq!(page.body, "The human's wording.", "a rebuild lost the human's fix");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn two_corrected_pages_in_one_cluster_both_stand() {
+        // Two human fixes are not the machine's to reconcile: the older one
+        // is the survivor, the other stays, and only the machine page between
+        // them is withdrawn. A cluster that is nothing but corrected pages
+        // folds nothing at all.
+        crate::embed::tests::use_checkout_model();
+        let first = "Worker-heavy /root 641MB is Playwright/Chromium binary, not a memory leak";
+        let second = "Worker-heavy /root footprint ~641 MB is Playwright/Chromium binary, not a leak";
+
+        let scenario = |name: &str, corrected: &[bool]| {
+            let dir = std::env::temp_dir().join(format!("brain-fold-{name}-{}", ulid::Ulid::new()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let scope = crate::ids::resolve_scope(&dir);
+            let store = Store::open_memory().unwrap();
+            let log = EventLog::open(&dir).unwrap();
+            let mut ids = Vec::new();
+            for (index, fix) in corrected.iter().enumerate() {
+                let title = if index % 2 == 0 { first } else { second };
+                let mut page = Event::new(
+                    scope.workspace_id,
+                    scope.project_id,
+                    uuid::Uuid::nil(),
+                    Source { cli: "brain".to_string(), hook: "gotcha".to_string() },
+                    EventKind::Knowledge,
+                    title.to_string(),
+                    format!("Machine, page {index}."),
+                );
+                page.consolidated = true;
+                log.append(&page).unwrap();
+                store.index(&page).unwrap();
+                if *fix {
+                    let mut note = Event::new(
+                        scope.workspace_id,
+                        scope.project_id,
+                        uuid::Uuid::nil(),
+                        Source { cli: "brain".to_string(), hook: "correct".to_string() },
+                        EventKind::Note,
+                        title.to_string(),
+                        format!("Human, page {index}."),
+                    );
+                    note.links = vec![page.id.clone()];
+                    log.append(&note).unwrap();
+                    store.index(&note).unwrap();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(3));
+                ids.push(page.id);
+            }
+            let folded = fold_duplicate_knowledge(&dir, &scope, &store).unwrap();
+            let mut live: Vec<String> = store
+                .knowledge_entries(&scope.project_id.to_string())
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            live.sort();
+            let bodies: Vec<String> = ids
+                .iter()
+                .map(|id| store.get(std::slice::from_ref(id)).unwrap().remove(0).body)
+                .collect();
+            std::fs::remove_dir_all(&dir).ok();
+            (folded, live, ids, bodies)
+        };
+
+        // corrected, machine, corrected: the machine page in the middle goes.
+        let (folded, live, ids, bodies) = scenario("two", &[true, false, true]);
+        assert_eq!(folded, 1, "exactly the machine page should fold");
+        assert_eq!(live, vec![ids[0].clone(), ids[2].clone()], "a corrected page was withdrawn");
+        assert_eq!(bodies[0], "Human, page 0.");
+        assert_eq!(bodies[2], "Human, page 2.", "the newest page's fix was reworded");
+
+        // Nothing but corrected pages: nothing to fold.
+        let (folded, live, ids, _) = scenario("all", &[true, true]);
+        assert_eq!(folded, 0, "a cluster of human fixes is not the machine's to fold");
+        assert_eq!(live, ids);
     }
 
     #[test]

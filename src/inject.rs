@@ -417,7 +417,8 @@ const PRIMER_HEADER: &str = "# Project memory\n\nPrior sessions in this project,
               may have happened before - an error seen again, a decision being \
               revisited, a file's history - call `brain_search` FIRST; call \
               `brain_get` with an id to read a pointer in full. Re-discovering \
-              what memory already holds wastes the turn. DEC decision, FND finding, \
+              what memory already holds wastes the turn, and so does asking the \
+              user what a past session settled. DEC decision, FND finding, \
               FIX bugfix, NEW feature, CFG config, TST test, KNW durable knowledge, \
               SUM session summary, SRC document read in, NTE note; lowercase `raw` is a session not yet \
               summarized - `brain_recent` with its session id reads it, and is the \

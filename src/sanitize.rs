@@ -176,7 +176,9 @@ impl Sanitizer {
             out = pattern
                 .replace_all(&out, |caps: &regex::Captures<'_>| {
                     let matched = caps.get(0).map_or("", |m| m.as_str());
-                    if self.inner.allowlist.iter().any(|allowed| matched.contains(allowed)) {
+                    if self.inner.allowlist.iter().any(|allowed| matched.contains(allowed))
+                        || names_where_a_secret_lives(matched)
+                    {
                         matched.to_string()
                     } else {
                         "[REDACTED]".to_string()
@@ -195,6 +197,34 @@ impl Sanitizer {
     pub fn scrub_body(&self, input: &str) -> String {
         truncate_head_tail(&self.scrub(input), BODY_MAX_BYTES)
     }
+}
+
+/// An assignment whose value says where a secret lives, not what it is:
+/// `KEY=${KEY}`, `apiKey = process.env.KEY`, `{{ secrets.KEY }}`.
+///
+/// Sessions are mostly talk about code, and the line that shows how a key
+/// is wired is the one a later session asks for. Redaction is irreversible,
+/// so destroying it protects nothing and costs exactly that memory. The
+/// bare `TOKEN=` pattern already excludes `$` in its own value class; this
+/// covers the named-provider and `*_KEY` shapes, whose values are
+/// deliberately `\S+` so that an unrecognizable secret is still caught.
+///
+/// The WHOLE value has to be the reference, not merely start like one:
+/// `${DB_PASSWORD:-hunter2}` carries its default in the clear, `$3cr3t` is
+/// a password that happens to open with a sigil, and a lone `{` or `<`
+/// would wave through a pasted JSON credential or a `<hex>` token. A
+/// `$(...)` substitution passes as a whole, the same carve-out the bare
+/// pattern already makes for `TOKEN=$(cat file)`.
+fn names_where_a_secret_lives(matched: &str) -> bool {
+    static REFERENCE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let reference = REFERENCE.get_or_init(|| {
+        regex::Regex::new(
+            r"^(?:\$\(|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$|\{\{|(?:process\.env|os\.environ|import\.meta\.env|Deno\.env)(?:[.\[(]|$))",
+        )
+        .expect("the reference shape compiles")
+    });
+    let Some(at) = matched.find(['=', ':']) else { return false };
+    reference.is_match(matched[at + 1..].trim_start())
 }
 
 impl Default for Sanitizer {
@@ -447,8 +477,39 @@ mod tests {
         // Redaction is irreversible; destroying `$(cat file)` protects nothing
         // and costs the recall value of the command.
         let s = Sanitizer::builtin();
-        for benign in ["TOKEN=$(cat /tmp/t.txt)", "TOKEN=$OTHER_VAR"] {
+        for benign in [
+            "TOKEN=$(cat /tmp/t.txt)",
+            "TOKEN=$OTHER_VAR",
+            // The named-provider and `*_KEY` shapes take any value, so they
+            // used to eat the one line that shows how a key is wired.
+            "OPENAI_API_KEY=${OPENAI_API_KEY}",
+            "export GITHUB_TOKEN=$GITHUB_TOKEN",
+            "apiKey = process.env.OPENAI_API_KEY",
+            "token: os.environ[\"SLACK_TOKEN\"]",
+            "ANTHROPIC_API_KEY: {{ secrets.ANTHROPIC_API_KEY }}",
+            "OPENAI_API_KEY: import.meta.env.VITE_OPENAI_API_KEY",
+            "GITHUB_TOKEN = Deno.env.get(\"GITHUB_TOKEN\")",
+        ] {
             assert_eq!(s.scrub(benign), benign, "over-redacted: {benign}");
+        }
+        // The exemption reads the whole value, never the name: a literal
+        // still goes, and so does anything that only opens like a reference.
+        for secret in [
+            "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx",
+            "GITHUB_TOKEN=hunter2hunter2",
+            "DB_PASSWORD=${DB_PASSWORD:-hunter2hunter2}",
+            "DB_PASSWORD=$3cr3tP@ssw0rd",
+            "SLACK_SIGNING_SECRET=<8f7e6d5c4b3a29180f1e2d3c4b5a6978>",
+            "GOOGLE_APPLICATION_CREDENTIALS={\"type\":\"service_account\",\"key\":\"hunter2\"}",
+            "MY_PASSWORD={Tr0ub4dor&3}",
+            "SECRET=os.environmentalSecretValue",
+        ] {
+            let out = s.scrub(secret);
+            let leaked = ["hunter2", "3cr3t", "8f7e6d5c", "Tr0ub4dor", "environmental"];
+            assert!(
+                out.contains("[REDACTED]") && !leaked.iter().any(|l| out.contains(l)),
+                "leaked: {secret} -> {out}"
+            );
         }
     }
 

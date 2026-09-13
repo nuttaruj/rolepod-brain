@@ -1937,6 +1937,14 @@ mod tests {
         for manifest in [".claude-plugin", ".cursor-plugin", ".codex-plugin"] {
             let plugin = read(root.join(manifest).join("plugin.json"));
             assert_eq!(plugin["name"], PLUGIN_NAME, "{manifest} disagrees about the name");
+            // Four files carry the version and a release bumps them by hand.
+            // A manifest left behind installs as the old version, and the
+            // binary then disagrees with the plugin that spawned it.
+            assert_eq!(
+                plugin["version"],
+                env!("CARGO_PKG_VERSION"),
+                "{manifest}/plugin.json lags Cargo.toml"
+            );
         }
 
         // Codex resolves its paths from the plugin root.
@@ -1980,6 +1988,46 @@ mod tests {
                 "the plugin does not carry {event}, which setup wires"
             );
         }
+    }
+
+    /// Nothing that ships may name the private brief directory by path.
+    ///
+    /// The public tree is this tree minus that directory, so a path or a
+    /// mention that leaks points every reader at a file they cannot have.
+    /// It leaked once (0.33.2). The publish gate that caught it runs by hand
+    /// at release time only; this runs on every build instead.
+    #[test]
+    fn nothing_that_ships_names_the_private_brief_directory() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        if !repo.join(".git").exists() {
+            return; // a source tarball: nothing tracked, nothing to leak
+        }
+        let Ok(listing) = std::process::Command::new("git")
+            .args(["-C", &repo.display().to_string(), "ls-files", "-z"])
+            .output()
+        else {
+            return; // a checkout with no git binary beside it: nothing to list
+        };
+        assert!(
+            listing.status.success(),
+            "git ls-files failed: {}",
+            String::from_utf8_lossy(&listing.stderr)
+        );
+        // Spelled in two halves so this file passes its own check.
+        let needle = ["bri", "ef/"].concat();
+        let mut leaks = Vec::new();
+        for path in String::from_utf8_lossy(&listing.stdout).split('\0') {
+            if path.is_empty() || path.starts_with(&needle) {
+                continue;
+            }
+            // Bytes, not text: a binary carrying the path is still a leak.
+            // Deleted in the worktree: nothing to read.
+            let Ok(bytes) = std::fs::read(repo.join(path)) else { continue };
+            if bytes.windows(needle.len()).any(|window| window == needle.as_bytes()) {
+                leaks.push(path.to_string());
+            }
+        }
+        assert!(leaks.is_empty(), "these files name the private directory: {leaks:?}");
     }
 
     #[test]

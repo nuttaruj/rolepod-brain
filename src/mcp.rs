@@ -139,7 +139,11 @@ fn tool_definitions(local_rerank: bool) -> Value {
                             observations with their ids, most relevant first (ties newest \
                             first). Use it \
                             before assuming context is lost: prior sessions in any CLI \
-                            wrote here. Pass an id to brain_get for the full body.",
+                            wrote here. Rank 1 is a candidate, not an answer: read the \
+                            hits and take the one that fits. Empty or off-topic results \
+                            earn one sharper retry - the subject named, a file path, a \
+                            quoted phrase - before concluding it was never recorded. \
+                            Pass an id to brain_get for the full body.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
