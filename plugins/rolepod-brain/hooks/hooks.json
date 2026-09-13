@@ -1,20 +1,4 @@
 {
-  "_comment": [
-    "Claude Code hooks, auto-discovered from hooks/hooks.json (plugins reference:",
-    "'Location: hooks/hooks.json in plugin root, or inline in plugin.json').",
-    "Event names are PascalCase here; Cursor's are camelCase (postToolUse,",
-    "beforeSubmitPrompt), so this file cannot be picked up by the wrong host.",
-    "Codex declares its own file explicitly in .codex-plugin/plugin.json.",
-    "",
-    "PreToolUse is scoped to Read and injects only - it is never captured, or it",
-    "would duplicate PostToolUse. PostCompact is absent on purpose: Claude Code",
-    "rejects injected context under that event. Both reasons are in src/setup.rs.",
-    "",
-    "Only SessionStart checks that the binary exists. It fires once a session,",
-    "where PostToolUse fires thousands of times and is the path a person waits on.",
-    "The `Setup` event is NOT an install hook - it fires on --init/--maintenance -",
-    "so it cannot be the thing that puts the binary in place."
-  ],
   "hooks": {
     "SessionStart": [
       {
