@@ -135,6 +135,10 @@ enum Commands {
         /// Keep the index's own order even when config says rerank.
         #[arg(long)]
         no_rerank: bool,
+        /// Show the working: where each stream ranked each hit, the fusion
+        /// arithmetic, and which streams did not run and why.
+        #[arg(long)]
+        explain: bool,
     },
     /// Sync this brain with your other machines through a folder you own.
     Sync {
@@ -367,7 +371,7 @@ fn run(command: Commands) -> Result<()> {
             }
             Ok(())
         }
-        Commands::Search { query, limit, topic, rerank, no_rerank } => {
+        Commands::Search { query, limit, topic, rerank, no_rerank, explain } => {
             let rerank = if rerank {
                 Some(true)
             } else if no_rerank {
@@ -375,7 +379,7 @@ fn run(command: Commands) -> Result<()> {
             } else {
                 None
             };
-            search(&query, limit, topic.as_deref(), rerank)
+            search(&query, limit, topic.as_deref(), rerank, explain)
         }
         Commands::History { query, diff } => history::report(&query, diff),
         Commands::Sync { action } => match action {
@@ -617,7 +621,7 @@ fn reindex() -> Result<()> {
     Ok(())
 }
 
-fn search(query: &str, limit: usize, topic: Option<&str>, rerank: Option<bool>) -> Result<()> {
+fn search(query: &str, limit: usize, topic: Option<&str>, rerank: Option<bool>, explain: bool) -> Result<()> {
     let paths = Paths::resolve()?;
     let scope = ids::resolve_scope(&std::env::current_dir().unwrap_or_default());
     let store = Store::open(&paths.db())?;
@@ -638,16 +642,35 @@ fn search(query: &str, limit: usize, topic: Option<&str>, rerank: Option<bool>) 
     let project = scope.project_id.to_string();
     // A reranker is worth a wider pool to choose from, as over MCP.
     let pool = if rerank { rerank::LOCAL_POOL.max(limit) } else { limit };
-    let mut hits = store.search(&project, query, scoped, pool, store::Recall::Fused)?;
+    let (mut hits, trace) = store.search_traced(&project, query, scoped, pool, store::Recall::Fused)?;
+    let mut rerank_line = None;
     if rerank {
         let ladder = summarizer::Ladder::new(&store, &config.summarizer);
         let cli = store.project_cli(&project)?.unwrap_or_default();
         let model_dir = paths.model_dir_for(rerank::LOCAL_MODEL);
+        let reranked_over = hits.len();
         let (reranked, outcome) = rerank::rerank(&ladder, &cli, query, &model_dir, hits);
         hits = reranked;
         let _ = store.record_rerank(outcome.engine, outcome.reason, outcome.ms, outcome.cold);
+        let why = if outcome.reason.is_empty() { String::new() } else { format!(" ({})", outcome.reason) };
+        rerank_line =
+            Some(format!("rerank: {}{why}, {} ms over {reranked_over} hit(s)", outcome.engine, outcome.ms));
     }
     hits.truncate(limit);
+
+    if explain {
+        // The streams first, so a missing stream is read before the order it
+        // did not shape. A stream that did not run prints why, which is the
+        // question "brain found nothing" always turns into.
+        for stream in &trace.streams {
+            let note = stream.note.as_deref().map_or(String::new(), |note| format!(" — {note}"));
+            println!("{:<10} weight {:.1}  {} hit(s){note}", stream.name, stream.weight, stream.ranked.len());
+        }
+        if let Some(line) = &rerank_line {
+            println!("{line}");
+        }
+        println!();
+    }
 
     if hits.is_empty() {
         let where_ = scoped.map_or(String::new(), |topic| format!(" under topic `{topic}`"));
@@ -659,8 +682,41 @@ fn search(query: &str, limit: usize, topic: Option<&str>, rerank: Option<bool>) 
         if !hit.snippet.is_empty() {
             println!("    {}", hit.snippet.replace('\n', " "));
         }
+        if explain {
+            println!("    {}", explain_hit(&trace, &hit.id));
+        }
     }
     Ok(())
+}
+
+/// One line of working per hit: each stream's rank for it, then the fusion.
+fn explain_hit(trace: &store::Trace, id: &str) -> String {
+    let mut parts: Vec<String> = trace
+        .streams
+        .iter()
+        .map(|stream| match stream.ranked.iter().position(|(candidate, _)| candidate == id) {
+            Some(index) => {
+                let own = stream.ranked[index].1.map_or(String::new(), |score| format!(" cos {score:.2}"));
+                format!("{} #{}{own}", stream.name, index + 1)
+            }
+            None => format!("{} -", stream.name),
+        })
+        .collect();
+    if let Some(fused) = trace.fused.get(id) {
+        let discount = if fused.discount > 1.0 {
+            format!(" ÷ {:.2} for {} bytes", fused.discount, fused.length)
+        } else {
+            String::new()
+        };
+        let demoted = if fused.demoted { ", demoted by a human" } else { "" };
+        parts.push(format!("→ {:.4}{discount} = {:.4}{demoted}", fused.raw, fused.score));
+    } else {
+        // Unreachable from `search`, which always fuses. `Recall::Lexical`
+        // through `search_traced` produces no arithmetic at all, so the branch
+        // is what the public API owes a caller that asks.
+        parts.push("→ not fused".to_string());
+    }
+    parts.join(" · ")
 }
 
 /// Remove the wiring, and on request the memory.
@@ -881,6 +937,35 @@ mod tests {
 
     fn run(engine: &str, reason: &str, ms: u64, cold: bool) -> store::RerankRun {
         store::RerankRun { engine: engine.into(), reason: reason.into(), ms, cold }
+    }
+
+    /// One line per hit: every stream, its rank or a dash, the cosine where
+    /// a stream has one, then the fusion as arithmetic a reader can redo.
+    #[test]
+    fn an_explain_line_names_every_stream_and_shows_the_arithmetic() {
+        let stream = |name: &'static str, ranked: Vec<(String, Option<f32>)>| store::StreamTrace {
+            name,
+            weight: 1.0,
+            ranked,
+            note: None,
+        };
+        let trace = store::Trace {
+            streams: vec![
+                stream("keyword", vec![("a".into(), None)]),
+                stream("semantic", vec![("b".into(), Some(0.5)), ("a".into(), Some(0.41))]),
+            ],
+            fused: [(
+                "a".to_string(),
+                store::Fused { raw: 0.0328, length: 812, discount: 1.84, score: 0.0178, demoted: true },
+            )]
+            .into(),
+        };
+
+        assert_eq!(
+            explain_hit(&trace, "a"),
+            "keyword #1 · semantic #2 cos 0.41 · → 0.0328 ÷ 1.84 for 812 bytes = 0.0178, demoted by a human"
+        );
+        assert_eq!(explain_hit(&trace, "b"), "keyword - · semantic #1 cos 0.50 · → not fused");
     }
 
     /// The section reads per engine, splits the local model's cold starts

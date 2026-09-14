@@ -74,6 +74,19 @@ const MAX_HEADER: u64 = 1 << 20;
 /// change into an ordinary backlog instead of a migration.
 pub const DIMS: usize = 256;
 
+/// What produced every vector in the index, as the index records it.
+///
+/// Width alone identifies a model only while no two models share one. Two
+/// model2vec tables at 256 dimensions are not interchangeable - a vector
+/// from one scores noise against a query from the other - and nothing about
+/// the bytes says which table wrote them. So the name goes into the store
+/// beside the width, and `Store` empties the index when the name it finds
+/// is not this one. See `Store::reconcile_embedding_model`.
+#[must_use]
+pub fn signature() -> String {
+    format!("{MODEL}:{DIMS}")
+}
+
 /// A unit vector, stored one byte per dimension.
 ///
 /// The model normalizes what it returns, so every component is already in

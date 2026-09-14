@@ -302,6 +302,7 @@ brain doctor            # is capture actually working?
 brain stats             # what it has captured, consolidated, and injected
 brain search "auth"     # full-text search this project's memory
 brain search "auth" --rerank   # same order an agent gets from brain_search; --no-rerank keeps the index's
+brain search "auth" --explain  # the working: each stream's rank per hit, the fusion, which streams did not run
 brain where             # which project am I in, and where does it live
 brain seed "the task"   # a paste-ready block to hand a subagent
 brain retire            # measure what old, never-used memory would free (dry run)

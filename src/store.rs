@@ -87,6 +87,8 @@ const ENTITY_TOKENS_MAX: usize = 8;
 /// order. The same 17 queries then returned 17 different first results, and
 /// the worst repeat was 1.
 const STREAM_WEIGHTS: [f32; 5] = [1.0, 1.0, 0.5, 1.0, 0.5];
+/// The same order, named - what `Trace` calls each stream.
+const STREAM_NAMES: [&str; 5] = ["keyword", "semantic", "entity", "substring", "graph"];
 
 /// Length past which an entry starts paying for being long, in bytes of
 /// title plus body. The corpus median, measured: 212 on a 22k-event brain.
@@ -216,6 +218,75 @@ pub struct Hit {
     /// this. It is opaque, and it does not need to be anything else - grouping
     /// asks for equality, not for meaning.
     pub session: String,
+}
+
+/// Why a search returned what it did, one stream at a time.
+///
+/// A fused order is the sum of five opinions, and the order alone cannot say
+/// which opinion put an entry where it is, or why an entry someone expected
+/// is missing. Tuning the fusion on a 22k-event brain meant reconstructing
+/// each stream's list by hand to answer that; this is the reconstruction,
+/// kept. `brain search --explain` prints it.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct Trace {
+    /// In fusion order: keyword, semantic, entity, substring, graph.
+    pub streams: Vec<StreamTrace>,
+    /// The fusion arithmetic for every id any stream nominated.
+    pub fused: std::collections::HashMap<String, Fused>,
+}
+
+/// One stream's opinion.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct StreamTrace {
+    pub name: &'static str,
+    /// Its share in the fusion — see `STREAM_WEIGHTS`.
+    pub weight: f32,
+    /// What it nominated, in its own order, with the stream's own score when
+    /// that score means something outside the order (cosine, for meaning).
+    pub ranked: Vec<(String, Option<f32>)>,
+    /// Why the list is empty or shorter than the query deserved, when the
+    /// stream knows: a model that would not load, a query its vocabulary
+    /// cannot read, a fallback taken, a stream skipped on purpose.
+    pub note: Option<String>,
+}
+
+/// How one id's fused score was arrived at.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct Fused {
+    /// The weighted reciprocal ranks, summed.
+    pub raw: f32,
+    /// Title plus body, in bytes.
+    pub length: i64,
+    /// What `raw` was divided by for being long; 1.0 at or under the pivot.
+    pub discount: f32,
+    /// `raw / discount`: the number the order came from.
+    pub score: f32,
+    /// A human flagged it stale, so it sorts last whatever the score.
+    pub demoted: bool,
+}
+
+impl Default for Fused {
+    /// No discount until a length says otherwise: an id whose `events` row
+    /// is gone must keep `raw`, not divide it by zero.
+    fn default() -> Self {
+        Self { raw: 0.0, length: 0, discount: 1.0, score: 0.0, demoted: false }
+    }
+}
+
+#[cfg(test)]
+impl Trace {
+    /// Where a stream ranked an id, counted from one; `None` when it did not
+    /// nominate it. The tests' question; `brain search --explain` walks the
+    /// streams once instead.
+    pub fn rank_in(&self, stream: &str, id: &str) -> Option<usize> {
+        self.streams
+            .iter()
+            .find(|s| s.name == stream)?
+            .ranked
+            .iter()
+            .position(|(candidate, _)| candidate == id)
+            .map(|index| index + 1)
+    }
 }
 
 /// The derived index.
@@ -530,7 +601,74 @@ impl Store {
             )
             .context("apply schema")?;
         self.add_missing_columns()?;
-        self.backfill_trigram()
+        self.backfill_trigram()?;
+        self.reconcile_embedding_model()
+    }
+
+    /// Empty the vector index when a different model wrote it.
+    ///
+    /// A vector is only meaningful against the table that produced it, and
+    /// the bytes do not say which table that was. Width caught the one
+    /// change so far because the widths differed; a swap between two models
+    /// of the same width would leave every old vector in place, each scoring
+    /// noise against every new query, with `doctor` reporting a full index.
+    /// So the model's signature is recorded beside the vectors, and a
+    /// mismatch drops them all - which is not a migration, it is the same
+    /// backlog `events_missing_vectors` already works through a slice at a
+    /// time.
+    ///
+    /// No record at all means the model this build carries: every store
+    /// without one was last embedded after the width change that introduced
+    /// the current model, so assuming otherwise would re-embed a hundred
+    /// thousand correct vectors on the upgrade that adds the record.
+    ///
+    /// This runs once, at open. A process that outlives the swap - an MCP
+    /// server from before the upgrade, a consolidation run in flight - still
+    /// carries the old model after a newer binary has re-stamped the index,
+    /// so [`Self::set_vectors`] and [`Self::nearest`] each check the record
+    /// again and refuse to touch an index that is no longer theirs.
+    fn reconcile_embedding_model(&self) -> Result<()> {
+        let current = crate::embed::signature();
+        let recorded = self.recorded_embedding_model()?;
+        if recorded.as_deref() == Some(current.as_str()) {
+            return Ok(());
+        }
+        if recorded.is_some() {
+            self.conn
+                .execute_batch("DELETE FROM event_vec;")
+                .context("drop vectors from a different model")?;
+        }
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO schema_state (key, value) VALUES ('embedding_model', ?1)",
+                params![current],
+            )
+            .context("record the embedding model")?;
+        Ok(())
+    }
+
+    fn recorded_embedding_model(&self) -> Result<Option<String>> {
+        self.conn
+            .query_row("SELECT value FROM schema_state WHERE key = 'embedding_model'", [], |row| row.get(0))
+            .optional()
+            .context("read the embedding model record")
+    }
+
+    /// Fail unless the index still belongs to the model this process carries.
+    ///
+    /// The record is checked at open; this re-checks it on every vector read
+    /// and write, for the process that was already running when a newer
+    /// build re-stamped the index. Its vectors would score noise against
+    /// everything the new model wrote, and nothing in the bytes would say so.
+    fn vectors_are_this_models(&self) -> Result<()> {
+        let current = crate::embed::signature();
+        match self.recorded_embedding_model()? {
+            Some(recorded) if recorded != current => anyhow::bail!(
+                "the vector index now belongs to {recorded}; this process carries {current} \
+                 and has to be restarted before it can use meaning"
+            ),
+            _ => Ok(()),
+        }
     }
 
     /// Fill a full-text index that was added after the events it covers.
@@ -937,6 +1075,25 @@ impl Store {
         limit: usize,
         recall: Recall,
     ) -> Result<Vec<Hit>> {
+        self.search_traced(project, query, topic, limit, recall).map(|(hits, _)| hits)
+    }
+
+    /// [`Self::search`], with the working shown.
+    ///
+    /// The hits are exactly what `search` returns; the [`Trace`] beside them
+    /// is every stream's own list and the fusion arithmetic, so a surprising
+    /// order can be read rather than guessed at.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn search_traced(
+        &self,
+        project: &str,
+        query: &str,
+        topic: Option<&str>,
+        limit: usize,
+        recall: Recall,
+    ) -> Result<(Vec<Hit>, Trace)> {
         let mut stmt = self
             .conn
             .prepare(
@@ -997,27 +1154,51 @@ impl Store {
         // as is anything with an unbalanced quote. Falling back to the same
         // text as a quoted phrase turns a failed search into a literal one,
         // which is what someone typing a path meant anyway.
-        let keyword = match read(query) {
-            Ok(hits) => hits,
+        let (keyword, keyword_note) = match read(query) {
+            Ok(hits) => (hits, None),
             Err(_) => {
                 let phrase = format!("\"{}\"", query.replace('"', " "));
-                read(&phrase).context("read search results")?
+                let hits = read(&phrase).context("read search results")?;
+                (hits, Some("FTS5 rejected the query's syntax; searched it as a quoted phrase".to_string()))
             }
         };
         drop(stmt);
 
         if recall == Recall::Lexical {
-            return Ok(spread_across_sessions(keyword, limit));
+            let trace = Trace {
+                streams: vec![StreamTrace {
+                    name: STREAM_NAMES[0],
+                    weight: STREAM_WEIGHTS[0],
+                    ranked: keyword.iter().map(|hit| (hit.id.clone(), None)).collect(),
+                    note: keyword_note,
+                }],
+                fused: std::collections::HashMap::new(),
+            };
+            return Ok((spread_across_sessions(keyword, limit), trace));
         }
 
         // Meaning, alongside words. Failure here degrades to the keyword
         // results rather than failing the search: a model that will not load
-        // is a worse search, not a broken one.
-        let semantic = crate::embed::encode(query)
-            .and_then(|vector| self.nearest(project, &vector, topic, pool))
-            .unwrap_or_default();
-        let semantic_ids: Vec<String> = semantic.into_iter().map(|(id, _)| id).collect();
+        // is a worse search, not a broken one. The trace keeps the reason,
+        // because "semantic found nothing" and "semantic did not run" call
+        // for different fixes and look identical in the results.
+        let (semantic_scored, semantic_note) = match crate::embed::encode(query) {
+            Err(error) => (Vec::new(), Some(format!("did not run: {error}"))),
+            Ok(vector) if vector.iter().all(|byte| *byte == 0) => (
+                Vec::new(),
+                Some("did not run: no word of the query is in the model's vocabulary".to_string()),
+            ),
+            Ok(vector) => match self.nearest(project, &vector, topic, pool) {
+                Ok(scored) => (scored, None),
+                Err(error) => (Vec::new(), Some(format!("did not run: {error}"))),
+            },
+        };
+        let semantic_ids: Vec<String> = semantic_scored.iter().map(|(id, _)| id.clone()).collect();
         let semantic = self.hits_by_id(&semantic_ids)?;
+        // The recall floor is the one number a reader of this list needs
+        // beside it: a cosine just above it is a loose association, not a
+        // match, and the floor is what "found nothing" was measured against.
+        let semantic_note = semantic_note.or_else(|| Some(format!("cosine floor {NEAREST_FLOOR}")));
 
         // Two more rankings that need no model at all, which is the point:
         // they are what keeps recall wide when every model is unreachable.
@@ -1028,10 +1209,13 @@ impl Store {
         // Only for the scripts the keyword tokenizer cannot cut into words.
         // An English query is already served correctly by `keyword`, and
         // substring matching would only add `author` to a search for `auth`.
-        let substring = if writes_without_spaces(query) {
-            self.substring_matches(project, query, topic, pool)?
+        let (substring, substring_note) = if writes_without_spaces(query) {
+            (self.substring_matches(project, query, topic, pool)?, None)
         } else {
-            Vec::new()
+            (
+                Vec::new(),
+                Some("skipped: the query has word boundaries, so the keyword stream already covers it".to_string()),
+            )
         };
         let mut seeds: Vec<String> = Vec::new();
         for hit in keyword.iter().chain(semantic.iter()).chain(substring.iter()) {
@@ -1043,11 +1227,35 @@ impl Store {
             }
         }
         let graph = self.neighbours_of(project, &seeds, topic, pool)?;
+        let graph_note =
+            Some(format!("neighbours of {} seed(s) from keyword, semantic and substring", seeds.len()));
 
-        Ok(spread_across_sessions(
-            self.fuse(&[keyword, semantic, entity, substring, graph], pool)?,
-            limit,
-        ))
+        // One array feeds both the fusion and the trace, so a stream's name,
+        // weight and list cannot drift apart by position.
+        let lists = [keyword, semantic, entity, substring, graph];
+        let notes = [keyword_note, semantic_note, None, substring_note, graph_note];
+        let streams = STREAM_NAMES
+            .into_iter()
+            .zip(STREAM_WEIGHTS)
+            .zip(&lists)
+            .zip(notes)
+            .map(|(((name, weight), list), note)| StreamTrace {
+                name,
+                weight,
+                ranked: list
+                    .iter()
+                    .map(|hit| {
+                        let own = (name == "semantic")
+                            .then(|| semantic_scored.iter().find(|(id, _)| *id == hit.id).map(|(_, cosine)| *cosine))
+                            .flatten();
+                        (hit.id.clone(), own)
+                    })
+                    .collect(),
+                note,
+            })
+            .collect();
+        let (hits, fused) = self.fuse(&lists, pool)?;
+        Ok((spread_across_sessions(hits, limit), Trace { streams, fused }))
     }
 
     /// Combine several rankings into one.
@@ -1061,22 +1269,26 @@ impl Store {
     ///
     /// An entry several rankings found outranks one that only appears in one,
     /// which is exactly the behaviour wanted: the keyword hit that is also
-    /// about the right thing goes first. The lists are equal-weight on
-    /// purpose — a per-stream weight is a knob nobody can justify a value
-    /// for.
-    fn fuse(&self, lists: &[Vec<Hit>], limit: usize) -> Result<Vec<Hit>> {
+    /// about the right thing goes first. Not equal-weight: see
+    /// `STREAM_WEIGHTS` for the two streams held at half and the
+    /// measurement that put them there.
+    fn fuse(
+        &self,
+        lists: &[Vec<Hit>],
+        limit: usize,
+    ) -> Result<(Vec<Hit>, std::collections::HashMap<String, Fused>)> {
         // The conventional damping constant. Large enough that the top of
         // any one list does not dominate outright, so agreement between
         // rankings can still outweigh a single strong opinion.
         const K: f32 = 60.0;
 
-        let mut score: std::collections::HashMap<&str, f32> = std::collections::HashMap::new();
+        let mut fused: std::collections::HashMap<&str, Fused> = std::collections::HashMap::new();
         for (index, list) in lists.iter().enumerate() {
             let weight = STREAM_WEIGHTS.get(index).copied().unwrap_or(1.0);
             for (rank, hit) in list.iter().enumerate() {
                 #[allow(clippy::cast_precision_loss)]
                 let contribution = weight / (K + rank as f32 + 1.0);
-                *score.entry(hit.id.as_str()).or_default() += contribution;
+                fused.entry(hit.id.as_str()).or_default().raw += contribution;
             }
         }
 
@@ -1086,21 +1298,25 @@ impl Store {
         // "flagging has to change what the user SEES" - so the flag is carried
         // across the fusion rather than re-derived from a position it no longer
         // occupies.
-        for (id, length) in self.lengths_of(score.keys().copied())? {
-            if let Some(value) = score.get_mut(id.as_str()) {
+        for (id, length) in self.lengths_of(fused.keys().copied())? {
+            if let Some(entry) = fused.get_mut(id.as_str()) {
                 #[allow(clippy::cast_precision_loss)]
                 let over = (length as f32 / LENGTH_PIVOT).ln().max(0.0);
-                *value /= 1.0 + LENGTH_PENALTY * over;
+                entry.length = length;
+                entry.discount = 1.0 + LENGTH_PENALTY * over;
             }
         }
+        let demoted = self.demoted_among(fused.keys().copied())?;
+        for (id, entry) in &mut fused {
+            entry.score = entry.raw / entry.discount;
+            entry.demoted = demoted.contains(*id);
+        }
 
-        let demoted = self.demoted_among(score.keys().copied())?;
-        let mut ranked: Vec<(&str, f32)> = score.into_iter().collect();
+        let mut ranked: Vec<(&str, &Fused)> = fused.iter().map(|(id, entry)| (*id, entry)).collect();
         ranked.sort_by(|a, b| {
-            demoted
-                .contains(a.0)
-                .cmp(&demoted.contains(b.0))
-                .then_with(|| b.1.total_cmp(&a.1))
+            a.1.demoted
+                .cmp(&b.1.demoted)
+                .then_with(|| b.1.score.total_cmp(&a.1.score))
                 .then_with(|| b.0.cmp(a.0))
         });
         ranked.truncate(limit);
@@ -1115,10 +1331,12 @@ impl Store {
             }
         }
 
-        Ok(ranked
+        let hits = ranked
             .into_iter()
             .filter_map(|(id, _)| known.get(id).map(|hit| (*hit).clone()))
-            .collect())
+            .collect();
+        let fused = fused.into_iter().map(|(id, entry)| (id.to_string(), entry)).collect();
+        Ok((hits, fused))
     }
 
     /// Which of these ids a human has flagged stale.
@@ -1593,6 +1811,7 @@ impl Store {
         // and one `SQLITE_BUSY` past the timeout used to take the whole
         // consolidation run down with it.
         let transaction = self.conn.unchecked_transaction().context("begin vectors")?;
+        self.vectors_are_this_models()?;
         {
             let mut stmt = transaction
                 .prepare(
@@ -1706,6 +1925,7 @@ impl Store {
             // answering it with nothing.
             return Ok(Vec::new());
         }
+        self.vectors_are_this_models()?;
         let mut stmt = self
             .conn
             .prepare(
@@ -3880,6 +4100,178 @@ mod tests {
             pending.iter().any(|(id, _)| *id == stale.id),
             "a vector of the wrong width was counted as present: {pending:?}"
         );
+    }
+
+    #[test]
+    fn a_vector_from_a_different_model_of_the_same_width_is_dropped_on_open() {
+        // Width caught the last model change because the widths differed.
+        // Two models at one width leave nothing in the bytes to tell them
+        // apart, so the model's name is what the store checks - and a
+        // mismatch has to empty the index, or every old vector scores noise
+        // against every new query while doctor reports a full index.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let old = event("Chose SQLite over Postgres", "nothing resident", project);
+        store.index(&old).unwrap();
+        store.set_vectors(&[(old.id.clone(), vec![7u8; crate::embed::DIMS])]).unwrap();
+        assert_eq!(store.vector_coverage().unwrap(), (1, 1));
+
+        // What a store looks like after a binary carrying another model of
+        // the same width wrote it.
+        store
+            .conn
+            .execute(
+                "UPDATE schema_state SET value = 'potion-base-8M:256' WHERE key = 'embedding_model'",
+                [],
+            )
+            .unwrap();
+        store.migrate().unwrap();
+
+        assert_eq!(store.vector_coverage().unwrap(), (0, 1), "the other model's vector survived reopening");
+        let pending = store.events_missing_vectors(&project.to_string(), 10).unwrap();
+        assert!(pending.iter().any(|(id, _)| *id == old.id), "not queued for re-embedding: {pending:?}");
+        assert_eq!(recorded_embedding_model(&store), crate::embed::signature());
+    }
+
+    #[test]
+    fn a_store_without_a_model_record_keeps_its_vectors() {
+        // The record is new. Every store without one was embedded by the
+        // model this build carries - the last change was caught by width -
+        // so the upgrade that adds the record must not throw a hundred
+        // thousand correct vectors away to be sure.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let fresh = event("Wrote the installation guide", "one page", project);
+        store.index(&fresh).unwrap();
+        store.set_vectors(&[(fresh.id.clone(), vec![7u8; crate::embed::DIMS])]).unwrap();
+        store.conn.execute("DELETE FROM schema_state WHERE key = 'embedding_model'", []).unwrap();
+
+        store.migrate().unwrap();
+
+        assert_eq!(
+            store.vector_coverage().unwrap(),
+            (1, 1),
+            "vectors were dropped with no evidence of a model change"
+        );
+        assert_eq!(recorded_embedding_model(&store), crate::embed::signature());
+    }
+
+    fn recorded_embedding_model(store: &Store) -> String {
+        store
+            .conn
+            .query_row("SELECT value FROM schema_state WHERE key = 'embedding_model'", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_process_that_outlived_a_model_swap_neither_writes_nor_reads_vectors() {
+        // The open-time check cannot reach a process already running: an MCP
+        // server from before the upgrade, a consolidation run in flight. Once
+        // a newer build has re-stamped the index, that process's vectors are
+        // noise to the new model and the new model's vectors are noise to
+        // it, so both directions have to refuse - and say why.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let page = event("Chose SQLite over Postgres", "one file", project);
+        store.index(&page).unwrap();
+        store.set_vectors(&[(page.id.clone(), vec![7u8; crate::embed::DIMS])]).unwrap();
+
+        // Another process, a newer build, re-stamps the index underneath us.
+        store
+            .conn
+            .execute("UPDATE schema_state SET value = 'a-newer-model:256' WHERE key = 'embedding_model'", [])
+            .unwrap();
+
+        let written = store.set_vectors(&[(page.id.clone(), vec![9u8; crate::embed::DIMS])]);
+        let error = written.expect_err("a stale process wrote into an index that is no longer its own");
+        assert!(error.to_string().contains("a-newer-model:256"), "{error}");
+        assert!(error.to_string().contains(&crate::embed::signature()), "{error}");
+        let stored: Vec<u8> = store
+            .conn
+            .query_row("SELECT vec FROM event_vec WHERE event_id = ?1", params![page.id], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored, vec![7u8; crate::embed::DIMS], "the refused write still changed the row");
+
+        let read = store.nearest(&project.to_string(), &vec![7u8; crate::embed::DIMS], None, 10);
+        let error = read.expect_err("a stale process ranked vectors another model wrote");
+        assert!(error.to_string().contains("restarted"), "{error}");
+    }
+
+    #[test]
+    fn the_trace_shows_each_streams_rank_and_the_fusion_arithmetic() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let short = event("Chose SQLite over Postgres", "one file, no daemon", project);
+        let long = event("SQLite considered at length", &"words and more words ".repeat(60), project);
+        let other = event("Wrote the installation guide", "one page", project);
+        store.index(&short).unwrap();
+        store.index(&long).unwrap();
+        store.index(&other).unwrap();
+
+        let (hits, trace) =
+            store.search_traced(&project.to_string(), "sqlite", None, 10, Recall::Fused).unwrap();
+
+        let names: Vec<&str> = trace.streams.iter().map(|stream| stream.name).collect();
+        assert_eq!(names, ["keyword", "semantic", "entity", "substring", "graph"]);
+        assert_eq!(trace.rank_in("keyword", &short.id), Some(1), "{trace:?}");
+        assert_eq!(trace.rank_in("keyword", &long.id), Some(2), "{trace:?}");
+        assert_eq!(trace.rank_in("keyword", &other.id), None);
+        // An English query has word boundaries: the substring stream says
+        // why it stood aside rather than looking like it found nothing.
+        assert!(
+            trace.streams[3].note.as_deref().unwrap_or("").starts_with("skipped"),
+            "{:?}",
+            trace.streams[3].note
+        );
+
+        let fused = trace.fused.get(&short.id).expect("a keyword hit has fusion arithmetic");
+        assert!(fused.raw > 0.0);
+        assert!((fused.discount - 1.0).abs() < f32::EPSILON, "a short entry pays no length discount");
+        assert!((fused.score - fused.raw).abs() < f32::EPSILON);
+        assert!(!fused.demoted);
+
+        let fused = trace.fused.get(&long.id).expect("the long hit has fusion arithmetic");
+        assert!(fused.length > 200, "{}", fused.length);
+        assert!(fused.discount > 1.0, "a long entry was not discounted: {fused:?}");
+        assert!(fused.score < fused.raw);
+        assert_eq!(hits[0].id, short.id, "{hits:?}");
+    }
+
+    #[test]
+    fn the_trace_carries_a_human_demotion() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let stale = event("SQLite chosen for the cache", "revisited later", project);
+        let live = event("SQLite chosen for the store", "still true", project);
+        store.index(&stale).unwrap();
+        store.index(&live).unwrap();
+        store.conn.execute("UPDATE events SET confidence = -1 WHERE id = ?1", params![stale.id]).unwrap();
+
+        let (hits, trace) =
+            store.search_traced(&project.to_string(), "sqlite", None, 10, Recall::Fused).unwrap();
+
+        assert!(trace.fused[&stale.id].demoted, "{trace:?}");
+        assert!(!trace.fused[&live.id].demoted);
+        assert_eq!(hits.last().unwrap().id, stale.id, "a demoted hit did not sort last: {hits:?}");
+    }
+
+    #[test]
+    fn a_lexical_search_traces_only_the_keyword_stream() {
+        // Lexical recall is what anything destructive gets: the trace must
+        // not claim streams that never ran.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let only = event("Chose SQLite over Postgres", "one file", project);
+        store.index(&only).unwrap();
+
+        let (hits, trace) =
+            store.search_traced(&project.to_string(), "sqlite", None, 10, Recall::Lexical).unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(trace.streams.len(), 1);
+        assert_eq!(trace.streams[0].name, "keyword");
+        assert_eq!(trace.rank_in("keyword", &only.id), Some(1));
+        assert!(trace.fused.is_empty(), "nothing was fused, so nothing has fusion arithmetic");
     }
 
     #[test]
