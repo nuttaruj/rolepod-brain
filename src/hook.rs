@@ -118,12 +118,13 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
     };
     let scope = ids::resolve_scope(&cwd);
 
-    let agent = AgentKind::parse(cli);
+    let cli_kind = AgentKind::parse(cli);
     let hook = normalize_hook(event_name);
     let session = ids::session_uuid(
         first_string(&payload, &["session_id", "sessionId", "thread_id", "conversationId"])
             .unwrap_or("unknown-session"),
     );
+    let delegate = delegate_label(&payload);
 
     // The one thing a lifecycle hook cannot see and the next session most
     // needs: what the model actually answered. Without it a handoff carries
@@ -137,11 +138,11 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
     let answer = (hook == "stop")
         .then(|| {
             first_string(&payload, &["transcript_path", "transcriptPath"])
-                .filter(|path| is_transcript_of(agent.as_str(), path))
+                .filter(|path| is_transcript_of(cli_kind.as_str(), path))
                 .and_then(|path| {
                     crate::transcript::last_answer(
                         std::path::Path::new(path),
-                        agent.as_str(),
+                        cli_kind.as_str(),
                         &sanitizer,
                     )
                 })
@@ -156,6 +157,23 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
         // says something; the body carries the rest for whoever pulls it.
         title = truncate(&first_line(&answer), TITLE_MAX_BYTES);
         body = answer;
+    }
+    // A delegate's report is the one thing it produced that the session will
+    // want back: a reviewer's findings, a scout's conclusions. Claude Code
+    // hands it over whole at `SubagentStop`; the lead's own captures only
+    // show that a delegate ran. `scrub_body` bounds it like every body, head
+    // and tail kept, so the last finding survives as well as the first.
+    if let Some(report) = (hook == "subagent_stop")
+        .then(|| first_string(&payload, &["last_assistant_message"]))
+        .flatten()
+        .filter(|message| !message.trim().is_empty())
+    {
+        let who = delegate.as_deref().unwrap_or("A subagent");
+        title = truncate(
+            &sanitizer.scrub(&format!("{who} reported: {}", first_line(report))),
+            TITLE_MAX_BYTES,
+        );
+        body = sanitizer.scrub_body(report);
     }
 
     // Classified once per session and remembered: working it out costs a
@@ -174,8 +192,12 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
     // A pointer to material consolidation will read and never copy. Claude
     // Code and Codex put it in every payload; the other three CLIs write no
     // transcript at all.
-    if let Some(path) = first_string(&payload, &["transcript_path", "transcriptPath"]) {
-        if is_transcript_of(agent.as_str(), path) {
+    // Not from a delegate: the lead's own hooks record the same path, and
+    // the write is last-writer-wins, so a delegate's must never be the last.
+    if let Some(path) = first_string(&payload, &["transcript_path", "transcriptPath"])
+        .filter(|_| delegate.is_none())
+    {
+        if is_transcript_of(cli_kind.as_str(), path) {
             let _ = store.record_transcript_path(&session_key, path);
         }
     }
@@ -184,7 +206,7 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
         scope.workspace_id,
         scope.project_id,
         session,
-        Source { cli: agent.as_str().to_string(), hook: hook.clone() },
+        Source { cli: cli_kind.as_str().to_string(), hook: hook.clone() },
         EventKind::Observation,
         title,
         body,
@@ -206,6 +228,14 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
             .extra
             .insert("invocation".to_string(), Value::String(invocation.as_str().to_string()));
     }
+    if let Some(label) = &delegate {
+        // Same rule, one level down. A subagent's tool calls arrive under the
+        // lead's session id - the host gives them no session of their own -
+        // and untagged they read as the lead's work: a scout's forty file
+        // reads summarized as what this session did. The tag lets the
+        // summary keep the delegate's report and drop its footsteps.
+        event.agent = Some(label.clone());
+    }
 
     // `pre_tool_use` is an injection surface, not a capture one. It reaches us
     // only for `Read`, and only so that what we know about a file lands before
@@ -221,6 +251,17 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
         store.index(&event)?;
     }
 
+    if delegate.is_some() {
+        // A subagent shares the lead's session id, so everything past this
+        // point - the wipe reset, the consolidation trigger, the file
+        // injection - would act on the lead's session on a delegate's
+        // behalf. A file injection in particular would spend the lead's
+        // budget and mark the file covered for a session that never saw the
+        // pointer. What a delegate should know goes in through `brain_seed`,
+        // chosen by the lead, and nothing else.
+        return Ok("{}".to_string());
+    }
+
     // A context wipe keeps the session id but destroys everything the agent
     // knew. Our own de-duplication is keyed to that surviving id, so without
     // this reset the guard that stops us repeating ourselves would instead
@@ -230,7 +271,7 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
         store.reset_injection_state(&session_key)?;
     }
 
-    if is_session_boundary(agent.as_str(), &hook) {
+    if is_session_boundary(cli_kind.as_str(), &hook) {
         // Compaction is the last moment this session's detail exists. Kicking
         // consolidation here means the primer that lands seconds later carries
         // a real narrative rather than a list of raw commands. Detached and
@@ -250,8 +291,18 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
         // destroys its independence in a way nothing downstream can see.
         return Ok("{}".to_string());
     }
-
     Ok(inject_for(&store, &config, &scope, &session_key, &hook, event_name, &event))
+}
+
+/// Which subagent a hook fired inside, if any.
+///
+/// `agent_id` is the host's own signal that the hook is inside a subagent;
+/// `agent_type` alone is not, because a session started with `--agent`
+/// carries it on the main thread too. The label is the type - the name the
+/// lead dispatched, and the name a lesson is addressed to.
+fn delegate_label(payload: &Value) -> Option<String> {
+    payload.get("agent_id").and_then(Value::as_str).filter(|id| !id.is_empty())?;
+    Some(first_string(payload, &["agent_type"]).unwrap_or("subagent").to_string())
 }
 
 /// Decide what, if anything, to push back into the model's context.
@@ -563,6 +614,12 @@ fn title_for(hook: &str, payload: &Value) -> String {
             }
         }
         "stop" => "Turn finished".to_string(),
+        // The report path in `capture` overrides this whenever the host sent
+        // the delegate's last message; this is the title when it sent none.
+        "subagent_stop" => match delegate_label(payload) {
+            Some(who) => format!("{who} finished"),
+            None => "Subagent finished".to_string(),
+        },
         "pre_compact" => {
             let trigger = str_field("trigger");
             if trigger.is_empty() {
@@ -973,6 +1030,28 @@ mod tests {
             Some(std::path::PathBuf::from("/repo"))
         );
         assert_eq!(title_for("post_tool_use", &payload), "view_file: /repo/src/main.rs");
+    }
+
+    #[test]
+    fn a_hook_inside_a_subagent_is_labelled_by_its_type_and_only_then() {
+        // `agent_id` is the host's signal that the hook fired inside a
+        // subagent. `agent_type` alone is a session started with `--agent`,
+        // whose main thread must stay the lead's own work.
+        let inside = json!({"agent_id": "agent-def456", "agent_type": "rolepod:universal-reviewer"});
+        assert_eq!(delegate_label(&inside).as_deref(), Some("rolepod:universal-reviewer"));
+        let unnamed = json!({"agent_id": "agent-def456"});
+        assert_eq!(delegate_label(&unnamed).as_deref(), Some("subagent"));
+        let agent_session = json!({"agent_type": "security-reviewer", "session_id": "abc"});
+        assert_eq!(delegate_label(&agent_session), None);
+        assert_eq!(delegate_label(&json!({"agent_id": ""})), None);
+        assert_eq!(delegate_label(&json!({})), None);
+    }
+
+    #[test]
+    fn a_subagent_stop_without_a_message_is_still_titled_by_who_finished() {
+        let payload = json!({"agent_id": "agent-1", "agent_type": "Explore"});
+        assert_eq!(title_for("subagent_stop", &payload), "Explore finished");
+        assert_eq!(title_for("subagent_stop", &json!({})), "Subagent finished");
     }
 
     #[test]

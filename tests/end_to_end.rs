@@ -4557,6 +4557,98 @@ fn walk_find(dir: &Path, name: &str) -> bool {
 
 /// Memory about a file has to arrive before the agent reads it.
 ///
+/// A subagent's hooks arrive under the lead's session id. Its tool calls are
+/// captured, tagged with its type, and met with no injection - a file
+/// injection would spend the lead's budget and mark the file covered for a
+/// session that never saw the pointer. Its report at `SubagentStop` becomes
+/// one searchable event named after it.
+#[test]
+fn a_subagents_work_is_tagged_captured_and_never_injected() {
+    let fixture = Fixture::new("subagent-lane");
+    let session = "0199a1f2-3c4d-7e8f-9012-3456789abcd8";
+
+    // Something worth knowing about one particular file, from an earlier
+    // session - a session's own captures are never echoed back to it.
+    for turn in 0..3 {
+        let payload = serde_json::json!({
+            "session_id": "0199aaaa-1111-7000-8000-000000000000",
+            "cwd": fixture.project,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": fixture.project.join("src/auth.rs")},
+            "prompt": format!("expiry compared with the wrong operator, take {turn}")
+        })
+        .to_string();
+        fixture.hook("claude-code", "PostToolUse", &payload);
+    }
+
+    // A reviewer dispatched from the session reads the file: nothing comes
+    // back, and the read is stored under the reviewer's name.
+    let read = serde_json::json!({
+        "session_id": session,
+        "cwd": fixture.project,
+        "agent_id": "agent-def456",
+        "agent_type": "rolepod:universal-reviewer",
+        "tool_name": "Read",
+        "tool_input": {"file_path": fixture.project.join("src/auth.rs")}
+    })
+    .to_string();
+    let before = fixture.hook("claude-code", "PreToolUse", &read);
+    assert!(before.status.success(), "{before:?}");
+    assert_eq!(injected_context(&before), None, "a subagent was handed the lead's file memory");
+    let after = fixture.hook("claude-code", "PostToolUse", &read);
+    assert_eq!(injected_context(&after), None);
+
+    let stored = Command::new("sqlite3")
+        .arg(fixture.home.join("brain.db"))
+        .arg("SELECT agent FROM events WHERE hook = 'post_tool_use' AND title LIKE 'Read:%';")
+        .output()
+        .expect("read the agent column");
+    assert_eq!(String::from_utf8_lossy(&stored.stdout).trim(), "rolepod:universal-reviewer");
+
+    // The lead reads the same file afterwards and still gets its memory: the
+    // reviewer's read did not mark the file covered.
+    let lead_read = serde_json::json!({
+        "session_id": session,
+        "cwd": fixture.project,
+        "tool_name": "Read",
+        "tool_input": {"file_path": fixture.project.join("src/auth.rs")}
+    })
+    .to_string();
+    let injected = injected_context(&fixture.hook("claude-code", "PreToolUse", &lead_read))
+        .expect("the lead's own read must still be met with the file's memory");
+    assert!(injected.contains("auth.rs"), "{injected}");
+
+    // The reviewer's report arrives and is findable by what it said. It is
+    // scrubbed before it is bounded: a credential sitting past the body
+    // clamp must not survive because the clamp came first.
+    let mut report = "PASS-WITH-NITS\n\n1. src/auth.rs:42 compares expiry with the wrong operator.\n".to_string();
+    report.push_str(&"finding filler line\n".repeat(900));
+    report.push_str("aws_access_key_id = AKIAIOSFODNN7EXAMPLE\n");
+    let stop = serde_json::json!({
+        "session_id": session,
+        "cwd": fixture.project,
+        "agent_id": "agent-def456",
+        "agent_type": "rolepod:universal-reviewer",
+        "last_assistant_message": report
+    })
+    .to_string();
+    let output = fixture.hook("claude-code", "SubagentStop", &stop);
+    assert!(output.status.success(), "{output:?}");
+    let found = String::from_utf8_lossy(&fixture.brain(&["search", "wrong operator"]).stdout).to_string();
+    assert!(
+        found.contains("rolepod:universal-reviewer reported: PASS-WITH-NITS"),
+        "the report is not a searchable event: {found}"
+    );
+    let body = Command::new("sqlite3")
+        .arg(fixture.home.join("brain.db"))
+        .arg("SELECT body FROM events WHERE hook = 'subagent_stop';")
+        .output()
+        .expect("read the report body");
+    let body = String::from_utf8_lossy(&body.stdout);
+    assert!(!body.contains("AKIAIOSFODNN7EXAMPLE"), "a credential past the clamp was stored: {}", body.len());
+    assert!(body.contains("[REDACTED]"), "the credential was cut away rather than redacted: {}", body.len());
+}
+
 /// It used to arrive on `PostToolUse` - after the read returned, with the file
 /// already in the agent's context. By then the agent has the answer it went
 /// looking for and no reason to weigh what we know against it. `PreToolUse`

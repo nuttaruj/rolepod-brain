@@ -289,6 +289,11 @@ fn is_quiet(events: &[Event]) -> bool {
         && !events.iter().any(|event| {
             crate::event::is_user_prompt(&event.source.hook)
                 || (event.source.hook == "stop" && event.title != "Turn finished")
+                // A delegate's report is work: a session that only dispatched
+                // a reviewer still has that reviewer's findings to narrate. A
+                // `subagent_stop` with no agent behind it is a stub with
+                // nothing to narrate, the same shape as "Turn finished".
+                || (event.source.hook == "subagent_stop" && event.agent.is_some())
                 || !event.files.is_empty()
                 || event.topic.is_some()
         })
@@ -424,7 +429,10 @@ fn consolidate_session(
     if events.is_empty() {
         return Ok(Tier::RuleBased);
     }
-    if is_quiet(&events) {
+    // What the summary is written from. A delegate's footsteps are marked
+    // consolidated with everything else below, but never narrated.
+    let narrated: Vec<Event> = events.iter().filter(|event| !is_delegate_footstep(event)).cloned().collect();
+    if is_quiet(&narrated) {
         // Settled, not summarized. Marking the events done is what keeps
         // this from being asked again; the run record is what `doctor` and
         // `should_wait` read. Nothing reaches the log: a rebuild finds the
@@ -467,7 +475,7 @@ fn consolidate_session(
         .filter(|path| path.is_file())
         .and_then(|path| crate::transcript::read_span(path.as_path(), &pending.cli, &sanitizer));
 
-    let chunks = chunk(&events);
+    let chunks = chunk(&narrated);
     let mut summaries = Vec::new();
     let mut retitled: Vec<Retitle> = Vec::new();
     let mut entities: Vec<String> = Vec::new();
@@ -897,10 +905,24 @@ fn render_event(event: &Event) -> String {
     } else {
         format!(" files={}", event.files.join(","))
     };
+    let agent = event.agent.as_deref().map_or(String::new(), |agent| format!(" agent={agent}"));
     format!(
-        "- id={} hook={}{}\n  title: {}\n  body: {}\n",
-        event.id, event.source.hook, files, event.title, body
+        "- id={id} hook={hook}{agent}{files}\n  title: {title}\n  body: {body}\n",
+        id = event.id,
+        hook = event.source.hook,
+        title = event.title,
     )
+}
+
+/// A delegate's footsteps: a tool call made inside a subagent.
+///
+/// Not summarized. A scout's forty reads are how it reached its conclusion,
+/// and the conclusion arrives whole as its `subagent_stop` report, which IS
+/// narrated - with `agent=` beside it so the summary says who found what.
+/// The footsteps stay in the log and the index, searchable, and are marked
+/// consolidated with the rest of the session so nothing waits on them.
+fn is_delegate_footstep(event: &Event) -> bool {
+    event.agent.is_some() && event.source.hook != "subagent_stop"
 }
 
 /// The consolidation prompt.
@@ -3144,6 +3166,39 @@ fn knowledge_prompt(summaries: &[Event], clusters: &[Vec<&Event>], known: &[Stri
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    /// A scout's reads are how it reached its conclusion; the conclusion
+    /// arrives whole as its report. The summary gets the report, with the
+    /// agent's name beside it, and none of the footsteps.
+    #[test]
+    fn a_delegates_footsteps_stay_out_of_the_prompt_and_its_report_stays_in() {
+        let tag = |mut event: Event| {
+            event.agent = Some("rolepod:scout".to_string());
+            event
+        };
+        let own = event("A", "post_tool_use", "Edit: src/store.rs", "{}");
+        let footstep = tag(event("B", "post_tool_use", "Read: docs/frameworks/MEMORY.md", "{}"));
+        let report = tag(event(
+            "C",
+            "subagent_stop",
+            "rolepod:scout reported: RRF k=60 with two streams",
+            "RRF k=60 with two streams, no length penalty.",
+        ));
+        assert!(!is_delegate_footstep(&own));
+        assert!(is_delegate_footstep(&footstep));
+        assert!(!is_delegate_footstep(&report));
+        assert!(
+            !is_quiet(std::slice::from_ref(&report)),
+            "a session whose only narrated event is a delegate's report was settled as quiet"
+        );
+
+        let narrated: Vec<Event> =
+            [own, footstep, report].into_iter().filter(|event| !is_delegate_footstep(event)).collect();
+        let prompt = build_prompt(&narrated, false, None);
+        assert!(!prompt.contains("Read: docs/frameworks/MEMORY.md"), "a footstep was narrated:\n{prompt}");
+        assert!(prompt.contains("hook=subagent_stop agent=rolepod:scout"), "the report lost its agent:\n{prompt}");
+        assert!(prompt.contains("Edit: src/store.rs"));
+    }
 
     fn event(id_hint: &str, hook: &str, title: &str, body: &str) -> Event {
         let mut event = Event::new(

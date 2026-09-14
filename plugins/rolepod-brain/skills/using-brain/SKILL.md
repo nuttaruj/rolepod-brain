@@ -74,6 +74,32 @@ what the session concluded, not a list of its tool calls.
 - `brain_note(text, files)` — record something worth remembering that no tool
   call would show: a decision and its reason, a constraint, a dead end worth
   not repeating. Capture is automatic, so this is only for the *why*.
+- `brain_seed(task, budget, agent)` — one compact block to paste into a
+  subagent's prompt: standing lessons first, then pointers relevant to the
+  task. See below for `agent`.
+
+## Subagents and reviewers
+
+A subagent has no session of its own: no primer, no file pointers, nothing
+unless you hand it something. Its tool calls are still captured under your
+session, tagged with its type, and kept out of your summary; its final
+message is stored as one event named after it (`<type> reported: …`), so a
+reviewer's findings are searchable afterwards.
+
+Give it memory through the seed, and only the seed:
+`brain_seed(task: "<what it will work on>", agent: "<its type as the host
+names it, e.g. rolepod:universal-reviewer>")`, pasted verbatim into its
+prompt. With `agent`, the lessons addressed to that type lead the block.
+
+Write those lessons after judging its findings, one per finding you did not
+apply as written — `brain_note(agent: "<the same type>", text: "…")`, the
+text starting with `avoid:` for a class of finding you rejected and why it
+does not apply here, `refine:` for a rule in the wording that is right here,
+`keep:` for a class the user confirmed mattered. The user overruling you is
+the strongest signal and always gets a note. One sentence, the class not the
+instance, no file paths that will rot. Findings applied as-is get nothing;
+so does a finding you merely disagreed with on taste. The subagent never
+writes memory itself.
 
 ## What arrives without you asking
 

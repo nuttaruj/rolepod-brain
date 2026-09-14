@@ -166,6 +166,9 @@ enum Commands {
         /// Maximum bytes for the block.
         #[arg(long, default_value_t = inject::SEED_BUDGET)]
         budget: usize,
+        /// The subagent's type as the host names it; its own lessons lead the block.
+        #[arg(long)]
+        agent: Option<String>,
     },
     /// What this brain has actually done. Local counters; nothing is sent anywhere.
     Stats,
@@ -452,12 +455,17 @@ fn run(command: Commands) -> Result<()> {
             }
             Ok(())
         }
-        Commands::Seed { task, budget } => {
+        Commands::Seed { task, budget, agent } => {
             let paths = Paths::resolve()?;
             let store = Store::open(&paths.db())?;
             let scope = ids::resolve_scope(&std::env::current_dir().unwrap_or_default());
-            let seed =
-                inject::seed(&store, &scope.project_id.to_string(), &task, budget.clamp(256, 8192))?;
+            let seed = inject::seed(
+                &store,
+                &scope.project_id.to_string(),
+                &task,
+                budget.clamp(256, 8192),
+                agent.as_deref(),
+            )?;
             if seed.text.is_empty() {
                 println!("Nothing to seed yet - no lessons and no matches for the task.");
             } else {

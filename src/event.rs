@@ -191,6 +191,15 @@ pub struct Event {
     /// field means.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
+    /// The subagent lane this event belongs to, when it belongs to one.
+    ///
+    /// Set by capture from the host's `agent_type` when a hook fires inside
+    /// a subagent, and by a note written as a lesson for that agent type.
+    /// One field, two directions: what an agent did, and what memory holds
+    /// for it. Additive like `topic`: absent on every line written before
+    /// it existed, and absent on the lead's own work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// Which store appended this line. Stamped at append time, absent on
     /// events written before the field existed. Provenance for a future
     /// multi-store merge: which replica wrote what cannot be reconstructed
@@ -231,6 +240,7 @@ impl Event {
             files: Vec::new(),
             links: Vec::new(),
             topic: None,
+            agent: None,
             origin: None,
             consolidated: false,
             extra: serde_json::Map::new(),

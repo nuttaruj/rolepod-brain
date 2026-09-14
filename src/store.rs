@@ -730,6 +730,7 @@ impl Store {
                 ("events", "injected_count", "INTEGER NOT NULL DEFAULT 0"),
                 ("events", "confidence", "INTEGER NOT NULL DEFAULT 0"),
                 ("events", "team", "INTEGER NOT NULL DEFAULT 0"),
+                ("events", "agent", "TEXT"),
                 ("summarizer_health", "last_failed_at", "TEXT"),
                 ("session_state", "claimed_at", "TEXT"),
                 ("injected", "active", "INTEGER NOT NULL DEFAULT 1"),
@@ -799,15 +800,16 @@ impl Store {
             .execute(
                 "INSERT INTO events
                     (id, ts, workspace, project, session, cli, hook, kind, title, body,
-                     files, topic, invocation, confidence, consolidated)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                     files, topic, invocation, confidence, consolidated, agent)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
                  ON CONFLICT(id) DO UPDATE SET
                      title = excluded.title,
                      body = excluded.body,
                      files = excluded.files,
                      topic = excluded.topic,
                      invocation = excluded.invocation,
-                     consolidated = excluded.consolidated",
+                     consolidated = excluded.consolidated,
+                     agent = excluded.agent",
                 params![
                     event.id,
                     event.ts,
@@ -824,6 +826,7 @@ impl Store {
                     event.extra.get("invocation").and_then(serde_json::Value::as_str),
                     i32::from(intent),
                     i32::from(event.consolidated),
+                    event.agent.as_deref(),
                 ],
             )
             .context("index event")?;
@@ -1976,7 +1979,7 @@ impl Store {
             .conn
             .prepare(
                 "SELECT id, ts, workspace, project, session, cli, hook, kind, title, body,
-                        files, topic, consolidated
+                        files, topic, consolidated, agent
                  FROM events WHERE id = ?1",
             )
             .context("prepare get")?;
@@ -1999,6 +2002,7 @@ impl Store {
                         files: serde_json::from_str(&files).unwrap_or_default(),
                         links: Vec::new(),
                         topic: row.get(11)?,
+                        agent: row.get(13)?,
                         origin: None,
                         consolidated: row.get::<_, i32>(12)? != 0,
                         extra: serde_json::Map::new(),
@@ -3341,7 +3345,7 @@ impl Store {
     /// # Errors
     /// Returns an error when the query fails.
     pub fn primer_pointers(&self, project: &str, limit: usize) -> Result<Vec<Pointer>> {
-        self.ranked_pointers(project, None, limit)
+        self.ranked_pointers(project, None, None, limit)
     }
 
     /// The same ranking, restricted to one kind.
@@ -3360,13 +3364,28 @@ impl Store {
         kind: &str,
         limit: usize,
     ) -> Result<Vec<Pointer>> {
-        self.ranked_pointers(project, Some(kind), limit)
+        self.ranked_pointers(project, Some(kind), None, limit)
+    }
+
+    /// Notes addressed to one subagent type, in the order every other
+    /// pointer read uses: one a person flagged sinks, one nobody reads decays.
+    ///
+    /// The lessons a lead writes after judging that agent's findings: what
+    /// not to flag in this project, what it got right, how to word it. Only
+    /// notes - a delegate's own captures carry the same `agent` and are not
+    /// lessons for anyone.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn lessons_for(&self, project: &str, agent: &str, limit: usize) -> Result<Vec<Pointer>> {
+        self.ranked_pointers(project, Some("note"), Some(agent), limit)
     }
 
     fn ranked_pointers(
         &self,
         project: &str,
         kind: Option<&str>,
+        agent: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Pointer>> {
         let sql = format!(
@@ -3378,13 +3397,14 @@ impl Store {
              WHERE project = ?1 AND forgotten = 0 AND kind NOT IN ('tombstone', 'retire')
                    AND hook NOT IN ('correct', 'feedback', 'supersede')
                    AND (?3 IS NULL OR kind = ?3)
+                   AND (?4 IS NULL OR agent = ?4)
              ORDER BY {}, id DESC
              LIMIT ?2",
             Self::rank("")
         );
         let mut stmt = self.conn.prepare(&sql).context("prepare primer pointers")?;
         let rows = stmt
-            .query_map(params![project, limit as i64, kind], |row| {
+            .query_map(params![project, limit as i64, kind, agent], |row| {
                 Ok(Pointer {
                     id: row.get(0)?,
                     ts: row.get(1)?,
@@ -4272,6 +4292,52 @@ mod tests {
         assert_eq!(trace.streams[0].name, "keyword");
         assert_eq!(trace.rank_in("keyword", &only.id), Some(1));
         assert!(trace.fused.is_empty(), "nothing was fused, so nothing has fusion arithmetic");
+    }
+
+    #[test]
+    fn a_delegates_capture_keeps_its_agent_through_the_index() {
+        // The tag is what lets a summary tell a scout's footsteps from the
+        // lead's work; lost between the log and the index it is no tag.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let mut footstep = event("Read: src/main.rs", "{}", project);
+        footstep.agent = Some("rolepod:scout".to_string());
+        let own = event("Edit: src/main.rs", "{}", project);
+        store.index(&footstep).unwrap();
+        store.index(&own).unwrap();
+
+        let back = store.get(&[footstep.id.clone(), own.id.clone()]).unwrap();
+        assert_eq!(back[0].agent.as_deref(), Some("rolepod:scout"));
+        assert_eq!(back[1].agent, None);
+    }
+
+    #[test]
+    fn lessons_for_an_agent_are_its_notes_newest_first_and_nothing_else() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let note_for = |title: &str, agent: Option<&str>, kind: EventKind| {
+            let mut event = event(title, title, project);
+            event.kind = kind;
+            event.agent = agent.map(str::to_string);
+            event
+        };
+        // Two notes minted in one millisecond share a ULID prefix and sort by
+        // their random tail; the order under test is the id order.
+        let mut older = note_for("avoid: flagging manual line wraps, rustfmt is not installed", Some("rolepod:universal-reviewer"), EventKind::Note);
+        older.id = "01TESTLESSON0000000000000A".to_string();
+        let mut newer = note_for("keep: the measured reason in every doc comment", Some("rolepod:universal-reviewer"), EventKind::Note);
+        newer.id = "01TESTLESSON0000000000000B".to_string();
+        let other_agent = note_for("avoid: rerunning the whole suite", Some("rolepod:qa-tester"), EventKind::Note);
+        let plain_note = note_for("a note for nobody in particular", None, EventKind::Note);
+        // A capture the reviewer made carries the same agent and is not a lesson.
+        let footstep = note_for("Read: src/store.rs", Some("rolepod:universal-reviewer"), EventKind::Observation);
+        for e in [&older, &newer, &other_agent, &plain_note, &footstep] {
+            store.index(e).unwrap();
+        }
+
+        let lessons = store.lessons_for(&project.to_string(), "rolepod:universal-reviewer", 10).unwrap();
+        let titles: Vec<&str> = lessons.iter().map(|p| p.title.as_str()).collect();
+        assert_eq!(titles, [newer.title.as_str(), older.title.as_str()], "{lessons:?}");
     }
 
     #[test]

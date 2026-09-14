@@ -48,8 +48,11 @@ memory used these words, which one means this, which session declared it was
 about this, what else touched the same things, and (for scripts written
 without spaces between words) which title contains this run of characters —
 and fuses whatever each one ranked. A memory several of them agree on
-outranks one a single ranking felt strongly about. Each is equal weight: a
-per-stream tuning knob is a number nobody can justify a value for.
+outranks one a single ranking felt strongly about. The two rankings that
+nominate whole sessions rather than single memories count for half, because
+measured on a 22k-event brain they agreed with each other too readily and
+pushed correct answers down; `brain search --explain` shows every stream's
+share and rank for each hit.
 
 None of the five needs a model to be reachable, which is what keeps recall
 wide when none is.
@@ -305,6 +308,7 @@ brain search "auth" --rerank   # same order an agent gets from brain_search; --n
 brain search "auth" --explain  # the working: each stream's rank per hit, the fusion, which streams did not run
 brain where             # which project am I in, and where does it live
 brain seed "the task"   # a paste-ready block to hand a subagent
+brain seed "review the diff" --agent rolepod:universal-reviewer   # that reviewer's own lessons first
 brain retire            # measure what old, never-used memory would free (dry run)
 ```
 
@@ -316,7 +320,21 @@ ask about it, and `brain_related`, for what sits beside a memory you are
 already holding. Four to write back — `brain_note`, `brain_correct`,
 `brain_feedback`, and `brain_forget`. And one to hand memory onward:
 `brain_seed`, a compact block — standing lessons first, then pointers
-relevant to a task — sized to paste into a subagent's prompt.
+relevant to a task — sized to paste into a subagent's prompt. Given the
+subagent's type (`agent: rolepod:universal-reviewer`), the lessons written
+for that type lead the block: after judging a reviewer's findings, the lead
+records one `brain_note` per finding it rejected (`avoid: …`), reworded
+(`refine: …`) or wants repeated (`keep: …`), addressed to that reviewer with
+the same `agent`. The reviewer needs no memory tools of its own; it reads
+through the seed, and only the lead writes.
+
+A subagent's own hook calls arrive under the lead's session. They are
+captured and tagged with the subagent's type, met with no injection — a file
+pointer handed to a reviewer would spend the lead's budget and mark the file
+covered for a session that never saw it — and kept out of the session's
+summary, which narrates the subagent's report instead: its last message at
+`SubagentStop` is stored as one event named after it, bounded like any other
+body, so a reviewer's findings are searchable afterwards.
 
 On Codex the plugin also ships two skills:
 `using-brain`, describing when to reach for those tools — MCP tools that
