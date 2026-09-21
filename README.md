@@ -218,6 +218,35 @@ plugin" rather than claiming the machine is unwired.
 The two paths are not exclusive. Whichever you use, `brain setup` is the thing
 that reconciles them, and it is safe to re-run at any time.
 
+#### Cursor
+
+On Cursor the plugin is half an install: it carries the MCP tools and the
+skills, and capture still comes from `brain setup`, which writes
+`~/.cursor/hooks.json`. With the plugin installed, `setup` takes its own entry
+back out of `~/.cursor/mcp.json` rather than register the server twice. The
+marketplace is added with Cursor's `agent` CLI:
+
+```sh
+# Install — then install "rolepod-brain" from /plugins (agent CLI) or Settings → Plugins
+agent plugin marketplace add https://github.com/nuttaruj/rolepod-brain
+
+# Update
+agent plugin marketplace remove rolepod-brain
+agent plugin marketplace add https://github.com/nuttaruj/rolepod-brain
+
+# Which commit is pinned — read gitRef
+agent plugin marketplace list --format json
+```
+
+Update is remove and add because Cursor pins a user marketplace to the commit
+it resolved at `add` time. `agent plugin marketplace update` re-indexes and
+keeps that commit, and `add` on a name it already has does nothing. The remove
+also drops the installed plugin, so install it again afterwards. The pin
+belongs to your Cursor account, not to the machine.
+
+What a stale pin freezes is the skills. The plugin's MCP entry runs whichever
+`brain` is on your PATH, so the tools follow the binary and update with it.
+
 ### Seeing what it would do
 
 ```sh
@@ -471,8 +500,9 @@ capture every event twice; `brain doctor` reports capture as coming "via the
 plugin".
 
 That only works where the host loads a hooks file from a plugin. Every other
-CLI is wired by the one-liner, which is why the plugin route is documented for
-these two and nothing else.
+CLI is wired by the one-liner, which is why the plugin route is a whole install
+on these two and nowhere else. [Cursor](#cursor) takes the plugin for its tools
+and skills and the one-liner for capture.
 
 ### Codex is the exception
 
