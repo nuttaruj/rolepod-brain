@@ -222,7 +222,7 @@ pub fn targets_in(home: &Path, exe: &Path) -> Result<Vec<Target>> {
                     "add".into(),
                     MCP_SERVER_NAME.into(),
                     "--".into(),
-                    exe,
+                    exe.clone(),
                     "mcp".into(),
                 ],
             )),
@@ -301,7 +301,23 @@ pub fn targets_in(home: &Path, exe: &Path) -> Result<Vec<Target>> {
             ],
             timeout: 0,
             mcp_file: None,
-            mcp_register: None,
+            // Through its own CLI, into the global config: the plugin only
+            // captures, and without this entry OpenCode has no recall tools.
+            // The full path to our binary, because the background service
+            // that starts the server does not have the shell's PATH. Re-adding
+            // an existing name overwrites it silently, so this is idempotent.
+            mcp_register: Some((
+                "opencode",
+                vec![
+                    "mcp".into(),
+                    "add".into(),
+                    "--global".into(),
+                    MCP_SERVER_NAME.into(),
+                    "--".into(),
+                    exe,
+                    "mcp".into(),
+                ],
+            )),
         },
         Target {
             kind: AgentKind::parse("cursor"),
@@ -625,6 +641,12 @@ fn strip_mcp(target: &Target, apply: bool) -> Vec<Change> {
         }];
     }
 
+    // OpenCode's CLI can add a server but not remove one, so the entry it
+    // wrote is taken back out of the file it wrote it to.
+    if target.kind.as_str() == "opencode" {
+        return strip_opencode_mcp(target, apply);
+    }
+
     let Some((program, _)) = &target.mcp_register else { return Vec::new() };
     if !apply {
         return vec![Change {
@@ -642,6 +664,77 @@ fn strip_mcp(target: &Target, apply: bool) -> Vec<Change> {
         // Not registered is the desired end state, not a failure.
         _ => Vec::new(),
     }
+}
+
+/// The global configs OpenCode reads, in the order `mcp add --global` prefers.
+///
+/// With both present, `add` wrote to `opencode.json` on the machine this was
+/// measured on; a machine with only the `.jsonc` has not been measured, so
+/// both are checked rather than one assumed.
+fn opencode_configs(target: &Target) -> Vec<PathBuf> {
+    let Some(dir) = target.hooks_file.parent().and_then(Path::parent) else { return Vec::new() };
+    ["opencode.json", "opencode.jsonc"].iter().map(|name| dir.join(name)).collect()
+}
+
+/// Take our server back out of OpenCode's global config.
+///
+/// OpenCode has `mcp add` but no `mcp remove`, and the file `add` writes is
+/// plain JSON we can read back. A server that cannot be removed is not really
+/// the user's, so this is the one vendor config we edit ourselves: one key,
+/// nothing else in the file touched. A file that mentions us but will not
+/// parse - a `.jsonc` with comments - is left alone and said so, because a
+/// stale entry makes OpenCode spawn a binary that is gone, every session.
+fn strip_opencode_mcp(target: &Target, apply: bool) -> Vec<Change> {
+    let label = target.kind.as_str().to_string();
+    let mut changes = Vec::new();
+    for path in opencode_configs(target) {
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let Ok(mut root) = serde_json::from_str::<Value>(&text) else {
+            if text.contains(&format!("\"{MCP_SERVER_NAME}\"")) {
+                changes.push(Change {
+                    target: label.clone(),
+                    detail: format!(
+                        "{} is not plain JSON; remove its `mcp.servers.{MCP_SERVER_NAME}` \
+                         entry yourself",
+                        path.display()
+                    ),
+                });
+            }
+            continue;
+        };
+        let present = root
+            .pointer("/mcp/servers")
+            .and_then(Value::as_object)
+            .is_some_and(|servers| servers.contains_key(MCP_SERVER_NAME));
+        if !present {
+            continue;
+        }
+        if apply {
+            if let Some(servers) = root.pointer_mut("/mcp/servers").and_then(Value::as_object_mut)
+            {
+                servers.remove(MCP_SERVER_NAME);
+            }
+            if let Err(error) = write_json(&path, &root) {
+                changes.push(Change {
+                    target: label.clone(),
+                    detail: format!(
+                        "could not remove MCP server from {}: {error:#}",
+                        path.display()
+                    ),
+                });
+                continue;
+            }
+        }
+        changes.push(Change {
+            target: label.clone(),
+            detail: format!(
+                "{} MCP server from {}",
+                if apply { "removed" } else { "would remove" },
+                path.display()
+            ),
+        });
+    }
+    changes
 }
 
 /// Plan (and optionally perform) the wiring.
@@ -858,7 +951,14 @@ fn sweep_legacy_timer(apply: bool) -> Result<Vec<Change>> {
 /// binary too would strand our entries forever on exactly the machines where
 /// the CLI is already gone.
 pub fn config_dir_present(target: &Target) -> bool {
-    target.hooks_file.parent().is_some_and(Path::is_dir)
+    let dir = match target.layout {
+        // The plugin file lives in a subdirectory we create ourselves, so
+        // the CLI's own directory is the one above it: a fresh install that
+        // has never had a plugin is still an install.
+        Layout::Plugin => target.hooks_file.parent().and_then(Path::parent),
+        _ => target.hooks_file.parent(),
+    };
+    dir.is_some_and(Path::is_dir)
 }
 
 /// Is the CLI itself on the machine — not merely its directory?
@@ -1703,6 +1803,91 @@ fn shell_quote(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OpenCode's CLI can add an MCP server but not remove one, so `setup`
+    /// registers through the CLI, with our full path because the background
+    /// service has no shell PATH, and `uninstall` takes the entry back out of
+    /// the file the CLI wrote it to - and touches nothing else in that file.
+    #[test]
+    fn opencode_registers_mcp_through_its_cli_and_strips_it_by_hand() {
+        let exe = Path::new("/usr/local/bin/brain");
+        let opencode = |home: &Path| {
+            targets_in(home, exe)
+                .unwrap()
+                .into_iter()
+                .find(|target| target.kind.as_str() == "opencode")
+                .expect("an opencode target")
+        };
+        let home = std::env::temp_dir().join(format!("brain-oc-{}", ulid::Ulid::new()));
+        let target = opencode(&home);
+        let (program, args) = target.mcp_register.as_ref().expect("opencode registers MCP");
+        assert_eq!(*program, "opencode");
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        assert_eq!(args, ["mcp", "add", "--global", "brain", "--", "/usr/local/bin/brain", "mcp"]);
+
+        let dir = home.join(".config/opencode");
+        std::fs::create_dir_all(dir.join("plugins")).unwrap();
+        let config = dir.join("opencode.json");
+
+        // No config, or a config that never had us: nothing to report.
+        assert!(strip_mcp(&target, true).is_empty());
+        std::fs::write(&config, r#"{"mcp":{"servers":{"other":{"type":"local","command":["x"]}}}}"#)
+            .unwrap();
+        assert!(strip_mcp(&target, true).is_empty());
+
+        std::fs::write(
+            &config,
+            r#"{"mcp":{"servers":{"other":{"type":"local","command":["x"]},"brain":{"type":"local","command":["/usr/local/bin/brain","mcp"]}}},"skills":["s"]}"#,
+        )
+        .unwrap();
+        let before = std::fs::read(&config).unwrap();
+        let dry = strip_mcp(&target, false);
+        assert_eq!(dry.len(), 1);
+        assert!(dry[0].detail.starts_with("would remove"), "{}", dry[0].detail);
+        assert_eq!(std::fs::read(&config).unwrap(), before, "a dry run wrote");
+
+        let done = strip_mcp(&target, true);
+        assert_eq!(done.len(), 1);
+        assert!(done[0].detail.starts_with("removed"), "{}", done[0].detail);
+        let root: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        assert!(root.pointer("/mcp/servers/brain").is_none());
+        assert!(root.pointer("/mcp/servers/other").is_some(), "another server was disturbed");
+        assert!(root.get("skills").is_some(), "an unrelated key was disturbed");
+        assert!(strip_mcp(&target, true).is_empty(), "a second strip found something");
+
+        // A `.jsonc` with comments cannot be edited safely: it is named, not
+        // touched, and only when it actually mentions us.
+        let jsonc = dir.join("opencode.jsonc");
+        std::fs::write(&jsonc, "{\n  // providers\n  \"provider\": {}\n}\n").unwrap();
+        assert!(strip_mcp(&target, true).is_empty());
+        let text = "{\n  // servers\n  \"mcp\": {\"servers\": {\"brain\": {\"type\": \"local\"}}}\n}\n";
+        std::fs::write(&jsonc, text).unwrap();
+        let told = strip_mcp(&target, true);
+        assert_eq!(told.len(), 1);
+        assert!(told[0].detail.contains("remove its `mcp.servers.brain` entry yourself"), "{}", told[0].detail);
+        assert_eq!(std::fs::read_to_string(&jsonc).unwrap(), text, "an unparseable file was rewritten");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A plugin target's presence marker is the CLI's own directory, not the
+    /// subdirectory we create for the file: a fresh OpenCode has the former
+    /// and not the latter, and skipping it would leave the MCP server
+    /// unregistered on exactly the machines `setup` is for.
+    #[test]
+    fn a_plugin_target_counts_the_cli_directory_as_present() {
+        let home = std::env::temp_dir().join(format!("brain-present-{}", ulid::Ulid::new()));
+        let target = targets_in(&home, Path::new("/x/brain"))
+            .unwrap()
+            .into_iter()
+            .find(|target| target.kind.as_str() == "opencode")
+            .unwrap();
+        assert!(!config_dir_present(&target));
+        std::fs::create_dir_all(home.join(".config/opencode")).unwrap();
+        assert!(config_dir_present(&target), "the CLI directory alone is an install");
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     /// OpenCode 2 loads a default export with an `id` and a `setup`, and
     /// refuses the OpenCode 1 factory outright. The file we write has to be

@@ -268,7 +268,7 @@ are.
 | Antigravity (`agy`) | 2 lifecycle events | register manually | `agy` | needs an explicit workspace, see below |
 | Cursor | 3 lifecycle events | registered automatically | `cursor-agent` | |
 | Gemini CLI | 5 lifecycle events | register manually | `gemini` | Google closed this CLI to individual accounts on 2026-06-18 — see below |
-| OpenCode | 4 lifecycle events | register manually | `opencode` | installed as a small plugin, see below |
+| OpenCode | 4 lifecycle events | registered automatically | `opencode` | installed as a small plugin, see below |
 
 **Summarizes** is whether that CLI can also write the summaries, not just
 capture the events. Consolidation asks the CLI whose session it is first, and
@@ -311,7 +311,11 @@ loaded, and only its log says so; `brain doctor` reports a file of the old
 shape as a failure. The plugin runs inside OpenCode's background service, so it
 takes the project path from the session itself and never from the process.
 After `setup`, `opencode reload` picks the new file up without restarting the
-service.
+service. The plugin only captures; `setup` registers the MCP server separately
+through `opencode mcp add --global`, which writes it into
+`~/.config/opencode/opencode.json` with the binary's full path, because the
+background service does not have your shell's PATH. OpenCode has no
+`mcp remove`, so `uninstall` takes that one entry back out of the file itself.
 
 Antigravity gives a hook no working directory and runs it from its own config
 directory, so it can only be placed in a project when the workspace is explicit
