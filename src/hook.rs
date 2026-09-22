@@ -418,15 +418,17 @@ pub fn is_session_boundary(cli: &str, hook: &str) -> bool {
 /// genuinely differs per CLI, because their lifecycle surfaces do.
 ///
 /// Stated per CLI rather than derived from the wired event list, because the
-/// two are not the same thing: OpenCode's plugin subscribes to `session.idle`
-/// and reports it to us as `stop`, so the event list would lie about it.
+/// two are not the same thing: OpenCode's plugin subscribes to the end of an
+/// execution and reports it to us as `stop`, so the event list would lie
+/// about it.
 #[must_use]
 pub fn consolidation_triggers(cli: &str) -> &'static str {
     match cli {
         // A real session end, plus compaction on the way out.
         "claude-code" | "codex" => "session end, compaction",
-        // No session end; its plugin reports idle, and compaction, as ours.
-        "opencode" => "session idle, compaction",
+        // No session end; its plugin reports the end of a turn, and
+        // compaction, as ours.
+        "opencode" => "end of turn, compaction",
         // No session end and no compaction hook: end of turn is all they
         // offer.
         "antigravity" | "cursor" => "end of turn (no session-end event)",
@@ -998,7 +1000,7 @@ mod tests {
         // gemini reaches us with no boundary event at all - saying "end of
         // turn" there would be a health report making something up.
         assert!(consolidation_triggers("gemini-cli").contains("backstop only"));
-        assert!(consolidation_triggers("opencode").contains("idle"));
+        assert!(consolidation_triggers("opencode").contains("end of turn"));
     }
 
     #[test]
@@ -1130,6 +1132,19 @@ mod tests {
         // OpenCode spells its events with dots.
         assert_eq!(normalize_hook("tool.execute.after"), "tool_execute_after");
         assert_eq!(normalize_hook("session.created"), "session_created");
+    }
+
+    /// OpenCode 2 renamed its tools (`bash` is `shell`, `task` is `subagent`)
+    /// and keys a file argument `path`. Nothing here had to change for that -
+    /// `shell` and `path` were already spellings we read - and this pins it,
+    /// so a later tightening of either match cannot drop OpenCode silently.
+    #[test]
+    fn opencode_2_tool_calls_title_like_everyone_elses() {
+        let shell = json!({"tool_name": "shell", "tool_input": {"command": "cargo test"}});
+        assert_eq!(title_for("post_tool_use", &shell), "cargo test");
+
+        let edit = json!({"tool_name": "edit", "tool_input": {"path": "/repo/src/main.rs"}});
+        assert_eq!(title_for("post_tool_use", &edit), "edit: /repo/src/main.rs");
     }
 
     #[test]

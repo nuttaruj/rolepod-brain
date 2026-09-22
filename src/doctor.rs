@@ -517,12 +517,23 @@ fn hook_checks() -> Vec<Check> {
                 };
             }
 
-            // A plugin target is a file we own outright: present or not.
+            // A plugin target is a file we own outright: present or not - and
+            // if present, the shape the installed CLI will load. OpenCode 2
+            // refuses the file OpenCode 1 loaded, and says so only in its log.
             if target.layout == crate::setup::Layout::Plugin {
-                return if path.is_file() {
-                    Check::pass(&name, format!("plugin installed: {}", path.display()))
-                } else {
+                return if !path.is_file() {
                     Check::fail(&name, "plugin missing — run `brain setup --apply`")
+                } else if !crate::setup::plugin_source_is_current(path) {
+                    Check::fail(
+                        &name,
+                        format!(
+                            "plugin {} has no default export, which OpenCode 2 requires to \
+                             load it — run `brain setup --apply`",
+                            path.display()
+                        ),
+                    )
+                } else {
+                    Check::pass(&name, format!("plugin installed: {}", path.display()))
                 };
             }
 

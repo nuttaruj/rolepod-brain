@@ -305,10 +305,13 @@ In headless `cursor-agent -p` runs, tool events are the only ones observed;
 `beforeSubmitPrompt` and `stop` are wired for interactive sessions.
 
 OpenCode has no hook configuration file — `setup` installs a small plugin into
-`~/.config/opencode/plugins/` instead. The plugin takes the project path from
-OpenCode's own plugin factory, so it has none of the placement problem below.
-Its tool events are wired against a handler signature read from a working
-plugin.
+`~/.config/opencode/plugins/` instead, written for OpenCode 2: a default export
+with an `id` and a `setup`. OpenCode 2 refuses the factory shape OpenCode 1
+loaded, and only its log says so; `brain doctor` reports a file of the old
+shape as a failure. The plugin runs inside OpenCode's background service, so it
+takes the project path from the session itself and never from the process.
+After `setup`, `opencode reload` picks the new file up without restarting the
+service.
 
 Antigravity gives a hook no working directory and runs it from its own config
 directory, so it can only be placed in a project when the workspace is explicit
@@ -580,7 +583,7 @@ boundary differs per CLI, because their lifecycle surfaces differ:
 | CLI | Consolidates on |
 |---|---|
 | Claude Code, Codex | session end, compaction |
-| OpenCode | session idle, compaction |
+| OpenCode | end of turn, compaction |
 | Antigravity, Cursor | end of turn — they expose no session-end event |
 | Gemini CLI | the backstop only; no boundary event reaches us |
 
