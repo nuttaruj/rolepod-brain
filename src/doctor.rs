@@ -532,6 +532,15 @@ fn hook_checks() -> Vec<Check> {
                             path.display()
                         ),
                     )
+                } else if !crate::setup::plugin_source_delivers(path) {
+                    Check::fail(
+                        &name,
+                        format!(
+                            "plugin {} only captures: OpenCode sessions get no memory pushed \
+                             — run `brain setup --apply`",
+                            path.display()
+                        ),
+                    )
                 } else {
                     Check::pass(&name, format!("plugin installed: {}", path.display()))
                 };

@@ -3564,6 +3564,79 @@ fn opencode_plugin_payloads_capture_like_any_other_cli() {
 }
 
 #[test]
+fn opencode_gets_memory_only_where_its_plugin_reads_the_answer() {
+    let fixture = Fixture::new("ocanswer");
+    // A primer's worth of history, and a file with memory of its own.
+    for question in ["why does the scheduler double-book?", "where is expiry compared?"] {
+        let payload = serde_json::json!({
+            "session_id": "0199aaaa-0000-7000-8000-000000000000",
+            "cwd": fixture.project,
+            "prompt": question
+        })
+        .to_string();
+        fixture.hook("claude-code", "UserPromptSubmit", &payload);
+    }
+    fixture.hook("claude-code", "PostToolUse", &claude_payload(&fixture.project));
+
+    let start = |session: &str, reads: bool| {
+        serde_json::json!({
+            "cwd": fixture.project,
+            "session_id": session,
+            "source": "startup",
+            "reads_answer": reads
+        })
+        .to_string()
+    };
+    let tool = |session: &str, reads: bool| {
+        serde_json::json!({
+            "cwd": fixture.project,
+            "session_id": session,
+            "tool_name": "edit",
+            "tool_input": {"filePath": fixture.project.join("src/auth.rs")},
+            "reads_answer": reads
+        })
+        .to_string()
+    };
+
+    // A fire-and-forget spawn - or a plugin written before it read anything -
+    // discards stdout. An injection built for it reached no model, yet it
+    // spent the session budget, and a burst of detached spawns racing on that
+    // budget recorded more than the cap.
+    let session = "0199c0de-0000-7000-8000-000000000000";
+    let unread = fixture.hook("opencode", "SessionStart", &start(session, false));
+    assert_eq!(String::from_utf8_lossy(&unread.stdout).trim(), "{}");
+    assert_eq!(injected_bytes(&fixture, session), 0, "primer spent budget nobody read");
+    // Each path in its own session, so the file path is proven apart from
+    // the primer's.
+    let touching = "0199c0de-0000-7000-8000-000000000002";
+    let unread = fixture.hook("opencode", "PostToolUse", &tool(touching, false));
+    assert_eq!(String::from_utf8_lossy(&unread.stdout).trim(), "{}");
+    assert_eq!(injected_bytes(&fixture, touching), 0, "file pointers spent budget nobody read");
+    assert!(fixture.log_text().contains(r#""cli":"opencode""#), "opencode stopped capturing");
+
+    // A plugin that has stopped waiting is not listening either.
+    let late = "0199c0de-0000-7000-8000-000000000005";
+    let mut payload: serde_json::Value = serde_json::from_str(&start(late, true)).unwrap();
+    payload["answer_by"] = serde_json::json!(1);
+    let dropped = fixture.hook("opencode", "SessionStart", &payload.to_string());
+    assert_eq!(String::from_utf8_lossy(&dropped.stdout).trim(), "{}");
+    assert_eq!(injected_bytes(&fixture, late), 0, "spent budget on an answer already dropped");
+
+    // Where the plugin waits for the answer, memory comes back and is paid for.
+    let session = "0199c0de-0000-7000-8000-000000000003";
+    let primer = fixture.hook("opencode", "SessionStart", &start(session, true));
+    let primer = injected_context(&primer).expect("a primer for a plugin that reads it");
+    assert!(primer.starts_with("# Project memory"), "not a primer: {primer}");
+    assert_eq!(injected_bytes(&fixture, session), i64::try_from(primer.len()).unwrap());
+
+    let touching = "0199c0de-0000-7000-8000-000000000004";
+    let pointers = fixture.hook("opencode", "PostToolUse", &tool(touching, true));
+    let pointers = injected_context(&pointers).expect("file pointers for a plugin that reads them");
+    assert!(pointers.contains("src/auth.rs"), "not the touched file's memory: {pointers}");
+    assert!(injected_bytes(&fixture, touching) > 0);
+}
+
+#[test]
 fn a_silenced_run_leaves_no_trace_at_all() {
     let fixture = Fixture::new("silentenv");
     fixture.seed_session(3);

@@ -3593,7 +3593,14 @@ impl Store {
         Ok(usize::try_from(bytes.unwrap_or(0)).unwrap_or(0))
     }
 
-    /// Record what an injection spent.
+    /// Record what an injection spent, if the session can still afford it.
+    ///
+    /// Returns `false`, recording nothing, when `bytes` would take the
+    /// session past `cap`. Every caller checked the budget before building
+    /// its text, but hooks run as separate processes and a burst of tool
+    /// calls arrives at once: each read the same remaining budget, each spent
+    /// it, and the session ended over its ceiling. The check that binds is
+    /// this one statement, which SQLite runs atomically.
     ///
     /// # Errors
     /// Returns an error when the write fails.
@@ -3603,7 +3610,24 @@ impl Store {
         ids: &[String],
         in_flight: usize,
         bytes: usize,
-    ) -> Result<()> {
+        cap: usize,
+    ) -> Result<bool> {
+        let reserved = self
+            .conn
+            .execute(
+                "INSERT INTO injected_bytes (session, bytes) SELECT ?1, ?2 WHERE ?2 <= ?3
+                 ON CONFLICT(session) DO UPDATE SET bytes = injected_bytes.bytes + ?2
+                 WHERE injected_bytes.bytes + ?2 <= ?3",
+                params![
+                    session,
+                    i64::try_from(bytes).unwrap_or(i64::MAX),
+                    i64::try_from(cap).unwrap_or(i64::MAX)
+                ],
+            )
+            .context("record injected bytes")?;
+        if reserved == 0 {
+            return Ok(false);
+        }
         for (at, id) in ids.iter().enumerate() {
             // Counted once per session, matching read_count: re-pushing the
             // same pointer inside one conversation says nothing new about
@@ -3646,14 +3670,7 @@ impl Store {
                 )
                 .context("record injected id")?;
         }
-        self.conn
-            .execute(
-                "INSERT INTO injected_bytes (session, bytes) VALUES (?1, ?2)
-                 ON CONFLICT(session) DO UPDATE SET bytes = injected_bytes.bytes + ?2",
-                params![session, i64::try_from(bytes).unwrap_or(0)],
-            )
-            .context("record injected bytes")?;
-        Ok(())
+        Ok(true)
     }
 
     /// Mark a file as covered for this session.
@@ -4892,12 +4909,12 @@ mod tests {
         store.index(&stale).unwrap();
 
         for n in 0..4 {
-            store.record_injected(&format!("s{n}"), std::slice::from_ref(&stale.id), 0, 10).unwrap();
+            store.record_injected(&format!("s{n}"), std::slice::from_ref(&stale.id), 0, 10, usize::MAX).unwrap();
         }
         let before = store.pointers_of_kind(&project.to_string(), "session_summary", 10).unwrap();
         assert_eq!(before[0].id, stale.id, "four offers are not yet decay");
 
-        store.record_injected("s4", std::slice::from_ref(&stale.id), 0, 10).unwrap();
+        store.record_injected("s4", std::slice::from_ref(&stale.id), 0, 10, usize::MAX).unwrap();
         let after = store.pointers_of_kind(&project.to_string(), "session_summary", 10).unwrap();
         assert_eq!(after[0].id, fresh.id, "the fifth unread offer must sink the pointer");
     }
@@ -4919,7 +4936,7 @@ mod tests {
         store.index(&stale).unwrap();
 
         for n in 0..6 {
-            store.record_injected(&format!("s{n}"), std::slice::from_ref(&stale.id), 0, 10).unwrap();
+            store.record_injected(&format!("s{n}"), std::slice::from_ref(&stale.id), 0, 10, usize::MAX).unwrap();
         }
         let pointers = store.pointers_of_kind(&project.to_string(), "knowledge", 10).unwrap();
         assert_eq!(pointers[0].id, stale.id, "a lesson must not decay for being shown");
@@ -4959,8 +4976,8 @@ mod tests {
         let project = Uuid::new_v4();
         let event = event("offered twice", "body", project);
         store.index(&event).unwrap();
-        store.record_injected("session-a", std::slice::from_ref(&event.id), 0, 10).unwrap();
-        store.record_injected("session-b", std::slice::from_ref(&event.id), 0, 10).unwrap();
+        store.record_injected("session-a", std::slice::from_ref(&event.id), 0, 10, usize::MAX).unwrap();
+        store.record_injected("session-b", std::slice::from_ref(&event.id), 0, 10, usize::MAX).unwrap();
 
         store.clear().unwrap();
         store.index(&event).unwrap();
@@ -4999,7 +5016,7 @@ mod tests {
             e
         };
 
-        store.record_injected("s1", std::slice::from_ref(&offered.id), 0, 10).unwrap();
+        store.record_injected("s1", std::slice::from_ref(&offered.id), 0, 10, usize::MAX).unwrap();
         store.record_recalled("s1", std::iter::once(read.id.as_str())).unwrap();
 
         let (ids, bytes) =
@@ -5156,7 +5173,7 @@ mod tests {
         // lines the reserve should hold.
         let store = Store::open_memory().unwrap();
         store
-            .record_injected("s1", &["01FLIGHT".into(), "01SUMMARY".into()], 1, 40)
+            .record_injected("s1", &["01FLIGHT".into(), "01SUMMARY".into()], 1, 40, usize::MAX)
             .unwrap();
         store.record_recalled("s1", ["01SUMMARY"].into_iter()).unwrap();
 
@@ -5170,7 +5187,7 @@ mod tests {
         // Pulled later, it moves - and re-injecting it from the ranked list
         // must not quietly reclassify what the agent was originally handed.
         store.record_recalled("s1", ["01FLIGHT"].into_iter()).unwrap();
-        store.record_injected("s1", &["01FLIGHT".into()], 0, 20).unwrap();
+        store.record_injected("s1", &["01FLIGHT".into()], 0, 20, usize::MAX).unwrap();
         assert_eq!(store.in_flight_uptake().unwrap(), (1, 1));
     }
 
@@ -5180,7 +5197,7 @@ mod tests {
         let session = "sess-1";
 
         // A pointer was pushed, and the agent went on to read it in full.
-        store.record_injected(session, &["01AAA".to_string()], 0, 100).unwrap();
+        store.record_injected(session, &["01AAA".to_string()], 0, 100, usize::MAX).unwrap();
         store.record_recalled(session, std::iter::once("01AAA")).unwrap();
         assert_eq!(store.injection_uptake().unwrap(), (1, 1));
 
@@ -5192,9 +5209,28 @@ mod tests {
 
         // Re-injecting the same pointer after the reset re-arms the guard
         // without double-counting the push.
-        store.record_injected(session, &["01AAA".to_string()], 0, 100).unwrap();
+        store.record_injected(session, &["01AAA".to_string()], 0, 100, usize::MAX).unwrap();
         assert!(store.already_injected(session, "01AAA").unwrap());
         assert_eq!(store.injection_uptake().unwrap(), (1, 1));
+    }
+
+    /// Two hooks of one session both read 192 bytes left and both built an
+    /// injection to fit it. Only the first may land.
+    #[test]
+    fn a_racing_injection_cannot_spend_past_the_cap() {
+        let store = Store::open_memory().unwrap();
+        let session = "sess-1";
+
+        assert!(store.record_injected(session, &["01AAA".to_string()], 0, 8000, 8192).unwrap());
+        assert!(store.record_injected(session, &["01BBB".to_string()], 0, 192, 8192).unwrap());
+        assert!(!store.record_injected(session, &["01CCC".to_string()], 0, 150, 8192).unwrap());
+        assert_eq!(store.session_injected_bytes(session).unwrap(), 8192);
+        // A rejected injection was never shown, so it must not read as one.
+        assert!(!store.already_injected(session, "01CCC").unwrap());
+
+        // A fresh session is bound by the same cap.
+        assert!(!store.record_injected("sess-2", &["01DDD".to_string()], 0, 9000, 8192).unwrap());
+        assert_eq!(store.session_injected_bytes("sess-2").unwrap(), 0);
     }
 
     #[test]

@@ -311,11 +311,16 @@ loaded, and only its log says so; `brain doctor` reports a file of the old
 shape as a failure. The plugin runs inside OpenCode's background service, so it
 takes the project path from the session itself and never from the process.
 After `setup`, `opencode reload` picks the new file up without restarting the
-service. The plugin only captures; `setup` registers the MCP server separately
-through `opencode mcp add --global`, which writes it into
-`~/.config/opencode/opencode.json` with the binary's full path, because the
-background service does not have your shell's PATH. OpenCode has no
-`mcp remove`, so `uninstall` takes that one entry back out of the file itself.
+service. The plugin also hands memory back, the way the hooks do elsewhere:
+the primer goes into the system prompt of every request a session makes, and
+what memory holds about a file rides back inside that tool call's result. Only
+those two wait for brain, for 2 seconds at most; capture never waits. A plugin
+file from before this reads no answer, and `brain doctor` says so. `setup`
+registers the MCP server separately through `opencode mcp add --global`, which
+writes it into `~/.config/opencode/opencode.json` with the binary's full path,
+because the background service does not have your shell's PATH. OpenCode has
+no `mcp remove`, so `uninstall` takes that one entry back out of the file
+itself.
 
 Antigravity gives a hook no working directory and runs it from its own config
 directory, so it can only be placed in a project when the workspace is explicit
@@ -571,6 +576,11 @@ but the same server started by another agent's plugin (Claude Code's codex
 companion, for one) is serving that agent, and every session it hosts is a
 delegate. brain walks the process tree to tell the two apart; an unknown host
 keeps the interactive default, so a new IDE still gets its injection.
+
+OpenCode is the one CLI where this cannot be told. Every session, `opencode
+run` included, is hosted by the same background service, so every hook
+reaches brain from the same parent process — and an `opencode run` gets the
+primer like any interactive session.
 
 For a completely clean room — no injection *and* no capture — set
 `ROLEPOD_BRAIN_SILENT=1` in the environment of the process you want left

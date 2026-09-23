@@ -1033,7 +1033,7 @@ mod tests {
             for_file(&store, &project.to_string(), session, "src/auth.rs", "", &config).unwrap();
         assert!(!first.is_empty());
         assert!(first.ids.len() <= MICRO_MAX_POINTERS);
-        store.record_injected(session, &first.ids, first.in_flight, first.text.len()).unwrap();
+        store.record_injected(session, &first.ids, first.in_flight, first.text.len(), config.session_budget).unwrap();
         store.record_injected_file(session, "src/auth.rs").unwrap();
 
         // Same file again in the same session: silence.
@@ -1049,7 +1049,7 @@ mod tests {
         let config = InjectionConfig::default();
 
         let first = for_file(&store, &project.to_string(), "s1", "src/auth.rs", "", &config).unwrap();
-        store.record_injected("s1", &first.ids, first.in_flight, first.text.len()).unwrap();
+        store.record_injected("s1", &first.ids, first.in_flight, first.text.len(), config.session_budget).unwrap();
 
         // A different file path that happens to share the same events.
         let again = for_file(&store, &project.to_string(), "s1", "src/auth.rs", "", &config).unwrap();
@@ -1087,12 +1087,12 @@ mod tests {
 
         let first = primer(&store, &project.to_string(), session, &config).unwrap();
         assert!(!first.is_empty());
-        store.record_injected(session, &first.ids, first.in_flight, first.text.len()).unwrap();
+        store.record_injected(session, &first.ids, first.in_flight, first.text.len(), config.session_budget).unwrap();
 
         // SessionStart fires again with source="resume": same session id, no
         // context wipe, so nothing resets injected_bytes.
         let second = primer(&store, &project.to_string(), session, &config).unwrap();
-        store.record_injected(session, &second.ids, second.in_flight, second.text.len()).unwrap();
+        store.record_injected(session, &second.ids, second.in_flight, second.text.len(), config.session_budget).unwrap();
 
         let third = primer(&store, &project.to_string(), session, &config).unwrap();
 
@@ -1126,7 +1126,7 @@ mod tests {
         let project = Uuid::new_v4();
         let store = store_with(project, 20);
         let config = InjectionConfig { primer_budget: 4096, session_budget: 100 };
-        store.record_injected("s1", &[], 0, 100).unwrap();
+        store.record_injected("s1", &[], 0, 100, config.session_budget).unwrap();
         let injection =
             for_file(&store, &project.to_string(), "s1", "src/auth.rs", "", &config).unwrap();
         assert!(injection.is_empty(), "the primer keeps the spend, not layer 3");

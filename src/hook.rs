@@ -291,7 +291,35 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
         // destroys its independence in a way nothing downstream can see.
         return Ok("{}".to_string());
     }
+    if !answer_is_read(cli_kind.as_str(), &payload) {
+        return Ok("{}".to_string());
+    }
     Ok(inject_for(&store, &config, &scope, &session_key, &hook, event_name, &event))
+}
+
+/// Will anyone read what this hook prints?
+///
+/// Every CLI with a hook protocol does. OpenCode has none: our plugin spawns
+/// the hook itself, and reads the answer only where it waits for one - and
+/// says so with `reads_answer`. Everything else it fires and forgets, and so
+/// does a plugin written before it read anything. An injection built for one
+/// of those reached no model, yet it spent the session budget and marked its
+/// pointers as shown.
+///
+/// The plugin also stops listening at a deadline, `answer_by`, in epoch
+/// milliseconds. A hook held past it - behind another writer's lock, most
+/// likely, since capture is the part that waits - would otherwise spend the
+/// budget on an answer the plugin has already dropped.
+fn answer_is_read(cli: &str, payload: &Value) -> bool {
+    if cli != "opencode" {
+        return true;
+    }
+    let listening = payload.get("reads_answer").and_then(Value::as_bool) == Some(true);
+    let in_time = payload
+        .get("answer_by")
+        .and_then(Value::as_i64)
+        .is_none_or(|by| jiff::Timestamp::now().as_millisecond() <= by);
+    listening && in_time
 }
 
 /// Which subagent a hook fired inside, if any.
@@ -349,7 +377,18 @@ fn inject_for(
     if injection.is_empty() {
         return "{}".to_string();
     }
-    let _ = store.record_injected(session, &injection.ids, injection.in_flight, injection.text.len());
+    let recorded = store.record_injected(
+        session,
+        &injection.ids,
+        injection.in_flight,
+        injection.text.len(),
+        config.injection.session_budget,
+    );
+    // Another hook of the same session spent the budget between our read of
+    // it and this write. A failed write still injects, as it always has.
+    if matches!(recorded, Ok(false)) {
+        return "{}".to_string();
+    }
     inject::as_hook_output(event_name, &injection)
 }
 
