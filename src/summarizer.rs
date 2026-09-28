@@ -635,7 +635,10 @@ fn is_host_session_var(name: &str) -> bool {
 fn inert_dir(candidate: PathBuf) -> Result<PathBuf> {
     std::fs::create_dir_all(&candidate)
         .with_context(|| format!("no usable working directory at {}", candidate.display()))?;
-    Ok(candidate)
+    // Absolute, because it is also the child's `PWD`: a relative `TMPDIR`
+    // would have the child resolve it again from inside the directory itself.
+    std::path::absolute(&candidate)
+        .with_context(|| format!("no usable working directory at {}", candidate.display()))
 }
 
 /// Run one CLI once and return its answer.
@@ -688,7 +691,11 @@ fn invoke(spec: &CliSpec, model: &str, prompt: &str, timeout: Duration) -> Resul
         .stderr(Stdio::piped())
         // Run somewhere inert: a headless CLI started inside the user's repo
         // may read project instructions we neither need nor want to pay for.
-        .current_dir(&workdir);
+        .current_dir(&workdir)
+        // `current_dir` leaves `PWD` naming the repo the hook fired in, and
+        // `opencode run` trusts `PWD` over its real directory: it chdirs back
+        // and files the session under the user's project.
+        .env("PWD", &workdir);
     if let Some(path) = interpreter_path(&program) {
         command.env("PATH", path);
     }
@@ -994,6 +1001,9 @@ mod tests {
 
         // Idempotent: the ordinary case is a directory that already exists.
         assert!(inert_dir(dir.clone()).is_ok());
+
+        // Absolute even from a relative `TMPDIR`, because it becomes `PWD`.
+        assert!(inert_dir(PathBuf::from(".")).unwrap().is_absolute());
 
         // And it is an error rather than a silent fallback to the user's repo,
         // which is the whole reason the child is sent elsewhere.

@@ -2442,6 +2442,51 @@ fn a_stale_tmpdir_does_not_look_like_every_cli_vanishing() {
 }
 
 #[test]
+fn a_cli_that_trusts_pwd_still_runs_in_the_inert_directory() {
+    // Found live: `opencode run` resolves its project as `$PWD ?? cwd()` and
+    // chdirs there. Setting only the child's working directory left `PWD`
+    // naming the repo the hook fired in, so every summary opened a session in
+    // the user's project - where other plugins took it for a sibling agent.
+    let fixture = Fixture::new("inherited-pwd");
+    let record = fixture.home.parent().unwrap().join("child-pwd");
+    let inert = fixture.home.parent().unwrap().join("tmpdir");
+    // Not `sh`: a shell replaces an inherited `PWD` that disagrees with its
+    // directory, which would hide the bug. Perl reads the environment as
+    // it was handed over, the way opencode's runtime does. The rewrite below
+    // truncates in place, so the file keeps the exec bit `fake_cli` gave it.
+    let bin = fixture.fake_cli("opencode", "");
+    std::fs::write(
+        bin.join("opencode"),
+        format!(
+            "#!/usr/bin/perl\nopen(my $f, '>>', '{}') or die;\nprint $f \"$ENV{{PWD}}\\n\";\n\
+             print '{}', \"\\n\";\n",
+            record.display(),
+            r#"{"summary":"Refactored the auth path and fixed token expiry.","titles":[]}"#
+        ),
+    )
+    .unwrap();
+    fixture.seed_session(4);
+
+    let output = std::process::Command::new(BRAIN)
+        .args(["consolidate", "--force"])
+        .current_dir(&fixture.project)
+        .env("PWD", &fixture.project)
+        .env("ROLEPOD_BRAIN_HOME", &fixture.home)
+        .env("HOME", fixture.home.parent().unwrap())
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("TMPDIR", &inert)
+        .output()
+        .expect("run brain");
+    assert!(output.status.success(), "consolidate errored: {output:?}");
+
+    let seen = std::fs::read_to_string(&record).expect("the stub was never called");
+    assert!(!seen.is_empty(), "the stub was never called");
+    for line in seen.lines() {
+        assert_eq!(line, inert.display().to_string(), "a call ran with PWD in the repo");
+    }
+}
+
+#[test]
 fn a_round_that_finds_nothing_is_finished_not_retried() {
     // The common outcome, and the one that used to cost the most. An empty
     // list was read as an unusable answer, which did two things: it charged
