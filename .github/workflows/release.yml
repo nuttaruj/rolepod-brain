@@ -12,8 +12,13 @@ on:
         description: "Tag to build and publish"
         required: true
 
+# Read-only unless a job says otherwise. Only `publish` writes, and it neither
+# fetches nor runs anything from outside this repository: every download and
+# every pip install happens in a job whose token cannot touch the release. What
+# those jobs made reaches `publish` as an artifact or through the cache, and
+# every model file is checked against its recorded hash again on arrival.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -69,7 +74,7 @@ jobs:
             test: true
             features: local-rerank
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust
         run: rustup target add ${{ matrix.target }}
@@ -80,15 +85,20 @@ jobs:
       # PROVENANCE.md: the vendored weights are what quantize.py produces from
       # a pinned revision, and nothing but running it says so.
       - name: Cache the embedding model
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: assets/potion-multilingual-128M/model-int8.safetensors
           key: model-73908c3438cf03b6a01bcb9611d62b23d0726f08-v3
       - name: Cache the tokenizer
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: assets/potion-multilingual-128M/tokenizer.json
           key: tokenizer-73908c3438cf03b6a01bcb9611d62b23d0726f08
+      # One interpreter everywhere, so the pinned packages resolve to the same
+      # wheels on every runner instead of whatever each image happens to ship.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
       - name: Build the embedding model
         shell: bash
         run: |
@@ -98,9 +108,8 @@ jobs:
           [ -s "$MODEL/tokenizer.json" ] || curl -fsSL -o "$MODEL/tokenizer.json" "$UP/tokenizer.json"
           if [ ! -s "$MODEL/model-int8.safetensors" ]; then
               curl -fsSL -o upstream.safetensors "$UP/model.safetensors"
-              python3 -m pip install --quiet --break-system-packages numpy safetensors \
-                  || python3 -m pip install --quiet numpy safetensors
-              python3 "$MODEL/quantize.py" upstream.safetensors "$MODEL/model-int8.safetensors"
+              python -m pip install --quiet --require-hashes --only-binary :all: -r "$MODEL/requirements.txt"
+              python "$MODEL/quantize.py" upstream.safetensors "$MODEL/model-int8.safetensors"
               rm -f upstream.safetensors
           fi
           # Neither tool is on every runner: Git Bash on Windows ships
@@ -112,9 +121,11 @@ jobs:
                   shasum -a 256 "$1" | awk '{print $1}'
               fi
           }
-          want=$(grep -A4 'vendored here' "$MODEL/PROVENANCE.md" | grep model-int8 | awk '{print $1}')
-          got=$(sha256 "$MODEL/model-int8.safetensors")
-          [ "$want" = "$got" ] || { echo "model checksum $got does not match PROVENANCE $want"; exit 1; }
+          for f in model-int8.safetensors tokenizer.json; do
+              want=$(grep -A4 'vendored here' "$MODEL/PROVENANCE.md" | grep " $f\$" | awk '{print $1}')
+              got=$(sha256 "$MODEL/$f")
+              [ "$want" = "$got" ] || { echo "$f checksum $got does not match PROVENANCE $want"; exit 1; }
+          done
 
       - name: Build
         shell: bash
@@ -166,56 +177,53 @@ jobs:
           fi
           cat "$name.sha256"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: brain-${{ matrix.target }}
           path: dist/*
 
-  publish:
-    needs: build
+  # The reranker is 569 MB and nobody downloads it at install — only the first
+  # search that actually asks for one does. It still has to be under this tag
+  # when that happens, so it is built here, from the published float32 weights,
+  # by the script in the repository. Its own job, because quantising means
+  # installing packages from PyPI, and that does not happen where the token can
+  # write. Cached because quantising 2.2 GB on every release is a waste of a
+  # runner.
+  reranker:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
-          path: artifacts
-
-      # Every release carries the model: an installer fetching it for version
-      # N must find it under version N's tag. The build jobs already produced
-      # and checked it, so this is the same cache rather than a second recipe.
-      - name: Cache the embedding model
-        uses: actions/cache@v4
-        with:
-          path: assets/potion-multilingual-128M/model-int8.safetensors
-          key: model-73908c3438cf03b6a01bcb9611d62b23d0726f08-v3
-      - name: Cache the tokenizer
-        uses: actions/cache@v4
-        with:
-          path: assets/potion-multilingual-128M/tokenizer.json
-          key: tokenizer-73908c3438cf03b6a01bcb9611d62b23d0726f08
-
-      # The reranker is 569 MB and nobody downloads it at install — only the
-      # first search that actually asks for one does. It still has to be under
-      # this tag when that happens, so it is built here, from the published
-      # float32 weights, by the script in the repository. Cached because
-      # quantising 2.2 GB on every release is a waste of a runner.
+          python-version: "3.12"
+      # Keyed on everything that decides the bytes: the upstream revision, the
+      # script, and the packages it runs under. Change any one and the cache
+      # misses rather than handing back a file built from something else.
       - name: Cache the reranker
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: assets/bge-reranker-v2-m3-int8/model.onnx
-          key: reranker-bge-v2-m3-int8-v1
+          key: reranker-bge-v2-m3-int8-c46cc14e4748b2332899dfe5e6dcd4750caf7cef-${{ hashFiles('assets/bge-reranker-v2-m3-int8/quantize.py', 'assets/bge-reranker-v2-m3-int8/requirements.txt') }}
       - name: Cache the reranker tokenizer
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: assets/bge-reranker-v2-m3-int8/tokenizer.json
-          key: reranker-tokenizer-bge-v2-m3-v1
+          key: reranker-tokenizer-bge-v2-m3-c46cc14e4748b2332899dfe5e6dcd4750caf7cef
       - name: Build the reranker
         shell: bash
         run: |
           set -eu
           R=assets/bge-reranker-v2-m3-int8
-          UP=https://huggingface.co/EmbeddedLLM/bge-reranker-v2-m3-onnx-o3-cpu/resolve/main
+          # A revision, not `main`: a Hugging Face branch is mutable, and a
+          # release built from it ships whatever was pushed there that day.
+          UP=https://huggingface.co/EmbeddedLLM/bge-reranker-v2-m3-onnx-o3-cpu/resolve/c46cc14e4748b2332899dfe5e6dcd4750caf7cef
+          # The same hashes are in PROVENANCE.md. Inputs are checked here,
+          # before anything runs on them; what this job hands on is checked
+          # against release.sha256 at the end.
+          check() {
+              got=$(sha256sum "$1" | cut -d' ' -f1)
+              [ "$got" = "$2" ] || { echo "$1 is $got, PROVENANCE.md says $2" >&2; exit 1; }
+          }
           [ -s "$R/tokenizer.json" ] || curl -fsSL -o "$R/tokenizer.json" "$UP/tokenizer.json"
           if [ ! -s "$R/model.onnx" ]; then
               # Both files keep their published names in a directory of their
@@ -226,13 +234,19 @@ jobs:
               mkdir -p fp32
               curl -fsSL -o fp32/model.onnx "$UP/model.onnx"
               curl -fsSL -o fp32/model.onnx.data "$UP/model.onnx.data"
-              python3 -m pip install --quiet --break-system-packages onnx onnxruntime sympy \
-                  || python3 -m pip install --quiet onnx onnxruntime sympy
-              python3 "$R/quantize.py" fp32/model.onnx "$R/model.onnx"
+              check fp32/model.onnx 0308488c0748152186d6bfb3bfc9589175211cfbe45ffcec909dd4465848eeaa
+              check fp32/model.onnx.data 84b66c787b9b98977a16d5c993a3959210a214c98fc3466da263c949c2068945
+              python -m pip install --quiet --require-hashes --only-binary :all: -r "$R/requirements.txt"
+              python "$R/quantize.py" fp32/model.onnx "$R/model.onnx"
               rm -rf fp32
           fi
-          ls -l "$R"
-
+          # Named apart from the embedding model's files: both are "a model
+          # and its tokenizer", and one directory of release assets cannot
+          # hold two files called tokenizer.json.
+          mkdir -p dist
+          cp "$R/model.onnx" dist/reranker-int8.onnx
+          cp "$R/tokenizer.json" dist/reranker-tokenizer.json
+          ls -l dist
       # ONNX Runtime, one per platform, taken from Microsoft's own releases
       # rather than linked into the binary.
       #
@@ -254,15 +268,18 @@ jobs:
       - name: Fetch ONNX Runtime
         run: |
           set -eu
-          mkdir -p runtimes
-          # PROVENANCE.md says these are copied unmodified. The fifth column is
-          # what makes that a checkable claim rather than a promise: these are
-          # the libraries that were measured, and a release asset that upstream
-          # replaced under the same name would stop this job rather than ship.
-          # Windows ships a zip where the others ship a tarball, which is the
-          # only reason the archive kind is a parameter rather than assumed.
+          mkdir -p dist
+          # PROVENANCE.md says these are copied unmodified. The hash each is
+          # held to in release.sha256 is what makes that a checkable claim
+          # rather than a promise: these are the libraries that were measured,
+          # and a release asset that upstream replaced under the same name
+          # would stop this job rather than ship. Windows ships a zip where the
+          # others ship a tarball, which is the only reason the archive kind is
+          # a parameter rather than assumed.
+          SUMS=assets/bge-reranker-v2-m3-int8/release.sha256
           fetch() {
-              target="$1"; pack="$2"; version="$3"; kind="$4"; inner="$5"; want="$6"
+              target="$1"; pack="$2"; version="$3"; kind="$4"; inner="$5"
+              want=$(awk -v f="onnxruntime-$target" '$2 == f { print $1 }' "$SUMS")
               url="https://github.com/microsoft/onnxruntime/releases/download"
               url="$url/v$version/onnxruntime-$pack-$version.$kind"
               echo "$target <- onnxruntime $version ($pack)"
@@ -274,8 +291,8 @@ jobs:
               # Copied, not moved: the tarballs ship the real library beside
               # unversioned symlinks pointing at it, and a release asset that
               # is a dangling symlink is a zero-byte download.
-              cp "onnxruntime-$pack-$version/lib/$inner" "runtimes/onnxruntime-$target"
-              got=$(sha256sum "runtimes/onnxruntime-$target" | cut -d' ' -f1)
+              cp "onnxruntime-$pack-$version/lib/$inner" "dist/onnxruntime-$target"
+              got=$(sha256sum "dist/onnxruntime-$target" | cut -d' ' -f1)
               if [ "$got" != "$want" ]; then
                   echo "onnxruntime $version for $target is not the one we measured" >&2
                   echo "  expected $want" >&2
@@ -284,31 +301,84 @@ jobs:
               fi
               rm -rf "rt.$kind" "onnxruntime-$pack-$version"
           }
-          fetch aarch64-apple-darwin      osx-arm64      1.28.0 tgz "libonnxruntime.1.28.0.dylib" \
-              dc19bbcb2f5c9fb3c68b4f9248aa0a35065ff702c5dbeae75eac54a74da97b6d
-          fetch x86_64-apple-darwin       osx-x86_64     1.23.0 tgz "libonnxruntime.1.23.0.dylib" \
-              091d265e49da84ac8eafd6ff76b67688555192a272d784a252d550a858797d6f
-          fetch x86_64-unknown-linux-gnu  linux-x64      1.28.0 tgz "libonnxruntime.so.1.28.0" \
-              1461ef7cc3d9e49982591721683cc3e3a55580aeca9a5254e7aac47b75ee4bab
-          fetch aarch64-unknown-linux-gnu linux-aarch64  1.28.0 tgz "libonnxruntime.so.1.28.0" \
-              f1ec1a08eb99bd6e5401340f0a2b101381bf4694415480291dc13bcaa30f9ec7
-          fetch x86_64-pc-windows-msvc    win-x64        1.28.0 zip "onnxruntime.dll" \
-              18370c375f07357fa5874344a9d9ac17e6b6fe1eb18b1dd209d79483b4470257
-          ls -l runtimes
+          fetch aarch64-apple-darwin      osx-arm64      1.28.0 tgz "libonnxruntime.1.28.0.dylib"
+          fetch x86_64-apple-darwin       osx-x86_64     1.23.0 tgz "libonnxruntime.1.23.0.dylib"
+          fetch x86_64-unknown-linux-gnu  linux-x64      1.28.0 tgz "libonnxruntime.so.1.28.0"
+          fetch aarch64-unknown-linux-gnu linux-aarch64  1.28.0 tgz "libonnxruntime.so.1.28.0"
+          fetch x86_64-pc-windows-msvc    win-x64        1.28.0 zip "onnxruntime.dll"
+          ls -l dist
+
+      - name: Check what leaves this job
+        run: cd dist && sha256sum -c ../assets/bge-reranker-v2-m3-int8/release.sha256
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: reranker
+          path: dist/*
+          # int8 weights and shared libraries barely compress; zipping 700 MB
+          # is time for nothing.
+          compression-level: 0
+
+  publish:
+    needs: [build, reranker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # `gh` reads the token from the environment; nothing here pushes, so the
+      # checkout has no reason to leave it in .git/config.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: artifacts
+
+      # Every release carries the model: an installer fetching it for version
+      # N must find it under version N's tag. The build jobs already produced
+      # and checked it, so this is the same cache rather than a second recipe.
+      - name: Cache the embedding model
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: assets/potion-multilingual-128M/model-int8.safetensors
+          key: model-73908c3438cf03b6a01bcb9611d62b23d0726f08-v3
+      - name: Cache the tokenizer
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: assets/potion-multilingual-128M/tokenizer.json
+          key: tokenizer-73908c3438cf03b6a01bcb9611d62b23d0726f08
 
       - name: Collect
         run: |
           set -eu
           mkdir -p dist
-          find artifacts -type f -exec cp {} dist/ \;
-          cp runtimes/onnxruntime-* dist/
-          cp assets/potion-multilingual-128M/model-int8.safetensors dist/
-          cp assets/potion-multilingual-128M/tokenizer.json dist/
-          # Named apart from the embedding model's files: both are "a model
-          # and its tokenizer", and one directory of release assets cannot
-          # hold two files called tokenizer.json.
-          cp assets/bge-reranker-v2-m3-int8/model.onnx dist/reranker-int8.onnx
-          cp assets/bge-reranker-v2-m3-int8/tokenizer.json dist/reranker-tokenizer.json
+          # Each file from the job that made it, by name. Merging every
+          # artifact into one folder would let any job - the reranker's, which
+          # installs packages from PyPI - drop a file named like another job's
+          # binary and have it shipped. The same goes for a whole artifact, so
+          # the list below is the build matrix, and anything else stops here.
+          for d in artifacts/*/; do
+              a=$(basename "$d")
+              case "$a" in
+                  reranker) ;;
+                  brain-aarch64-apple-darwin|brain-x86_64-apple-darwin|\
+                  brain-x86_64-unknown-linux-gnu|brain-aarch64-unknown-linux-gnu|\
+                  brain-x86_64-pc-windows-msvc)
+                      cp "$d$a"* dist/ ;;
+                  *) echo "unexpected artifact $a - add it to the matrix and here" >&2; exit 1 ;;
+              esac
+          done
+          ( cd artifacts/reranker && sha256sum -c ../../assets/bge-reranker-v2-m3-int8/release.sha256 )
+          awk '{ print $2 }' assets/bge-reranker-v2-m3-int8/release.sha256 \
+              | while read -r f; do cp "artifacts/reranker/$f" dist/; done
+          # The embedding model arrives through the cache the build jobs
+          # wrote, not an artifact, so it is held to PROVENANCE.md here too.
+          MODEL=assets/potion-multilingual-128M
+          grep -A4 'vendored here' "$MODEL/PROVENANCE.md" \
+              | grep -E ' (model-int8\.safetensors|tokenizer\.json)$' | sed 's/^ *//' \
+              | ( cd "$MODEL" && sha256sum -c - )
+          cp "$MODEL/model-int8.safetensors" "$MODEL/tokenizer.json" dist/
           cd dist
           for f in model-int8.safetensors tokenizer.json reranker-int8.onnx \
                    reranker-tokenizer.json onnxruntime-*; do

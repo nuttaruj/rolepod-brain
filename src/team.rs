@@ -63,7 +63,7 @@ pub struct Outcome {
 }
 
 /// Join (or create) a team: point at a shared folder, mint the key, take a
-/// name to sign with.
+/// name to put on what we publish.
 ///
 /// # Errors
 /// Returns an error when the name is empty, the directory cannot be used, or
@@ -72,7 +72,7 @@ pub fn init(dir: &str, author: &str) -> Result<String> {
     let author = author.trim();
     anyhow::ensure!(
         !author.is_empty(),
-        "a team needs a name to sign your entries with: `brain team init <dir> --name \"Your Name\"`"
+        "a team needs a name to put on your entries: `brain team init <dir> --name \"Your Name\"`"
     );
     let paths = Paths::resolve()?;
     paths.ensure()?;
@@ -90,7 +90,7 @@ pub fn init(dir: &str, author: &str) -> Result<String> {
     let minted = crate::sync::mint_key(&key_path)?;
 
     Ok(format!(
-        "team folder: {}\nsigning as: {author}\nkey: {} ({})\n\n\
+        "team folder: {}\npublishing as: {author}\nkey: {} ({})\n\n\
          What crosses: rules, gotchas, decisions and procedures - the lessons\n\
          that already survived several sessions. What never does: your\n\
          sessions, your prompts, your captures, your notes.\n\n\
@@ -123,7 +123,7 @@ pub fn run() -> Result<Outcome> {
     let author = config.team.author.clone().unwrap_or_default();
     anyhow::ensure!(
         !author.trim().is_empty(),
-        "no name to sign with - run `brain team init` again with --name"
+        "no name to publish under - run `brain team init` again with --name"
     );
     let key = crate::sync::read_key(&paths.data_dir.join("team.key"), "brain team init")?;
     let origin = crate::ids::origin().context("this store has no origin id yet")?;
@@ -159,7 +159,7 @@ pub fn run() -> Result<Outcome> {
         let _ = crate::consolidate::write_hubs(&project_dir, &scope, &store);
     }
 
-    // Publish: our own knowledge, scrubbed again, signed.
+    // Publish: our own knowledge, scrubbed again, named.
     let mut lines = Vec::new();
     for (_, project_dir) in crate::consolidate::known_projects(&paths)? {
         let (events, _) = EventLog::open(&project_dir)?.read_all()?;
@@ -386,7 +386,7 @@ fn author_of(event: &Event) -> String {
         .get("author")
         .and_then(serde_json::Value::as_str)
         .filter(|name| !name.trim().is_empty())
-        .unwrap_or("unsigned")
+        .unwrap_or("unnamed")
         .to_string()
 }
 
@@ -456,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn only_our_own_lessons_are_published_and_they_leave_signed_and_scrubbed() {
+    fn only_our_own_lessons_are_published_and_they_leave_named_and_scrubbed() {
         let clean = sanitizer();
         let mine = knowledge(
             "vitest runs file-by-file here",
@@ -549,7 +549,7 @@ mod tests {
         // An entry with no name still says so rather than looking like ours.
         let anonymous = knowledge("A rule", "body", "rule", Some("them"));
         write_pages(&dir, std::slice::from_ref(&anonymous)).unwrap();
-        assert!(std::fs::read_to_string(dir.join("rules/a-rule.md")).unwrap().contains("unsigned"));
+        assert!(std::fs::read_to_string(dir.join("rules/a-rule.md")).unwrap().contains("unnamed"));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

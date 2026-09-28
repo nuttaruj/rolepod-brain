@@ -11,6 +11,10 @@ Apache-2.0, 0.6B parameters, XLM-RoBERTa large. The ONNX export used as the
 source is [`EmbeddedLLM/bge-reranker-v2-m3-onnx-o3-cpu`](https://huggingface.co/EmbeddedLLM/bge-reranker-v2-m3-onnx-o3-cpu).
 `quantize.py` in this directory turns that into what the release ships.
 
+That export declares no license of its own. It is a format conversion of the
+Apache-2.0 model above, and the release states the modification that matters -
+int8 weights - in `NOTICE`.
+
 ## Why this model and not a smaller one
 
 `jinaai/jina-reranker-v1-tiny-en` is 130 MB and four layers, which is what
@@ -66,8 +70,9 @@ MIT licensed:
 | `x86_64-unknown-linux-gnu` | `onnxruntime-linux-x64-1.28.0.tgz` | 1.28.0 | `1461ef7cc3d9e49982591721683cc3e3a55580aeca9a5254e7aac47b75ee4bab` |
 | `aarch64-unknown-linux-gnu` | `onnxruntime-linux-aarch64-1.28.0.tgz` | 1.28.0 | `f1ec1a08eb99bd6e5401340f0a2b101381bf4694415480291dc13bcaa30f9ec7` |
 
-Those hashes are in the release workflow too, and a build stops rather than
-ships if upstream ever answers with something else under the same name. They
+Those hashes are in `release.sha256` beside this file too, which the release
+workflow holds every download to, and a build stops rather than ships if
+upstream ever answers with something else under the same name. They
 are what makes "copied unmodified" a claim you can check.
 
 Two versions rather than one, because Microsoft stopped building for Intel
@@ -84,6 +89,33 @@ Nothing links ONNX Runtime into the binary. That is what lets every platform
 carry the reranker at all - the prebuilt runtime the `ort` crate ships is
 what demanded glibc 2.38, and it has no Intel macOS build. Microsoft's
 official binaries need glibc 2.27.
+
+## Verifying this
+
+The export is pinned to a revision, because a Hugging Face branch is mutable
+and a release built from `main` ships whatever was pushed there that day:
+
+    EmbeddedLLM/bge-reranker-v2-m3-onnx-o3-cpu
+    revision c46cc14e4748b2332899dfe5e6dcd4750caf7cef   (last changed 2024-08-15)
+
+`quantize.py`, run on Python 3.12 under exactly the packages in
+`requirements.txt`, turns those inputs into the shipped file byte for byte.
+That was checked by rebuilding it from scratch and comparing against the file
+already released. The release workflow checks the inputs before anything
+runs on them, and every released file against `release.sha256` - twice, in
+the job that builds them and again in the one that publishes - and stops
+rather than ships on a mismatch:
+
+```
+sha256, upstream at the revision above
+  0308488c0748152186d6bfb3bfc9589175211cfbe45ffcec909dd4465848eeaa  model.onnx
+  84b66c787b9b98977a16d5c993a3959210a214c98fc3466da263c949c2068945  model.onnx.data
+  8bf8afbfd11306bd872018c53bfdf2e160a56f8edbcf49933324404791c148d3  tokenizer.json
+```
+
+A different onnxruntime is a different quantiser. Moving `requirements.txt`
+means rebuilding, measuring the ranking again, and updating
+`release.sha256` in the same change.
 
 ## What is not established
 

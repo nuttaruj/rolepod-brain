@@ -4,29 +4,55 @@ Copyright (c) 2026 Nuttaruj
 This software is released under the MIT License; see LICENSE.
 
 ------------------------------------------------------------------------------
-Bundled model weights
+Model weights and runtime published with each release
 ------------------------------------------------------------------------------
 
-assets/potion-retrieval-32M/ contains a static embedding model:
+These are release assets, not repository files (the potion model's small
+config.json is the one exception): downloaded after install and checked
+against the release's SHA256SUMS.
 
-    potion-retrieval-32M
+model-int8.safetensors, tokenizer.json -- a static embedding model:
+
+    potion-multilingual-128M
     Copyright (c) MinishLab
     MIT License
-    https://huggingface.co/minishlab/potion-retrieval-32M
+    https://huggingface.co/minishlab/potion-multilingual-128M
 
-`tokenizer.json` and `config.json` are that model's files, unmodified. Its
-tokenizer derives from BAAI/bge-base-en-v1.5 (MIT).
+Distilled from BAAI/bge-m3 (MIT), whose tokenizer it uses. `tokenizer.json`
+and `config.json` are potion-multilingual-128M's own files, unmodified.
+`model-int8.safetensors` is its `embeddings` tensor quantized from f32 to int8;
+the transformation and its checksums are in
+assets/potion-multilingual-128M/PROVENANCE.md.
 
-`model-int8.safetensors` is the model's `embeddings` tensor quantized from f32
-to int8. The quantization, its arithmetic, and the measured cost of it are
-documented in assets/potion-retrieval-32M/PROVENANCE.md.
+reranker-int8.onnx, reranker-tokenizer.json -- a cross-encoder:
+
+    bge-reranker-v2-m3
+    Copyright (c) BAAI (Beijing Academy of Artificial Intelligence)
+    Apache License 2.0
+    https://huggingface.co/BAAI/bge-reranker-v2-m3
+
+Converted from the ONNX export at
+https://huggingface.co/EmbeddedLLM/bge-reranker-v2-m3-onnx-o3-cpu, which
+declares no license of its own. Modified: the weights are quantized to int8.
+`reranker-tokenizer.json` is that export's tokenizer, unmodified. The pinned
+revision, the transformation and the checksums are in
+assets/bge-reranker-v2-m3-int8/PROVENANCE.md.
+
+onnxruntime-<target> -- the library that runs the reranker:
+
+    ONNX Runtime
+    Copyright (c) Microsoft Corporation
+    MIT License
+    https://github.com/microsoft/onnxruntime
+
+Copied unmodified from Microsoft's release archives; versions and checksums
+are in assets/bge-reranker-v2-m3-int8/PROVENANCE.md.
 
 ------------------------------------------------------------------------------
 Third-party Rust crates under Apache License 2.0
 ------------------------------------------------------------------------------
 
-Semantic search links the following crates, which are Apache-2.0 only (the rest
-of this binary's dependency tree is MIT or MIT/Apache dual-licensed):
+Semantic search links the following crates, which are Apache-2.0 only:
 
     tokenizers        Copyright (c) Hugging Face
     safetensors       Copyright (c) Hugging Face
@@ -41,6 +67,21 @@ Unless required by applicable law or agreed to in writing, software distributed
 under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
 CONDITIONS OF ANY KIND, either express or implied. See the License for the
 specific language governing permissions and limitations under the License.
+
+------------------------------------------------------------------------------
+Other third-party Rust crates
+------------------------------------------------------------------------------
+
+The rest of the binary's dependency tree is MIT or offers MIT as an option,
+except for these, each under the license named, whose full text ships with the
+crate's source:
+
+    foldhash          Zlib
+    libloading        ISC
+    option-ext        MPL-2.0 (source: https://crates.io/crates/option-ext)
+    ryu               Apache-2.0 OR BSL-1.0
+    sha1_smol         BSD-3-Clause
+    subtle            BSD-3-Clause
 
 model2vec-rs (MIT, Copyright (c) MinishLab) is a development dependency only.
 It is not linked into the shipped binary; it is used by the test that holds

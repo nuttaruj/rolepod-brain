@@ -231,7 +231,7 @@ enum TeamAction {
     Init {
         /// A folder your team already shares (Drive, Dropbox, a NAS...).
         dir: String,
-        /// The name your published lessons are signed with.
+        /// The name put on the lessons you publish.
         #[arg(long)]
         name: String,
     },

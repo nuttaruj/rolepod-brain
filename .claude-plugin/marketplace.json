@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "rolepod-brain",
-      "description": "Session memory that survives context wipes: a searchable markdown wiki, an MCP server to query it, and a short list of pointers at the start of every session. No daemon, no API keys, nothing leaves the machine.",
+      "description": "Session memory that survives context wipes: a searchable markdown wiki, an MCP server to query it, and a short list of pointers at the start of every session. No daemon, no API keys, and brain itself uploads nothing.",
       "source": "./plugins/rolepod-brain",
       "category": "productivity"
     }

@@ -42,16 +42,25 @@ model_only=""
 reranker_only=""
 model_into=""
 
-for arg in "$@"; do
+# A `while` over the arguments, not a `for`: `--into` takes the next one as
+# its value, and a `for` loop has already expanded the list, so a `shift`
+# inside it consumed nothing and the directory came round again as an option.
+while [ $# -gt 0 ]; do
+    arg="$1"
     case "$arg" in
         --target=all) target="" ;;
         --target=*)   target="${arg#--target=}" ;;
         --yes|-y)     assume_yes=1 ;;
         --uninstall)  uninstall=1 ;;
         --binary-only) binary_only=1 ;;
---model-only) model_only=1 ;;
---reranker-only) reranker_only=1 ;;
---into)       shift; model_into="$1" ;;
+        --model-only) model_only=1 ;;
+        --reranker-only) reranker_only=1 ;;
+        --into=*)     model_into="${arg#--into=}" ;;
+        --into)
+            [ $# -ge 2 ] || { printf 'error: --into needs a directory\n' >&2; exit 2; }
+            shift
+            model_into="$1"
+            ;;
         -h|--help)
             # The header block: from the second line to the first that is
             # not a comment. A fixed line range went stale the moment the
@@ -66,6 +75,7 @@ for arg in "$@"; do
             exit 2
             ;;
     esac
+    shift
 done
 
 REPO="nuttaruj/rolepod-brain"
@@ -97,7 +107,7 @@ platform=""
 [ -n "$os" ] && [ -n "$arch" ] && platform="$arch-$os"
 
 version="${BRAIN_VERSION:-}"
-if [ -z "$version" ] && [ -n "$platform" ]; then
+if [ -z "$version" ]; then
     version=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
         | sed -n 's/.*"tag_name" *: *"\([^"]*\)".*/\1/p' | head -n 1) || true
 fi
@@ -110,8 +120,11 @@ from_source() {
     # cloned into a temporary directory and removed on the way out.
     work=$(mktemp -d)
     trap 'rm -rf "$work"' EXIT INT TERM
-    git clone --depth 1 "https://github.com/$REPO.git" "$work/src" >/dev/null 2>&1 \
-        || die "could not clone https://github.com/$REPO"
+    # The release that was asked for, not whatever `main` holds today: a
+    # platform with no prebuilt binary still gets the version it was promised.
+    # Only when no release could be named at all is `main` the answer.
+    git clone --depth 1 ${version:+--branch "$version"} "https://github.com/$REPO.git" "$work/src" \
+        >/dev/null 2>&1 || die "could not clone https://github.com/$REPO ${version:-(main)}"
     # The reranker goes in. Nothing links ONNX Runtime at build time any more,
     # so this compiles wherever `brain` itself compiles - the runtime is a file
     # downloaded later, and a machine that cannot load it falls through to the

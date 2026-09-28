@@ -27,7 +27,7 @@
 //! two-pass replay, origin stamps, root-commit project identity. Sync is
 //! those pieces plus one cipher and one loop.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chacha20poly1305::aead::Aead;
@@ -101,12 +101,28 @@ pub fn run() -> Result<Outcome> {
     let key = load_key(&paths)?;
     let origin = crate::ids::origin().context("this store has no origin id yet")?;
 
-    // Pull before push: merge what the other machines said, then publish
-    // the merged state - one round trip fewer to convergence.
+    // Under the data directory, not the system temp dir: decrypted bundles are
+    // plaintext memory, and on a shared machine `/tmp/brain-sync-<pid>` is a
+    // name another user can guess, read, or create first. Removed on every
+    // way out, a refused bundle's included, for the same reason.
+    let staging = paths.data_dir.join(format!("sync.staging.{}", std::process::id()));
+    std::fs::create_dir_all(&staging).context("create sync staging")?;
+    let exchanged = exchange(&paths, dir, &key, &origin, &staging);
+    let _ = std::fs::remove_dir_all(&staging);
+    exchanged
+}
+
+/// Pull before push: merge what the other machines said, then publish the
+/// merged state - one round trip fewer to convergence.
+fn exchange(
+    paths: &Paths,
+    dir: &Path,
+    key: &[u8; 32],
+    origin: &str,
+    staging: &Path,
+) -> Result<Outcome> {
     let mut outcome =
         Outcome { pulled: 0, skipped: Vec::new(), gained: 0, pushed_bytes: 0 };
-    let staging = std::env::temp_dir().join(format!("brain-sync-{}", std::process::id()));
-    std::fs::create_dir_all(&staging).context("create sync staging")?;
     for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
         let path = entry.context("read sync dir entry")?.path();
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else { continue };
@@ -115,7 +131,7 @@ pub fn run() -> Result<Outcome> {
             continue;
         }
         let sealed = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-        let Ok(archive_bytes) = open_bundle(&key, &sealed) else {
+        let Ok(archive_bytes) = open_bundle(key, &sealed) else {
             // Wrong key or corruption. Either way this file is not ours to
             // merge, and saying so beats both crashing and silence.
             outcome.skipped.push(name.to_string());
@@ -137,20 +153,17 @@ pub fn run() -> Result<Outcome> {
     // mid-first-sync - has nothing to push and every reason to pull. Push
     // when there is something to say.
     if !paths.wiki().is_dir() {
-        let _ = std::fs::remove_dir_all(&staging);
         return Ok(outcome);
     }
     let archive = staging.join("push.tar.gz");
     crate::portable::export_wiki_only(&archive)?;
     let plain = std::fs::read(&archive).context("read export for push")?;
-    let sealed = seal_bundle(&key, &plain)?;
+    let sealed = seal_bundle(key, &plain)?;
     outcome.pushed_bytes = sealed.len() as u64;
     let target = dir.join(format!("{origin}{BUNDLE_SUFFIX}"));
     let tmp = dir.join(format!("{origin}{BUNDLE_SUFFIX}.tmp"));
     std::fs::write(&tmp, sealed).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, &target).with_context(|| format!("publish {}", target.display()))?;
-
-    let _ = std::fs::remove_dir_all(&staging);
     Ok(outcome)
 }
 

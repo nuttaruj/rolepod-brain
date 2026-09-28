@@ -758,7 +758,7 @@ fn sync_check(paths: &Paths) -> Check {
     Check::pass("sync", format!("{} - {bundles} bundle(s), key present", dir.display()))
 }
 
-/// A team, when there is one: where it publishes and who this machine signs as.
+/// A team, when there is one: where it publishes and whose name this machine puts on it.
 fn team_check(paths: &Paths) -> Check {
     let config = Config::load(&paths.config_file()).unwrap_or_default();
     let Some(dir) = config.team.dir else {
@@ -786,7 +786,7 @@ fn team_check(paths: &Paths) -> Check {
         .unwrap_or(0);
     Check::pass(
         "team",
-        format!("{} - {bundles} bundle(s), signing as {author}; lessons only", dir.display()),
+        format!("{} - {bundles} bundle(s), publishing as {author}; lessons only", dir.display()),
     )
 }
 

@@ -1032,6 +1032,77 @@ fn an_archive_that_writes_outside_the_data_directory_is_refused() {
 }
 
 #[test]
+fn an_archive_member_that_is_a_link_is_refused() {
+    // A member with an ordinary name can still be a symlink to a file outside
+    // the archive. Copying it into the brain follows the link, so the import
+    // read that file into memory the user may later sync or share. A hard
+    // link reaches the same place by another route.
+    let fixture = Fixture::new("tarlink");
+    fixture.seed_session(2);
+    let secret = fixture.home.parent().unwrap().join("secret.txt");
+    std::fs::write(&secret, "outside-the-archive").unwrap();
+    for (kind, linkname) in [
+        ("SYMTYPE", secret.display().to_string()),
+        ("LNKTYPE", "Rolepod Brain/ok.md".to_string()),
+    ] {
+        let archive = fixture.home.parent().unwrap().join(format!("{kind}.tar.gz"));
+        let script = format!(
+            "import io, tarfile\n\
+             t = tarfile.open(r'{archive}', 'w:gz')\n\
+             ok = tarfile.TarInfo('Rolepod Brain/ok.md')\n\
+             ok.size = 2\n\
+             t.addfile(ok, io.BytesIO(b'hi'))\n\
+             link = tarfile.TarInfo('Rolepod Brain/leak.md')\n\
+             link.type = tarfile.{kind}\n\
+             link.linkname = r'{linkname}'\n\
+             t.addfile(link)\n\
+             t.close()\n",
+            archive = archive.display(),
+        );
+        let built = Command::new("python3").args(["-c", &script]).output().expect("build archive");
+        assert!(built.status.success(), "could not build the test archive: {built:?}");
+
+        for policy in ["--merge", "--replace"] {
+            let refused = fixture.brain(&["import", policy, &archive.to_string_lossy()]);
+            assert!(!refused.status.success(), "{policy} accepted an archive with a {kind} member");
+            let why = String::from_utf8_lossy(&refused.stderr);
+            assert!(why.contains("not a regular file"), "refused for the wrong reason: {why}");
+        }
+    }
+    // Refused before anything moved: `--replace` sets the current brain aside
+    // only for an archive that is going to be unpacked.
+    let aside: Vec<_> = std::fs::read_dir(&fixture.home)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("wiki.replaced."))
+        .collect();
+    assert!(aside.is_empty(), "a refused archive still moved the brain aside");
+    let mut imported = String::new();
+    collect_ext(&fixture.home, "md", &mut imported);
+    assert!(
+        !imported.contains("outside-the-archive"),
+        "a file outside the archive was read into the brain"
+    );
+}
+
+#[test]
+fn an_export_with_a_link_in_the_wiki_is_refused_where_it_can_be_fixed() {
+    // Imports take files and directories only. A link exported anyway would
+    // be refused by every machine that received it, on every sync.
+    let fixture = Fixture::new("exportlink");
+    fixture.seed_session(2);
+    let wiki = fixture.home.join("Rolepod Brain");
+    let archive = fixture.home.parent().unwrap().join("linked.tar.gz");
+    assert!(fixture.brain(&["export", &archive.to_string_lossy()]).status.success());
+
+    std::os::unix::fs::symlink("/etc/hosts", wiki.join("hosts.md")).unwrap();
+    let refused = fixture.brain(&["export", &archive.to_string_lossy()]);
+    assert!(!refused.status.success(), "a wiki holding a link was exported");
+    let why = String::from_utf8_lossy(&refused.stderr);
+    assert!(why.contains("hosts.md") && why.contains("replace the link"), "{why}");
+}
+
+#[test]
 fn a_sensitive_path_is_redacted_in_the_file_list_too() {
     // Titles were scrubbed and the parallel files[] array was not, so the
     // path the sanitizer exists to hide sat intact in the column beside it.
@@ -2777,7 +2848,7 @@ fn every_installer_flag_has_a_default_before_the_loop_that_sets_it() {
     )
     .expect("bootstrap.sh is part of the repository");
 
-    let loop_at = script.find("for arg in").expect("the argument loop moved");
+    let loop_at = script.find("while [ $# -gt 0 ]").expect("the argument loop moved");
     let (preamble, arg_loop) = script.split_at(loop_at);
 
     let mut checked = 0usize;
@@ -2799,6 +2870,21 @@ fn every_installer_flag_has_a_default_before_the_loop_that_sets_it() {
         }
     }
     assert!(checked >= 4, "the loop parser matched almost nothing ({checked}); it has drifted");
+}
+
+#[test]
+fn an_installer_option_value_is_never_read_as_an_option() {
+    // `--into DIR` was parsed inside a `for` loop, where `shift` consumes
+    // nothing: DIR came round again and the installer died on "unknown
+    // option". `--help` exits before anything is downloaded, so it is how a
+    // test reaches the parser alone.
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap.sh");
+    for args in [&["--into", "/nowhere", "--help"][..], &["--into=/nowhere", "--help"]] {
+        let run = Command::new("sh").arg(&script).args(args).output().expect("run sh");
+        assert!(run.status.success(), "{args:?}: {}", String::from_utf8_lossy(&run.stderr));
+    }
+    let bare = Command::new("sh").arg(&script).arg("--into").output().expect("run sh");
+    assert!(!bare.status.success(), "--into with no directory was accepted");
 }
 
 #[test]
@@ -5828,7 +5914,7 @@ esac
     assert!(hits.contains("vitest must run file-by-file"), "a rebuild lost the team shelf: {hits}");
 
     let doctor = String::from_utf8_lossy(&b.brain(&["doctor"]).stdout).to_string();
-    assert!(doctor.contains("signing as Sam"), "{doctor}");
+    assert!(doctor.contains("publishing as Sam"), "{doctor}");
 }
 
 #[test]
@@ -5844,7 +5930,7 @@ fn a_team_is_off_and_needs_a_name_before_anything_is_shared() {
     let dir = fixture.home.parent().unwrap().join("t");
     let empty = fixture.brain(&["team", "init", dir.to_str().unwrap(), "--name", "  "]);
     assert!(!empty.status.success(), "a team without a name must be refused");
-    assert!(String::from_utf8_lossy(&empty.stderr).contains("name to sign"), "{empty:?}");
+    assert!(String::from_utf8_lossy(&empty.stderr).contains("name to put on"), "{empty:?}");
 }
 
 #[test]

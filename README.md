@@ -14,10 +14,13 @@ stop thinking about it.
 
 ## What makes it different
 
-**Your brain never leaves your machine.** No cloud, no remote, no telemetry,
-no account. There is no sync command that uploads anything, because there is
-nowhere for it to upload to — see below for why that is a design decision
-rather than a missing feature.
+**Your brain stays on your machine unless you move it.** No cloud, no server,
+no telemetry, no account, and brain uploads nothing on its own. Memory leaves
+only by a door you open: `brain sync` and `brain team` write encrypted bundles
+to a folder you choose, and summaries are written by a CLI you are signed
+into, which sends what it summarizes to its own model provider — see
+"What leaves this machine" below, and `mode = "off"` for keeping every word
+here.
 
 **No resident process, ever.** No daemon, no server, no supervised worker, no
 port. Hooks spawn a short-lived process that exits; the MCP server lives
@@ -34,7 +37,8 @@ by whichever CLI you are already signed into, through that vendor's own
 supported headless entry point (`claude -p --model haiku`, `codex exec`). This
 project never holds a credential, because it never has one to hold. If no
 model is reachable it writes rule-based summaries instead — a permanent,
-first-class mode, not a broken one.
+first-class mode, not a broken one, and the one `[summarizer] mode = "off"`
+chooses for good.
 
 **Pointers in, content pulled.** Automatic injection carries titles and ids
 against a hard byte budget. Full content is never pushed into your context;
@@ -273,9 +277,11 @@ are.
 **Summarizes** is whether that CLI can also write the summaries, not just
 capture the events. Consolidation asks the CLI whose session it is first, and
 falls through to whichever others are installed — so the more of these are on
-the machine, the fewer sessions end up with the rule-based floor. Nothing is
-sent anywhere: these are CLIs you are already signed into, invoked locally on
-their cheap tier.
+the machine, the fewer sessions end up with the rule-based floor. These are
+CLIs you are already signed into, invoked locally on their cheap tier — and
+each sends what it is asked to summarize to its own model provider, as it
+does with everything you type into it. brain adds no destination of its own;
+`mode = "off"` removes that one.
 
 Most of them are pinned to a specific cheap model, and those can be repinned
 under `summarizer.models`. Two are not pinned at all: OpenCode fronts whatever
@@ -742,8 +748,10 @@ Three properties are structural rather than configured:
   capture sanitizer again, then a boundary scrub that takes home directories
   and email addresses out of text that was distilled from sessions full of
   them.
-- **Every entry is signed.** Joining asks for a name, and a lesson nobody can
-  be asked about is one nobody can retire.
+- **Every entry carries its author's name.** Joining asks for one, and a
+  lesson nobody can be asked about is one nobody can retire. It is a label,
+  not a signature: the whole team shares one key, so a name tells you who
+  wrote an entry only as far as you trust everyone who holds that key.
 - **Nobody edits anyone else's memory.** Only additive knowledge is ever
   published - no withdrawals, no corrections - so no bundle can delete or
   rewrite what a teammate wrote, and anything arriving that is not a lesson
@@ -1030,6 +1038,15 @@ on arrival, which also proves the log really is the source of truth. Importing
 onto a machine that already has memory refuses until you pick `--merge` or
 `--replace`, and `--replace` moves the old wiki aside rather than deleting it.
 
+The archive is a plain tarball, not encrypted — it holds everything the wiki
+does, so keep it where you would keep the wiki. An import takes back only what
+an export writes: files and directories under the wiki, plus `config.toml`.
+A link, a path outside the wiki, or anything under `.git` or `.obsidian` stops
+the import before anything is moved or written — and a sync, which never
+carries a config, refuses one too. Export holds itself to the same rule, so a
+link inside the wiki is reported on the machine that has it rather than
+refused by every machine it is sent to.
+
 One thing to know: a project's identity normally follows its path, so the same
 repository checked out somewhere else is a different project. Put a
 `.rolepod-brain.toml` with a `name` in it and identity follows the name instead
@@ -1047,7 +1064,7 @@ brain uninstall --apply --wipe   # ...and deletes the memory, after you type DEL
 Hooks belonging to other tools are left exactly where they are. Without
 `--wipe`, your memory stays on disk and the command tells you where.
 
-## Why it stays local
+## What leaves this machine
 
 The wiki is the most sensitive file set this machine holds, and that is not an
 exaggeration about privacy in general — it is what the contents actually are.
@@ -1058,13 +1075,28 @@ the weak points already known internally. Someone holding this wiki can
 reconstruct a project *and the reasoning behind it* without ever seeing the
 source. For client or confidential work, that is worse than a source leak.
 
-So:
+So brain itself sends nothing anywhere. There is no server of ours, no
+account, no telemetry. What it fetches is itself — the binary, the embedding
+model and, the first time a rerank asks for it, the reranker and the ONNX
+Runtime library that runs it — from this repository's GitHub releases. The
+installer script doing the fetching comes from this repository's `main`
+branch, and checks every file against the release's published hashes before
+installing it.
 
-- **No remote sync.** The code to push anywhere was removed, not disabled.
-  `brain sync` exists only to say so.
-- **No cloud, no account, no telemetry.** Nothing is sent anywhere, ever.
-- **No API keys held.** Summarization borrows a CLI you are already signed
-  into, through its own supported entry point.
+Three things can carry memory off the machine, and each is a choice:
+
+- **Summaries.** Consolidation, `brain ingest` and reranking without the local
+  model borrow a CLI you are already signed into, through its own supported
+  entry point. That CLI sends the text it is given to its own model provider,
+  exactly as it does with what you type into it. Which provider that is
+  depends on how the CLI is configured, not on brain. `[summarizer]
+  mode = "off"` hands no text to any CLI: summaries become rule-based and a
+  rerank uses the local model or nothing.
+- **`brain sync`**, off until `brain sync init`. It moves your whole brain
+  between your own machines through a folder you pick, encrypted before it
+  gets there.
+- **`brain team`**, off until `brain team init`. It publishes lessons only,
+  scrubbed twice and encrypted, to a folder your team shares.
 
 What remains is a plain-markdown git repository at `~/.rolepod-brain/Rolepod Brain` —
 `grep` it, open it in Obsidian, read its history with `git log`, roll it back

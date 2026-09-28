@@ -82,10 +82,10 @@ interpolated percentile differs by an ULP between platforms: macOS and Linux
 ran the same script over the same input and produced two different files.
 It is an exact order statistic now, a value that is actually in the array, so
 every platform computes the identical scale and therefore the identical file.
-The release workflow rebuilds it from upstream and checks it against this
-line, which is the only thing that makes the claim checkable rather than
-merely stated. A 122 MB blob nobody can read is worth exactly the
-provenance attached to it.
+The release workflow rebuilds it from upstream - Python 3.12, the packages in
+`requirements.txt` - and checks it against this line, which is the only thing
+that makes the claim checkable rather than merely stated. A 122 MB blob nobody
+can read is worth exactly the provenance attached to it.
 
 ```
 sha256, upstream model.safetensors (f32, 489 MB, at the revision above)

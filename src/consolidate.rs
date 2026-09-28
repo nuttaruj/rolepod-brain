@@ -1620,7 +1620,7 @@ pub fn write_hubs(project_dir: &Path, scope: &ProjectScope, store: &Store) -> Re
         hub.push('\n');
     }
 
-    // What teammates published: the same four kinds, each signed, none of
+    // What teammates published: the same four kinds, each named, none of
     // them ours to rewrite.
     if !team.is_empty() {
         let _ = writeln!(hub, "## Team knowledge\n");
@@ -2050,7 +2050,7 @@ into the log as a correction.
   summary page, and the immutable copy it was read from.
 - `<project>/entities/` and `entities.md` - the things more than one session was about.
 - `<project>/<topic>.md` - sessions that produced decisions, bugfixes, features, ...
-- `_team/<project id>/` - knowledge teammates published, signed with their names.
+- `_team/<project id>/` - knowledge teammates published, each under its author's name.
   Read it; never edit it. Yours is under `<project>/knowledge/`.
 - `<project>/_lint/flagged.md` - entries a person marked stale, when any.
 

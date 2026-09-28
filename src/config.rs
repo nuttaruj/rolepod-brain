@@ -49,14 +49,14 @@ pub struct SearchConfig {
 }
 
 /// Where sync bundles go, when the owner opts in. `None` - the default,
-/// forever - means memory never leaves this machine.
+/// forever - means sync moves nothing off this machine.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SyncConfig {
     pub dir: Option<std::path::PathBuf>,
 }
 
-/// A team's shared folder, and the name published work is signed with.
+/// A team's shared folder, and the name put on published work.
 ///
 /// Off by default, like [`SyncConfig`] and for the same reason. What crosses
 /// here is narrower than what crosses between a person's own machines: only
