@@ -99,33 +99,12 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
+      # The recipe lives in the repository, shared with the CI lane: fetch the
+      # pinned upstream revision, check it, quantise it, and hold the result to
+      # PROVENANCE.md - which is also what checks a restored cache.
       - name: Build the embedding model
         shell: bash
-        run: |
-          set -eu
-          MODEL=assets/potion-multilingual-128M
-          UP=https://huggingface.co/minishlab/potion-multilingual-128M/resolve/73908c3438cf03b6a01bcb9611d62b23d0726f08
-          [ -s "$MODEL/tokenizer.json" ] || curl -fsSL -o "$MODEL/tokenizer.json" "$UP/tokenizer.json"
-          if [ ! -s "$MODEL/model-int8.safetensors" ]; then
-              curl -fsSL -o upstream.safetensors "$UP/model.safetensors"
-              python -m pip install --quiet --require-hashes --only-binary :all: -r "$MODEL/requirements.txt"
-              python "$MODEL/quantize.py" upstream.safetensors "$MODEL/model-int8.safetensors"
-              rm -f upstream.safetensors
-          fi
-          # Neither tool is on every runner: Git Bash on Windows ships
-          # `sha256sum` and no `shasum`, and macOS ships the reverse.
-          sha256() {
-              if command -v sha256sum >/dev/null 2>&1; then
-                  sha256sum "$1" | awk '{print $1}'
-              else
-                  shasum -a 256 "$1" | awk '{print $1}'
-              fi
-          }
-          for f in model-int8.safetensors tokenizer.json; do
-              want=$(grep -A4 'vendored here' "$MODEL/PROVENANCE.md" | grep " $f\$" | awk '{print $1}')
-              got=$(sha256 "$MODEL/$f")
-              [ "$want" = "$got" ] || { echo "$f checksum $got does not match PROVENANCE $want"; exit 1; }
-          done
+        run: sh assets/potion-multilingual-128M/build.sh
 
       - name: Build
         shell: bash
@@ -373,11 +352,10 @@ jobs:
           awk '{ print $2 }' assets/bge-reranker-v2-m3-int8/release.sha256 \
               | while read -r f; do cp "artifacts/reranker/$f" dist/; done
           # The embedding model arrives through the cache the build jobs
-          # wrote, not an artifact, so it is held to PROVENANCE.md here too.
+          # wrote, not an artifact, so it is held to PROVENANCE.md here too -
+          # by the same script that built it, fetching nothing.
           MODEL=assets/potion-multilingual-128M
-          grep -A4 'vendored here' "$MODEL/PROVENANCE.md" \
-              | grep -E ' (model-int8\.safetensors|tokenizer\.json)$' | sed 's/^ *//' \
-              | ( cd "$MODEL" && sha256sum -c - )
+          sh "$MODEL/build.sh" --check
           cp "$MODEL/model-int8.safetensors" "$MODEL/tokenizer.json" dist/
           cd dist
           for f in model-int8.safetensors tokenizer.json reranker-int8.onnx \

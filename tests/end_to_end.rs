@@ -1086,6 +1086,37 @@ fn an_archive_member_that_is_a_link_is_refused() {
 }
 
 #[test]
+fn a_compression_bomb_is_refused_without_being_unpacked() {
+    // Two hundred megabytes of zeros pack into a fraction of one. The import
+    // measures what an archive unpacks to before unpacking it, and stops the
+    // measuring itself at the limit, so the disk never sees the bomb.
+    let fixture = Fixture::new("tarbomb");
+    let archive = fixture.home.parent().unwrap().join("bomb.tar.gz");
+    let script = format!(
+        "import io, tarfile\n\
+         class Zeros(io.RawIOBase):\n    \
+             def readable(self): return True\n    \
+             def readinto(self, b):\n        \
+                 b[:] = bytes(len(b)); return len(b)\n\
+         t = tarfile.open(r'{}', 'w:gz')\n\
+         info = tarfile.TarInfo('Rolepod Brain/zeros.md')\n\
+         info.size = 200 << 20\n\
+         t.addfile(info, io.BufferedReader(Zeros()))\n\
+         t.close()\n",
+        archive.display()
+    );
+    let built = Command::new("python3").args(["-c", &script]).output().expect("build archive");
+    assert!(built.status.success(), "could not build the test archive: {built:?}");
+    assert!(std::fs::metadata(&archive).unwrap().len() < 1 << 20, "not much of a bomb");
+
+    let refused = fixture.brain(&["import", "--merge", &archive.to_string_lossy()]);
+    assert!(!refused.status.success(), "a compression bomb was accepted");
+    let why = String::from_utf8_lossy(&refused.stderr);
+    assert!(why.contains("unpacks to more than"), "refused for the wrong reason: {why}");
+    assert!(!fixture.home.join("Rolepod Brain/zeros.md").exists(), "the bomb was unpacked");
+}
+
+#[test]
 fn an_export_with_a_link_in_the_wiki_is_refused_where_it_can_be_fixed() {
     // Imports take files and directories only. A link exported anyway would
     // be refused by every machine that received it, on every sync.

@@ -1047,6 +1047,13 @@ carries a config, refuses one too. Export holds itself to the same rule, so a
 link inside the wiki is reported on the machine that has it rather than
 refused by every machine it is sent to.
 
+An import also stops at limits no honest archive comes near: 200,000 files and
+folders, paths of 512 bytes and 32 levels, logs of 2 GiB, and 32 GiB unpacked
+or a hundred times the archive's own size, whichever is less (64 MiB is always
+allowed). It works from a private copy of the archive, measures what that
+unpacks to before writing any of it, so a compression bomb never reaches the
+disk, and gives each step ten minutes.
+
 One thing to know: a project's identity normally follows its path, so the same
 repository checked out somewhere else is a different project. Put a
 `.rolepod-brain.toml` with a `name` in it and identity follows the name instead
@@ -1115,7 +1122,14 @@ day the machine itself is the breach.
 cargo test              # unit and end-to-end
 cargo test --release    # also enforces the 50ms hook latency budget
 cargo clippy --all-targets
+cargo audit             # advisories against Cargo.lock (cargo install cargo-audit)
+sh assets/potion-multilingual-128M/build.sh   # the embedding model the tests read
 ```
+
+Every pull request and push to main runs clippy, the tests and `cargo audit`,
+and builds on macOS and Windows (`.github/workflows/ci.yml`). The tests there
+leave out the `local-rerank` feature, since a lane that fetched a 600 MB
+reranker per run would not stay fast; the release workflow tests with it.
 
 The end-to-end suite runs against the real binary in an isolated data
 directory: two CLIs merging into one store, cross-CLI recall, secrets never

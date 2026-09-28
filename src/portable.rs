@@ -11,11 +11,50 @@
 //! that the log really is the source of truth.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
 use crate::config::Paths;
+
+/// What an import may cost, whatever the archive claims.
+///
+/// Each is a multiple of a real brain measured on 2026-09-28 - 3,839 members
+/// in 293 folders at most five deep, a longest path of 183 bytes, a largest
+/// log of 213 MB, 665 MB unpacked from 153 MB (4.3 to one) - so
+/// an honest archive clears them by a wide margin, and a crafted one cannot
+/// fill the disk, the inode table, or the afternoon.
+struct Limits {
+    /// Files and folders both, counting the folders tar makes on the way to a
+    /// member: nesting is how a small archive would create millions of them.
+    members: usize,
+    path_bytes: usize,
+    depth: usize,
+    /// One log is read whole to be merged, so one log is what memory bounds.
+    log_bytes: u64,
+    /// Never unpack more than this, however large the archive.
+    unpacked_bytes: u64,
+    /// Nor more than this many times the archive's own size - what a
+    /// compression bomb cannot hide...
+    ratio: u64,
+    /// ...except that a small archive may always reach this much, since a
+    /// few kilobytes of repetitive text can compress past any fixed ratio.
+    ratio_floor: u64,
+    /// Per tar run: listing, measuring and unpacking each get this long.
+    deadline: Duration,
+}
+
+const LIMITS: Limits = Limits {
+    members: 200_000,
+    path_bytes: 512,
+    depth: 32,
+    log_bytes: 2 << 30,
+    unpacked_bytes: 32 << 30,
+    ratio: 100,
+    ratio_floor: 64 << 20,
+    deadline: Duration::from_secs(600),
+};
 
 /// How an import should treat a brain that already exists here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,11 +165,6 @@ fn import_archive(
     with_config: bool,
 ) -> Result<(String, usize)> {
     anyhow::ensure!(archive.is_file(), "no archive at {}", archive.display());
-    // What tar refuses is not the same on every platform: bsdtar rejects a
-    // `..` member, GNU tar historically extracts it. An archive is attacker
-    // controlled the moment someone is talked into importing one, so the
-    // check belongs here rather than in whichever tar is installed.
-    refuse_escaping_members(archive, with_config)?;
     let paths = Paths::resolve()?;
     paths.ensure()?;
 
@@ -149,31 +183,27 @@ fn import_archive(
         wiki.display()
     );
 
-    // Unpack somewhere else first. `tar -xzf` straight into the data
+    // Every pass reads one private copy. The path someone named can change
+    // between the checks and the unpacking, and checking one file and then
+    // unpacking another checks nothing.
+    //
+    // Unpacked somewhere else first, too. `tar -xzf` straight into the data
     // directory REPLACES same-named files, and the whole point of a named
     // marker is that the same project on two machines has the same project
     // id, the same directory, and the same events/YYYY-MM.jsonl - so a
     // merge that let tar win would silently destroy the local month. The
     // logs are the source of truth and are not in the wiki's git history,
     // so there would be nothing to recover from.
-    let staging = paths
-        .data_dir
-        .join(format!("import.staging.{}", jiff::Zoned::now().strftime("%Y%m%d-%H%M%S")));
-    std::fs::create_dir_all(&staging)
-        .with_context(|| format!("create {}", staging.display()))?;
-    let unpacked = run(
-        "tar",
-        &[
-            "-xzf".to_string(),
-            archive.display().to_string(),
-            "-C".to_string(),
-            staging.display().to_string(),
-        ],
-    )
-    .context("unpack the archive")
-    .and_then(|()| refuse_links(&staging, &[]));
+    //
+    // Named for the moment and for this run alike: two imports - or a sync
+    // and an import - can start in the same second, and neither may unpack
+    // the other's archive or clear the other's staging.
+    let stamp = jiff::Zoned::now().strftime("%Y%m%d-%H%M%S").to_string();
+    let run = ulid::Ulid::new();
+    let copy = paths.data_dir.join(format!("import.{stamp}-{run}.tar.gz"));
+    let staging = paths.data_dir.join(format!("import.staging.{stamp}-{run}"));
     let mut notes = Vec::new();
-    let merged = unpacked.and_then(|()| {
+    let merged = unpack_and_graft(archive, &copy, &staging, &paths, with_config, || {
         if occupied && existing == Existing::Replace {
             // Moved, never deleted. An import that destroys the memory it was
             // meant to restore is the worst possible outcome of this command.
@@ -186,11 +216,12 @@ fn import_archive(
                 .with_context(|| format!("move {} aside", wiki.display()))?;
             notes.push(format!("previous wiki moved to {}", aside.display()));
         }
-        graft(&staging, &paths.data_dir)
+        Ok(())
     });
-    // Staging is scratch space; leaving it behind would look like a second
+    // Both are scratch space; leaving them behind would look like a second
     // brain sitting next to the real one.
     let _ = std::fs::remove_dir_all(&staging);
+    let _ = std::fs::remove_file(&copy);
     let counts = merged?;
 
     notes.push(format!(
@@ -201,6 +232,78 @@ fn import_archive(
     ));
 
     Ok((notes.join("; "), counts.events))
+}
+
+/// Copy, check, unpack, check again, make room, graft - each step only once
+/// the one before it has passed.
+fn unpack_and_graft(
+    archive: &Path,
+    copy: &Path,
+    staging: &Path,
+    paths: &Paths,
+    with_config: bool,
+    make_room: impl FnOnce() -> Result<()>,
+) -> Result<Grafted> {
+    // Opened once, judged on that handle, and copied for exactly the length
+    // it had then: a path that turns into a pipe, or a file that keeps
+    // growing, cannot make the copy itself unbounded.
+    let mut source =
+        std::fs::File::open(archive).with_context(|| format!("open {}", archive.display()))?;
+    let meta = source.metadata().with_context(|| format!("read {}", archive.display()))?;
+    anyhow::ensure!(meta.is_file(), "{} is not a file", archive.display());
+    anyhow::ensure!(
+        meta.len() <= LIMITS.unpacked_bytes,
+        "{} is {} bytes, more than an import unpacks at all",
+        archive.display(),
+        meta.len()
+    );
+    let mut target =
+        std::fs::File::create(copy).with_context(|| format!("create {}", copy.display()))?;
+    std::io::copy(&mut std::io::Read::take(&mut source, meta.len()), &mut target)
+        .with_context(|| format!("copy {}", archive.display()))?;
+    // What tar refuses is not the same on every platform: bsdtar rejects a
+    // `..` member, GNU tar historically extracts it. An archive is attacker
+    // controlled the moment someone is talked into importing one, so the
+    // check belongs here rather than in whichever tar is installed.
+    let measured = refuse_escaping_members(copy, with_config, &LIMITS)?;
+
+    std::fs::create_dir_all(staging).with_context(|| format!("create {}", staging.display()))?;
+    let args = [
+        "-xzf".to_string(),
+        copy.display().to_string(),
+        "-C".to_string(),
+        staging.display().to_string(),
+    ];
+    match tar_bounded(&args, false, measured, LIMITS.deadline).context("unpack the archive")? {
+        Ran::Finished { .. } => {}
+        // `-x` writes nothing to stdout; a tar that does is not one to trust.
+        Ran::PastLimit => anyhow::bail!("tar wrote to stdout while unpacking"),
+    }
+    // What landed, judged again on disk rather than on the listing's word:
+    // the same names, no links, and no more bytes than were measured on the
+    // way through - a sparse member is where the two could part.
+    refuse_unexpected_members(staging, with_config)?;
+    let unpacked = refuse_links(staging, &[])?;
+    anyhow::ensure!(
+        unpacked <= measured,
+        "the archive unpacked to {unpacked} bytes, past the {measured} it was measured at"
+    );
+
+    make_room()?;
+    graft(staging, &paths.data_dir)
+}
+
+/// Refuse anything unpacked beside the wiki (and `config.toml`, when the
+/// caller takes one) - the listing's allowlist, held to what is on disk.
+fn refuse_unexpected_members(staging: &Path, with_config: bool) -> Result<()> {
+    for entry in std::fs::read_dir(staging).with_context(|| format!("read {}", staging.display()))? {
+        let name = entry.context("read entry")?.file_name();
+        let expected = name == crate::config::WIKI_DIR
+            || name == crate::config::LEGACY_WIKI_DIR
+            || (with_config && name == "config.toml");
+        anyhow::ensure!(expected, "the archive unpacked {} outside the wiki", name.to_string_lossy());
+    }
+    Ok(())
 }
 
 /// What a graft did, for the caller to report.
@@ -248,6 +351,14 @@ fn graft(staging: &Path, data_dir: &Path) -> Result<Grafted> {
             if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
                 && dest.is_file()
             {
+                // Merging reads the log whole; one past this is not a log.
+                let size = entry.metadata().map(|meta| meta.len()).unwrap_or(u64::MAX);
+                anyhow::ensure!(
+                    size <= LIMITS.log_bytes,
+                    "{} is {size} bytes, past the {} a log may be",
+                    relative.display(),
+                    LIMITS.log_bytes
+                );
                 counts.events += union_logs(&path, &dest)?;
             } else {
                 std::fs::copy(&path, &dest)
@@ -281,19 +392,21 @@ fn normalize_wiki_member(data_dir: &Path, relative: &Path) -> PathBuf {
 /// reads in the order things actually happened on both machines.
 fn union_logs(incoming: &Path, local: &Path) -> Result<usize> {
     let mut lines: Vec<String> = Vec::new();
-    let mut ids: Vec<String> = Vec::new();
+    // A set, not a list: a month's log is tens of thousands of lines, and a
+    // list searched once per line made merging one into itself take minutes.
+    let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut added = 0usize;
     for (path, is_local) in [(local, true), (incoming, false)] {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("read {}", path.display()))?;
         for line in text.lines().filter(|line| !line.trim().is_empty()) {
             match line_id(line) {
-                Some(id) if ids.contains(&id) => {}
                 Some(id) => {
-                    ids.push(id);
-                    lines.push(line.to_string());
-                    if !is_local {
-                        added += 1;
+                    if ids.insert(id) {
+                        lines.push(line.to_string());
+                        if !is_local {
+                            added += 1;
+                        }
                     }
                 }
                 // A line we cannot read is still someone's data. Keeping it
@@ -302,7 +415,9 @@ fn union_logs(incoming: &Path, local: &Path) -> Result<usize> {
             }
         }
     }
-    lines.sort_by_key(|line| line_id(line));
+    // Cached: the key is a JSON parse, and a plain sort would run it on both
+    // sides of every comparison.
+    lines.sort_by_cached_key(|line| line_id(line));
     std::fs::write(local, format!("{}\n", lines.join("\n")))
         .with_context(|| format!("write {}", local.display()))?;
     Ok(added)
@@ -331,9 +446,29 @@ fn line_id(line: &str) -> Option<String> {
 /// ordinary name that is a symlink to `~/.ssh/id_rsa` is copied into the
 /// brain by following it. Nothing brain exports is a link, a device or a
 /// pipe, so only files and directories are let through.
-fn refuse_escaping_members(archive: &Path, with_config: bool) -> Result<()> {
+///
+/// Returns how many bytes the archive unpacks to, measured by letting tar
+/// write every member to a counter that stops it at the limit - the budget
+/// the unpacked tree is held to afterwards.
+fn refuse_escaping_members(archive: &Path, with_config: bool, limits: &Limits) -> Result<u64> {
     use std::path::Component;
-    for member in list_archive(archive, "-tzf")?.lines() {
+    let listing = list_archive(archive, "-tzf", limits)?;
+    let members = listing.lines().count();
+    anyhow::ensure!(
+        members <= limits.members,
+        "archive holds {members} members; an import takes at most {}",
+        limits.members
+    );
+    // The folders tar creates on the way to each member, which the listing
+    // does not count. Collected only up to the limit, so the counting cannot
+    // cost what it exists to prevent.
+    let mut folders: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for member in listing.lines() {
+        anyhow::ensure!(
+            member.len() <= limits.path_bytes,
+            "archive contains a path longer than {} bytes: {member}",
+            limits.path_bytes
+        );
         let member = member.trim();
         let mut names = Vec::new();
         for part in Path::new(member).components() {
@@ -342,6 +477,22 @@ fn refuse_escaping_members(archive: &Path, with_config: bool) -> Result<()> {
                 Component::CurDir => {}
                 // `..`, a root, or a Windows drive: each one reaches out.
                 _ => anyhow::bail!("archive contains an unsafe path: {member}"),
+            }
+        }
+        anyhow::ensure!(
+            names.len() <= limits.depth,
+            "archive contains a path deeper than {} levels: {member}",
+            limits.depth
+        );
+        let mut folder = PathBuf::new();
+        for name in names.iter().take(names.len().saturating_sub(1)) {
+            folder.push(name);
+            if folders.insert(folder.clone()) {
+                anyhow::ensure!(
+                    members + folders.len() <= limits.members,
+                    "archive would create more than {} files and folders",
+                    limits.members
+                );
             }
         }
         let top = names.first().map(|name| name.to_string_lossy()).unwrap_or_default();
@@ -359,13 +510,26 @@ fn refuse_escaping_members(archive: &Path, with_config: bool) -> Result<()> {
     // `d` a directory, `l` a symlink, `h` a hard link. bsdtar prints a hard
     // link whose header claims a size as `-`, but it will not unpack one to a
     // target outside the archive, so what slips past here stays inside it.
-    for line in list_archive(archive, "-tvzf")?.lines() {
+    for line in list_archive(archive, "-tvzf", limits)?.lines() {
         anyhow::ensure!(
             line.starts_with('-') || line.starts_with('d'),
             "archive contains a member that is not a regular file or directory: {line}"
         );
     }
-    Ok(())
+
+    let packed = std::fs::metadata(archive).map(|meta| meta.len()).unwrap_or(0);
+    let budget =
+        limits.unpacked_bytes.min(limits.ratio_floor.max(packed.saturating_mul(limits.ratio)));
+    let args = ["-xzOf".to_string(), archive.display().to_string()];
+    match tar_bounded(&args, false, budget, limits.deadline).context("measure the archive")? {
+        Ran::Finished { wrote, .. } => Ok(wrote),
+        Ran::PastLimit => anyhow::bail!(
+            "the archive unpacks to more than {budget} bytes - past {}x its own {packed}, \
+             or {} in all",
+            limits.ratio,
+            limits.unpacked_bytes
+        ),
+    }
 }
 
 /// Is this a name for `.git` or `.obsidian`, as the filesystem will read it?
@@ -394,12 +558,13 @@ fn is_hidden(name: &std::ffi::OsStr) -> bool {
 /// this runs over what tar actually unpacked, and catches a symlink whatever
 /// the local tar made of the archive. A hard link unpacks as an ordinary file
 /// and cannot be told apart here; the listing check is what refuses those.
-fn refuse_links(root: &Path, skip: &[&str]) -> Result<()> {
+fn refuse_links(root: &Path, skip: &[&str]) -> Result<u64> {
+    let mut bytes = 0u64;
     let mut stack = vec![root.to_path_buf()];
     while let Some(path) = stack.pop() {
-        let kind = std::fs::symlink_metadata(&path)
-            .with_context(|| format!("read {}", path.display()))?
-            .file_type();
+        let meta = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("read {}", path.display()))?;
+        let kind = meta.file_type();
         if kind.is_dir() {
             for entry in
                 std::fs::read_dir(&path).with_context(|| format!("read {}", path.display()))?
@@ -419,22 +584,122 @@ fn refuse_links(root: &Path, skip: &[&str]) -> Result<()> {
             continue;
         }
         anyhow::ensure!(kind.is_file(), "{} is not a regular file or directory", path.display());
+        bytes += meta.len();
     }
-    Ok(())
+    Ok(bytes)
 }
 
-fn list_archive(archive: &Path, flags: &str) -> Result<String> {
-    let listing = Command::new("tar")
-        .args([flags, &archive.display().to_string()])
-        .output()
-        .context("list the archive")?;
-    anyhow::ensure!(
-        listing.status.success(),
-        "cannot read {}: {}",
-        archive.display(),
-        String::from_utf8_lossy(&listing.stderr).trim()
-    );
-    Ok(String::from_utf8_lossy(&listing.stdout).into_owned())
+fn list_archive(archive: &Path, flags: &str, limits: &Limits) -> Result<String> {
+    // Room for every member the limits allow, with its verbose columns.
+    let most = (limits.members as u64) * (limits.path_bytes as u64 + 256);
+    let args = [flags.to_string(), archive.display().to_string()];
+    match tar_bounded(&args, true, most, limits.deadline)
+        .with_context(|| format!("cannot read {}", archive.display()))?
+    {
+        Ran::Finished { kept, .. } => Ok(String::from_utf8_lossy(&kept).into_owned()),
+        Ran::PastLimit => anyhow::bail!(
+            "the listing of {} runs past {most} bytes, more than {} members could fill",
+            archive.display(),
+            limits.members
+        ),
+    }
+}
+
+/// How a bounded tar run ended, when it did not fail.
+enum Ran {
+    /// It finished, having written this much - and this, when asked to keep it.
+    Finished { wrote: u64, kept: Vec<u8> },
+    /// It was stopped for writing more than the limit.
+    PastLimit,
+}
+
+/// Run tar on an archive someone else made, within bounds.
+///
+/// Killed at the deadline, or the moment it has written more than `limit`
+/// bytes to stdout - reading on past that is exactly the cost the limit is
+/// there to refuse. Passing the limit is an answer, not a failure: the caller
+/// knows what the limit meant and says so. A deadline or a failing tar is an
+/// error.
+fn tar_bounded(args: &[String], keep: bool, limit: u64, deadline: Duration) -> Result<Ran> {
+    use std::io::{ErrorKind, Read};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let mut child = Command::new("tar")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("run tar")?;
+    let over = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let over = Arc::clone(&over);
+        let mut stdout = child.stdout.take().context("tar stdout")?;
+        std::thread::spawn(move || {
+            let (mut seen, mut kept, mut buf) = (0u64, Vec::new(), vec![0u8; 64 * 1024]);
+            loop {
+                let n = match stdout.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
+                seen += n as u64;
+                if seen > limit {
+                    over.store(true, Ordering::Relaxed);
+                    break;
+                }
+                if keep {
+                    kept.extend_from_slice(&buf[..n]);
+                }
+            }
+            (seen, kept)
+        })
+    };
+    let errors = {
+        let mut stderr = child.stderr.take().context("tar stderr")?;
+        std::thread::spawn(move || {
+            // Enough to say what went wrong; the rest is drained, not kept,
+            // so a tar that complains forever neither blocks nor fills memory.
+            let mut text = Vec::new();
+            let _ = (&mut stderr).take(64 * 1024).read_to_end(&mut text);
+            let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+            String::from_utf8_lossy(&text).into_owned()
+        })
+    };
+
+    let started = Instant::now();
+    let status = loop {
+        let exited = match child.try_wait() {
+            Ok(exited) => exited,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error).context("wait for tar");
+            }
+        };
+        if let Some(status) = exited {
+            break Some(status);
+        }
+        if over.load(Ordering::Relaxed) || started.elapsed() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let (wrote, kept) = reader.join().map_err(|_| anyhow::anyhow!("tar output reader panicked"))?;
+    let stderr = errors.join().unwrap_or_default();
+    // Before the exit status: a tar stopped for writing too much dies of a
+    // closed pipe, and that is not the story to tell.
+    if over.load(Ordering::Relaxed) {
+        return Ok(Ran::PastLimit);
+    }
+    let status = status
+        .with_context(|| format!("tar did not finish within {} s", deadline.as_secs()))?;
+    anyhow::ensure!(status.success(), "tar failed: {}", stderr.trim());
+    Ok(Ran::Finished { wrote, kept })
 }
 
 fn run(program: &str, args: &[String]) -> Result<()> {
@@ -526,11 +791,11 @@ mod tests {
 
         let page = wiki("project/pages/a.md");
         let ordinary = archive_of("ordinary", &[&page, "wiki/old.md"]);
-        assert!(refuse_escaping_members(&ordinary, false).is_ok());
+        assert!(refuse_escaping_members(&ordinary, false, &LIMITS).is_ok());
 
         let with_config = archive_of("config", &[&page, "config.toml"]);
-        assert!(refuse_escaping_members(&with_config, true).is_ok(), "a full import takes it");
-        assert!(refuse_escaping_members(&with_config, false).is_err(), "a sync must not");
+        assert!(refuse_escaping_members(&with_config, true, &LIMITS).is_ok(), "a full import takes it");
+        assert!(refuse_escaping_members(&with_config, false, &LIMITS).is_err(), "a sync must not");
 
         let hook = wiki(".git/hooks/pre-commit");
         let folded = wiki(".GIT/hooks/post-commit");
@@ -543,9 +808,70 @@ mod tests {
             &plugin,
         ] {
             let archive = archive_of(&format!("bad{}", member.len()), &[&page, member]);
-            let refused = refuse_escaping_members(&archive, true).unwrap_err();
+            let refused = refuse_escaping_members(&archive, true, &LIMITS).unwrap_err();
             assert!(refused.to_string().contains("outside the wiki"), "{member}: {refused}");
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_archive_past_any_limit_is_refused_before_it_is_unpacked() {
+        // The same checks at a scale a test can reach: few members, short
+        // paths, a megabyte unpacked.
+        let small = Limits {
+            members: 3,
+            path_bytes: 64,
+            depth: 4,
+            log_bytes: 1 << 20,
+            unpacked_bytes: 1 << 20,
+            ratio: 100,
+            ratio_floor: 1 << 20,
+            deadline: Duration::from_secs(60),
+        };
+        let base = std::env::temp_dir().join(format!("brain-limits-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let archive_of = |name: &str, files: &[(String, Vec<u8>)]| {
+            let tree = base.join(name);
+            for (member, body) in files {
+                let path = tree.join(member);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, body).unwrap();
+            }
+            let archive = base.join(format!("{name}.tar.gz"));
+            let mut args = vec!["-czf".to_string(), archive.display().to_string()];
+            args.extend(["-C".to_string(), tree.display().to_string()]);
+            args.extend(files.iter().map(|(member, _)| member.clone()));
+            run("tar", &args).unwrap();
+            archive
+        };
+        let page = |name: &str| (format!("{}/{name}", crate::config::WIKI_DIR), b"x".to_vec());
+
+        let fits = archive_of("fits", &[page("a.md"), page("b.md")]);
+        assert!(refuse_escaping_members(&fits, false, &small).is_ok());
+
+        let many = archive_of("many", &[page("a.md"), page("b.md"), page("c.md"), page("d.md")]);
+        let refused = refuse_escaping_members(&many, false, &small).unwrap_err();
+        assert!(format!("{refused:#}").contains("members"), "{refused:#}");
+
+        let long = archive_of("long", &[page(&"x".repeat(80))]);
+        let refused = refuse_escaping_members(&long, false, &small).unwrap_err();
+        assert!(format!("{refused:#}").contains("longer than"), "{refused:#}");
+
+        let deep = archive_of("deep", &[page("a/b/c/d.md")]);
+        let refused = refuse_escaping_members(&deep, false, &small).unwrap_err();
+        assert!(format!("{refused:#}").contains("deeper than"), "{refused:#}");
+
+        // Two members, but four folders on the way to them: past three.
+        let nested = archive_of("nested", &[page("a/x.md"), page("b/y.md")]);
+        let refused = refuse_escaping_members(&nested, false, &small).unwrap_err();
+        assert!(format!("{refused:#}").contains("files and folders"), "{refused:#}");
+
+        // Eight megabytes of zeros pack into a few kilobytes: a bomb, in
+        // miniature, and measured without ever landing on disk.
+        let zeros = (format!("{}/zeros.md", crate::config::WIKI_DIR), vec![0u8; 8 << 20]);
+        let bomb = archive_of("bomb", &[zeros]);
+        let refused = refuse_escaping_members(&bomb, false, &small).unwrap_err();
+        assert!(format!("{refused:#}").contains("unpacks to more than"), "{refused:#}");
         let _ = std::fs::remove_dir_all(&base);
     }
 

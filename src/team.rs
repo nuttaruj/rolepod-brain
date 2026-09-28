@@ -274,7 +274,7 @@ fn absorb(paths: &Paths, plain: &str) -> Result<usize> {
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         let path = dir.join("knowledge.jsonl");
         let existing = std::fs::read_to_string(&path).unwrap_or_default();
-        let mut ids: Vec<String> = existing
+        let mut ids: std::collections::HashSet<String> = existing
             .lines()
             .filter_map(|line| {
                 serde_json::from_str::<serde_json::Value>(line)
@@ -287,10 +287,9 @@ fn absorb(paths: &Paths, plain: &str) -> Result<usize> {
         let mut lines: Vec<String> =
             existing.lines().filter(|line| !line.trim().is_empty()).map(str::to_string).collect();
         for (id, line) in incoming {
-            if ids.contains(&id) {
+            if !ids.insert(id) {
                 continue;
             }
-            ids.push(id);
             lines.push(line);
             gained += 1;
         }
