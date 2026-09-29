@@ -1054,28 +1054,68 @@ impl Store {
         Ok(rows.filter_map(std::result::Result::ok).collect())
     }
 
-    /// Which of these ids something has classified: any entry that is not
-    /// a raw observation, or an observation consolidation gave a topic.
+    /// The topic consolidation gave each of these ids, when it gave one.
     ///
     /// A raw capture's title is the command that produced it - "Ran brain",
-    /// "cargo test" - which says nothing to a reader who was not there.
+    /// "cargo test" - which says nothing to a reader who was not there; the
+    /// topic is what says a capture was classified, and as what.
     ///
     /// # Errors
     /// Returns an error when the query fails.
-    pub fn classified(&self, ids: &[String]) -> Result<std::collections::HashSet<String>> {
+    pub fn topics_of(&self, ids: &[String]) -> Result<std::collections::HashMap<String, Option<String>>> {
         if ids.is_empty() {
-            return Ok(std::collections::HashSet::new());
+            return Ok(std::collections::HashMap::new());
         }
         let slots = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "SELECT id FROM events
-             WHERE id IN ({slots}) AND (kind != 'observation' OR topic IS NOT NULL)"
-        );
-        let mut stmt = self.conn.prepare(&sql).context("prepare classified")?;
+        let sql = format!("SELECT id, topic FROM events WHERE id IN ({slots})");
+        let mut stmt = self.conn.prepare(&sql).context("prepare topics of")?;
         let rows = stmt
-            .query_map(rusqlite::params_from_iter(ids.iter()), |row| row.get::<_, String>(0))
-            .context("run classified")?;
+            .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .context("run topics of")?;
         Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// How widely each of these words is spread through a project's memory.
+    ///
+    /// Returns the project's entry count and, per word that occurs at all,
+    /// how many entries mention it. A word in most entries says nothing about
+    /// which of them is relevant, whatever the words around it are: it is how
+    /// a dispatch prompt's setup lines ("worktree", "tests", "commit") were
+    /// driving matches on memory about unrelated work.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn word_spread(&self, project: &str, words: &[String]) -> Result<(i64, Vec<(String, i64)>)> {
+        let total: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE project = ?1 AND forgotten = 0
+                       AND kind NOT IN ('tombstone', 'retire')",
+                params![project],
+                |row| row.get(0),
+            )
+            .context("count project entries")?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT COUNT(*) FROM events_fts JOIN events e ON e.rowid = events_fts.rowid
+                 WHERE events_fts MATCH ?1 AND e.project = ?2 AND e.forgotten = 0
+                       AND e.kind NOT IN ('tombstone', 'retire')",
+            )
+            .context("prepare word spread")?;
+        let mut spread = Vec::with_capacity(words.len());
+        for word in words {
+            // Quoted: a prompt's own "AND", "OR" and "NEAR" are words here.
+            let quoted = format!("\"{}\"", word.replace('"', ""));
+            if let Ok(count) = stmt.query_row(params![quoted, project], |row| row.get::<_, i64>(0)) {
+                if count > 0 {
+                    spread.push((word.clone(), count));
+                }
+            }
+        }
+        Ok((total, spread))
     }
 
     /// Full-text search within one project, most relevant first.
