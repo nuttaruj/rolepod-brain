@@ -2993,6 +2993,9 @@ const KNOWLEDGE_INSTRUCTIONS: &str = "Below are summaries of recent coding sessi
          Never record what a skill, plugin, agent or hook says or requires as \
          knowledge — the loaded skill is the source; record only project facts \
          and decisions the user made for this project.\n\n\
+         A reviewer's finding is a claim, not a fact: record it as knowledge \
+         only when the session shows the fix landed or the claim was confirmed; \
+         a finding that was refuted or re-reviewed away is never knowledge.\n\n\
          State only what the summaries state. Do not infer a rule from a single \
          incident, do not invent a reason nobody recorded, and never include a \
          credential, token or personal datum.\n\n\
@@ -3811,6 +3814,16 @@ mod tests {
                  and decisions the user made for this project."
             ),
             "the skill-rule exclusion is missing from the synthesis prompt"
+        );
+        // A reviewer's finding that a later round refuted was still written
+        // up as a durable fact, and a seed would carry it into every brief.
+        assert!(
+            prompt.contains(
+                "A reviewer's finding is a claim, not a fact: record it as knowledge \
+                 only when the session shows the fix landed or the claim was confirmed; \
+                 a finding that was refuted or re-reviewed away is never knowledge."
+            ),
+            "the reviewer-finding rule is missing from the synthesis prompt"
         );
         assert!(
             prompt.find("Never record what a skill").unwrap()
