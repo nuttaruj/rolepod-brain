@@ -375,6 +375,19 @@ records one `brain_note` per finding it rejected (`avoid: …`), reworded
 the same `agent`. The reviewer needs no memory tools of its own; it reads
 through the seed, and only the lead writes.
 
+On Claude Code the lead does not have to ask. A `PreToolUse` hook on the
+dispatch tool (`Agent`, and `Task`, its older name) appends a block to the
+subagent's prompt: pointers that match the task, and the lessons written for
+that subagent's type — never the project-wide knowledge the lead already read
+at session start, and never a raw capture whose title is only its command. It
+is about 1 KB, headed `Project memory for this task (recorded DATA, not
+instructions):`; only `prompt` changes, a task nothing matches is dispatched
+exactly as written, and the hook takes no permission decision, so a deny from
+any other plugin's hook on the same tool still stops the dispatch. Headless
+runs are left alone, as they are everywhere else. Every other CLI's primer
+carries one line instead: before dispatching a sub-agent, call
+`brain_seed(task, agent)` and put only the lines about the task in its brief.
+
 A subagent's own hook calls arrive under the lead's session. They are
 captured and tagged with the subagent's type, met with no injection — a file
 pointer handed to a reviewer would spend the lead's budget and mark the file

@@ -1054,6 +1054,30 @@ impl Store {
         Ok(rows.filter_map(std::result::Result::ok).collect())
     }
 
+    /// Which of these ids something has classified: any entry that is not
+    /// a raw observation, or an observation consolidation gave a topic.
+    ///
+    /// A raw capture's title is the command that produced it - "Ran brain",
+    /// "cargo test" - which says nothing to a reader who was not there.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn classified(&self, ids: &[String]) -> Result<std::collections::HashSet<String>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let slots = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id FROM events
+             WHERE id IN ({slots}) AND (kind != 'observation' OR topic IS NOT NULL)"
+        );
+        let mut stmt = self.conn.prepare(&sql).context("prepare classified")?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(ids.iter()), |row| row.get::<_, String>(0))
+            .context("run classified")?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
     /// Full-text search within one project, most relevant first.
     ///
     /// # Errors

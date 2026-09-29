@@ -13,8 +13,9 @@ Event names are PascalCase here; Cursor's are camelCase (postToolUse,
 beforeSubmitPrompt), so this file cannot be picked up by the wrong host.
 Codex declares its own file explicitly in .codex-plugin/plugin.json.
 
-PreToolUse is scoped to Read and injects only - it is never captured, or it
-would duplicate PostToolUse. PostCompact is absent on purpose: Claude Code
+PreToolUse is scoped to Read and the subagent dispatch tool (Agent, and Task,
+its older name) and injects only - it is never captured, or it would duplicate
+PostToolUse. PostCompact is absent on purpose: Claude Code
 rejects injected context under that event. Both reasons are in src/setup.rs.
 
 Only SessionStart checks that the binary exists. It fires once a session,

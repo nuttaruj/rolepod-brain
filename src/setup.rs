@@ -130,10 +130,12 @@ pub fn targets_in(home: &Path, exe: &Path) -> Result<Vec<Target>> {
             hooks_file: home.join(".claude/settings.json"),
             binaries: &["claude"],
             timeout_overrides: &[],
-            // `PreToolUse` is wired for one tool only. It is not a capture
+            // `PreToolUse` is wired for two jobs only. It is not a capture
             // surface - see `hook::captures` - it is there so that what we know
-            // about a file reaches the agent before the file's contents do.
-            matchers: &[("PreToolUse", "Read")],
+            // about a file reaches the agent before the file's contents do, and
+            // so a subagent's prompt carries what memory holds about its task
+            // (`Agent`, and `Task`, its older name).
+            matchers: &[("PreToolUse", "Read|Agent|Task")],
             // Verified against the installed Claude Code binary's own event
             // names, not documentation.
             //
@@ -141,9 +143,11 @@ pub fn targets_in(home: &Path, exe: &Path) -> Result<Vec<Target>> {
             // 1,433 real captures: 701 pre against 676 post, and the pre title
             // is the same command text with no result attached — 96% pure
             // duplication that doubled storage and every consolidation prompt.
-            // So it is scoped to `Read`, and `hook::captures` drops it on the
-            // floor afterwards; all it does is get memory about a file in
-            // front of the agent while that can still change anything.
+            // So it is scoped to `Read` and the dispatch tool, and
+            // `hook::captures` drops it on the floor afterwards; all it does is
+            // get memory about a file in front of the agent while that can
+            // still change anything, and memory about a task into a subagent's
+            // brief.
             //
             // `PostCompact` is absent too, and for a harder reason: Claude Code
             // will not accept `additionalContext` under that event name, so the

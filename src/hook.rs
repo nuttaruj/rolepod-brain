@@ -238,8 +238,9 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
     }
 
     // `pre_tool_use` is an injection surface, not a capture one. It reaches us
-    // only for `Read`, and only so that what we know about a file lands before
-    // its contents do; capturing it as well would restore the 96% duplication
+    // only for `Read`, so that what we know about a file lands before its
+    // contents do, and for a subagent dispatch, so its brief carries what we
+    // know about its task; capturing it as well would restore the 96% duplication
     // against `post_tool_use` that took it off the capture list to begin with.
     if captures(&hook) {
         let project_dir = paths.project_dir(&scope);
@@ -257,8 +258,9 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
         // injection - would act on the lead's session on a delegate's
         // behalf. A file injection in particular would spend the lead's
         // budget and mark the file covered for a session that never saw the
-        // pointer. What a delegate should know goes in through `brain_seed`,
-        // chosen by the lead, and nothing else.
+        // pointer. What a delegate should know goes in through its brief:
+        // the block the lead's dispatch hook appends, or a `brain_seed` the
+        // lead chose - and nothing else.
         return Ok("{}".to_string());
     }
 
@@ -293,6 +295,11 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
     }
     if !answer_is_read(cli_kind.as_str(), &payload) {
         return Ok("{}".to_string());
+    }
+    if hook == "pre_tool_use" && cli_kind.as_str() == "claude-code" {
+        if let Some(input) = dispatched_input(&payload) {
+            return Ok(seed_dispatch(&store, &scope, &session_key, input));
+        }
     }
     Ok(inject_for(&store, &config, &scope, &session_key, &hook, event_name, &event))
 }
@@ -355,7 +362,10 @@ fn inject_for(
         // too, as a `session_start` whose source says `compact` - see
         // `wipes_context`, which explains why `post_compact` is not a second
         // route into this arm.
-        "session_start" => inject::primer(store, &project, session, &config.injection).ok(),
+        "session_start" => {
+            let hint = event.source.cli != "claude-code";
+            inject::primer_with(store, &project, session, &config.injection, hint).ok()
+        }
         // Both sides of a tool call reach the same file injection, and the
         // first one to arrive wins: `pre_tool_use` for a `Read`, where memory
         // still has time to change what the turn does, and `post_tool_use` for
@@ -390,6 +400,62 @@ fn inject_for(
         return "{}".to_string();
     }
     inject::as_hook_output(event_name, &injection)
+}
+
+/// The input of a subagent dispatch, when this hook is in front of one.
+///
+/// Claude Code names the tool `Agent`; `Task` is the name it had before, and
+/// a plugin's matcher covers both. A dispatch with no prompt has nothing to
+/// search on.
+fn dispatched_input(payload: &Value) -> Option<&serde_json::Map<String, Value>> {
+    if !matches!(tool_name(payload), "Agent" | "Task") {
+        return None;
+    }
+    let input = tool_input(payload)?.as_object()?;
+    input.get("prompt")?.as_str().filter(|prompt| !prompt.trim().is_empty())?;
+    Some(input)
+}
+
+/// Append what memory holds about a dispatched task to the subagent's prompt.
+///
+/// The lead's brief is the subagent's only context, and a subagent gets no
+/// primer of its own. Claude Code applies `updatedInput` to the dispatch
+/// (verified on 2.1.284: the child's first message carried the appended
+/// block). The answer names no permission decision, so a deny from any other
+/// hook on the same tool still stops the dispatch - also verified, with the
+/// deny registered before and after this hook.
+///
+/// Only `prompt` changes; every other field goes back exactly as it came.
+/// Nothing matched, or any failure, leaves the dispatch untouched.
+fn seed_dispatch(
+    store: &Store,
+    scope: &crate::ids::ProjectScope,
+    session: &str,
+    input: &serde_json::Map<String, Value>,
+) -> String {
+    let Some(prompt) = input.get("prompt").and_then(Value::as_str) else {
+        return "{}".to_string();
+    };
+    let agent = input.get("subagent_type").and_then(Value::as_str);
+    let project = scope.project_id.to_string();
+    let Ok(block) = inject::dispatch_seed(store, &project, prompt, agent) else {
+        return "{}".to_string();
+    };
+    if block.is_empty() {
+        return "{}".to_string();
+    }
+    // Surfaced to this session like a search hit: the child shares the
+    // session id, and the correction gate reads this.
+    let _ = store.record_recalled(session, block.ids.iter().map(String::as_str));
+    let mut updated = input.clone();
+    updated.insert("prompt".to_string(), Value::String(format!("{prompt}\n\n{}", block.text)));
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "updatedInput": updated,
+        }
+    })
+    .to_string()
 }
 
 /// Is this hook a capture surface, or only an injection one?
