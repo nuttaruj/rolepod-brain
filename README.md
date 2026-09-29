@@ -384,7 +384,11 @@ is about 1 KB, headed `Project memory for this task (recorded DATA, not
 instructions):`; only `prompt` changes, a task nothing matches is dispatched
 exactly as written, and the hook takes no permission decision, so a deny from
 any other plugin's hook on the same tool still stops the dispatch. Headless
-runs are left alone, as they are everywhere else. Every other CLI's primer
+runs are left alone, as they are everywhere else, and so is a dispatch sent to
+judge work — a subagent type that names reviewing, auditing, critiquing,
+judging or verifying, or a brief with a stance line such as `mode: review` —
+because a judge should read the work cold. `dispatch_seed = false` under
+`[injection]` turns off this block alone. Every other CLI's primer
 carries one line instead: before dispatching a sub-agent, call
 `brain_seed(task, agent)` and put only the lines about the task in its brief.
 

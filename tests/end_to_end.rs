@@ -6151,3 +6151,34 @@ fn a_dispatch_carries_what_memory_holds_about_its_task() {
     let out = fixture.hook("claude-code", "PreToolUse", &unmatched);
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "{}");
 }
+
+#[test]
+fn a_dispatch_to_judge_work_goes_cold_and_the_switch_stops_only_the_seed() {
+    // A reviewer reads the work cold, as a headless run does: memory of how
+    // the lead saw it is the prior it must not start from.
+    let fixture = Fixture::new("dispatch-judge");
+    let session = "0199c000-0000-7000-8000-00000000d151";
+    fixture.mcp(&[
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"brain_note","arguments":{"text":"The stripe webhook secret rotates on every stripe listen run."}}}"#,
+    ]);
+    let dispatch = |kind: &str, prompt: &str| {
+        let payload = serde_json::json!({
+            "session_id": session,
+            "cwd": fixture.project,
+            "tool_name": "Agent",
+            "tool_input": {"description": "x", "prompt": prompt, "subagent_type": kind}
+        })
+        .to_string();
+        String::from_utf8_lossy(&fixture.hook("claude-code", "PreToolUse", &payload).stdout).trim().to_string()
+    };
+
+    assert_eq!(dispatch("code-reviewer", "stripe webhook"), "{}", "a reviewer got memory");
+    assert_eq!(dispatch("general-purpose", "mode: adversarial\nstripe webhook"), "{}", "a stance got memory");
+    assert!(dispatch("Explore", "stripe webhook").contains("webhook secret rotates"), "a scout lost its seed");
+
+    std::fs::write(fixture.home.join("config.toml"), "[injection]\ndispatch_seed = false\n").unwrap();
+    assert_eq!(dispatch("backend-developer", "stripe webhook"), "{}", "the switch did not stop the seed");
+    let start = serde_json::json!({"session_id": session, "cwd": fixture.project, "source": "startup"}).to_string();
+    let primer = String::from_utf8_lossy(&fixture.hook("claude-code", "SessionStart", &start).stdout).to_string();
+    assert!(primer.contains("additionalContext"), "the switch reached the primer: {primer}");
+}

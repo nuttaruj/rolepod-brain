@@ -730,7 +730,7 @@ mod tests {
         lesson.consolidated = true;
         store.index(&lesson).unwrap();
 
-        let config = InjectionConfig { primer_budget: SMALL_BUDGET, session_budget: 8192 };
+        let config = InjectionConfig { primer_budget: SMALL_BUDGET, session_budget: 8192, dispatch_seed: true };
         let injection = primer(&store, &project.to_string(), "squeeze", &config).unwrap();
         let knw = injection.text.find("KNW  Test only against an isolated HOME");
         let sum = injection.text.find("SUM  ");
@@ -927,7 +927,7 @@ mod tests {
         inflight.id = "01ZZZZSMALLBUDGET00000000".to_string();
         store.index(&inflight).unwrap();
 
-        let config = InjectionConfig { primer_budget: SMALL_BUDGET, session_budget: 8192 };
+        let config = InjectionConfig { primer_budget: SMALL_BUDGET, session_budget: 8192, dispatch_seed: true };
         let injection = primer(&store, &project.to_string(), "s", &config).unwrap();
         assert!(
             injection.text.contains(&inflight.id),
@@ -976,7 +976,7 @@ mod tests {
             store.index(&event).unwrap();
         }
 
-        let config = InjectionConfig { primer_budget: 4096, session_budget: 8192 };
+        let config = InjectionConfig { primer_budget: 4096, session_budget: 8192, dispatch_seed: true };
         let injection = primer(&store, &project.to_string(), "s", &config).unwrap();
         let summaries = injection.text.matches("01SUM").count();
         assert!(
@@ -1030,7 +1030,7 @@ mod tests {
         inflight.id = "01ZZZZINFLIGHT00000000000".to_string();
         store.index(&inflight).unwrap();
 
-        let config = InjectionConfig { primer_budget: SMALL_BUDGET, session_budget: 8192 };
+        let config = InjectionConfig { primer_budget: SMALL_BUDGET, session_budget: 8192, dispatch_seed: true };
         let injection = primer(&store, &project.to_string(), "next", &config).unwrap();
         assert!(
             injection.text.contains(&inflight.id),
@@ -1152,7 +1152,7 @@ mod tests {
     fn the_primer_respects_its_byte_budget_exactly() {
         let project = Uuid::new_v4();
         let store = store_with(project, 200);
-        let config = InjectionConfig { primer_budget: SMALL_BUDGET, session_budget: 8192 };
+        let config = InjectionConfig { primer_budget: SMALL_BUDGET, session_budget: 8192, dispatch_seed: true };
         let injection = primer(&store, &project.to_string(), "s1", &config).unwrap();
         assert!(!injection.is_empty());
         assert!(
@@ -1167,7 +1167,7 @@ mod tests {
     fn the_primer_never_clips_a_line() {
         let project = Uuid::new_v4();
         let store = store_with(project, 200);
-        let config = InjectionConfig { primer_budget: 700, session_budget: 8192 };
+        let config = InjectionConfig { primer_budget: 700, session_budget: 8192, dispatch_seed: true };
         let injection = primer(&store, &project.to_string(), "s1", &config).unwrap();
         for line in injection.text.lines().filter(|line| line.starts_with("01TEST")) {
             assert!(line.len() > 30, "a pointer line was clipped: {line:?}");
@@ -1241,7 +1241,7 @@ mod tests {
         let project = Uuid::new_v4();
         let store = store_with(project, 20);
         // Just enough for the header and nothing else.
-        let config = InjectionConfig { primer_budget: 4096, session_budget: 30 };
+        let config = InjectionConfig { primer_budget: 4096, session_budget: 30, dispatch_seed: true };
         let injection =
             for_file(&store, &project.to_string(), "s1", "src/auth.rs", "", &config).unwrap();
         assert!(
@@ -1260,7 +1260,7 @@ mod tests {
     fn a_resumed_session_s_primer_cannot_stack_past_the_ceiling() {
         let project = Uuid::new_v4();
         let store = store_with(project, 200);
-        let config = InjectionConfig { primer_budget: 4096, session_budget: 8192 };
+        let config = InjectionConfig { primer_budget: 4096, session_budget: 8192, dispatch_seed: true };
         let session = "resumed-session";
 
         let first = primer(&store, &project.to_string(), session, &config).unwrap();
@@ -1294,7 +1294,7 @@ mod tests {
         let project = Uuid::new_v4();
         let store = store_with(project, 200);
         // A misconfiguration: primer budget larger than the session cap.
-        let config = InjectionConfig { primer_budget: 100_000, session_budget: 2048 };
+        let config = InjectionConfig { primer_budget: 100_000, session_budget: 2048, dispatch_seed: true };
         let injection = primer(&store, &project.to_string(), "s1", &config).unwrap();
         assert!(injection.text.len() <= config.session_budget);
     }
@@ -1303,7 +1303,7 @@ mod tests {
     fn layer_three_goes_quiet_when_the_session_budget_is_spent() {
         let project = Uuid::new_v4();
         let store = store_with(project, 20);
-        let config = InjectionConfig { primer_budget: 4096, session_budget: 100 };
+        let config = InjectionConfig { primer_budget: 4096, session_budget: 100, dispatch_seed: true };
         store.record_injected("s1", &[], 0, 100, config.session_budget).unwrap();
         let injection =
             for_file(&store, &project.to_string(), "s1", "src/auth.rs", "", &config).unwrap();

@@ -298,6 +298,9 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
     }
     if hook == "pre_tool_use" && cli_kind.as_str() == "claude-code" {
         if let Some(input) = dispatched_input(&payload) {
+            if !config.injection.dispatch_seed || judges_work(input) {
+                return Ok("{}".to_string());
+            }
             return Ok(seed_dispatch(&store, &scope, &session_key, input));
         }
     }
@@ -414,6 +417,69 @@ fn dispatched_input(payload: &Value) -> Option<&serde_json::Map<String, Value>> 
     let input = tool_input(payload)?.as_object()?;
     input.get("prompt")?.as_str().filter(|prompt| !prompt.trim().is_empty())?;
     Some(input)
+}
+
+/// Is this dispatch sent to judge work rather than do it?
+///
+/// A reviewer, auditor, critic or judge should read the work cold - the
+/// reason headless runs get nothing - and memory of how the lead saw it is
+/// exactly the prior it must not start from. Two generic signals, no plugin's
+/// names: the subagent type says so (`code-reviewer`, `security-auditor`,
+/// `Verifier`), or the brief carries a stance line (`mode: review`,
+/// `mode: adversarial`), which is how a general-purpose agent is sent to judge.
+fn judges_work(input: &serde_json::Map<String, Value>) -> bool {
+    let named = input
+        .get("subagent_type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| identifier_words(kind).iter().any(|word| is_judging(word)));
+    let stance = input.get("prompt").and_then(Value::as_str).is_some_and(|prompt| {
+        prompt.lines().any(|line| {
+            let line = line.trim_start_matches(|c: char| c.is_whitespace() || "-*>`#".contains(c));
+            // The stance is the mode's first word: `mode: build, then review`
+            // sends a builder.
+            line.get(..5).is_some_and(|head| head.eq_ignore_ascii_case("mode:"))
+                && identifier_words(&line[5..])
+                    .first()
+                    .is_some_and(|word| is_judging(word) || word == "adversarial")
+        })
+    });
+    named || stance
+}
+
+/// A word that names judging: review, audit, critique, judge, verify, and
+/// their agent and -ing forms. `critical` and `preview` are not.
+fn is_judging(word: &str) -> bool {
+    ["review", "audit", "critiq", "judg", "verif"].iter().any(|stem| word.starts_with(stem))
+        || word == "critic"
+        || word == "critics"
+}
+
+/// Lowercase words of an identifier: split on anything not alphanumeric,
+/// at a lower-to-upper case change, and before the last capital of an
+/// acronym, so `CodeReviewer`, `code-reviewer` and `PRReviewer` all yield
+/// `reviewer`. A name run together in one case (`codereviewer`) stays whole.
+fn identifier_words(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut words = Vec::new();
+    let mut current = String::new();
+    for (index, &c) in chars.iter().enumerate() {
+        let previous = index.checked_sub(1).map(|at| chars[at]);
+        let next = chars.get(index + 1);
+        let camel = c.is_uppercase()
+            && previous.is_some_and(|p| {
+                p.is_lowercase() || (p.is_uppercase() && next.is_some_and(|n| n.is_lowercase()))
+            });
+        if (!c.is_alphanumeric() || camel) && !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+        if c.is_alphanumeric() {
+            current.extend(c.to_lowercase());
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
 }
 
 /// Append what memory holds about a dispatched task to the subagent's prompt.
@@ -1043,6 +1109,40 @@ pub fn first_line(input: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn dispatch(kind: &str, prompt: &str) -> serde_json::Map<String, Value> {
+        json!({"subagent_type": kind, "prompt": prompt}).as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn a_dispatch_sent_to_judge_work_is_told_by_its_type_or_its_stance() {
+        for kind in [
+            "code-reviewer",
+            "rolepod:universal-reviewer",
+            "security-auditor",
+            "Verifier",
+            "CodeReviewer",
+            "plan_critic",
+            "judge",
+            "verification-agent",
+            "PRReviewer",
+            "LLMJudge",
+            "judging-panel",
+        ] {
+            assert!(judges_work(&dispatch(kind, "look at the diff")), "{kind} judges work");
+        }
+        for prompt in ["mode: review\nthe diff", "Scope: x\n- mode: adversarial", "`Mode: Audit`"] {
+            assert!(judges_work(&dispatch("general-purpose", prompt)), "{prompt:?} is a stance");
+        }
+        for kind in ["backend-developer", "Explore", "scout", "ui-preview-builder", "critical-path-planner"] {
+            assert!(!judges_work(&dispatch(kind, "fix the webhook retry")), "{kind} builds or finds");
+        }
+        // Words about reviewing inside the task are not a stance.
+        assert!(!judges_work(&dispatch("general-purpose", "address the review findings in src/a.rs")));
+        // The stance is the mode's first word; a builder told a review follows
+        // is still a builder.
+        assert!(!judges_work(&dispatch("general-purpose", "mode: build, then review")));
+    }
 
     #[test]
     fn a_silenced_process_captures_nothing() {

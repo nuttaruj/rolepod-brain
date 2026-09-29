@@ -112,11 +112,15 @@ pub struct InjectionConfig {
     pub primer_budget: usize,
     /// Ceiling for everything auto-injected in one session, across layers.
     pub session_budget: usize,
+    /// Append task memory to a subagent's prompt at dispatch (Claude Code).
+    /// `false` turns off only that; the primer and file memory stay as they
+    /// are.
+    pub dispatch_seed: bool,
 }
 
 impl Default for InjectionConfig {
     fn default() -> Self {
-        Self { primer_budget: 4096, session_budget: 8192 }
+        Self { primer_budget: 4096, session_budget: 8192, dispatch_seed: true }
     }
 }
 
