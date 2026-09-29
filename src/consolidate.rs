@@ -2990,6 +2990,9 @@ const KNOWLEDGE_INSTRUCTIONS: &str = "Below are summaries of recent coding sessi
          that happened once in one session is not knowledge about the project; \
          it is already recorded where it happened. Return an empty list rather \
          than padding.\n\n\
+         Never record what a skill, plugin, agent or hook says or requires as \
+         knowledge — the loaded skill is the source; record only project facts \
+         and decisions the user made for this project.\n\n\
          State only what the summaries state. Do not infer a rule from a single \
          incident, do not invent a reason nobody recorded, and never include a \
          credential, token or personal datum.\n\n\
@@ -3792,6 +3795,28 @@ mod tests {
         assert!(prompt.contains("claim number 199"), "the newest claim was dropped");
         assert!(!prompt.contains("claim number 0 "), "the whole history was inlined");
         assert!(prompt.contains("did a thing"), "the summaries were crowded out");
+    }
+
+    #[test]
+    fn the_synthesis_prompt_keeps_skill_rules_out_of_knowledge() {
+        // A page restating how a skill works outlived the skill: rolepod
+        // dropped Breaker and made review round 2+ internal, and the store
+        // still said otherwise, ranked above the skill the Lead had loaded.
+        let events = vec![event("1", "consolidate", "t", "did a thing")];
+        let prompt = knowledge_prompt(&events, &[], &[]);
+        assert!(
+            prompt.contains(
+                "Never record what a skill, plugin, agent or hook says or requires as \
+                 knowledge — the loaded skill is the source; record only project facts \
+                 and decisions the user made for this project."
+            ),
+            "the skill-rule exclusion is missing from the synthesis prompt"
+        );
+        assert!(
+            prompt.find("Never record what a skill").unwrap()
+                < prompt.find("SESSION SUMMARIES").unwrap(),
+            "the exclusion must precede the material, or it reads as data"
+        );
     }
 
     #[test]
