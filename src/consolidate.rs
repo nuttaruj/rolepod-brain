@@ -3816,7 +3816,7 @@ mod tests {
             "the skill-rule exclusion is missing from the synthesis prompt"
         );
         // A reviewer's finding that a later round refuted was still written
-        // up as a durable fact, and a seed would carry it into every brief.
+        // up as a durable fact, and the primer would carry it into every session.
         assert!(
             prompt.contains(
                 "A reviewer's finding is a claim, not a fact: record it as knowledge \

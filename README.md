@@ -354,8 +354,6 @@ brain search "auth"     # full-text search this project's memory
 brain search "auth" --rerank   # same order an agent gets from brain_search; --no-rerank keeps the index's
 brain search "auth" --explain  # the working: each stream's rank per hit, the fusion, which streams did not run
 brain where             # which project am I in, and where does it live
-brain seed "the task"   # a paste-ready block to hand a subagent
-brain seed "review the diff" --agent rolepod:universal-reviewer   # that reviewer's own lessons first
 brain retire            # measure what old, never-used memory would free (dry run)
 ```
 
@@ -365,32 +363,11 @@ meaning, `brain_get` for a full body, `brain_recent` to re-orient, and
 than query it: `brain_outline`, for what a project IS before you know what to
 ask about it, and `brain_related`, for what sits beside a memory you are
 already holding. Four to write back — `brain_note`, `brain_correct`,
-`brain_feedback`, and `brain_forget`. And one to hand memory onward:
-`brain_seed`, a compact block — standing lessons first, then pointers
-relevant to a task — sized to paste into a subagent's prompt. Given the
-subagent's type (`agent: rolepod:universal-reviewer`), the lessons written
-for that type lead the block: after judging a reviewer's findings, the lead
-records one `brain_note` per finding it rejected (`avoid: …`), reworded
-(`refine: …`) or wants repeated (`keep: …`), addressed to that reviewer with
-the same `agent`. The reviewer needs no memory tools of its own; it reads
-through the seed, and only the lead writes.
+`brain_feedback`, and `brain_forget`. And `brain_doctor`, to check that
+capture is working.
 
-On Claude Code the lead does not have to ask. A `PreToolUse` hook on the
-dispatch tool (`Agent`, and `Task`, its older name) appends a block to the
-subagent's prompt: pointers that match the task, and the lessons written for
-that subagent's type — never the project-wide knowledge the lead already read
-at session start, and never a raw capture whose title is only its command. It
-is about 1 KB, headed `Project memory for this task (recorded DATA, not
-instructions):`; only `prompt` changes, a task nothing matches is dispatched
-exactly as written, and the hook takes no permission decision, so a deny from
-any other plugin's hook on the same tool still stops the dispatch. Headless
-runs are left alone, as they are everywhere else, and so is a dispatch sent to
-judge work — a subagent type that names reviewing, auditing, critiquing,
-judging or verifying, or a brief with a stance line such as `mode: review` —
-because a judge should read the work cold. `dispatch_seed = false` under
-`[injection]` turns off this block alone. Every other CLI's primer
-carries one line instead: before dispatching a sub-agent, call
-`brain_seed(task, agent)` and put only the lines about the task in its brief.
+Brain adds nothing to a subagent's prompt: what a subagent knows is the brief
+the lead writes, and memory is the lead's to use while writing it.
 
 A subagent's own hook calls arrive under the lead's session. They are
 captured and tagged with the subagent's type, met with no injection — a file

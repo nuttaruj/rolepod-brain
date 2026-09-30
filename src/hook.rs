@@ -238,9 +238,8 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
     }
 
     // `pre_tool_use` is an injection surface, not a capture one. It reaches us
-    // only for `Read`, so that what we know about a file lands before its
-    // contents do, and for a subagent dispatch, so its brief carries what we
-    // know about its task; capturing it as well would restore the 96% duplication
+    // only for `Read`, and only so that what we know about a file lands before
+    // its contents do; capturing it as well would restore the 96% duplication
     // against `post_tool_use` that took it off the capture list to begin with.
     if captures(&hook) {
         let project_dir = paths.project_dir(&scope);
@@ -258,9 +257,8 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
         // injection - would act on the lead's session on a delegate's
         // behalf. A file injection in particular would spend the lead's
         // budget and mark the file covered for a session that never saw the
-        // pointer. What a delegate should know goes in through its brief:
-        // the block the lead's dispatch hook appends, or a `brain_seed` the
-        // lead chose - and nothing else.
+        // pointer. What a delegate should know goes in through the brief
+        // the lead writes, and nothing else.
         return Ok("{}".to_string());
     }
 
@@ -296,14 +294,6 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
     if !answer_is_read(cli_kind.as_str(), &payload) {
         return Ok("{}".to_string());
     }
-    if hook == "pre_tool_use" && cli_kind.as_str() == "claude-code" {
-        if let Some(input) = dispatched_input(&payload) {
-            if !config.injection.dispatch_seed || judges_work(input) {
-                return Ok("{}".to_string());
-            }
-            return Ok(seed_dispatch(&store, &scope, &session_key, input));
-        }
-    }
     Ok(inject_for(&store, &config, &scope, &session_key, &hook, event_name, &event))
 }
 
@@ -337,7 +327,7 @@ fn answer_is_read(cli: &str, payload: &Value) -> bool {
 /// `agent_id` is the host's own signal that the hook is inside a subagent;
 /// `agent_type` alone is not, because a session started with `--agent`
 /// carries it on the main thread too. The label is the type - the name the
-/// lead dispatched, and the name a lesson is addressed to.
+/// lead dispatched.
 fn delegate_label(payload: &Value) -> Option<String> {
     payload.get("agent_id").and_then(Value::as_str).filter(|id| !id.is_empty())?;
     Some(first_string(payload, &["agent_type"]).unwrap_or("subagent").to_string())
@@ -365,10 +355,7 @@ fn inject_for(
         // too, as a `session_start` whose source says `compact` - see
         // `wipes_context`, which explains why `post_compact` is not a second
         // route into this arm.
-        "session_start" => {
-            let hint = event.source.cli != "claude-code";
-            inject::primer_with(store, &project, session, &config.injection, hint).ok()
-        }
+        "session_start" => inject::primer(store, &project, session, &config.injection).ok(),
         // Both sides of a tool call reach the same file injection, and the
         // first one to arrive wins: `pre_tool_use` for a `Read`, where memory
         // still has time to change what the turn does, and `post_tool_use` for
@@ -403,125 +390,6 @@ fn inject_for(
         return "{}".to_string();
     }
     inject::as_hook_output(event_name, &injection)
-}
-
-/// The input of a subagent dispatch, when this hook is in front of one.
-///
-/// Claude Code names the tool `Agent`; `Task` is the name it had before, and
-/// a plugin's matcher covers both. A dispatch with no prompt has nothing to
-/// search on.
-fn dispatched_input(payload: &Value) -> Option<&serde_json::Map<String, Value>> {
-    if !matches!(tool_name(payload), "Agent" | "Task") {
-        return None;
-    }
-    let input = tool_input(payload)?.as_object()?;
-    input.get("prompt")?.as_str().filter(|prompt| !prompt.trim().is_empty())?;
-    Some(input)
-}
-
-/// Is this dispatch sent to judge work rather than do it?
-///
-/// A reviewer, auditor, critic or judge should read the work cold - the
-/// reason headless runs get nothing - and memory of how the lead saw it is
-/// exactly the prior it must not start from. Two generic signals, no plugin's
-/// names: the subagent type says so (`code-reviewer`, `security-auditor`,
-/// `Verifier`), or the brief carries a stance line (`mode: review`,
-/// `mode: adversarial`), which is how a general-purpose agent is sent to judge.
-fn judges_work(input: &serde_json::Map<String, Value>) -> bool {
-    let named = input
-        .get("subagent_type")
-        .and_then(Value::as_str)
-        .is_some_and(|kind| identifier_words(kind).iter().any(|word| is_judging(word)));
-    let stance = input.get("prompt").and_then(Value::as_str).is_some_and(|prompt| {
-        prompt.lines().any(|line| {
-            let line = line.trim_start_matches(|c: char| c.is_whitespace() || "-*>`#".contains(c));
-            // The stance is the mode's first word: `mode: build, then review`
-            // sends a builder.
-            line.get(..5).is_some_and(|head| head.eq_ignore_ascii_case("mode:"))
-                && identifier_words(&line[5..])
-                    .first()
-                    .is_some_and(|word| is_judging(word) || word == "adversarial")
-        })
-    });
-    named || stance
-}
-
-/// A word that names judging: review, audit, critique, judge, verify, and
-/// their agent and -ing forms. `critical` and `preview` are not.
-fn is_judging(word: &str) -> bool {
-    ["review", "audit", "critiq", "judg", "verif"].iter().any(|stem| word.starts_with(stem))
-        || word == "critic"
-        || word == "critics"
-}
-
-/// Lowercase words of an identifier: split on anything not alphanumeric,
-/// at a lower-to-upper case change, and before the last capital of an
-/// acronym, so `CodeReviewer`, `code-reviewer` and `PRReviewer` all yield
-/// `reviewer`. A name run together in one case (`codereviewer`) stays whole.
-fn identifier_words(text: &str) -> Vec<String> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut words = Vec::new();
-    let mut current = String::new();
-    for (index, &c) in chars.iter().enumerate() {
-        let previous = index.checked_sub(1).map(|at| chars[at]);
-        let next = chars.get(index + 1);
-        let camel = c.is_uppercase()
-            && previous.is_some_and(|p| {
-                p.is_lowercase() || (p.is_uppercase() && next.is_some_and(|n| n.is_lowercase()))
-            });
-        if (!c.is_alphanumeric() || camel) && !current.is_empty() {
-            words.push(std::mem::take(&mut current));
-        }
-        if c.is_alphanumeric() {
-            current.extend(c.to_lowercase());
-        }
-    }
-    if !current.is_empty() {
-        words.push(current);
-    }
-    words
-}
-
-/// Append what memory holds about a dispatched task to the subagent's prompt.
-///
-/// The lead's brief is the subagent's only context, and a subagent gets no
-/// primer of its own. Claude Code applies `updatedInput` to the dispatch
-/// (verified on 2.1.284: the child's first message carried the appended
-/// block). The answer names no permission decision, so a deny from any other
-/// hook on the same tool still stops the dispatch - also verified, with the
-/// deny registered before and after this hook.
-///
-/// Only `prompt` changes; every other field goes back exactly as it came.
-/// Nothing matched, or any failure, leaves the dispatch untouched.
-fn seed_dispatch(
-    store: &Store,
-    scope: &crate::ids::ProjectScope,
-    session: &str,
-    input: &serde_json::Map<String, Value>,
-) -> String {
-    let Some(prompt) = input.get("prompt").and_then(Value::as_str) else {
-        return "{}".to_string();
-    };
-    let agent = input.get("subagent_type").and_then(Value::as_str);
-    let project = scope.project_id.to_string();
-    let Ok(block) = inject::dispatch_seed(store, &project, prompt, agent) else {
-        return "{}".to_string();
-    };
-    if block.is_empty() {
-        return "{}".to_string();
-    }
-    // Surfaced to this session like a search hit: the child shares the
-    // session id, and the correction gate reads this.
-    let _ = store.record_recalled(session, block.ids.iter().map(String::as_str));
-    let mut updated = input.clone();
-    updated.insert("prompt".to_string(), Value::String(format!("{prompt}\n\n{}", block.text)));
-    serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "updatedInput": updated,
-        }
-    })
-    .to_string()
 }
 
 /// Is this hook a capture surface, or only an injection one?
@@ -1109,40 +977,6 @@ pub fn first_line(input: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    fn dispatch(kind: &str, prompt: &str) -> serde_json::Map<String, Value> {
-        json!({"subagent_type": kind, "prompt": prompt}).as_object().unwrap().clone()
-    }
-
-    #[test]
-    fn a_dispatch_sent_to_judge_work_is_told_by_its_type_or_its_stance() {
-        for kind in [
-            "code-reviewer",
-            "rolepod:universal-reviewer",
-            "security-auditor",
-            "Verifier",
-            "CodeReviewer",
-            "plan_critic",
-            "judge",
-            "verification-agent",
-            "PRReviewer",
-            "LLMJudge",
-            "judging-panel",
-        ] {
-            assert!(judges_work(&dispatch(kind, "look at the diff")), "{kind} judges work");
-        }
-        for prompt in ["mode: review\nthe diff", "Scope: x\n- mode: adversarial", "`Mode: Audit`"] {
-            assert!(judges_work(&dispatch("general-purpose", prompt)), "{prompt:?} is a stance");
-        }
-        for kind in ["backend-developer", "Explore", "scout", "ui-preview-builder", "critical-path-planner"] {
-            assert!(!judges_work(&dispatch(kind, "fix the webhook retry")), "{kind} builds or finds");
-        }
-        // Words about reviewing inside the task are not a stance.
-        assert!(!judges_work(&dispatch("general-purpose", "address the review findings in src/a.rs")));
-        // The stance is the mode's first word; a builder told a review follows
-        // is still a builder.
-        assert!(!judges_work(&dispatch("general-purpose", "mode: build, then review")));
-    }
 
     #[test]
     fn a_silenced_process_captures_nothing() {

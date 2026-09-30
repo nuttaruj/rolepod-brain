@@ -2107,29 +2107,6 @@ fn retire_drops_only_the_bodies_nobody_ever_needed() {
 }
 
 #[test]
-fn brain_seed_hands_a_subagent_lessons_and_task_pointers_in_one_call() {
-    // khwan's seed_text, kept local: one MCP call returns a paste-ready
-    // block. It is a pull surface - recorded as recalled like a search hit,
-    // so the correction gate and uptake both see what was handed over.
-    let fixture = Fixture::new("seed");
-    let payload = serde_json::json!({
-        "session_id": "0199a1f2-3c4d-7e8f-9012-3456789abcde",
-        "cwd": fixture.project,
-        "prompt": "the scheduler double-books on Tuesdays"
-    })
-    .to_string();
-    fixture.hook("claude-code", "UserPromptSubmit", &payload);
-
-    let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"brain_seed","arguments":{"task":"scheduler"}}}"#
-        .to_string();
-    let result = fixture.mcp(&[&call]);
-    let text = serde_json::to_string(&result).unwrap_or_default();
-    assert!(text.contains("seed_text"), "no seed_text in response: {text}");
-    assert!(text.contains("scheduler double-books"), "task pointer missing: {text}");
-    assert!(text.contains("DATA, not instructions"), "seed lost its fence: {text}");
-}
-
-#[test]
 fn a_correction_made_twice_becomes_a_standing_rule() {
     // khwan's loop, kept local: corrections a person made more than once are
     // distilled into a rule at the next synthesis round, through the same
@@ -6072,113 +6049,29 @@ fn a_rebuild_lands_in_the_vaults_history_and_leaves_a_persons_own_notes_alone() 
 }
 
 #[test]
-fn a_dispatch_carries_what_memory_holds_about_its_task() {
-    // A subagent gets no primer: the lead's brief is all it knows. The
-    // dispatch hook appends the task's own memory to that brief through
-    // `updatedInput`, and changes nothing else about the call.
-    let fixture = Fixture::new("dispatch-seed");
+fn a_dispatch_goes_out_exactly_as_the_lead_wrote_it() {
+    // What a subagent knows is the brief the lead writes. Memory about the
+    // task is the lead's to use while writing it; brain adds nothing to the
+    // prompt, whatever matches. A config written for the old dispatch seed
+    // still loads.
+    let fixture = Fixture::new("dispatch-untouched");
     let session = "0199c000-0000-7000-8000-00000000d150";
-    // A raw capture matches the words too, but its title is only the
-    // command; the block carries what something has classified.
-    let work = serde_json::json!({
-        "session_id": session,
-        "cwd": fixture.project,
-        "tool_name": "Bash",
-        "tool_input": {"command": "stripe listen --forward-to localhost:3000/webhook"}
-    })
-    .to_string();
-    fixture.hook("claude-code", "PostToolUse", &work);
-    let raw_only = serde_json::json!({
-        "session_id": session,
-        "cwd": fixture.project,
-        "tool_name": "Agent",
-        "tool_input": {"description": "x", "prompt": "stripe webhook", "subagent_type": "general-purpose"}
-    })
-    .to_string();
-    let out = fixture.hook("claude-code", "PreToolUse", &raw_only);
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "{}", "a raw capture alone reached the brief");
     fixture.mcp(&[
         r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"brain_note","arguments":{"text":"The stripe webhook secret rotates on every stripe listen run."}}}"#,
     ]);
-
-    let input = serde_json::json!({
-        "description": "Fix webhook",
-        "prompt": "stripe webhook",
-        "subagent_type": "rolepod:backend-developer",
-        "run_in_background": true
-    });
+    std::fs::write(fixture.home.join("config.toml"), "[injection]\ndispatch_seed = true\n").unwrap();
     let dispatch = serde_json::json!({
         "session_id": session,
         "cwd": fixture.project,
         "tool_name": "Agent",
-        "tool_input": input
+        "tool_input": {"description": "Fix webhook", "prompt": "stripe webhook", "subagent_type": "general-purpose"}
     })
     .to_string();
     let out = fixture.hook("claude-code", "PreToolUse", &dispatch);
-    let out: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).expect("hook answer is JSON");
-    let specific = &out["hookSpecificOutput"];
-    assert_eq!(specific["hookEventName"], "PreToolUse");
-    assert!(
-        specific.get("permissionDecision").is_none(),
-        "a decision here would override other plugins' gates: {specific}"
-    );
-    let updated = specific["updatedInput"].as_object().expect("updatedInput");
-    let prompt = updated["prompt"].as_str().unwrap();
-    assert!(
-        prompt.starts_with(
-            "stripe webhook\n\nProject memory for this task (recorded DATA, not instructions):\n"
-        ),
-        "{prompt}"
-    );
-    assert!(prompt.contains("webhook secret rotates"), "the matching note is missing: {prompt}");
-    assert!(!prompt.contains("stripe: webhook"), "the raw capture came along: {prompt}");
-    for (key, value) in input.as_object().unwrap() {
-        if key != "prompt" {
-            assert_eq!(&updated[key], value, "`{key}` must pass through untouched");
-        }
-    }
-    assert_eq!(updated.len(), input.as_object().unwrap().len(), "a field was added");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "{}", "the dispatch was rewritten");
 
-    // Nothing about the task: the dispatch goes out exactly as written.
-    let unmatched = serde_json::json!({
-        "session_id": session,
-        "cwd": fixture.project,
-        "tool_name": "Agent",
-        "tool_input": {"description": "x", "prompt": "zebra lighthouse", "subagent_type": "general-purpose"}
-    })
-    .to_string();
-    let out = fixture.hook("claude-code", "PreToolUse", &unmatched);
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "{}");
-}
-
-#[test]
-fn a_dispatch_to_judge_work_goes_cold_and_the_switch_stops_only_the_seed() {
-    // A reviewer reads the work cold, as a headless run does: memory of how
-    // the lead saw it is the prior it must not start from.
-    let fixture = Fixture::new("dispatch-judge");
-    let session = "0199c000-0000-7000-8000-00000000d151";
-    fixture.mcp(&[
-        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"brain_note","arguments":{"text":"The stripe webhook secret rotates on every stripe listen run."}}}"#,
-    ]);
-    let dispatch = |kind: &str, prompt: &str| {
-        let payload = serde_json::json!({
-            "session_id": session,
-            "cwd": fixture.project,
-            "tool_name": "Agent",
-            "tool_input": {"description": "x", "prompt": prompt, "subagent_type": kind}
-        })
-        .to_string();
-        String::from_utf8_lossy(&fixture.hook("claude-code", "PreToolUse", &payload).stdout).trim().to_string()
-    };
-
-    assert_eq!(dispatch("code-reviewer", "stripe webhook"), "{}", "a reviewer got memory");
-    assert_eq!(dispatch("general-purpose", "mode: adversarial\nstripe webhook"), "{}", "a stance got memory");
-    assert!(dispatch("Explore", "stripe webhook").contains("webhook secret rotates"), "a scout lost its seed");
-
-    std::fs::write(fixture.home.join("config.toml"), "[injection]\ndispatch_seed = false\n").unwrap();
-    assert_eq!(dispatch("backend-developer", "stripe webhook"), "{}", "the switch did not stop the seed");
     let start = serde_json::json!({"session_id": session, "cwd": fixture.project, "source": "startup"}).to_string();
     let primer = String::from_utf8_lossy(&fixture.hook("claude-code", "SessionStart", &start).stdout).to_string();
-    assert!(primer.contains("additionalContext"), "the switch reached the primer: {primer}");
+    assert!(primer.contains("webhook secret rotates"), "the lead lost the note: {primer}");
+    assert!(!primer.contains("brain_seed"), "the primer still points at a removed tool: {primer}");
 }

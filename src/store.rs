@@ -1054,70 +1054,6 @@ impl Store {
         Ok(rows.filter_map(std::result::Result::ok).collect())
     }
 
-    /// The topic consolidation gave each of these ids, when it gave one.
-    ///
-    /// A raw capture's title is the command that produced it - "Ran brain",
-    /// "cargo test" - which says nothing to a reader who was not there; the
-    /// topic is what says a capture was classified, and as what.
-    ///
-    /// # Errors
-    /// Returns an error when the query fails.
-    pub fn topics_of(&self, ids: &[String]) -> Result<std::collections::HashMap<String, Option<String>>> {
-        if ids.is_empty() {
-            return Ok(std::collections::HashMap::new());
-        }
-        let slots = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(",");
-        let sql = format!("SELECT id, topic FROM events WHERE id IN ({slots})");
-        let mut stmt = self.conn.prepare(&sql).context("prepare topics of")?;
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-            })
-            .context("run topics of")?;
-        Ok(rows.filter_map(std::result::Result::ok).collect())
-    }
-
-    /// How widely each of these words is spread through a project's memory.
-    ///
-    /// Returns the project's entry count and, per word that occurs at all,
-    /// how many entries mention it. A word in most entries says nothing about
-    /// which of them is relevant, whatever the words around it are: it is how
-    /// a dispatch prompt's setup lines ("worktree", "tests", "commit") were
-    /// driving matches on memory about unrelated work.
-    ///
-    /// # Errors
-    /// Returns an error when the query fails.
-    pub fn word_spread(&self, project: &str, words: &[String]) -> Result<(i64, Vec<(String, i64)>)> {
-        let total: i64 = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM events WHERE project = ?1 AND forgotten = 0
-                       AND kind NOT IN ('tombstone', 'retire')",
-                params![project],
-                |row| row.get(0),
-            )
-            .context("count project entries")?;
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT COUNT(*) FROM events_fts JOIN events e ON e.rowid = events_fts.rowid
-                 WHERE events_fts MATCH ?1 AND e.project = ?2 AND e.forgotten = 0
-                       AND e.kind NOT IN ('tombstone', 'retire')",
-            )
-            .context("prepare word spread")?;
-        let mut spread = Vec::with_capacity(words.len());
-        for word in words {
-            // Quoted: a prompt's own "AND", "OR" and "NEAR" are words here.
-            let quoted = format!("\"{}\"", word.replace('"', ""));
-            if let Ok(count) = stmt.query_row(params![quoted, project], |row| row.get::<_, i64>(0)) {
-                if count > 0 {
-                    spread.push((word.clone(), count));
-                }
-            }
-        }
-        Ok((total, spread))
-    }
-
     /// Full-text search within one project, most relevant first.
     ///
     /// # Errors
@@ -3409,7 +3345,7 @@ impl Store {
     /// # Errors
     /// Returns an error when the query fails.
     pub fn primer_pointers(&self, project: &str, limit: usize) -> Result<Vec<Pointer>> {
-        self.ranked_pointers(project, None, None, limit)
+        self.ranked_pointers(project, None, limit)
     }
 
     /// The same ranking, restricted to one kind.
@@ -3428,28 +3364,13 @@ impl Store {
         kind: &str,
         limit: usize,
     ) -> Result<Vec<Pointer>> {
-        self.ranked_pointers(project, Some(kind), None, limit)
-    }
-
-    /// Notes addressed to one subagent type, in the order every other
-    /// pointer read uses: one a person flagged sinks, one nobody reads decays.
-    ///
-    /// The lessons a lead writes after judging that agent's findings: what
-    /// not to flag in this project, what it got right, how to word it. Only
-    /// notes - a delegate's own captures carry the same `agent` and are not
-    /// lessons for anyone.
-    ///
-    /// # Errors
-    /// Returns an error when the query fails.
-    pub fn lessons_for(&self, project: &str, agent: &str, limit: usize) -> Result<Vec<Pointer>> {
-        self.ranked_pointers(project, Some("note"), Some(agent), limit)
+        self.ranked_pointers(project, Some(kind), limit)
     }
 
     fn ranked_pointers(
         &self,
         project: &str,
         kind: Option<&str>,
-        agent: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Pointer>> {
         let sql = format!(
@@ -3461,14 +3382,13 @@ impl Store {
              WHERE project = ?1 AND forgotten = 0 AND kind NOT IN ('tombstone', 'retire')
                    AND hook NOT IN ('correct', 'feedback', 'supersede')
                    AND (?3 IS NULL OR kind = ?3)
-                   AND (?4 IS NULL OR agent = ?4)
              ORDER BY {}, id DESC
              LIMIT ?2",
             Self::rank("")
         );
         let mut stmt = self.conn.prepare(&sql).context("prepare primer pointers")?;
         let rows = stmt
-            .query_map(params![project, limit as i64, kind, agent], |row| {
+            .query_map(params![project, limit as i64, kind], |row| {
                 Ok(Pointer {
                     id: row.get(0)?,
                     ts: row.get(1)?,
@@ -4390,35 +4310,6 @@ mod tests {
         let back = store.get(&[footstep.id.clone(), own.id.clone()]).unwrap();
         assert_eq!(back[0].agent.as_deref(), Some("rolepod:scout"));
         assert_eq!(back[1].agent, None);
-    }
-
-    #[test]
-    fn lessons_for_an_agent_are_its_notes_newest_first_and_nothing_else() {
-        let store = Store::open_memory().unwrap();
-        let project = Uuid::new_v4();
-        let note_for = |title: &str, agent: Option<&str>, kind: EventKind| {
-            let mut event = event(title, title, project);
-            event.kind = kind;
-            event.agent = agent.map(str::to_string);
-            event
-        };
-        // Two notes minted in one millisecond share a ULID prefix and sort by
-        // their random tail; the order under test is the id order.
-        let mut older = note_for("avoid: flagging manual line wraps, rustfmt is not installed", Some("rolepod:universal-reviewer"), EventKind::Note);
-        older.id = "01TESTLESSON0000000000000A".to_string();
-        let mut newer = note_for("keep: the measured reason in every doc comment", Some("rolepod:universal-reviewer"), EventKind::Note);
-        newer.id = "01TESTLESSON0000000000000B".to_string();
-        let other_agent = note_for("avoid: rerunning the whole suite", Some("rolepod:qa-tester"), EventKind::Note);
-        let plain_note = note_for("a note for nobody in particular", None, EventKind::Note);
-        // A capture the reviewer made carries the same agent and is not a lesson.
-        let footstep = note_for("Read: src/store.rs", Some("rolepod:universal-reviewer"), EventKind::Observation);
-        for e in [&older, &newer, &other_agent, &plain_note, &footstep] {
-            store.index(e).unwrap();
-        }
-
-        let lessons = store.lessons_for(&project.to_string(), "rolepod:universal-reviewer", 10).unwrap();
-        let titles: Vec<&str> = lessons.iter().map(|p| p.title.as_str()).collect();
-        assert_eq!(titles, [newer.title.as_str(), older.title.as_str()], "{lessons:?}");
     }
 
     #[test]

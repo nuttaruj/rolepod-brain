@@ -159,17 +159,6 @@ enum Commands {
         #[arg(long)]
         apply: bool,
     },
-    /// One compact block to seed a subagent: lessons, then task-relevant pointers.
-    Seed {
-        /// What the subagent will work on, in a phrase.
-        task: String,
-        /// Maximum bytes for the block.
-        #[arg(long, default_value_t = inject::SEED_BUDGET)]
-        budget: usize,
-        /// The subagent's type as the host names it; its own lessons lead the block.
-        #[arg(long)]
-        agent: Option<String>,
-    },
     /// What this brain has actually done. Local counters; nothing is sent anywhere.
     Stats,
     /// Write this brain to an archive, for moving it to another machine.
@@ -452,24 +441,6 @@ fn run(command: Commands) -> Result<()> {
                      The log is untouched."
                 );
                 println!("Re-run with --apply to retire them.");
-            }
-            Ok(())
-        }
-        Commands::Seed { task, budget, agent } => {
-            let paths = Paths::resolve()?;
-            let store = Store::open(&paths.db())?;
-            let scope = ids::resolve_scope(&std::env::current_dir().unwrap_or_default());
-            let seed = inject::seed(
-                &store,
-                &scope.project_id.to_string(),
-                &task,
-                budget.clamp(256, 8192),
-                agent.as_deref(),
-            )?;
-            if seed.text.is_empty() {
-                println!("Nothing to seed yet - no lessons and no matches for the task.");
-            } else {
-                print!("{}", seed.text);
             }
             Ok(())
         }
