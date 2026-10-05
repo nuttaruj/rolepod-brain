@@ -1,6 +1,6 @@
 ---
 name: using-brain
-description: How this project's memory works and when to search it. Use when you need context from earlier sessions, when the user refers to a past decision or an earlier fix, when you are about to re-investigate something that may already be known, or when the user asks what brain remembers. Also covers keeping something out of memory.
+description: How this project's memory works and when to search it; use for context from earlier sessions or past decisions.
 ---
 
 # Using brain

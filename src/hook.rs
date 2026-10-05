@@ -236,8 +236,8 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
     };
 
     // A pointer to material consolidation will read and never copy. Claude
-    // Code and Codex put it in every payload; the other three CLIs write no
-    // transcript at all.
+    // Code and Codex put it in every payload; Cursor's is accepted when its
+    // payload carries one (consolidation finds it by session id otherwise).
     // Not from a delegate: the lead's own hooks record the same path, and
     // the write is last-writer-wins, so a delegate's must never be the last.
     if let Some(path) = first_string(&payload, &["transcript_path", "transcriptPath"])
@@ -681,6 +681,24 @@ fn tool_name(payload: &Value) -> &str {
         .unwrap_or("")
 }
 
+/// What a brain recall result is stored as: it is a copy of rows already in
+/// the store, and keeping it would put every recalled row in the index twice.
+const BRAIN_RECALL_OMITTED: &str = "[brain recall result omitted]";
+
+/// Brain's own read tools, in every spelling a host gives them
+/// (`mcp__plugin_rolepod-brain_brain__brain_search`, `mcp__brain__brain_get`,
+/// `MCP:brain_recent`, `brain_brain_related`, `brain_outline`). The writers
+/// (note, correct, forget, feedback) and doctor are not recall and stay kept.
+fn is_brain_recall(tool: &str) -> bool {
+    let lower = tool.to_ascii_lowercase();
+    let tail = lower.rsplit(['_', ':']).next().unwrap_or("");
+    let head = &lower[..lower.len() - tail.len()];
+    matches!(tail, "search" | "get" | "recent" | "timeline" | "related" | "outline")
+        && head.strip_suffix("brain_").is_some_and(|before| {
+            before.is_empty() || before.ends_with(['_', ':'])
+        })
+}
+
 /// The tool's arguments, whatever the CLI calls them.
 fn tool_input(payload: &Value) -> Option<&Value> {
     payload.get("tool_input").or_else(|| payload.pointer("/toolCall/args"))
@@ -845,6 +863,9 @@ fn body_for(payload: &Value, sanitizer: &Sanitizer, footstep: bool) -> String {
             }
             let mut value = value.clone();
             match key {
+                "tool_response" if is_brain_recall(tool_name(payload)) => {
+                    value = Value::String(BRAIN_RECALL_OMITTED.into());
+                }
                 "tool_response" | "tool_output" | "error" => {
                     // `tool_response`, or a failure's `tool_output` / `error`
                     // (a string or an object, by host). The file as it was and
@@ -932,9 +953,15 @@ fn files_for(payload: &Value, root: &std::path::Path) -> Vec<String> {
 /// anywhere else.
 fn is_transcript_of(cli: &str, path: &str) -> bool {
     let Some(home) = dirs::home_dir() else { return false };
+    is_transcript_under(&home, cli, path)
+}
+
+/// [`is_transcript_of`] against an explicit home, so a test needs no `$HOME`.
+fn is_transcript_under(home: &std::path::Path, cli: &str, path: &str) -> bool {
     let roots: &[&str] = match cli {
         "claude-code" => &[".claude/projects"],
         "codex" => &[".codex/sessions"],
+        "cursor" => &[".cursor/projects"],
         // The other CLIs write no transcript at all, so any path claiming to
         // be one is by definition not theirs.
         _ => return false,
@@ -942,10 +969,26 @@ fn is_transcript_of(cli: &str, path: &str) -> bool {
     // Resolve before comparing: `~/.claude/projects/../../.ssh/id_rsa` is
     // inside the directory only until someone reads it.
     let Ok(resolved) = std::fs::canonicalize(path) else { return false };
-    roots.iter().any(|root| {
-        std::fs::canonicalize(home.join(root))
-            .is_ok_and(|root| resolved.starts_with(&root))
-    })
+    let Some(rest) = roots.iter().find_map(|root| {
+        let root = std::fs::canonicalize(home.join(root)).ok()?;
+        resolved.strip_prefix(&root).ok().map(std::path::Path::to_path_buf)
+    }) else {
+        return false;
+    };
+    if cli != "cursor" {
+        return true;
+    }
+    // Cursor keeps other files under the same tree (rules, mcp state, canvases).
+    // Its transcripts are only ever `<project>/agent-transcripts/<id>/<id>.jsonl`.
+    let parts: Vec<_> = rest.components().map(|part| part.as_os_str()).collect();
+    match parts.as_slice() {
+        [_project, dir, id, file] => {
+            *dir == "agent-transcripts"
+                && std::path::Path::new(file).extension().is_some_and(|ext| ext == "jsonl")
+                && std::path::Path::new(file).file_stem() == Some(*id)
+        }
+        _ => false,
+    }
 }
 
 /// Pull a filesystem path out of a tool input, whatever the tool calls it.
@@ -1487,6 +1530,71 @@ mod tests {
     }
 
     #[test]
+    fn a_brain_recall_result_is_not_stored_again_in_any_spelling() {
+        for tool in [
+            "mcp__plugin_rolepod-brain_brain__brain_search",
+            "mcp__brain__brain_get",
+            "MCP:brain_recent",
+            "brain_brain_timeline",
+            "brain_related",
+            "brain_outline",
+        ] {
+            let payload = json!({
+                "tool_name": tool,
+                "tool_input": {"id": "obs-4242"},
+                "tool_response": {"content": "a recalled row about pineapple"},
+            });
+            let body = shaped(&payload, false);
+            assert!(!body.contains("pineapple"), "{tool}: {body}");
+            assert!(body.contains("obs-4242"), "{tool}: {body}");
+            assert!(body.contains("[brain recall result omitted]"), "{tool}: {body}");
+        }
+    }
+
+    #[test]
+    fn brain_writers_and_other_tools_keep_their_response() {
+        for tool in [
+            "mcp__plugin_rolepod-brain_brain__brain_note",
+            "brain_correct",
+            "brain_forget",
+            "brain_feedback",
+            "brain_doctor",
+            "mcp__other__search",
+            "mcp__second-brain__search",
+            "mcp__my_brain__get",
+            "mcp__gbrain__get",
+            "gbrain_get",
+            "mcp__second-brain_search",
+            "Read",
+        ] {
+            let payload = json!({
+                "tool_name": tool,
+                "tool_input": {"id": "x"},
+                "tool_response": {"content": "kept pineapple"},
+            });
+            assert!(shaped(&payload, false).contains("kept pineapple"), "{tool}");
+        }
+        let payload = json!({
+            "tool_name": "mcp__second-brain__search",
+            "tool_input": {"id": "x"},
+            "tool_response": {"content": "kept pineapple"},
+        });
+        assert!(shaped(&payload, false).contains(r#""content":"kept pineapple""#));
+    }
+
+    #[test]
+    fn a_brain_recall_footstep_and_title_keep_the_input() {
+        let payload = json!({
+            "tool_name": "mcp__brain__brain_search",
+            "tool_input": {"query": "q-needle"},
+            "tool_response": {"content": "a recalled row about pineapple"},
+        });
+        let body = shaped(&payload, true);
+        assert!(!body.contains("pineapple"), "{body}");
+        assert!(body.contains("[brain recall result omitted]"), "{body}");
+    }
+
+    #[test]
     fn an_edit_body_drops_the_file_copies_and_keeps_the_input() {
         let payload = json!({
             "tool_name": "Edit",
@@ -1696,10 +1804,11 @@ mod tests {
     fn a_failed_file_call_injects_nothing_where_the_same_success_does() {
         with_store(|home, store| {
             let run = |event: &str, session: &str| {
-                let payload = tool_payload(home, session, "Read", json!({"error": "no such file"}));
+                let payload = tool_payload(home, session, "Edit", json!({"error": "no such file"}));
                 capture("claude-code", event, Some(payload.to_string())).unwrap()
             };
-            // A prior event on the file gives it memory to inject.
+            // A prior event on the file gives it memory to inject. It is an
+            // Edit: a bare Read is no longer offered as a file hint.
             run("PostToolUse", "seed");
             let control = run("PostToolUse", "control");
             assert!(control.contains("Memory for"), "control must inject: {control}");
@@ -1944,5 +2053,68 @@ mod tests {
         assert!(store.record_injected("s1", &[], 0, 100, 100).unwrap());
         assert_eq!(prompt_hook(&store, &config, TASK), "{}");
         assert_eq!(store.session_injected_bytes("s1").unwrap(), 100);
+    }
+
+    #[test]
+    fn only_a_cursor_agent_transcript_is_accepted_as_cursors() {
+        let home = std::env::temp_dir().join(format!("brain-cursor-home-{}", ulid::Ulid::new()));
+        let id = "4f603393-e229-4512-b7d4-f1eb1804434f";
+        let dir = home.join(".cursor/projects/x/agent-transcripts").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join(format!("{id}.jsonl"));
+        std::fs::write(&good, "{}\n").unwrap();
+        let other = home.join(".cursor/projects/x/other.jsonl");
+        std::fs::write(&other, "{}\n").unwrap();
+        let wrong_ext = dir.join("notes.txt");
+        std::fs::write(&wrong_ext, "x").unwrap();
+        let outside = home.join("secret.jsonl");
+        std::fs::write(&outside, "{}\n").unwrap();
+
+        let ok = |cli: &str, path: &std::path::Path| {
+            is_transcript_under(&home, cli, &path.display().to_string())
+        };
+        assert!(ok("cursor", &good), "a cursor transcript was rejected");
+        assert!(!ok("cursor", &other), "a jsonl outside agent-transcripts was accepted");
+        assert!(!ok("cursor", &wrong_ext), "a non-jsonl file was accepted");
+        let stray = home.join(".cursor/projects/x/agent-transcripts/other.jsonl");
+        std::fs::write(&stray, "{}\n").unwrap();
+        assert!(!ok("cursor", &stray), "a jsonl not named for its folder was accepted");
+        let shallow = home.join(".cursor/projects/agent-transcripts");
+        std::fs::create_dir_all(&shallow).unwrap();
+        let shallow = shallow.join("x.jsonl");
+        std::fs::write(&shallow, "{}\n").unwrap();
+        assert!(!ok("cursor", &shallow), "agent-transcripts directly under projects was accepted");
+        let deep = dir.join("sub");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join(format!("{id}.jsonl")), "{}\n").unwrap();
+        assert!(!ok("cursor", &deep.join(format!("{id}.jsonl"))), "deeper nesting was accepted");
+        assert!(!ok("cursor", &outside), "a path outside .cursor was accepted");
+        let traversal = home.join(".cursor/projects/x/agent-transcripts").join(id).join("../../../../../secret.jsonl");
+        assert!(!ok("cursor", &traversal), "a ../ escape was accepted");
+        assert!(!ok("cursor", std::path::Path::new("/nonexistent/a.jsonl")));
+        // Another CLI's directory is not cursor's, and cursor's is not theirs.
+        assert!(!ok("claude-code", &good));
+        assert!(!ok("gemini-cli", &good));
+
+        // A symlink inside the tree that points out of it resolves out of it.
+        #[cfg(unix)]
+        {
+            let link = dir.join("link.jsonl");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            assert!(!ok("cursor", &link), "a symlink escape was accepted");
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn claude_and_codex_roots_are_unchanged() {
+        let home = std::env::temp_dir().join(format!("brain-roots-home-{}", ulid::Ulid::new()));
+        for (cli, rel) in [("claude-code", ".claude/projects/p/s.jsonl"), ("codex", ".codex/sessions/s.jsonl")] {
+            let path = home.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "{}\n").unwrap();
+            assert!(is_transcript_under(&home, cli, &path.display().to_string()), "{cli}");
+        }
+        std::fs::remove_dir_all(&home).ok();
     }
 }

@@ -107,6 +107,35 @@ pub fn last_answer(path: &Path, cli: &str, sanitizer: &Sanitizer) -> Option<Stri
     (!text.is_empty()).then_some(text)
 }
 
+/// Where Cursor keeps this session's transcript, when its hook did not say.
+///
+/// Cursor's documented `stop` input lists only `status` and `loop_count`, and
+/// no captured payload of ours has proven a `transcript_path` there, so
+/// consolidation looks for the file itself:
+/// `~/.cursor/projects/*/agent-transcripts/<id>/<id>.jsonl`.
+///
+/// The id is parsed as a UUID and rendered back before it touches a path, so
+/// nothing but hex and dashes is ever joined. The result must still resolve
+/// inside the projects tree.
+#[must_use]
+pub fn cursor_transcript_in(home: &Path, session: &str) -> Option<std::path::PathBuf> {
+    let id = uuid::Uuid::try_parse(session).ok()?.hyphenated().to_string();
+    let projects = std::fs::canonicalize(home.join(".cursor/projects")).ok()?;
+    for project in std::fs::read_dir(&projects).ok()?.flatten() {
+        let candidate = project
+            .path()
+            .join("agent-transcripts")
+            .join(&id)
+            .join(format!("{id}.jsonl"));
+        if let Ok(resolved) = std::fs::canonicalize(&candidate) {
+            if resolved.starts_with(&projects) && resolved.is_file() {
+                return Some(resolved);
+            }
+        }
+    }
+    None
+}
+
 /// One line of extracted prose.
 struct Line {
     speaker: &'static str,
@@ -118,7 +147,8 @@ struct Line {
 /// Returns `None` when the file is missing, unreadable, or contains nothing we
 /// recognize. Every one of those is expected rather than exceptional: host CLIs
 /// clean transcripts up on their own schedule (Claude Code defaults to 30 days),
-/// and three of the five CLIs we support write no transcript at all.
+/// and some CLIs we support (Gemini, Antigravity) write no transcript brain
+/// can use. Cursor does, under `~/.cursor/projects`.
 #[must_use]
 pub fn read_span(path: &Path, cli: &str, sanitizer: &Sanitizer) -> Option<String> {
     let raw = std::fs::read_to_string(path).ok()?;
@@ -481,6 +511,53 @@ mod tests {
         let answer = last_answer(&path, "claude-code", &sanitizer);
         assert_eq!(answer.as_deref(), Some("The only answer here."));
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_cursor_transcript_yields_the_last_answer() {
+        let sanitizer = Sanitizer::builtin();
+        let path = write(
+            "c.jsonl",
+            concat!(
+                r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>hi</user_query>"}]}}"#,
+                "\n",
+                r#"{"role":"assistant","message":{"content":[{"type":"text","text":"First."}]}}"#,
+                "\n",
+                r#"{"role":"assistant","message":{"content":[{"type":"text","text":"Final answer."}]}}"#,
+                "\n"
+            ),
+        );
+        assert_eq!(last_answer(&path, "cursor", &sanitizer).as_deref(), Some("Final answer."));
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn cursor_fallback_finds_the_session_file_and_only_for_a_uuid() {
+        let home = std::env::temp_dir().join(format!("brain-cursor-fb-{}", ulid::Ulid::new()));
+        let id = "4f603393-e229-4512-b7d4-f1eb1804434f";
+        let dir = home.join(".cursor/projects/proj-a/agent-transcripts").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(format!("{id}.jsonl"));
+        std::fs::write(&file, "{}\n").unwrap();
+        let found = cursor_transcript_in(&home, id).expect("resolved");
+        assert_eq!(found, std::fs::canonicalize(&file).unwrap());
+        // Not a UUID: never joined into a path.
+        assert!(cursor_transcript_in(&home, "../../etc/passwd").is_none());
+        assert!(cursor_transcript_in(&home, "unknown-session").is_none());
+        // A UUID with no file.
+        assert!(cursor_transcript_in(&home, "00000000-0000-4000-8000-000000000000").is_none());
+        // A symlinked session directory that leaves the tree is refused.
+        let outside = home.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let other = "11111111-2222-4333-8444-555555555555";
+        std::fs::write(outside.join(format!("{other}.jsonl")), "{}\n").unwrap();
+        let dir2 = home.join(".cursor/projects/proj-a/agent-transcripts");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, dir2.join(other)).unwrap();
+            assert!(cursor_transcript_in(&home, other).is_none());
+        }
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]

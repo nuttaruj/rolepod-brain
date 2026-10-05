@@ -44,7 +44,8 @@ pub fn serve() -> Result<()> {
     // Identifies this MCP session for the "has this id been surfaced?" check.
     // A per-process id is right: the guard is about what THIS conversation has
     // seen, and the server lives exactly as long as one.
-    let session = format!("mcp-{}", std::process::id());
+    let mut client: Option<&'static str> = None;
+    let mut session = session_key(client, std::process::id());
 
     for line in stdin.lock().lines() {
         let line = line.context("read MCP request")?;
@@ -67,7 +68,10 @@ pub fn serve() -> Result<()> {
         let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
 
         let response = match method {
-            "initialize" => success(id, initialize_result()),
+            "initialize" => {
+                (client, session) = on_initialize(&params, std::process::id());
+                success(id, initialize_result())
+            }
             "ping" => success(id, json!({})),
             "tools/list" => {
                 // Listed once per session, so a model that finishes downloading
@@ -79,7 +83,7 @@ pub fn serve() -> Result<()> {
                 );
                 success(id, json!({ "tools": tool_definitions(ready) }))
             }
-            "tools/call" => match call_tool(&paths, &project, &session, &params) {
+            "tools/call" => match call_tool(&paths, &project, &session, client, &params) {
                 Ok(result) => success(id, result),
                 // A failed tool call is reported inside the result, not as a
                 // protocol error: the agent should see what went wrong and be
@@ -99,6 +103,45 @@ pub fn serve() -> Result<()> {
         write_message(&mut stdout, &response)?;
     }
     Ok(())
+}
+
+/// The CLI behind a MCP client, from `initialize.params.clientInfo.name`.
+///
+/// Only names observed on the wire belong here (probed with a logging MCP stub
+/// in an isolated HOME; see the task receipt). A client that cannot be probed
+/// without a model call stays out of the table and falls back to the old
+/// behaviour - never a guess.
+fn client_cli(params: &Value) -> Option<&'static str> {
+    match params.pointer("/clientInfo/name").and_then(Value::as_str)? {
+        "claude-code" => Some("claude-code"),
+        _ => None,
+    }
+}
+
+/// Per-session state an `initialize` request sets: the client and its session id.
+fn on_initialize(params: &Value, pid: u32) -> (Option<&'static str>, String) {
+    let client = client_cli(params);
+    (client, session_key(client, pid))
+}
+
+/// The CLI whose cheap tier a rerank borrows: the calling client when it said
+/// so, else the project's most recent CLI (looked up only then).
+fn rerank_cli(
+    client: Option<&str>,
+    project_cli: impl FnOnce() -> Result<Option<String>>,
+) -> Result<String> {
+    match client {
+        Some(cli) => Ok(cli.to_string()),
+        None => Ok(project_cli()?.unwrap_or_default()),
+    }
+}
+
+/// The id this MCP session answers to for the "has this id been surfaced?" check.
+fn session_key(cli: Option<&str>, pid: u32) -> String {
+    match cli {
+        Some(cli) => format!("mcp-{cli}-{pid}"),
+        None => format!("mcp-{pid}"),
+    }
 }
 
 fn initialize_result() -> Value {
@@ -124,13 +167,11 @@ fn tool_definitions(local_rerank: bool) -> Value {
     let rerank_cost = if local_rerank {
         "Runs on this machine in under two seconds - no subscription spent, \
          nothing sent anywhere - so ask for it whenever the first ordering \
-         looks off. It is not free, but it is cheap enough to reach for."
+         looks off."
     } else {
-        "Costs about 12 seconds of real waiting, 20 at the ceiling, because \
-         this machine has no local reranker and the work goes out to a host \
-         CLI. Ask for it when the answer is worth that and not otherwise. The \
-         first such search also starts a one-time 600 MB download in the \
-         background, and the searches after it are the fast kind."
+        "Costs about 12 seconds of waiting, 20 at most, via a host \
+         CLI. Ask when the answer is worth that. The first \
+         one also starts a one-off 600 MB download."
     };
     json!([
         {
@@ -168,12 +209,9 @@ fn tool_definitions(local_rerank: bool) -> Value {
                     "rerank": {
                         "type": "boolean",
                         "description": format!(
-                            "Let a cheap model reorder the results by what the \
-                             question was actually asking. {rerank_cost} It earns \
-                             its keep on a question whose words the entry probably \
-                             does not use (\"why did we stop doing X\"), or on a \
-                             first search that came back plausible but not right. \
-                             Omit it for ordinary lookups."
+                            "Let a cheap model reorder results by what the \
+                             question asked. {rerank_cost} Omit it \
+                             for ordinary lookups; pass false to skip."
                         ),
                     },
                 },
@@ -254,18 +292,13 @@ fn tool_definitions(local_rerank: bool) -> Value {
         {
             "name": "brain_correct",
             "description": "Replace what a memory says, when the recorded version is \
-                            wrong but the event itself matters. The user telling you is \
-                            one way to learn that; FINDING IT YOURSELF is the common \
-                            one - a claim here can be true when written and false a \
-                            week later, and nothing else in this system retires it. If \
-                            memory says something the code in front of you \
-                            contradicts, correcting it is part of the work, not a \
-                            favour: the next session is told the same thing otherwise. \
-                            Write the replacement with a SHORT FIRST LINE - it becomes \
-                            the title - and the detail below it. The original stays in \
-                            the log; recall returns your text. Prefer this over \
-                            brain_forget when something happened but was described \
-                            badly, or was described correctly and has since changed.",
+                            wrong but the event itself matters. A claim can be true \
+                            when written and false a week later; FINDING IT \
+                            YOURSELF is the common case. If memory says something the code in front of \
+                            you contradicts, correcting it is part of the work, not a \
+                            favour. Write the replacement with a SHORT FIRST LINE - it \
+                            becomes the title - and the detail below it. The original \
+                            stays in the log; recall returns your text.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -277,12 +310,8 @@ fn tool_definitions(local_rerank: bool) -> Value {
         },
         {
             "name": "brain_feedback",
-            "description": "Mark a memory as stale or unhelpful without deleting it. \
-                            Use when the user says a remembered thing is out of date \
-                            or was not worth keeping, but is not claiming it is wrong \
-                            — for that, brain_correct or brain_forget. Flagged entries \
-                            sink in what gets shown and are listed for the user to \
-                            review; nothing is destroyed.",
+            "description": "Flag a memory as stale or unhelpful, without deleting \
+                            it; for a wrong one use brain_correct or brain_forget.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -294,12 +323,8 @@ fn tool_definitions(local_rerank: bool) -> Value {
         },
         {
             "name": "brain_related",
-            "description": "What sits beside a memory you are already holding. \
-                            Given an id, returns other memories whose sessions \
-                            named the same files, symbols, or subjects, most \
-                            overlap first. Use it when a search result is close \
-                            but not the whole story — it answers \"what else \
-                            touched this\", which a query for words cannot.",
+            "description": "Given a memory id, returns other memories whose sessions \
+                            touched the same files, symbols, or subjects.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -395,7 +420,13 @@ fn tool_definitions(local_rerank: bool) -> Value {
     ])
 }
 
-fn call_tool(paths: &Paths, project: &str, session: &str, params: &Value) -> Result<Value> {
+fn call_tool(
+    paths: &Paths,
+    project: &str,
+    session: &str,
+    client: Option<&str>,
+    params: &Value,
+) -> Result<Value> {
     let name = params.get("name").and_then(Value::as_str).unwrap_or_default();
     let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
     let store = Store::open(&paths.db())?;
@@ -455,7 +486,9 @@ fn call_tool(paths: &Paths, project: &str, session: &str, params: &Value) -> Res
 
                 let ladder = crate::summarizer::Ladder::new(&store, &config.summarizer);
                 // Borrow the cheap tier of whichever CLI works here.
-                let cli = store.project_cli(project)?.unwrap_or_default();
+                // The client that is calling, when it said so; else the
+                // project's most recent CLI as before.
+                let cli = rerank_cli(client, || store.project_cli(project))?;
                 let model_dir = paths.model_dir_for(crate::rerank::LOCAL_MODEL);
                 let (reranked, outcome) =
                     crate::rerank::rerank(&ladder, &cli, query, &model_dir, hits);
@@ -621,7 +654,7 @@ fn call_tool(paths: &Paths, project: &str, session: &str, params: &Value) -> Res
                     items.iter().filter_map(|item| item.as_str().map(str::to_string)).collect()
                 })
                 .unwrap_or_default();
-            let id = write_note(paths, text, &files)?;
+            let id = write_note(paths, text, &files, client)?;
             json!({ "id": id, "saved": true })
         }
         other => anyhow::bail!("unknown tool: {other}"),
@@ -640,7 +673,7 @@ fn call_tool(paths: &Paths, project: &str, session: &str, params: &Value) -> Res
 /// A note goes through the same sanitizer as captured text: an agent pasting a
 /// config snippet into a note is exactly as likely to carry a secret as a tool
 /// result is.
-fn write_note(paths: &Paths, text: &str, files: &[String]) -> Result<String> {
+fn write_note(paths: &Paths, text: &str, files: &[String], client: Option<&str>) -> Result<String> {
     let scope = ids::resolve_scope(&std::env::current_dir().unwrap_or_default());
     let config = crate::config::Config::load(&paths.config_file())?;
     let sanitizer = crate::sanitize::Sanitizer::new(&config.sanitize)
@@ -653,7 +686,7 @@ fn write_note(paths: &Paths, text: &str, files: &[String]) -> Result<String> {
         // A note belongs to the project, not to the session that happened to
         // write it: it must still surface when that session is long gone.
         uuid::Uuid::nil(),
-        crate::event::Source { cli: "mcp".to_string(), hook: "note".to_string() },
+        crate::event::Source { cli: client.unwrap_or("mcp").to_string(), hook: "note".to_string() },
         crate::event::EventKind::Note,
         crate::sanitize::truncate(&body, 120),
         body,
@@ -772,6 +805,37 @@ mod tests {
         }
     }
 
+    /// The list is loaded whole by CLIs that front-load schemas, so its size is
+    /// a cost paid every session.
+    #[test]
+    fn the_tool_list_stays_under_its_size_ceiling() {
+        for local_rerank in [false, true] {
+            let size = serde_json::to_string(&tool_definitions(local_rerank)).unwrap().len();
+            assert!(size <= 7_500, "tools/list is {size} B (local_rerank={local_rerank})");
+        }
+    }
+
+    /// Trimming for size must not cut the nudge that makes agents correct
+    /// memory unprompted, nor leave the download looking like a per-call cost.
+    #[test]
+    fn trimmed_descriptions_keep_their_load_bearing_clauses() {
+        let tools = tool_definitions(false);
+        let correct = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "brain_correct")
+            .and_then(|t| t["description"].as_str())
+            .unwrap()
+            .to_string();
+        assert!(correct.contains("FINDING IT YOURSELF"), "self-discovery nudge lost");
+        let slow = tools[0]["inputSchema"]["properties"]["rerank"]["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(slow.contains("first one also starts"), "download reads as per-call");
+    }
+
     /// The point of wording the list per machine is the number in it.
     ///
     /// Asserted on the substance rather than the sentence: a machine with the
@@ -805,6 +869,63 @@ mod tests {
         assert_eq!(limit_from(&json!({"k": 0})), 1);
         assert_eq!(limit_from(&json!({"k": 5})), 5);
         assert_eq!(limit_from(&json!({"k": 9999})), MAX_SEARCH_LIMIT);
+    }
+
+    fn initialize(name: &str) -> Value {
+        json!({"protocolVersion": PROTOCOL_VERSION, "clientInfo": {"name": name, "version": "1"}})
+    }
+
+    #[test]
+    fn a_known_client_name_maps_to_its_cli_and_an_unknown_one_to_none() {
+        assert_eq!(client_cli(&initialize("claude-code")), Some("claude-code"));
+        assert_eq!(client_cli(&initialize("some-new-cli")), None);
+        assert_eq!(client_cli(&json!({})), None, "no clientInfo, no guess");
+    }
+
+    #[test]
+    fn initialize_sets_the_client_and_rekeys_the_session() {
+        assert_eq!(on_initialize(&initialize("claude-code"), 7), (Some("claude-code"), "mcp-claude-code-7".to_string()));
+        assert_eq!(on_initialize(&initialize("some-new-cli"), 7), (None, "mcp-7".to_string()));
+    }
+
+    #[test]
+    fn rerank_borrows_the_calling_client_else_the_project_cli() {
+        let fallback = || Ok(Some("codex".to_string()));
+        assert_eq!(rerank_cli(Some("claude-code"), fallback).unwrap(), "claude-code");
+        assert_eq!(rerank_cli(None, fallback).unwrap(), "codex");
+        assert_eq!(rerank_cli(None, || Ok(None)).unwrap(), "");
+        let never = || -> Result<Option<String>> { panic!("fallback must not run when the client is known") };
+        assert_eq!(rerank_cli(Some("claude-code"), never).unwrap(), "claude-code");
+    }
+
+    #[test]
+    fn the_session_key_names_the_cli_when_known() {
+        assert_eq!(session_key(Some("claude-code"), 7), "mcp-claude-code-7");
+        assert_eq!(session_key(None, 7), "mcp-7");
+    }
+
+    /// A note carries the CLI that wrote it, and `mcp` when that is not known.
+    #[test]
+    fn a_note_is_attributed_to_the_cli_that_initialized_the_session() {
+        let note = |client: Option<&str>| {
+            let data_dir = std::env::temp_dir().join(format!("brain-mcp-note-{}", ulid::Ulid::new()));
+            let paths = Paths { data_dir };
+            let project = ids::resolve_scope(&std::env::current_dir().unwrap()).project_id.to_string();
+            call_tool(
+                &paths,
+                &project,
+                "s",
+                client,
+                &json!({"name": "brain_note", "arguments": {"text": "remember this"}}),
+            )
+            .unwrap();
+            let cli = Store::open(&paths.db()).unwrap().project_cli(&project).unwrap();
+            std::fs::remove_dir_all(&paths.data_dir).ok();
+            cli
+        };
+        let known = client_cli(&initialize("claude-code"));
+        assert_eq!(note(known).as_deref(), Some("claude-code"));
+        assert_eq!(note(client_cli(&initialize("some-new-cli"))).as_deref(), Some("mcp"));
     }
 
     #[test]
@@ -848,6 +969,7 @@ mod tests {
             &paths,
             &scope.project_id.to_string(),
             "s",
+            None,
             &json!({"name": "brain_get", "arguments": {"ids": [event.id.clone()]}}),
         )
         .unwrap();
@@ -899,6 +1021,7 @@ mod tests {
             &paths,
             &scope.project_id.to_string(),
             "s",
+            None,
             &json!({"name": "brain_get", "arguments": {"ids": [event.id.clone()]}}),
         )
         .unwrap();
@@ -928,6 +1051,7 @@ mod tests {
             &paths,
             &scope.project_id.to_string(),
             "s",
+            None,
             &json!({"name": "brain_get", "arguments": {"ids": [event.id.clone()]}}),
         )
         .unwrap();
@@ -940,7 +1064,7 @@ mod tests {
     fn a_failed_tool_call_reports_inside_the_result() {
         let paths = Paths { data_dir: std::env::temp_dir().join("brain-mcp-test") };
         let result =
-            call_tool(&paths, "project", "s", &json!({"name": "brain_search", "arguments": {}}));
+            call_tool(&paths, "project", "s", None, &json!({"name": "brain_search", "arguments": {}}));
         assert!(result.is_err(), "missing query must be an error the caller can see");
     }
 }

@@ -4250,6 +4250,60 @@ impl Store {
         rows.collect::<rusqlite::Result<Vec<_>>>().context("read unconsolidated sessions")
     }
 
+    /// The newest summary another session wrote, with the CLI that wrote it.
+    ///
+    /// The hand-off line's source: not a ranking, just "what did the last
+    /// person here finish". A one-shot (headless) run is skipped for the
+    /// reason `rank` demotes it, and nothing older than `max_age` counts - a
+    /// hand-off from last week is history, not a hand-off. The CLI rides
+    /// beside the pointer rather than in it so no other read pays for it.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn newest_summary(
+        &self,
+        project: &str,
+        exclude_session: &str,
+        max_age: std::time::Duration,
+    ) -> Result<Option<(Pointer, String)>> {
+        let age = jiff::SignedDuration::try_from(max_age).context("hand-off age out of range")?;
+        let cutoff = jiff::Timestamp::now()
+            .checked_sub(age)
+            .context("hand-off cutoff out of range")?
+            .to_string();
+        self.conn
+            .query_row(
+                "SELECT id, ts, kind, title, topic, cli FROM events
+                 WHERE project = ?1 AND kind = 'session_summary' AND forgotten = 0
+                       AND session != ?2
+                       AND (invocation IS NULL OR invocation != 'headless')
+                       -- A summary event never carries `invocation`; the run
+                       -- is recorded per session, as `unconsolidated_sessions`
+                       -- reads it.
+                       AND session NOT IN (SELECT session FROM session_invocation
+                                            WHERE invocation = 'headless')
+                       AND ts >= ?3
+                 ORDER BY id DESC LIMIT 1",
+                params![project, exclude_session, cutoff],
+                |row| Ok((Self::pointer_row(row)?, row.get::<_, String>(5)?)),
+            )
+            .optional()
+            .context("read newest summary")
+    }
+
+    /// The CLI a session was captured through, from its first capture.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn session_cli(&self, session: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row("SELECT cli FROM events WHERE session = ?1 ORDER BY id LIMIT 1", params![session], |row| {
+                row.get(0)
+            })
+            .optional()
+            .context("read session cli")
+    }
+
     /// Pointers for events that touched one file, best first.
     ///
     /// # Errors
@@ -4267,6 +4321,8 @@ impl Store {
              WHERE f.project = ?1 AND f.path = ?2 AND e.forgotten = 0
                    AND e.kind NOT IN ('tombstone', 'retire')
                          AND e.hook NOT IN ('correct', 'feedback', 'supersede')
+                   AND NOT (e.kind = 'observation'
+                            AND (e.title LIKE 'Read:%' OR e.title LIKE 'Grep:%' OR e.title LIKE 'Glob:%'))
              ORDER BY {}, e.id DESC
              LIMIT ?3",
             Self::rank("e.")

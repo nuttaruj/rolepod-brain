@@ -307,8 +307,9 @@ directory.
 
 Only `postToolUse` is wired for tool activity: `afterShellExecution` fires for
 the *same* execution, so wiring both would record every shell command twice.
-In headless `cursor-agent -p` runs, tool events are the only ones observed;
-`beforeSubmitPrompt` and `stop` are wired for interactive sessions.
+In headless `cursor-agent -p` (or `--print`) runs, tool events are the only ones
+observed and the run is settled as headless (see Headless runs); `beforeSubmitPrompt`
+and `stop` are wired for interactive sessions.
 
 OpenCode has no hook configuration file — `setup` installs a small plugin into
 `~/.config/opencode/plugins/` instead, written for OpenCode 2: a default export
@@ -556,7 +557,7 @@ gathered at session end — so a compaction costs context, never memory.
 
 ## Headless runs
 
-A one-shot invocation — `claude -p`, `codex exec` — usually is not a person
+A one-shot invocation — `claude -p`, `codex exec`, `cursor-agent -p` — usually is not a person
 working. It is an orchestrated step: a reviewer, a judge, a summarizer. So
 those runs receive **no automatic injection**. Handing a reviewer the author's
 own narrative quietly destroys its independence, and nothing downstream can see
@@ -635,8 +636,9 @@ transcript content is ever copied into this memory; the store keeps a path, and
 that is all. If the transcript has been cleaned up by the CLI, consolidation
 quietly proceeds without it.
 
-Claude Code and Codex provide transcripts. OpenCode, Antigravity and Cursor do
-not, and their summaries are written from events alone.
+Claude Code, Codex and Cursor provide transcripts (Cursor's are found under
+`~/.cursor/projects/*/agent-transcripts/` when its hook does not name one).
+OpenCode and Antigravity do not, and their summaries are written from events alone.
 
 ## What outlives a session
 

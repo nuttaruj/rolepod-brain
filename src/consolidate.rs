@@ -836,6 +836,21 @@ fn should_wait(store: &Store, pending: &PendingSession, retriable: bool) -> Resu
 }
 
 /// Consolidate one session and write its page.
+/// Where a session's transcript lives: the path its hooks recorded wins; only
+/// Cursor, whose stop payload may carry none, is looked up by session id.
+fn transcript_source(
+    stored: Option<String>,
+    cli: &str,
+    home: Option<&std::path::Path>,
+    session: &str,
+) -> Option<std::path::PathBuf> {
+    stored.map(std::path::PathBuf::from).or_else(|| {
+        (cli == "cursor")
+            .then(|| crate::transcript::cursor_transcript_in(home?, session))
+            .flatten()
+    })
+}
+
 fn consolidate_session(
     paths: &Paths,
     store: &Store,
@@ -897,11 +912,17 @@ fn consolidate_session(
     // The richest material a session produced is the model's own prose, and no
     // hook can see it. The host CLI already wrote it to disk, so we read it
     // here, summarize from it, and persist nothing but the summary. Missing or
-    // unreadable is the normal case for three of five CLIs, and silent.
-    let transcript = store
-        .transcript_path(&pending.session)?
-        .map(std::path::PathBuf::from)
-        .filter(|path| path.is_file())
+    // unreadable is the normal case for CLIs that write no usable transcript,
+    // and silent.
+    // Cursor's stop payload is not documented to carry a path, so for it the
+    // file is looked up by session id here - never in the hook, which waits.
+    let transcript = transcript_source(
+        store.transcript_path(&pending.session)?,
+        &pending.cli,
+        dirs::home_dir().as_deref(),
+        &pending.session,
+    )
+    .filter(|path| path.is_file())
         .and_then(|path| crate::transcript::read_span(path.as_path(), &pending.cli, &sanitizer));
 
     let first_reserve = transcript.as_deref().map_or(0, |span| TRANSCRIPT_HEADER.len() + span.len());
@@ -3702,6 +3723,27 @@ fn knowledge_prompt(summaries: &[Event], clusters: &[Vec<&Event>], known: &[Stri
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    fn only_cursor_falls_back_to_a_lookup_and_a_stored_path_wins() {
+        let home = std::env::temp_dir().join(format!("brain-tsrc-{}", ulid::Ulid::new()));
+        let id = "4f603393-e229-4512-b7d4-f1eb1804434f";
+        let dir = home.join(".cursor/projects/p/agent-transcripts").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(format!("{id}.jsonl"));
+        std::fs::write(&file, "{}\n").unwrap();
+        let found = std::fs::canonicalize(&file).unwrap();
+
+        let h = Some(home.as_path());
+        assert_eq!(transcript_source(None, "cursor", h, id), Some(found));
+        assert_eq!(transcript_source(None, "gemini-cli", h, id), None);
+        assert_eq!(transcript_source(None, "cursor", None, id), None);
+        assert_eq!(
+            transcript_source(Some("/stored.jsonl".into()), "cursor", h, id),
+            Some(std::path::PathBuf::from("/stored.jsonl"))
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 
     /// A scout's reads are how it reached its conclusion; the conclusion
     /// arrives whole as its report. The summary gets the report, with the

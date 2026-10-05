@@ -118,11 +118,17 @@ pub struct InjectionConfig {
     /// every turn, and whether it is pulled through is measured before it is
     /// trusted. Lexical only, never a model.
     pub prompt_pointers: bool,
+    /// Name the newest other session's summary in the primer, right after the
+    /// in-flight line - the hand-off a session started in another CLI needs.
+    ///
+    /// Off by default: it is one more line in every primer, and the layer
+    /// quotas below already decide which summaries earn a slot.
+    pub handoff_line: bool,
 }
 
 impl Default for InjectionConfig {
     fn default() -> Self {
-        Self { primer_budget: 4096, session_budget: 8192, prompt_pointers: false }
+        Self { primer_budget: 4096, session_budget: 8192, prompt_pointers: false, handoff_line: false }
     }
 }
 

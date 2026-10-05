@@ -93,6 +93,15 @@ pub fn primer(store: &Store, project: &str, session: &str, config: &InjectionCon
     // ranking, so `read_count` and a human's staleness flag decide which
     // knowledge earns its slots rather than which layer gets any.
     let mut seen = in_flight.clone();
+    // The hand-off line, when asked for: the newest finished session, right
+    // after the in-flight line and ahead of knowledge. Its id goes into
+    // `seen` so the summary layer below does not name it a second time.
+    let handoff: Vec<Pointer> = if config.handoff_line {
+        handoff_pointer(store, project, session)?.into_iter().collect()
+    } else {
+        Vec::new()
+    };
+    seen.extend(handoff.iter().map(|pointer| pointer.id.clone()));
     let summaries: Vec<Pointer> = store
         .pointers_of_kind(project, "session_summary", LAYER_CANDIDATES)?
         .into_iter()
@@ -116,7 +125,7 @@ pub fn primer(store: &Store, project: &str, session: &str, config: &InjectionCon
         .filter(|pointer| pointer.kind != "observation")
         .filter(|pointer| seen.insert(pointer.id.clone()))
         .collect();
-    if flight.is_empty() && summaries.is_empty() && knowledge.is_empty() && rest.is_empty() {
+    if flight.is_empty() && handoff.is_empty() && summaries.is_empty() && knowledge.is_empty() && rest.is_empty() {
         return Ok(Injection::default());
     }
 
@@ -201,6 +210,10 @@ pub fn primer(store: &Store, project: &str, session: &str, config: &InjectionCon
     // that can be re-earned from the log, not the rule.
     for (candidates, share) in [
         (&flight, IN_FLIGHT_SHARE),
+        // One line, so the first-line rule (the budget binds, not a share)
+        // is the only ceiling that matters; `already_injected` skips it on a
+        // resume or compaction like any other pointer.
+        (&handoff, 100),
         (&knowledge, KNOWLEDGE_SHARE),
         (&summaries, SUMMARY_SHARE),
         (&rest, 100),
@@ -474,6 +487,25 @@ fn in_flight_pointer(work: &crate::store::InFlight, reader: &str) -> Pointer {
         ),
         topic: None,
     }
+}
+
+/// How old a summary may be and still be a hand-off.
+const HANDOFF_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(48 * 60 * 60);
+
+/// The hand-off line: the newest other session's summary, tagged with its CLI
+/// (` (codex)`) only when that CLI is not the reader's and is a real agent
+/// CLI - `brain` and `mcp` write summaries too, and naming them tells the
+/// reader nothing. A reader whose CLI is unknown is never labelled.
+fn handoff_pointer(store: &Store, project: &str, reader: &str) -> Result<Option<Pointer>> {
+    let Some((mut pointer, cli)) = store.newest_summary(project, reader, HANDOFF_MAX_AGE)? else {
+        return Ok(None);
+    };
+    if !matches!(cli.as_str(), "brain" | "mcp")
+        && store.session_cli(reader)?.is_some_and(|mine| mine != cli)
+    {
+        pointer.title = format!("{} ({cli})", pointer.title);
+    }
+    Ok(Some(pointer))
 }
 
 /// Share of the primer each layer may spend, as a percentage of its budget.
@@ -1075,6 +1107,67 @@ mod tests {
         assert!(!injection.ids.contains(&current), "told the agent what it just did");
     }
 
+    fn file_event(project: Uuid, n: usize, kind: EventKind, title: &str) -> Event {
+        let mut event = Event::new(
+            Uuid::nil(),
+            project,
+            Uuid::nil(),
+            Source { cli: "claude-code".into(), hook: "post_tool_use".into() },
+            kind,
+            title.to_string(),
+            String::new(),
+        );
+        event.id = format!("01FILE{n:021}");
+        event.files = vec!["src/auth.rs".to_string()];
+        event.consolidated = true;
+        event
+    }
+
+    #[test]
+    fn a_bare_read_is_not_offered_as_a_file_hint() {
+        let project = Uuid::new_v4();
+        let config = InjectionConfig::default();
+        let store = Store::open_memory().unwrap();
+        for (n, kind, title) in [
+            (1, EventKind::Observation, "Read: src/auth.rs"),
+            (2, EventKind::Observation, "Grep: auth in src"),
+            (3, EventKind::Observation, "read: src/auth.rs"),
+            (4, EventKind::Observation, "Edit: src/auth.rs"),
+            (5, EventKind::Observation, "Readme regenerated"),
+        ] {
+            store.index(&file_event(project, n, kind, title)).unwrap();
+        }
+        let injection =
+            for_file(&store, &project.to_string(), "s1", "src/auth.rs", "", &config).unwrap();
+        assert_eq!(injection.ids.len(), 2, "only Edit and the non-tool title: {}", injection.text);
+        assert!(injection.text.contains("Edit: src/auth.rs"));
+        assert!(injection.text.contains("Readme regenerated"));
+
+        // The filter runs before LIMIT: more newer Reads than the limit must
+        // not crowd the one older Edit out.
+        let crowded = Store::open_memory().unwrap();
+        crowded.index(&file_event(project, 1, EventKind::Observation, "Edit: src/auth.rs")).unwrap();
+        for n in 2..(2 + MICRO_MAX_POINTERS * 3 + 5) {
+            crowded.index(&file_event(project, n, EventKind::Observation, "Read: src/auth.rs")).unwrap();
+        }
+        let kept_edit =
+            for_file(&crowded, &project.to_string(), "s1", "src/auth.rs", "", &config).unwrap();
+        assert!(kept_edit.text.contains("Edit: src/auth.rs"), "{}", kept_edit.text);
+
+        // Only reads: no block at all.
+        let reads = Store::open_memory().unwrap();
+        reads.index(&file_event(project, 1, EventKind::Observation, "Read: src/auth.rs")).unwrap();
+        reads.index(&file_event(project, 2, EventKind::Observation, "Glob: src/*.rs")).unwrap();
+        let none = for_file(&reads, &project.to_string(), "s1", "src/auth.rs", "", &config).unwrap();
+        assert!(none.is_empty(), "a Read-only file got a block: {}", none.text);
+
+        // Knowledge and summaries tied to the file survive, even if titled Read...
+        reads.index(&file_event(project, 3, EventKind::Knowledge, "Reading auth needs the cache warm")).unwrap();
+        reads.index(&file_event(project, 4, EventKind::SessionSummary, "Session about auth")).unwrap();
+        let kept = for_file(&reads, &project.to_string(), "s1", "src/auth.rs", "", &config).unwrap();
+        assert_eq!(kept.ids.len(), 2, "{}", kept.text);
+    }
+
     #[test]
     fn a_file_with_no_memory_injects_nothing() {
         let project = Uuid::new_v4();
@@ -1201,5 +1294,218 @@ mod tests {
                      about how a skill or workflow works is history: when it disagrees \
                      with a loaded skill, the skill wins.";
         assert!(PRIMER_HEADER.contains(fence), "the skill-wins line left the header");
+    }
+
+    /// One consolidated summary written by `cli` for `session`, `hours_ago`
+    /// old, optionally from a headless run.
+    fn handoff_summary(
+        store: &Store,
+        project: Uuid,
+        session: Uuid,
+        cli: &str,
+        id: &str,
+        hours_ago: i64,
+        headless: bool,
+    ) {
+        let mut event = Event::new(
+            Uuid::nil(),
+            project,
+            session,
+            Source { cli: cli.into(), hook: "consolidate".into() },
+            EventKind::SessionSummary,
+            format!("Handoff candidate {id}"),
+            "body".into(),
+        );
+        event.id = id.to_string();
+        event.ts = (jiff::Timestamp::now() - jiff::SignedDuration::from_hours(hours_ago)).to_string();
+        event.consolidated = true;
+        if headless {
+            event.extra.insert("invocation".into(), serde_json::json!("headless"));
+        }
+        store.index(&event).unwrap();
+    }
+
+    fn one_lesson(store: &Store, project: Uuid) {
+        let mut lesson = Event::new(
+            Uuid::nil(),
+            project,
+            Uuid::nil(),
+            Source { cli: "brain".into(), hook: "consolidate".into() },
+            EventKind::Knowledge,
+            "A lesson that outranks every summary".into(),
+            "body".into(),
+        );
+        lesson.id = "01HANDOFFLESSON0000000000".to_string();
+        lesson.consolidated = true;
+        store.index(&lesson).unwrap();
+    }
+
+    fn handoff_on() -> InjectionConfig {
+        InjectionConfig { handoff_line: true, ..InjectionConfig::default() }
+    }
+
+    /// A reader session that has already been captured as `cli`.
+    fn reader_in(store: &Store, project: Uuid, cli: &str) -> Uuid {
+        let session = Uuid::new_v4();
+        let event = Event::new(
+            Uuid::nil(),
+            project,
+            session,
+            Source { cli: cli.into(), hook: "session_start".into() },
+            EventKind::Observation,
+            "start".into(),
+            String::new(),
+        );
+        store.index(&event).unwrap();
+        session
+    }
+
+    #[test]
+    fn handoff_line_comes_before_knowledge_and_the_summary_layer_does_not_repeat_it() {
+        let project = Uuid::new_v4();
+        let store = Store::open_memory().unwrap();
+        one_lesson(&store, project);
+        handoff_summary(&store, project, Uuid::new_v4(), "claude-code", "01HANDOFFNEWEST0000000000", 1, false);
+        let reader = reader_in(&store, project, "claude-code");
+
+        let on = primer(&store, &project.to_string(), &reader.to_string(), &handoff_on()).unwrap();
+        let at = on.text.find("01HANDOFFNEWEST0000000000").expect("handoff line missing");
+        let knowledge = on.text[PRIMER_HEADER.len()..].find("KNW").map(|i| i + PRIMER_HEADER.len());
+        let knowledge = knowledge.expect("fixture has knowledge");
+        assert!(at < knowledge, "the handoff line must precede knowledge:\n{}", on.text);
+        let lines = on.text.lines().filter(|line| line.starts_with("01HANDOFFNEWEST0000000000")).count();
+        assert_eq!(lines, 1, "summary layer repeated it:\n{}", on.text);
+    }
+
+    #[test]
+    fn handoff_skips_old_and_headless_summaries() {
+        let project = Uuid::new_v4();
+        let store = Store::open_memory().unwrap();
+        handoff_summary(&store, project, Uuid::new_v4(), "claude-code", "01HANDOFFSTALE00000000000", 49, false);
+        // A real summary event carries no `invocation`: the run is recorded
+        // per session, so that is what must exclude it.
+        let headless = Uuid::new_v4();
+        store.record_session_invocation(&headless.to_string(), "headless").unwrap();
+        handoff_summary(&store, project, headless, "claude-code", "01HANDOFFHEADLESS000000000", 1, false);
+        handoff_summary(&store, project, Uuid::new_v4(), "claude-code", "01HANDOFFFRESH000000000000", 47, false);
+        // The headless one is the newest id, the stale one the oldest ts.
+        let pick = store
+            .newest_summary(&project.to_string(), "none", std::time::Duration::from_secs(48 * 3600))
+            .unwrap()
+            .expect("the fresh interactive summary qualifies");
+        assert_eq!(pick.0.id, "01HANDOFFFRESH000000000000");
+    }
+
+    #[test]
+    fn handoff_sits_after_in_flight_and_is_skipped_once_injected() {
+        let project = Uuid::new_v4();
+        let store = Store::open_memory().unwrap();
+        one_lesson(&store, project);
+        let mut work = Event::new(
+            Uuid::nil(),
+            project,
+            Uuid::new_v4(),
+            Source { cli: "codex".into(), hook: "user_prompt_submit".into() },
+            EventKind::Observation,
+            "unfinished work".into(),
+            String::new(),
+        );
+        work.id = "01HANDOFFINFLIGHT0000000".to_string();
+        store.index(&work).unwrap();
+        handoff_summary(&store, project, Uuid::new_v4(), "claude-code", "01HANDOFFNEWEST0000000000", 1, false);
+        let reader = reader_in(&store, project, "claude-code");
+
+        let first = primer(&store, &project.to_string(), &reader.to_string(), &handoff_on()).unwrap();
+        let flight = first.text.find("01HANDOFFINFLIGHT0000000").expect("in-flight line missing");
+        let line = first.text.find("01HANDOFFNEWEST0000000000").expect("handoff line missing");
+        let knowledge = first.text[PRIMER_HEADER.len()..].find("KNW").expect("fixture has knowledge") + PRIMER_HEADER.len();
+        assert!(flight < line && line < knowledge, "order is in-flight, handoff, knowledge:\n{}", first.text);
+
+        // Recorded as shown to this session (what the hook does), a resume or
+        // compaction primer must not spend budget on it again.
+        store.record_injected(&reader.to_string(), &first.ids, first.in_flight, first.text.len(), usize::MAX).unwrap();
+        let second = primer(&store, &project.to_string(), &reader.to_string(), &handoff_on()).unwrap();
+        assert!(!second.text.contains("01HANDOFFNEWEST0000000000"), "repeated on resume:\n{}", second.text);
+    }
+
+    #[test]
+    fn handoff_label_names_the_cli_only_when_it_differs() {
+        let project = Uuid::new_v4();
+        let store = Store::open_memory().unwrap();
+        handoff_summary(&store, project, Uuid::new_v4(), "codex", "01HANDOFFCODEX00000000000", 1, false);
+        let claude = reader_in(&store, project, "claude-code");
+        let other = primer(&store, &project.to_string(), &claude.to_string(), &handoff_on()).unwrap();
+        assert!(other.text.contains("(codex)"), "{}", other.text);
+
+        let codex = reader_in(&store, project, "codex");
+        let same = primer(&store, &project.to_string(), &codex.to_string(), &handoff_on()).unwrap();
+        assert!(same.text.contains("01HANDOFFCODEX00000000000"), "{}", same.text);
+        assert!(!same.text.contains("(codex)"), "same-CLI line was labelled:\n{}", same.text);
+
+        let store = Store::open_memory().unwrap();
+        handoff_summary(&store, project, Uuid::new_v4(), "brain", "01HANDOFFBRAIN00000000000", 1, false);
+        let reader = reader_in(&store, project, "claude-code");
+        let brain = primer(&store, &project.to_string(), &reader.to_string(), &handoff_on()).unwrap();
+        assert!(!brain.text.contains("(brain)"), "{}", brain.text);
+
+        let store = Store::open_memory().unwrap();
+        handoff_summary(&store, project, Uuid::new_v4(), "mcp", "01HANDOFFMCP0000000000000", 1, false);
+        let reader = reader_in(&store, project, "claude-code");
+        let mcp = primer(&store, &project.to_string(), &reader.to_string(), &handoff_on()).unwrap();
+        assert!(mcp.text.contains("01HANDOFFMCP0000000000000"), "{}", mcp.text);
+        assert!(!mcp.text.contains("(mcp)"), "{}", mcp.text);
+
+        // A reader with no capture of its own has no known CLI: no label.
+        let store = Store::open_memory().unwrap();
+        handoff_summary(&store, project, Uuid::new_v4(), "codex", "01HANDOFFCODEX00000000000", 1, false);
+        let unknown = primer(&store, &project.to_string(), &Uuid::new_v4().to_string(), &handoff_on()).unwrap();
+        assert!(unknown.text.contains("01HANDOFFCODEX00000000000"), "{}", unknown.text);
+        assert!(!unknown.text.contains("(codex)"), "{}", unknown.text);
+    }
+
+    #[test]
+    fn session_cli_is_the_first_capture() {
+        let project = Uuid::new_v4();
+        let store = Store::open_memory().unwrap();
+        let session = reader_in(&store, project, "claude-code");
+        let mut later = Event::new(
+            Uuid::nil(),
+            project,
+            session,
+            Source { cli: "codex".into(), hook: "stop".into() },
+            EventKind::Observation,
+            "later".into(),
+            String::new(),
+        );
+        // Two ULIDs minted in one millisecond order at random; pin this one last.
+        later.id = "7ZZZZZZZZZZZZZZZZZZZZZZZZZ".into();
+        store.index(&later).unwrap();
+        assert_eq!(store.session_cli(&session.to_string()).unwrap().as_deref(), Some("claude-code"));
+        assert_eq!(store.session_cli(&Uuid::new_v4().to_string()).unwrap(), None);
+    }
+
+    #[test]
+    fn handoff_off_leaves_the_primer_byte_for_byte() {
+        let project = Uuid::new_v4();
+        let store = Store::open_memory().unwrap();
+        one_lesson(&store, project);
+        let reader = reader_in(&store, project, "claude-code");
+        handoff_summary(&store, project, Uuid::new_v4(), "codex", "01HANDOFFNEWEST0000000000", 1, false);
+        assert!(!InjectionConfig::default().handoff_line, "the line is opt-in");
+        let off = primer(&store, &project.to_string(), &reader.to_string(), &InjectionConfig::default()).unwrap();
+        // Off, the summary is only a candidate for the ordinary summary layer:
+        // the primer is exactly header + knowledge + that summary, unlabelled.
+        let project_key = project.to_string();
+        let mut expected = PRIMER_HEADER.to_string();
+        for kind in ["knowledge", "session_summary"] {
+            for pointer in store.pointers_of_kind(&project_key, kind, 10).unwrap() {
+                expected.push_str(&render_line(&pointer));
+            }
+        }
+        assert!(expected.len() > PRIMER_HEADER.len() + 100, "{expected}");
+        assert!(expected.contains("01HANDOFFNEWEST0000000000"), "{expected}");
+        assert_eq!(off.text, expected);
+        let again = primer(&store, &project.to_string(), &reader.to_string(), &InjectionConfig::default()).unwrap();
+        assert_eq!(off.text, again.text);
     }
 }

@@ -145,6 +145,9 @@ fn classify_argv(argv: &str) -> Option<Invocation> {
         "agy" => args
             .iter()
             .any(|arg| matches!(*arg, "-p" | "--print" | "--prompt") || arg.starts_with("-p=")),
+        // Cursor's one-shot flag. Only the full name: the bare `agent` alias is
+        // too generic to claim.
+        "cursor-agent" => args.iter().any(|arg| matches!(*arg, "-p" | "--print")),
         _ => return None,
     };
 
@@ -270,6 +273,39 @@ mod tests {
             Some(Invocation::Headless)
         );
         assert_eq!(classify_argv("agy"), Some(Invocation::Interactive));
+    }
+
+    #[test]
+    fn cursor_agent_print_is_headless_and_the_rest_is_not() {
+        // As `ps` prints a real run: the launcher passes the script path as a
+        // word, then the user's own flags.
+        assert_eq!(
+            classify_argv(
+                "/home/me/.local/bin/cursor-agent --use-system-ca /home/me/.local/share/cursor-agent/versions/X/index.js -p --mode ask --output-format stream-json"
+            ),
+            Some(Invocation::Headless)
+        );
+        assert_eq!(classify_argv("cursor-agent --print 'do it'"), Some(Invocation::Headless));
+        assert_eq!(classify_argv("cursor-agent"), Some(Invocation::Interactive));
+        assert_eq!(
+            classify_argv("cursor-agent worker start --worker-dir /home/me/proj"),
+            Some(Invocation::Interactive)
+        );
+        // A path with a space (`.../Application Support/...`) is cut at the
+        // first space, so such a process is not recognised (None): the chain
+        // falls back to Interactive unless another agent hosts it, which is the
+        // safe direction, since it keeps its injection.
+        assert_eq!(
+            classify_argv("/Users/me/Library/Application Support/cursor/bin/cursor-agent -p"),
+            None
+        );
+        // The bare `agent` alias is not claimed.
+        assert_eq!(classify_argv("agent -p"), None);
+
+        // Under another agent, a cursor-agent without -p is still a delegate.
+        let chain: Vec<String> =
+            ["cursor-agent", "claude --model opus"].map(String::from).to_vec();
+        assert_eq!(classify_chain(&chain), Invocation::Headless);
     }
 
     #[test]
