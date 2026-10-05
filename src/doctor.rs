@@ -84,6 +84,7 @@ pub fn run() -> Result<Vec<Check>> {
         Err(error) => checks.push(Check::fail("index", error.to_string())),
     }
 
+    checks.extend(cursor_overlap_check(&paths));
     checks.extend(split_tree_check(&paths));
     checks.push(injection_check(&paths));
     checks.push(taxonomy_check(&paths));
@@ -100,6 +101,46 @@ pub fn run() -> Result<Vec<Check>> {
     checks.push(error_log_check(&paths.log_file()));
 
     Ok(checks)
+}
+
+/// Sessions since `cutoff` (an RFC 3339 timestamp) captured under both the
+/// `cursor` and the `claude-code` label.
+fn double_captured_sessions(
+    conn: &rusqlite::Connection,
+    cutoff: &str,
+) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM (
+             SELECT session FROM events WHERE ts >= ?1 GROUP BY session
+             HAVING SUM(cli = 'cursor') > 0 AND SUM(cli = 'claude-code') > 0
+         )",
+        [cutoff],
+        |row| row.get(0),
+    )
+}
+
+/// Info line: Cursor sessions the store holds twice, under both labels.
+///
+/// Cursor also fires Claude Code's hooks, which `capture` now drops; sessions
+/// recorded before that, or by an older binary, still show here. A zero or an
+/// unreadable store says nothing.
+fn cursor_overlap_check(paths: &Paths) -> Option<Check> {
+    let conn = rusqlite::Connection::open_with_flags(
+        paths.db(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .ok()?;
+    let cutoff = jiff::Timestamp::now()
+        .checked_sub(jiff::SignedDuration::from_secs(7 * 24 * 3600))
+        .ok()?
+        .to_string();
+    let sessions = double_captured_sessions(&conn, &cutoff).ok()?;
+    (sessions > 0).then(|| {
+        Check::pass(
+            "cursor duplicate capture",
+            format!("{sessions} session(s) in the last 7 days hold both `cursor` and `claude-code` events"),
+        )
+    })
 }
 
 /// How much memory has actually been classified.
@@ -347,6 +388,93 @@ fn model_label(spec: &crate::summarizer::CliSpec, overrides: &HashMap<String, St
     format!("{}={model}", spec.cli)
 }
 
+/// The "summarizer calls" row: information, not a verdict - what the
+/// summarizer has cost in the last day. Absent when it made no call.
+fn spend_check(today: &[crate::store::SummarizerCall]) -> Option<Check> {
+    if today.is_empty() {
+        return None;
+    }
+    let failed = today.iter().filter(|call| call.outcome != "ok").count();
+    Some(Check::pass(
+        "summarizer calls",
+        format!("{} in the last 24h, {failed} not ok (see `brain stats`)", today.len()),
+    ))
+}
+
+/// The "failing sessions" row: sessions consolidation keeps failing on, with
+/// the last reason. A warning, not a failure - the rest of memory is fine, and
+/// a parked session is waiting on `brain consolidate --session X --force`.
+/// Absent when none has failed twice.
+fn failing_check(failing: &[(String, i64, String)]) -> Option<Check> {
+    if failing.is_empty() {
+        return None;
+    }
+    let parked = failing.iter().filter(|(_, n, _)| *n >= Store::PARK_AFTER).count();
+    let lines: Vec<String> = failing
+        .iter()
+        .take(3)
+        .map(|(session, attempts, error)| format!("{session} x{attempts}: {error}"))
+        .collect();
+    Some(Check::pass(
+        "failing sessions",
+        format!(
+            "warn: {} session(s) failing, {parked} parked after {} attempts\n    {}",
+            failing.len(),
+            Store::PARK_AFTER,
+            lines.join("\n    ")
+        ),
+    ))
+}
+
+/// Observations older than this, still unsummarized, are worth a warning.
+const BACKLOG_WARN_SECS: i64 = 2 * 3600;
+
+/// The "backlog" row: how old the oldest observation still waiting for a
+/// summary is, parked sessions not counted (they wait on a person). A warning
+/// past two hours, never a failure; absent when nothing is waiting or it is
+/// young. Hours of backlog is the shape of a run that keeps yielding.
+fn backlog_check(oldest_pending: Option<&str>) -> Option<Check> {
+    let at: jiff::Timestamp = oldest_pending?.parse().ok()?;
+    let age = jiff::Timestamp::now().as_second() - at.as_second();
+    if age <= BACKLOG_WARN_SECS {
+        return None;
+    }
+    Some(Check::pass(
+        "consolidation backlog",
+        format!(
+            "warn: the oldest unsummarized observation is {}h old (run `brain consolidate --all`)",
+            age / 3600
+        ),
+    ))
+}
+
+/// The "consolidation runs" row: invocations in the last day, how many stood
+/// aside for another run, and the longest one that did work. Information.
+fn runs_check(runs: &[crate::store::ConsolidationRun]) -> Option<Check> {
+    if runs.is_empty() {
+        return None;
+    }
+    let yielded = runs.iter().filter(|run| run.yielded).count();
+    let failed = runs.iter().filter(|run| run.error.is_some()).count();
+    let longest = runs
+        .iter()
+        .filter(|run| !run.yielded)
+        .filter_map(|run| {
+            let (start, end) =
+                (run.started.parse::<jiff::Timestamp>().ok()?, run.ended.parse::<jiff::Timestamp>().ok()?);
+            Some(end.as_second() - start.as_second())
+        })
+        .max();
+    Some(Check::pass(
+        "consolidation runs",
+        format!(
+            "{} in the last 24h, {yielded} yielded, {failed} errored{}",
+            runs.len(),
+            longest.map_or(String::new(), |secs| format!(", longest pass {}m{}s", secs / 60, secs % 60))
+        ),
+    ))
+}
+
 fn summarizer_checks(paths: &Paths) -> Vec<Check> {
     let mut checks = Vec::new();
     // Effective models, overrides applied: a report that shows the spec's
@@ -395,6 +523,14 @@ fn summarizer_checks(paths: &Paths) -> Vec<Check> {
         ) {
             checks.push(check);
         }
+        // Information, not a verdict: what the summarizer has cost today.
+        let today = store.summarizer_calls_since(crate::store::DAY_SECS).unwrap_or_default();
+        checks.extend(spend_check(&today));
+        checks.extend(failing_check(&store.failing_sessions(2).unwrap_or_default()));
+        checks.extend(backlog_check(store.oldest_pending_ts().unwrap_or_default().as_deref()));
+        checks.extend(runs_check(
+            &store.consolidation_runs_since(crate::store::DAY_SECS).unwrap_or_default(),
+        ));
         for health in store.summarizer_health().unwrap_or_default() {
             if health.failures == 0 || !live_rungs.contains(&health.cli.as_str()) {
                 continue;
@@ -865,6 +1001,70 @@ mod tests {
     }
 
     #[test]
+    fn the_failing_row_names_the_session_its_attempts_and_the_reason() {
+        assert!(failing_check(&[]).is_none());
+        let row = failing_check(&[
+            ("s-1".into(), 3, "write page: disk full".into()),
+            ("s-2".into(), 2, "timed out".into()),
+        ])
+        .unwrap();
+        assert!(row.ok, "a failing session warns, it does not fail the report");
+        assert!(row.detail.contains("warn: 2 session(s) failing, 1 parked"), "{}", row.detail);
+        assert!(row.detail.contains("s-1 x3: write page: disk full"), "{}", row.detail);
+    }
+
+    #[test]
+    fn the_backlog_row_warns_only_past_two_hours() {
+        let ago = |secs: i64| {
+            (jiff::Timestamp::now() - jiff::SignedDuration::from_secs(secs)).to_string()
+        };
+        assert!(backlog_check(None).is_none());
+        assert!(backlog_check(Some(&ago(3600))).is_none(), "an hour is not stale");
+        let row = backlog_check(Some(&ago(3 * 3600 + 60))).unwrap();
+        assert!(row.ok, "a warning, not a failure");
+        assert!(row.detail.starts_with("warn: the oldest unsummarized observation is 3h old"), "{}", row.detail);
+    }
+
+    #[test]
+    fn the_runs_row_counts_yields_errors_and_the_longest_pass() {
+        let run = |yielded: bool, secs: i64, error: Option<&str>| {
+            let now = jiff::Timestamp::now();
+            crate::store::ConsolidationRun {
+                started: (now - jiff::SignedDuration::from_secs(secs)).to_string(),
+                ended: now.to_string(),
+                mode: "all".into(),
+                yielded,
+                sessions: 0,
+                events: 0,
+                failed: 0,
+                rule_based: 0,
+                error: error.map(str::to_string),
+            }
+        };
+        assert!(runs_check(&[]).is_none());
+        let row = runs_check(&[run(true, 1, None), run(false, 125, None), run(false, 5, Some("x"))]).unwrap();
+        assert_eq!(row.detail, "3 in the last 24h, 1 yielded, 1 errored, longest pass 2m5s");
+    }
+
+    #[test]
+    fn the_spend_row_counts_the_day_and_what_did_not_end_ok() {
+        let call = |outcome: &str| crate::store::SummarizerCall {
+            session: "s".into(),
+            purpose: "consolidate".into(),
+            cli: "codex".into(),
+            model: "m".into(),
+            prompt_bytes: 1,
+            answer_bytes: 1,
+            ms: 1,
+            outcome: outcome.into(),
+        };
+        assert!(spend_check(&[]).is_none());
+        let row = spend_check(&[call("ok"), call("timeout"), call("unusable")]).unwrap();
+        assert_eq!(row.name, "summarizer calls");
+        assert!(row.detail.contains("3 in the last 24h, 2 not ok"), "{}", row.detail);
+    }
+
+    #[test]
     fn all_passing_reports_ok() {
         let (_, ok) = render(&[Check::pass("a", "fine")]);
         assert!(ok);
@@ -937,5 +1137,21 @@ mod tests {
         // One model answer anywhere proves the ladder reaches a CLI.
         let mixed = vec![("rule-based".to_string(), 7), ("codex".to_string(), 1)];
         assert!(consolidation_check(&mixed, "auto", true).expect("row").ok);
+    }
+
+    #[test]
+    fn only_sessions_under_both_labels_in_the_window_count() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE events (session TEXT, cli TEXT, ts TEXT);
+             INSERT INTO events VALUES ('both', 'cursor', '2026-10-04T00:00:00Z');
+             INSERT INTO events VALUES ('both', 'claude-code', '2026-10-04T00:00:01Z');
+             INSERT INTO events VALUES ('cursor-only', 'cursor', '2026-10-04T00:00:00Z');
+             INSERT INTO events VALUES ('claude-only', 'claude-code', '2026-10-04T00:00:00Z');
+             INSERT INTO events VALUES ('old', 'cursor', '2026-09-01T00:00:00Z');
+             INSERT INTO events VALUES ('old', 'claude-code', '2026-09-01T00:00:00Z');",
+        )
+        .unwrap();
+        assert_eq!(double_captured_sessions(&conn, "2026-09-28T00:00:00Z").unwrap(), 1);
     }
 }

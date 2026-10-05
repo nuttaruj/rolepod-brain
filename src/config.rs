@@ -100,11 +100,11 @@ impl Default for SummarizerConfig {
     }
 }
 
-/// Byte budgets for automatic context injection.
+/// Byte budgets, and the one opt-in switch, for automatic context injection.
 ///
 /// Byte-denominated on purpose: a count of "50 observations" is an
 /// approximation, because 50 long lines and 50 short lines are not the same
-/// spend. These are ceilings, not targets.
+/// spend. The budgets are ceilings, not targets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InjectionConfig {
@@ -112,11 +112,17 @@ pub struct InjectionConfig {
     pub primer_budget: usize,
     /// Ceiling for everything auto-injected in one session, across layers.
     pub session_budget: usize,
+    /// Push up to three KNW/SUM/NTE pointers when a task prompt arrives.
+    ///
+    /// Off by default: a prompt-time push is one more thing in the context on
+    /// every turn, and whether it is pulled through is measured before it is
+    /// trusted. Lexical only, never a model.
+    pub prompt_pointers: bool,
 }
 
 impl Default for InjectionConfig {
     fn default() -> Self {
-        Self { primer_budget: 4096, session_budget: 8192 }
+        Self { primer_budget: 4096, session_budget: 8192, prompt_pointers: false }
     }
 }
 
@@ -337,6 +343,9 @@ mod tests {
         assert_eq!(config.summarizer.mode, "auto");
         assert_eq!(config.injection.primer_budget, 4096);
         assert_eq!(config.injection.session_budget, 8192);
+        assert!(!config.injection.prompt_pointers, "the prompt-time push is opt-in");
+        let on: Config = toml::from_str("[injection]\nprompt_pointers = true\n").unwrap();
+        assert!(on.injection.prompt_pointers);
     }
 
     #[test]

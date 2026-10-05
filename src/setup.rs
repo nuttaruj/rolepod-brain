@@ -156,6 +156,9 @@ pub fn targets_in(home: &Path, exe: &Path) -> Result<Vec<Target>> {
                 "UserPromptSubmit",
                 "PreToolUse",
                 "PostToolUse",
+                // Capture-only: a failed call is a fact worth keeping, and
+                // there is nothing to inject into one.
+                "PostToolUseFailure",
                 "Stop",
                 "SubagentStop",
                 "PreCompact",
@@ -2623,6 +2626,36 @@ mod tests {
             !planned.contains("would write 8 hook(s)"),
             "both would wire the same CLI: {planned}"
         );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A failed tool call is captured: applying setup on an isolated HOME
+    /// writes a `PostToolUseFailure` entry for Claude Code, with the same
+    /// 5 s budget as `PostToolUse`, and none for the other CLIs.
+    #[cfg(unix)]
+    #[test]
+    fn setup_wires_post_tool_use_failure_for_claude_code_only() {
+        let home = std::env::temp_dir().join(format!("brain-failure-hook-{}", ulid::Ulid::new()));
+        let _ = std::fs::remove_dir_all(&home);
+        let _guard =
+            crate::invocation::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = take_home(&home);
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let exe = Path::new("/usr/local/bin/brain");
+        let all = targets_in(&home, exe).unwrap();
+        let claude = all.iter().find(|t| t.kind == AgentKind::ClaudeCode).unwrap();
+        wire_hooks(claude, exe, true).unwrap();
+        let written = read_json(&home.join(".claude/settings.json")).unwrap();
+        let entry = &written["hooks"]["PostToolUseFailure"][0]["hooks"][0];
+        assert!(
+            entry["command"].as_str().is_some_and(|c| c.contains("--event PostToolUseFailure")),
+            "no PostToolUseFailure entry: {written}"
+        );
+        assert_eq!(entry["timeout"], written["hooks"]["PostToolUse"][0]["hooks"][0]["timeout"]);
+        for other in all.iter().filter(|t| t.kind != AgentKind::ClaudeCode) {
+            assert!(!other.events.contains(&"PostToolUseFailure"), "another CLI's wiring changed");
+        }
 
         let _ = std::fs::remove_dir_all(&home);
     }

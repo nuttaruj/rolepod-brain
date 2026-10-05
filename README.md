@@ -267,7 +267,7 @@ are.
 
 | CLI | Capture | MCP recall | Summarizes | Notes |
 |---|---|---|---|---|
-| Claude Code | 8 lifecycle events | registered automatically | `claude` | |
+| Claude Code | 9 lifecycle events | registered automatically | `claude` | |
 | Codex | 7 lifecycle events | via the plugin | `codex` | installs as a plugin; capture needs one approval — see below |
 | Antigravity (`agy`) | 2 lifecycle events | register manually | `agy` | needs an explicit workspace, see below |
 | Cursor | 3 lifecycle events | registered automatically | `cursor-agent` | |

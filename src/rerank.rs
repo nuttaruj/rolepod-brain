@@ -21,7 +21,7 @@
 use std::time::{Duration, Instant};
 
 use crate::store::Hit;
-use crate::summarizer::{Ladder, Tier};
+use crate::summarizer::{CallContext, Ladder, Tier};
 
 /// Hits offered to a host CLI.
 ///
@@ -130,7 +130,9 @@ pub fn rerank(
     let offered: Vec<Hit> = hits.iter().take(POOL).cloned().collect();
     let prompt = prompt_for(query, &offered);
     let ladder = ladder.while_waiting(TIMEOUT);
-    let Ok((Tier::Cli(_), answer)) = ladder.run(&prompt, cli, usable) else {
+    // Advisory, so the ladder writes no ledger row; `rerank_runs` has it.
+    let ctx = CallContext { purpose: "rerank", session: "" };
+    let Ok((Tier::Cli(_), answer)) = ladder.run(&ctx, &prompt, cli, usable) else {
         let ms = elapsed(started);
         return (hits, Outcome { engine: "none", reason: "cli-no-answer", ms, cold: false });
     };

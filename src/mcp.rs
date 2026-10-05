@@ -433,20 +433,26 @@ fn call_tool(paths: &Paths, project: &str, session: &str, params: &Value) -> Res
                 .get("topic")
                 .and_then(Value::as_str)
                 .and_then(crate::event::normalize_topic);
-            let mut hits = store.search(project, query, topic, pool, crate::store::Recall::Fused)?;
-
-            // Second retrieval stream: a query that names a file or a service
-            // finds the work about it even when no title contains the word.
-            // Appended rather than interleaved, so text relevance still leads.
-            let by_entity = store
-                .search_by_entity(project, &crate::consolidate::normalize_entity(query), pool)
-                .unwrap_or_default();
-            let seen: std::collections::HashSet<String> =
-                hits.iter().map(|hit| hit.id.clone()).collect();
-            hits.extend(by_entity.into_iter().filter(|hit| !seen.contains(&hit.id)).take(pool));
-            hits.truncate(pool);
+            // The relevance floor applies only when this page is final: a
+            // pool headed for the reranker stays wide for it to judge. If the
+            // reranker then falls back to "none", that page goes out unfloored.
+            let (mut hits, _) =
+                store.search_traced(project, query, topic, pool, crate::store::Recall::Fused, !rerank)?;
 
             if rerank {
+                // An entity lookup joins the wide pool: a query that names a
+                // file or a service finds the work about it even when no title
+                // contains the word. Appended rather than interleaved, so text
+                // relevance still leads. Not on a floored page: an id only an
+                // entity proposed is exactly what the floor keeps off it.
+                let by_entity = store
+                    .search_by_entity(project, &crate::consolidate::normalize_entity(query), pool)
+                    .unwrap_or_default();
+                let seen: std::collections::HashSet<String> =
+                    hits.iter().map(|hit| hit.id.clone()).collect();
+                hits.extend(by_entity.into_iter().filter(|hit| !seen.contains(&hit.id)).take(pool));
+                hits.truncate(pool);
+
                 let ladder = crate::summarizer::Ladder::new(&store, &config.summarizer);
                 // Borrow the cheap tier of whichever CLI works here.
                 let cli = store.project_cli(project)?.unwrap_or_default();
@@ -476,6 +482,17 @@ fn call_tool(paths: &Paths, project: &str, session: &str, params: &Value) -> Res
             // forgotten events pending forever.
             let mut events = store.get(&ids)?;
             events.retain(|event| store.event_exists(&event.id).unwrap_or(false));
+            // The index keeps an observation bounded; the log has the whole
+            // line, and this is the one reader that wants it. Not found (a
+            // pruned or moved log) leaves the clamped body.
+            let mut known = None;
+            for event in &mut events {
+                if store.is_clamped(&event.id).unwrap_or(false) {
+                    if let Some(full) = full_body_from_log(paths, event, &mut known) {
+                        event.body = full;
+                    }
+                }
+            }
             // Not `record_recalled`: asking for a body, having seen only the
             // title, is the one moment an agent says an entry was worth the
             // tokens. Everything else in this file merely offered it.
@@ -653,6 +670,41 @@ fn write_note(paths: &Paths, text: &str, files: &[String]) -> Result<String> {
     Ok(event.id)
 }
 
+/// The un-clamped body of an event, read from its monthly log line.
+///
+/// The project directory comes from the event's own project id, found among
+/// the known projects, so an id surfaced from another project still resolves.
+fn full_body_from_log(
+    paths: &Paths,
+    event: &crate::event::Event,
+    known: &mut Option<Vec<(crate::ids::ProjectScope, std::path::PathBuf)>>,
+) -> Option<String> {
+    let month = format!("{}.jsonl", event.month());
+    // The current scope first - the common case, no wiki walk. Only an id
+    // from another project falls back to the scan, done once per call.
+    let current = ids::resolve_scope(&std::env::current_dir().unwrap_or_default());
+    let mut dirs = Vec::new();
+    if current.project_id == event.project {
+        dirs.push(paths.project_dir(&current));
+    }
+    let read = |dir: &std::path::Path| -> Option<String> {
+        let text = std::fs::read_to_string(dir.join("events").join(&month)).ok()?;
+        text.lines()
+            .filter(|line| line.contains(&event.id))
+            .filter_map(|line| serde_json::from_str::<crate::event::Event>(line).ok())
+            .find(|logged| logged.id == event.id)
+            .map(|logged| logged.body)
+    };
+    if let Some(body) = dirs.iter().find_map(|dir| read(dir)) {
+        return Some(body);
+    }
+    known
+        .get_or_insert_with(|| crate::consolidate::known_projects(paths).unwrap_or_default())
+        .iter()
+        .filter(|(scope, _)| scope.project_id == event.project)
+        .find_map(|(_, dir)| read(dir))
+}
+
 /// Kinds a caller may ask for, and the one alias that has to work.
 ///
 /// `raw` is not a kind - it is what the primer PRINTS for an untyped
@@ -761,6 +813,127 @@ mod tests {
         assert_eq!(result["protocolVersion"], PROTOCOL_VERSION);
         assert!(result["capabilities"].get("tools").is_some());
         assert_eq!(result["serverInfo"]["name"], "rolepod-brain");
+    }
+
+    /// `brain_get` is the one reader that gets the whole line back from the
+    /// log; `Store::get` (consolidation's path) keeps the clamped body.
+    #[test]
+    fn brain_get_returns_the_full_body_of_a_clamped_row_from_the_log() {
+        let data_dir = std::env::temp_dir().join(format!("brain-mcp-get-{}", ulid::Ulid::new()));
+        let paths = Paths { data_dir };
+        let scope = ids::ProjectScope {
+            workspace: "default".to_string(),
+            workspace_id: uuid::Uuid::new_v4(),
+            project: "demo".to_string(),
+            project_id: uuid::Uuid::new_v4(),
+            root: std::path::PathBuf::from("/tmp/demo"),
+        };
+        let stdout = format!("{}END_OF_OUTPUT", "q".repeat(10 * 1024));
+        let body = json!({"tool_name": "Bash", "tool_response": {"stdout": stdout}}).to_string();
+        let mut event = crate::event::Event::new(
+            scope.workspace_id,
+            scope.project_id,
+            uuid::Uuid::new_v4(),
+            crate::event::Source { cli: "claude-code".into(), hook: "post_tool_use".into() },
+            crate::event::EventKind::Observation,
+            "Bash: make".to_string(),
+            body.clone(),
+        );
+        event.consolidated = true;
+        crate::event::EventLog::open(&paths.project_dir(&scope)).unwrap().append(&event).unwrap();
+        let store = Store::open(&paths.db()).unwrap();
+        store.index(&event).unwrap();
+
+        let got = call_tool(
+            &paths,
+            &scope.project_id.to_string(),
+            "s",
+            &json!({"name": "brain_get", "arguments": {"ids": [event.id.clone()]}}),
+        )
+        .unwrap();
+        let text = got.to_string();
+        assert!(text.contains("END_OF_OUTPUT"));
+        assert!(text.len() > 10 * 1024, "the whole body came back");
+
+        let bounded = &store.get(&[event.id.clone()]).unwrap()[0].body;
+        assert!(bounded.len() <= 4096 && bounded.len() < body.len());
+        std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    fn big_observation_in(paths: &Paths, log_it: bool) -> (ids::ProjectScope, crate::event::Event) {
+        let scope = ids::ProjectScope {
+            workspace: "default".to_string(),
+            workspace_id: uuid::Uuid::new_v4(),
+            project: "demo".to_string(),
+            project_id: uuid::Uuid::new_v4(),
+            root: std::path::PathBuf::from("/tmp/demo"),
+        };
+        let stdout = format!("{}END_OF_OUTPUT", "q".repeat(10 * 1024));
+        let body = json!({"tool_name": "Bash", "tool_response": {"stdout": stdout}}).to_string();
+        let mut event = crate::event::Event::new(
+            scope.workspace_id,
+            scope.project_id,
+            uuid::Uuid::new_v4(),
+            crate::event::Source { cli: "claude-code".into(), hook: "post_tool_use".into() },
+            crate::event::EventKind::Observation,
+            "Bash: make".to_string(),
+            body,
+        );
+        event.consolidated = true;
+        if log_it {
+            crate::event::EventLog::open(&paths.project_dir(&scope))
+                .unwrap()
+                .append(&event)
+                .unwrap();
+        }
+        Store::open(&paths.db()).unwrap().index(&event).unwrap();
+        (scope, event)
+    }
+
+    #[test]
+    fn brain_get_keeps_the_clamped_body_when_the_log_line_is_gone() {
+        let data_dir = std::env::temp_dir().join(format!("brain-mcp-gone-{}", ulid::Ulid::new()));
+        let paths = Paths { data_dir };
+        let (scope, event) = big_observation_in(&paths, false);
+        let got = call_tool(
+            &paths,
+            &scope.project_id.to_string(),
+            "s",
+            &json!({"name": "brain_get", "arguments": {"ids": [event.id.clone()]}}),
+        )
+        .unwrap();
+        let text = got.to_string();
+        assert!(text.contains("\"count\":1") || text.contains("\"count\": 1"));
+        assert!(text.len() < 10 * 1024, "no log line: the bounded body stays");
+        std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    #[test]
+    fn brain_get_does_not_resurrect_a_retired_observation() {
+        let data_dir = std::env::temp_dir().join(format!("brain-mcp-ret-{}", ulid::Ulid::new()));
+        let paths = Paths { data_dir };
+        let (scope, event) = big_observation_in(&paths, true);
+        let mut retire = crate::event::Event::new(
+            scope.workspace_id,
+            scope.project_id,
+            uuid::Uuid::nil(),
+            crate::event::Source { cli: "brain".into(), hook: "retire".into() },
+            crate::event::EventKind::Retire,
+            "Retired 1".to_string(),
+            String::new(),
+        );
+        retire.links = vec![event.id.clone()];
+        Store::open(&paths.db()).unwrap().index(&retire).unwrap();
+        let got = call_tool(
+            &paths,
+            &scope.project_id.to_string(),
+            "s",
+            &json!({"name": "brain_get", "arguments": {"ids": [event.id.clone()]}}),
+        )
+        .unwrap();
+        let text = got.to_string();
+        assert!(!text.contains("END_OF_OUTPUT"), "retired body came back from the log");
+        std::fs::remove_dir_all(&paths.data_dir).ok();
     }
 
     #[test]

@@ -19,6 +19,21 @@ use crate::event::{Event, EventKind, Source};
 /// How long a writer waits for a competing writer before giving up.
 const BUSY_TIMEOUT_MS: u32 = 5_000;
 
+/// Hooks whose events carry a tool call or a lifecycle marker, not prose.
+/// Claude Code, Gemini and OpenCode spell the same hooks differently, and
+/// each stored spelling is listed (`normalize_hook` output).
+const PAYLOAD_HOOKS: &str = "'post_tool_use', 'pre_tool_use', 'session_start', 'session_end', \
+     'pre_compact', 'after_tool', 'pre_compress', 'tool_execute_after'";
+
+/// SQL for "this event is prose the embedder keeps", over the `events` table
+/// aliased `alias`. A delegate's footsteps are skipped; its `subagent_stop`
+/// report is prose and stays, matching `consolidate::is_delegate_footstep`.
+fn embeddable(alias: &str) -> String {
+    format!(
+        "{alias}.hook NOT IN ({PAYLOAD_HOOKS}) AND ({alias}.agent IS NULL OR {alias}.hook = 'subagent_stop')"
+    )
+}
+
 /// How much wider than the caller's limit a search reads before spreading
 /// results across sessions. Four deep enough that a busy session cannot fill
 /// the pool by itself, shallow enough that the query stays one index scan.
@@ -66,7 +81,7 @@ fn writes_without_spaces(text: &str) -> bool {
 const ENTITY_TOKENS_MAX: usize = 8;
 
 /// What each stream's opinion is worth, in the order `search` fuses them:
-/// keyword, semantic, entity, substring, graph.
+/// keyword, semantic, entity, substring, graph, keyword_relaxed.
 ///
 /// Not equal, because they do not answer the same question. Keyword,
 /// semantic and substring rank EVENTS against the query. Entity and graph
@@ -86,9 +101,152 @@ const ENTITY_TOKENS_MAX: usize = 8;
 /// entries fall out of the pool than before, not more - without deciding the
 /// order. The same 17 queries then returned 17 different first results, and
 /// the worst repeat was 1.
-const STREAM_WEIGHTS: [f32; 5] = [1.0, 1.0, 0.5, 1.0, 0.5];
+///
+/// `keyword_relaxed` stays at 1.0: like keyword it ranks EVENTS, and it
+/// exists to let in partial matches the AND query cannot, so halving it
+/// would bury the very entries it adds. It is a superset of keyword, so an
+/// entry both find collects two close contributions; if that proves too
+/// strong, drop ids already in `keyword` from it rather than lowering this.
+const STREAM_WEIGHTS: [f32; 6] = [1.0, 1.0, 0.5, 1.0, 0.5, 1.0];
 /// The same order, named - what `Trace` calls each stream.
-const STREAM_NAMES: [&str; 5] = ["keyword", "semantic", "entity", "substring", "graph"];
+const STREAM_NAMES: [&str; 6] =
+    ["keyword", "semantic", "entity", "substring", "graph", "keyword_relaxed"];
+/// Each stream's position in `STREAM_NAMES` and in the `lists` array
+/// `search_traced` fuses; `fuse` records which streams found an id as one bit
+/// per position. A test pins these to the names.
+const KEYWORD: usize = 0;
+const SEMANTIC: usize = 1;
+const ENTITY: usize = 2;
+const SUBSTRING: usize = 3;
+const GRAPH: usize = 4;
+const RELAXED: usize = 5;
+
+/// The `seen_in` bit of one stream.
+const fn bit(stream: usize) -> u8 {
+    1 << stream
+}
+
+/// English words that say what kind of question this is, not what it is
+/// about. Memmy's 22 plus the interrogatives and auxiliaries a natural
+/// question is mostly made of.
+const RELAXED_STOP_WORDS: [&str; 34] = [
+    "a", "an", "and", "are", "as", "be", "by", "for", "from", "in", "is", "it", "of", "on", "or", "that",
+    "the", "this", "to", "with", "you", "your", "how", "why", "what", "which", "does", "did", "do", "get",
+    "was", "were", "about", "not",
+];
+
+/// Wall clock a prompt-time lookup may take before it is interrupted.
+const PROMPT_POINTER_DEADLINE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// How much of a prompt becomes the query.
+const PROMPT_QUERY_CHARS: usize = 400;
+
+/// Terms a relaxed query keeps. Its groups are always three terms wide: the
+/// nested loops in `compile_fts` and the `3` in its guard and trace note
+/// are that width.
+const RELAXED_TERMS: usize = 5;
+
+/// The first read of a prompt-time lookup, with its phrase fallback.
+///
+/// A query FTS5 cannot parse is read as a phrase instead, as `search_traced`
+/// does. An interrupt is not a parse error: it propagates, so a lookup that
+/// ran out of time never goes on to run more reads past its deadline.
+fn raw_or_phrase(
+    first: rusqlite::Result<Vec<Pointer>>,
+    phrase: impl FnOnce() -> rusqlite::Result<Vec<Pointer>>,
+) -> Result<Vec<Pointer>> {
+    match first {
+        Ok(found) => Ok(found),
+        Err(rusqlite::Error::SqliteFailure(failure, _))
+            if failure.code == rusqlite::ErrorCode::OperationInterrupted =>
+        {
+            Err(anyhow::anyhow!("prompt lookup interrupted at its deadline"))
+        }
+        Err(_) => phrase().context("read prompt pointers"),
+    }
+}
+
+/// A prompt as `compile_fts` can relax it: a prompt's quotes, `*` and
+/// capitalised `OR`/`AND`/`NOT`/`NEAR` are prose (quoted error text, markdown
+/// bold), not FTS5 syntax, so they must not switch the relaxed read off.
+fn relaxable(prompt: &str) -> String {
+    prompt
+        .replace(['"', '*'], " ")
+        .split_whitespace()
+        .map(|word| {
+            if matches!(word, "OR" | "AND" | "NOT") || word.starts_with("NEAR") {
+                word.to_lowercase()
+            } else {
+                word.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A natural-language question as an FTS5 query that needs only SOME of its
+/// words: an OR of every three-term AND group over its (at most five)
+/// longest terms.
+///
+/// The raw query is an implicit AND, so a question with one word the answer
+/// never used finds nothing. `how does retry backoff jitter get capped` should
+/// still reach the note about retry, backoff and jitter. Terms are quoted, so
+/// a `/` or `.` inside a path stays one phrase. Thai goes through untouched:
+/// the index's own tokenizer cuts it, exactly as it does for the raw query.
+///
+/// `None` when the query already speaks FTS5 (a quote, `*`, `OR`/`AND`/`NOT`/
+/// `NEAR`) - the person meant it - or when fewer than three terms remain,
+/// where relaxing would be the raw query again.
+fn compile_fts(query: &str) -> Option<String> {
+    if query.contains('"') || query.contains('*') {
+        return None;
+    }
+    if query
+        .split_whitespace()
+        .any(|word| matches!(word, "OR" | "AND" | "NOT") || word.starts_with("NEAR"))
+    {
+        return None;
+    }
+    let edge = |c: char| c.is_ascii_punctuation() || matches!(c, '\u{2018}' | '\u{2019}' | '\u{201c}' | '\u{201d}');
+    let mut terms: Vec<String> = Vec::new();
+    for word in query.split_whitespace() {
+        let word = word.trim_matches(edge);
+        let pieces: Vec<&str> = if word.contains('/') || word.contains('.') {
+            vec![word]
+        } else {
+            word.split(|c: char| edge(c) && c != '_' && c != '-').collect()
+        };
+        for piece in pieces {
+            let piece = piece.trim_matches(|c: char| c == '-' || c == '_');
+            if piece.chars().count() < 3 || RELAXED_STOP_WORDS.contains(&piece.to_lowercase().as_str()) {
+                continue;
+            }
+            if !terms.iter().any(|seen| seen.eq_ignore_ascii_case(piece)) {
+                terms.push(piece.to_string());
+            }
+        }
+    }
+    if terms.len() > RELAXED_TERMS {
+        // Longest first, earlier wins a tie; then back to the order asked.
+        let mut order: Vec<usize> = (0..terms.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(terms[i].chars().count()));
+        order.truncate(RELAXED_TERMS);
+        order.sort_unstable();
+        terms = order.into_iter().map(|i| terms[i].clone()).collect();
+    }
+    if terms.len() < 3 {
+        return None;
+    }
+    let mut groups: Vec<String> = Vec::new();
+    for a in 0..terms.len() {
+        for b in a + 1..terms.len() {
+            for c in b + 1..terms.len() {
+                groups.push(format!("(\"{}\" \"{}\" \"{}\")", terms[a], terms[b], terms[c]));
+            }
+        }
+    }
+    Some(groups.join(" OR "))
+}
 
 /// Length past which an entry starts paying for being long, in bytes of
 /// title plus body. The corpus median, measured: 212 on a 22k-event brain.
@@ -199,6 +357,24 @@ pub struct RerankRun {
     pub cold: bool,
 }
 
+/// Seconds in a day: the window `brain stats` and `brain doctor` read.
+pub const DAY_SECS: i64 = 24 * 3600;
+
+/// One model call made for consolidation, synthesis or ingest. `outcome` is
+/// `ok`, `unusable`, `unparseable` (JSON of the wrong shape), `timeout` or
+/// `spawn_error`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummarizerCall {
+    pub session: String,
+    pub purpose: String,
+    pub cli: String,
+    pub model: String,
+    pub prompt_bytes: u64,
+    pub answer_bytes: u64,
+    pub ms: u64,
+    pub outcome: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Hit {
     pub id: String,
@@ -220,6 +396,75 @@ pub struct Hit {
     pub session: String,
 }
 
+/// A cosine at or above this is a match on meaning alone; between
+/// [`NEAREST_FLOOR`] and this it is a loose association that needs company or
+/// a place in the semantic top [`SEMANTIC_TOP_KEEP`].
+/// 0.36 is the median cosine of the live store's real hits.
+const SEMANTIC_MATCH: f32 = 0.36;
+
+/// How many of the semantic stream's own best guesses the floor keeps even
+/// below [`SEMANTIC_MATCH`] (they still need [`NEAREST_FLOOR`]). A short query
+/// such as "authentication" scores a true meaning-match under 0.36 against
+/// the static multilingual model, and finding it is what semantic search is
+/// for; the deep tail of the same list is the noise. Ranks are 0-based here.
+const SEMANTIC_TOP_KEEP: usize = 3;
+
+/// Why the relevance floor kept an id off the page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Dropped {
+    /// Only the semantic stream found it, below [`SEMANTIC_MATCH`] and outside
+    /// its top [`SEMANTIC_TOP_KEEP`].
+    LooseSemantic,
+    Entity,
+    Graph,
+    EntityAndGraph,
+}
+
+impl std::fmt::Display for Dropped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LooseSemantic => write!(f, "semantic only, below {SEMANTIC_MATCH}"),
+            Self::Entity => f.write_str("entity only"),
+            Self::Graph => f.write_str("graph only"),
+            Self::EntityAndGraph => f.write_str("entity and graph only"),
+        }
+    }
+}
+
+impl serde::Serialize for Dropped {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+/// The relevance floor for one id: `None` keeps it, `Some(why)` drops it.
+/// `seen_in` has a bit per fusion list (see [`bit`]); `cosine` is its
+/// semantic score when it had one; `semantic_rank` is its 0-based place in the
+/// semantic stream, kept while within [`SEMANTIC_TOP_KEEP`] and at or above
+/// [`NEAREST_FLOOR`].
+fn floor_reason(seen_in: u8, cosine: Option<f32>, semantic_rank: Option<usize>) -> Option<Dropped> {
+    const WORDS: u8 = bit(KEYWORD) | bit(SUBSTRING) | bit(RELAXED);
+    const COMPANY: u8 = bit(ENTITY) | bit(GRAPH);
+    if seen_in & WORDS != 0 || cosine.is_some_and(|c| c >= SEMANTIC_MATCH) {
+        return None;
+    }
+    // Two loose semantic hits in sessions that share an entity keep each
+    // other: company is not independent evidence, a trade-off the rule accepts.
+    // `nearest` sorts stale-flagged entries last, so with fewer than 3
+    // non-demoted candidates above the floor one can survive as a top guess;
+    // it still sorts last on the page.
+    if seen_in & bit(SEMANTIC) != 0 {
+        let top = semantic_rank.is_some_and(|rank| rank < SEMANTIC_TOP_KEEP)
+            && cosine.is_some_and(|c| c >= NEAREST_FLOOR);
+        return if top || seen_in & COMPANY != 0 { None } else { Some(Dropped::LooseSemantic) };
+    }
+    Some(match seen_in & COMPANY {
+        x if x == bit(ENTITY) => Dropped::Entity,
+        x if x == bit(GRAPH) => Dropped::Graph,
+        _ => Dropped::EntityAndGraph,
+    })
+}
+
 /// Why a search returned what it did, one stream at a time.
 ///
 /// A fused order is the sum of five opinions, and the order alone cannot say
@@ -229,7 +474,8 @@ pub struct Hit {
 /// kept. `brain search --explain` prints it.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Trace {
-    /// In fusion order: keyword, semantic, entity, substring, graph.
+    /// In fusion order: keyword, semantic, entity, substring, graph,
+    /// keyword_relaxed.
     pub streams: Vec<StreamTrace>,
     /// The fusion arithmetic for every id any stream nominated.
     pub fused: std::collections::HashMap<String, Fused>,
@@ -263,13 +509,15 @@ pub struct Fused {
     pub score: f32,
     /// A human flagged it stale, so it sorts last whatever the score.
     pub demoted: bool,
+    /// Why the relevance floor kept this id off the page, when it did.
+    pub dropped: Option<Dropped>,
 }
 
 impl Default for Fused {
     /// No discount until a length says otherwise: an id whose `events` row
     /// is gone must keep `raw`, not divide it by zero.
     fn default() -> Self {
-        Self { raw: 0.0, length: 0, discount: 1.0, score: 0.0, demoted: false }
+        Self { raw: 0.0, length: 0, discount: 1.0, score: 0.0, demoted: false, dropped: None }
     }
 }
 
@@ -575,6 +823,23 @@ impl Store {
                     cold   INTEGER NOT NULL DEFAULT 0
                 );
 
+                -- Every model call consolidation, synthesis and ingest made,
+                -- failed ones too: what the summarizer costs per session is a
+                -- number nobody could read before. Local bookkeeping the log
+                -- cannot rebuild, so `clear()` leaves it alone. Advisory
+                -- reranks are in `rerank_runs`, not here.
+                CREATE TABLE IF NOT EXISTS summarizer_calls (
+                    ts           TEXT NOT NULL,
+                    session      TEXT NOT NULL,
+                    purpose      TEXT NOT NULL,
+                    cli          TEXT NOT NULL,
+                    model        TEXT NOT NULL,
+                    prompt_bytes INTEGER NOT NULL,
+                    answer_bytes INTEGER NOT NULL,
+                    ms           INTEGER NOT NULL,
+                    outcome      TEXT NOT NULL
+                );
+
                 -- What consolidation has already done for a session, so a
                 -- debounced trigger and the catch-up backstop do not redo work.
                 -- One semantic vector per event. Separate from `events`
@@ -595,7 +860,41 @@ impl Store {
                     last_tier     TEXT,
                     -- Who is consolidating this session right now. Taken by
                     -- `claim_session`, cleared when that run finishes.
-                    claimed_at    TEXT
+                    claimed_at    TEXT,
+                    -- Consecutive runs that failed or fell to the rule-based
+                    -- floor while a model was reachable. Parked at
+                    -- `PARK_AFTER`; a success resets it.
+                    attempts        INTEGER NOT NULL DEFAULT 0,
+                    last_error      TEXT,
+                    last_attempt_at TEXT
+                );
+
+                -- A consolidation ask, written BEFORE the run lock is tried, so
+                -- an ask that finds the lock held is not lost: the holder reads
+                -- the rows still unconsumed once it has let go of the lock.
+                -- `session` NULL is not a scope; `all_projects` and `cwd` are.
+                CREATE TABLE IF NOT EXISTS consolidation_requests (
+                    id           INTEGER PRIMARY KEY,
+                    session      TEXT,
+                    all_projects INTEGER NOT NULL,
+                    force        INTEGER NOT NULL,
+                    cwd          TEXT NOT NULL,
+                    requested_at TEXT NOT NULL,
+                    consumed_at  TEXT
+                );
+
+                -- One row per `brain consolidate` invocation, written by the
+                -- command, so a run that yielded or failed is still on record.
+                CREATE TABLE IF NOT EXISTS consolidation_runs (
+                    started     TEXT NOT NULL,
+                    ended       TEXT NOT NULL,
+                    mode        TEXT NOT NULL,
+                    yielded     INTEGER NOT NULL,
+                    sessions    INTEGER NOT NULL,
+                    events      INTEGER NOT NULL,
+                    failed      INTEGER NOT NULL,
+                    rule_based  INTEGER NOT NULL,
+                    error       TEXT
                 );
                 ",
             )
@@ -603,6 +902,51 @@ impl Store {
         self.add_missing_columns()?;
         self.backfill_trigram()?;
         self.reconcile_embedding_model()
+    }
+
+    /// Drop, one bounded batch, the vectors of events that are no longer
+    /// embedded. Returns how many it deleted; 0 means the migration is done.
+    ///
+    /// Tool-call payloads and a delegate's footsteps are JSON, not prose; they
+    /// crowded the semantic stream and cost three quarters of the index.
+    /// Touches `event_vec` only, never the log or `events`.
+    ///
+    /// Never run from `open`: a store this size cannot be scanned and written
+    /// inside a hook's budget. The backlog pass calls it instead, until a
+    /// batch finds nothing and records `payload_vectors_dropped`. Once that
+    /// marker is set this is a single indexed read.
+    ///
+    /// # Errors
+    /// Returns an error when a query fails.
+    pub fn drop_payload_vectors(&self, batch: usize) -> Result<usize> {
+        let done: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_state WHERE key = 'payload_vectors_dropped')",
+                [],
+                |row| row.get(0),
+            )
+            .context("check payload vectors")?;
+        if done {
+            return Ok(0);
+        }
+        let sql = format!(
+            "DELETE FROM event_vec WHERE event_id IN (
+                 SELECT v.event_id FROM event_vec v JOIN events e ON e.id = v.event_id
+                 WHERE NOT ({}) LIMIT ?1
+             )",
+            embeddable("e")
+        );
+        let deleted = self.conn.execute(&sql, params![batch as i64]).context("drop payload vectors")?;
+        if deleted == 0 {
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO schema_state (key, value) VALUES ('payload_vectors_dropped', '1')",
+                    [],
+                )
+                .context("mark payload vectors dropped")?;
+        }
+        Ok(deleted)
     }
 
     /// Empty the vector index when a different model wrote it.
@@ -731,8 +1075,12 @@ impl Store {
                 ("events", "confidence", "INTEGER NOT NULL DEFAULT 0"),
                 ("events", "team", "INTEGER NOT NULL DEFAULT 0"),
                 ("events", "agent", "TEXT"),
+                ("events", "clamped", "INTEGER NOT NULL DEFAULT 0"),
                 ("summarizer_health", "last_failed_at", "TEXT"),
                 ("session_state", "claimed_at", "TEXT"),
+                ("session_state", "attempts", "INTEGER NOT NULL DEFAULT 0"),
+                ("session_state", "last_error", "TEXT"),
+                ("session_state", "last_attempt_at", "TEXT"),
                 ("injected", "active", "INTEGER NOT NULL DEFAULT 1"),
                 ("injected", "in_flight", "INTEGER NOT NULL DEFAULT 0"),
                 ("recalled", "opened", "INTEGER NOT NULL DEFAULT 0"),
@@ -796,15 +1144,17 @@ impl Store {
             && crate::event::is_user_prompt(&event.source.hook)
             && (crate::event::carries_memory_intent(&event.title)
                 || crate::event::carries_memory_intent(&event.body));
+        let (body, clamped) = clamp_for_index(event);
         self.conn
             .execute(
                 "INSERT INTO events
                     (id, ts, workspace, project, session, cli, hook, kind, title, body,
-                     files, topic, invocation, confidence, consolidated, agent)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                     files, topic, invocation, confidence, consolidated, agent, clamped)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
                  ON CONFLICT(id) DO UPDATE SET
                      title = excluded.title,
                      body = excluded.body,
+                     clamped = excluded.clamped,
                      files = excluded.files,
                      topic = excluded.topic,
                      invocation = excluded.invocation,
@@ -820,13 +1170,14 @@ impl Store {
                     event.source.hook,
                     event.kind.as_str(),
                     event.title,
-                    event.body,
+                    body,
                     files,
                     event.topic,
                     event.extra.get("invocation").and_then(serde_json::Value::as_str),
                     i32::from(intent),
                     i32::from(event.consolidated),
                     event.agent.as_deref(),
+                    i32::from(clamped),
                 ],
             )
             .context("index event")?;
@@ -843,7 +1194,10 @@ impl Store {
                 // titles only and never carried it.
                 for target in &event.links {
                     self.conn
-                        .execute("UPDATE events SET body = '' WHERE id = ?1", params![target])
+                        .execute(
+                            "UPDATE events SET body = '', clamped = 0 WHERE id = ?1",
+                            params![target],
+                        )
                         .context("apply retirement")?;
                 }
             }
@@ -1078,14 +1432,22 @@ impl Store {
         limit: usize,
         recall: Recall,
     ) -> Result<Vec<Hit>> {
-        self.search_traced(project, query, topic, limit, recall).map(|(hits, _)| hits)
+        self.search_traced(project, query, topic, limit, recall, false).map(|(hits, _)| hits)
     }
 
     /// [`Self::search`], with the working shown.
     ///
-    /// The hits are exactly what `search` returns; the [`Trace`] beside them
-    /// is every stream's own list and the fusion arithmetic, so a surprising
-    /// order can be read rather than guessed at.
+    /// With `floor` off the hits are exactly what `search` returns; the
+    /// [`Trace`] beside them is every stream's own list and the fusion
+    /// arithmetic, so a surprising order can be read rather than guessed at.
+    ///
+    /// `floor` keeps off the page what only a loose association nominated:
+    /// an id survives when a word stream (keyword, keyword_relaxed,
+    /// substring) found it, when its cosine reaches [`SEMANTIC_MATCH`], or
+    /// when it clears [`NEAREST_FLOOR`] and entity or graph agrees or it is
+    /// among the semantic stream's top [`SEMANTIC_TOP_KEEP`]. Callers
+    /// that rerank pass `false`: the reranker is the judge of a wide pool.
+    /// The trace's `fused` names each id the floor dropped and why.
     ///
     /// # Errors
     /// Returns an error when the query fails.
@@ -1096,6 +1458,7 @@ impl Store {
         topic: Option<&str>,
         limit: usize,
         recall: Recall,
+        floor: bool,
     ) -> Result<(Vec<Hit>, Trace)> {
         let mut stmt = self
             .conn
@@ -1165,6 +1528,23 @@ impl Store {
                 (hits, Some("FTS5 rejected the query's syntax; searched it as a quoted phrase".to_string()))
             }
         };
+        // The same query with only some of its words required. Fused, not
+        // substituted: the raw AND stays the first opinion, this one only
+        // lets a partial match into the pool.
+        let (relaxed, relaxed_note) = if recall == Recall::Lexical {
+            (Vec::new(), None)
+        } else {
+            match compile_fts(query) {
+                None => (
+                    Vec::new(),
+                    Some("skipped: the query is FTS syntax or has fewer than three terms".to_string()),
+                ),
+                Some(fts) => match read(&fts) {
+                    Ok(hits) => (hits, Some(format!("any 3 of the longest terms: {fts}"))),
+                    Err(error) => (Vec::new(), Some(format!("did not run: {error}"))),
+                },
+            }
+        };
         drop(stmt);
 
         if recall == Recall::Lexical {
@@ -1204,7 +1584,9 @@ impl Store {
         let semantic_note = semantic_note.or_else(|| Some(format!("cosine floor {NEAREST_FLOOR}")));
 
         // Two more rankings that need no model at all, which is the point:
-        // they are what keeps recall wide when every model is unreachable.
+        // they are what keeps recall wide when every model is unreachable -
+        // wide for a reranker; a floored page lets them in only as company
+        // for a semantic hit (see `floor_reason`).
         // Entities are what a session DECLARED it was about, so they find
         // work whose words never matched; neighbours are what else touched
         // the same things, so a hit pulls in its context.
@@ -1234,9 +1616,11 @@ impl Store {
             Some(format!("neighbours of {} seed(s) from keyword, semantic and substring", seeds.len()));
 
         // One array feeds both the fusion and the trace, so a stream's name,
-        // weight and list cannot drift apart by position.
-        let lists = [keyword, semantic, entity, substring, graph];
-        let notes = [keyword_note, semantic_note, None, substring_note, graph_note];
+        // weight and list cannot drift apart by position. The order is
+        // KEYWORD, SEMANTIC, ENTITY, SUBSTRING, GRAPH, RELAXED.
+        let lists = [keyword, semantic, entity, substring, graph, relaxed];
+        let notes = [keyword_note, semantic_note, None, substring_note, graph_note, relaxed_note];
+        let cosines: std::collections::HashMap<String, f32> = semantic_scored.iter().cloned().collect();
         let streams = STREAM_NAMES
             .into_iter()
             .zip(STREAM_WEIGHTS)
@@ -1248,16 +1632,14 @@ impl Store {
                 ranked: list
                     .iter()
                     .map(|hit| {
-                        let own = (name == "semantic")
-                            .then(|| semantic_scored.iter().find(|(id, _)| *id == hit.id).map(|(_, cosine)| *cosine))
-                            .flatten();
+                        let own = (name == STREAM_NAMES[SEMANTIC]).then(|| cosines.get(&hit.id).copied()).flatten();
                         (hit.id.clone(), own)
                     })
                     .collect(),
                 note,
             })
             .collect();
-        let (hits, fused) = self.fuse(&lists, pool)?;
+        let (hits, fused) = self.fuse(&lists, pool, floor.then_some(&cosines))?;
         Ok((spread_across_sessions(hits, limit), Trace { streams, fused }))
     }
 
@@ -1279,6 +1661,7 @@ impl Store {
         &self,
         lists: &[Vec<Hit>],
         limit: usize,
+        floor: Option<&std::collections::HashMap<String, f32>>,
     ) -> Result<(Vec<Hit>, std::collections::HashMap<String, Fused>)> {
         // The conventional damping constant. Large enough that the top of
         // any one list does not dominate outright, so agreement between
@@ -1286,12 +1669,20 @@ impl Store {
         const K: f32 = 60.0;
 
         let mut fused: std::collections::HashMap<&str, Fused> = std::collections::HashMap::new();
+        // Which streams nominated each id, as a bit per list position.
+        let mut seen_in: std::collections::HashMap<&str, u8> = std::collections::HashMap::new();
+        // Each id's 0-based rank in the semantic list (first occurrence).
+        let mut semantic_rank: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for (index, list) in lists.iter().enumerate() {
             let weight = STREAM_WEIGHTS.get(index).copied().unwrap_or(1.0);
             for (rank, hit) in list.iter().enumerate() {
+                if index == SEMANTIC {
+                    semantic_rank.entry(hit.id.as_str()).or_insert(rank);
+                }
                 #[allow(clippy::cast_precision_loss)]
                 let contribution = weight / (K + rank as f32 + 1.0);
                 fused.entry(hit.id.as_str()).or_default().raw += contribution;
+                *seen_in.entry(hit.id.as_str()).or_default() |= bit(index);
             }
         }
 
@@ -1313,9 +1704,17 @@ impl Store {
         for (id, entry) in &mut fused {
             entry.score = entry.raw / entry.discount;
             entry.demoted = demoted.contains(*id);
+            if let Some(cosines) = floor {
+                entry.dropped = floor_reason(
+                    seen_in.get(id).copied().unwrap_or(0),
+                    cosines.get(*id).copied(),
+                    semantic_rank.get(id).copied(),
+                );
+            }
         }
 
-        let mut ranked: Vec<(&str, &Fused)> = fused.iter().map(|(id, entry)| (*id, entry)).collect();
+        let mut ranked: Vec<(&str, &Fused)> =
+            fused.iter().filter(|(_, entry)| entry.dropped.is_none()).map(|(id, entry)| (*id, entry)).collect();
         ranked.sort_by(|a, b| {
             a.1.demoted
                 .cmp(&b.1.demoted)
@@ -1846,10 +2245,8 @@ impl Store {
     /// # Errors
     /// Returns an error when the query fails.
     pub fn events_missing_vectors(&self, project: &str, limit: usize) -> Result<Vec<(String, String)>> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                // Scoped to the project being consolidated. Globally ordered,
+        let sql = format!(
+            // Scoped to the project being consolidated. Globally ordered,
                 // a busy project spends every run's budget on its own newest
                 // rows and a quiet one never gets embedded at all.
                 //
@@ -1865,10 +2262,12 @@ impl Store {
                  LEFT JOIN event_vec v ON v.event_id = e.id
                  WHERE (v.event_id IS NULL OR length(v.vec) != ?3)
                        AND e.kind NOT IN ('tombstone', 'retire') AND e.project = ?1
+                       AND {}
                  ORDER BY e.id DESC
                  LIMIT ?2",
-            )
-            .context("prepare missing vectors")?;
+            embeddable("e")
+        );
+        let mut stmt = self.conn.prepare(&sql).context("prepare missing vectors")?;
         let rows = stmt
             .query_map(params![project, limit as i64, crate::embed::DIMS as i64], |row| {
                 Ok((row.get(0)?, row.get(1)?))
@@ -1889,16 +2288,25 @@ impl Store {
         let embedded: i64 = self
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM event_vec WHERE length(vec) = ?1",
+                &format!(
+                    "SELECT COUNT(*) FROM event_vec v JOIN events e ON e.id = v.event_id
+                     WHERE length(v.vec) = ?1 AND e.kind NOT IN ('tombstone', 'retire') AND {}",
+                    embeddable("e")
+                ),
                 params![crate::embed::DIMS as i64],
                 |row| row.get(0),
             )
             .context("count vectors")?;
         let total: i64 = self
             .conn
-            .query_row("SELECT COUNT(*) FROM events WHERE kind NOT IN ('tombstone', 'retire')", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM events e WHERE e.kind NOT IN ('tombstone', 'retire') AND {}",
+                    embeddable("e")
+                ),
+                [],
+                |row| row.get(0),
+            )
             .context("count events")?;
         Ok((embedded, total))
     }
@@ -1967,6 +2375,23 @@ impl Store {
         scored.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| b.1.total_cmp(&a.1)));
         scored.truncate(limit);
         Ok(scored.into_iter().map(|(id, score, _)| (id, score)).collect())
+    }
+
+    /// Was this row's body cut down when it was indexed?
+    ///
+    /// The log still holds the whole line; `brain_get` reads it from there.
+    /// Separate from [`Store::get`] on purpose: consolidation reads through
+    /// `get` and wants the bounded body.
+    ///
+    /// # Errors
+    /// Returns an error when the lookup fails.
+    pub fn is_clamped(&self, id: &str) -> Result<bool> {
+        let clamped: Option<i32> = self
+            .conn
+            .query_row("SELECT clamped FROM events WHERE id = ?1", params![id], |row| row.get(0))
+            .optional()
+            .context("read clamped flag")?;
+        Ok(clamped.unwrap_or(0) != 0)
     }
 
     /// Fetch full events by id, in the order requested.
@@ -2761,15 +3186,7 @@ impl Store {
             )
             .context("prepare flagged")?;
         let rows = stmt
-            .query_map(params![project], |row| {
-                Ok(Pointer {
-                    id: row.get(0)?,
-                    ts: row.get(1)?,
-                    kind: row.get(2)?,
-                    title: row.get(3)?,
-                    topic: row.get(4)?,
-                })
-            })
+            .query_map(params![project], Self::pointer_row)
             .context("run flagged")?;
         rows.collect::<rusqlite::Result<Vec<_>>>().context("read flagged")
     }
@@ -2855,6 +3272,68 @@ impl Store {
             .context("read rerank runs")?
             .collect::<std::result::Result<Vec<_>, _>>()
             .context("read rerank runs")?;
+        Ok(rows)
+    }
+
+    /// Write down one summarizer model call, whatever came of it.
+    ///
+    /// # Errors
+    /// Returns an error when the write fails.
+    pub fn record_summarizer_call(&self, call: &SummarizerCall) -> Result<()> {
+        let size = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+        self.conn
+            .execute(
+                "INSERT INTO summarizer_calls
+                   (ts, session, purpose, cli, model, prompt_bytes, answer_bytes, ms, outcome)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    jiff::Timestamp::now().to_string(),
+                    call.session,
+                    call.purpose,
+                    call.cli,
+                    call.model,
+                    size(call.prompt_bytes),
+                    size(call.answer_bytes),
+                    size(call.ms),
+                    call.outcome
+                ],
+            )
+            .context("record summarizer call")?;
+        Ok(())
+    }
+
+    /// Summarizer calls made in the last `secs` seconds, oldest first.
+    ///
+    /// # Errors
+    /// Returns an error when the read fails.
+    pub fn summarizer_calls_since(&self, secs: i64) -> Result<Vec<SummarizerCall>> {
+        let cutoff = (jiff::Timestamp::now() - jiff::SignedDuration::from_secs(secs)).to_string();
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session, purpose, cli, model, prompt_bytes, answer_bytes, ms, outcome
+                 FROM summarizer_calls WHERE ts >= ?1 ORDER BY rowid",
+            )
+            .context("prepare summarizer calls")?;
+        let size = |row: &rusqlite::Row<'_>, i: usize| -> rusqlite::Result<u64> {
+            Ok(row.get::<_, i64>(i)?.max(0).unsigned_abs())
+        };
+        let rows = stmt
+            .query_map(params![cutoff], |row| {
+                Ok(SummarizerCall {
+                    session: row.get(0)?,
+                    purpose: row.get(1)?,
+                    cli: row.get(2)?,
+                    model: row.get(3)?,
+                    prompt_bytes: size(row, 4)?,
+                    answer_bytes: size(row, 5)?,
+                    ms: size(row, 6)?,
+                    outcome: row.get(7)?,
+                })
+            })
+            .context("read summarizer calls")?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("read summarizer calls")?;
         Ok(rows)
     }
 
@@ -2984,15 +3463,274 @@ impl Store {
         let found: Option<i64> = self
             .conn
             .query_row(
-                "SELECT 1 FROM events
-                 WHERE consolidated = 0 AND kind = 'observation' AND ts < ?1
-                 LIMIT 1",
+                // A parked session is not work a run can finish, so it must
+                // not summon one: that is the loop this guard exists to stop.
+                &format!(
+                    "SELECT 1 FROM events
+                     WHERE consolidated = 0 AND kind = 'observation' AND ts < ?1
+                       AND session NOT IN ({})
+                     LIMIT 1",
+                    Self::parked_sessions_sql()
+                ),
                 params![cutoff],
                 |row| row.get(0),
             )
             .optional()
             .context("check stale backlog")?;
         Ok(found.is_some())
+    }
+
+    /// Take the idle-sweep window: true when the last sweep check is older
+    /// than `debounce_secs` before `now`, and the window is spent from here on.
+    ///
+    /// A plain read answers most stops; only a stop that finds the window open
+    /// writes. That write is one conditional upsert, so two stops racing take
+    /// it once. The caller spends the window whatever it finds next: a check
+    /// that found nothing must not be repeated every turn.
+    ///
+    /// # Errors
+    /// Returns an error when the read or the write fails.
+    pub fn claim_idle_sweep(&self, now: jiff::Timestamp, debounce_secs: i64) -> Result<bool> {
+        let cutoff = (now - jiff::SignedDuration::from_secs(debounce_secs)).to_string();
+        let last: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM schema_state WHERE key = 'last_idle_sweep_at'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("read the idle sweep window")?;
+        if last.is_some_and(|at| at >= cutoff) {
+            return Ok(false);
+        }
+        self.take_idle_sweep(&now.to_string(), &cutoff)
+    }
+
+    /// The write half of [`Self::claim_idle_sweep`]: succeeds only while the
+    /// stored window is still older than `cutoff`. A stop that read the window
+    /// open before another one wrote it loses here, so one window spawns once.
+    fn take_idle_sweep(&self, now: &str, cutoff: &str) -> Result<bool> {
+        let taken = self
+            .conn
+            .execute(
+                "INSERT INTO schema_state (key, value) VALUES ('last_idle_sweep_at', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                 WHERE schema_state.value < ?2",
+                params![now, cutoff],
+            )
+            .context("claim the idle sweep")?;
+        Ok(taken > 0)
+    }
+
+    /// The sessions set aside: out of attempts, and nothing new to try on.
+    ///
+    /// A session that has failed [`Self::PARK_AFTER`] times stays parked only
+    /// while it has no pending observation newer than its last failed attempt;
+    /// an event that arrived afterwards is new work, and gets one more try
+    /// (the count stays, so one more failure parks it again).
+    fn parked_sessions_sql() -> String {
+        format!(
+            "SELECT ss.session FROM session_state ss
+             WHERE ss.attempts >= {}
+               AND NOT EXISTS (
+                   SELECT 1 FROM events n
+                   WHERE n.session = ss.session AND n.consolidated = 0
+                     AND n.kind = 'observation' AND n.ts > ss.last_attempt_at)",
+            Self::PARK_AFTER
+        )
+    }
+
+    /// Timestamp of the oldest observation still waiting for a summary, not
+    /// counting a parked session's: what `brain doctor` ages the backlog by.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn oldest_pending_ts(&self) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT MIN(ts) FROM events
+                     WHERE consolidated = 0 AND kind = 'observation'
+                       AND session NOT IN ({})",
+                    Self::parked_sessions_sql()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .context("read oldest pending event")
+    }
+
+    /// Write a consolidation ask down. Done before the run lock is tried.
+    ///
+    /// # Errors
+    /// Returns an error when the write fails.
+    pub fn add_consolidation_request(
+        &self,
+        session: Option<&str>,
+        all_projects: bool,
+        force: bool,
+        cwd: &str,
+    ) -> Result<i64> {
+        self.conn
+            .execute(
+                "INSERT INTO consolidation_requests
+                     (session, all_projects, force, cwd, requested_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![session, all_projects, force, cwd, jiff::Timestamp::now().to_string()],
+            )
+            .context("record consolidation request")?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Mark an ask taken. `false` when it already was: somebody else holds it.
+    ///
+    /// One statement, so two takers cannot both win.
+    ///
+    /// # Errors
+    /// Returns an error when the write fails.
+    pub fn consume_consolidation_request(&self, id: i64) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE consolidation_requests SET consumed_at = ?2
+                 WHERE id = ?1 AND consumed_at IS NULL",
+                params![id, jiff::Timestamp::now().to_string()],
+            )
+            .context("consume consolidation request")?;
+        if changed != 1 {
+            return Ok(false);
+        }
+        // Identical open asks are one piece of work: this run serves them all,
+        // so they must not each cost a drain round and a full pass. They stay
+        // behind this one if it is handed back, since it stands for them.
+        self.conn
+            .execute(
+                "UPDATE consolidation_requests SET consumed_at = ?2
+                 WHERE consumed_at IS NULL AND id != ?1
+                   AND session IS (SELECT session FROM consolidation_requests WHERE id = ?1)
+                   AND all_projects = (SELECT all_projects FROM consolidation_requests WHERE id = ?1)
+                   AND force = (SELECT force FROM consolidation_requests WHERE id = ?1)
+                   AND cwd = (SELECT cwd FROM consolidation_requests WHERE id = ?1)",
+                params![id, jiff::Timestamp::now().to_string()],
+            )
+            .context("consume identical consolidation requests")?;
+        Ok(true)
+    }
+
+    /// Hand an ask back, for a run that took it and could not finish it.
+    ///
+    /// # Errors
+    /// Returns an error when the write fails.
+    pub fn release_consolidation_request(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("UPDATE consolidation_requests SET consumed_at = NULL WHERE id = ?1", params![id])
+            .context("release consolidation request")?;
+        Ok(())
+    }
+
+    /// The oldest ask nobody has taken. Never compared against a run's start:
+    /// whether it is still open is `consumed_at`, and only that.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn next_consolidation_request(&self) -> Result<Option<ConsolidationRequest>> {
+        self.conn
+            .query_row(
+                "SELECT id, session, all_projects, force, cwd FROM consolidation_requests
+                 WHERE consumed_at IS NULL ORDER BY id LIMIT 1",
+                [],
+                |row| {
+                    Ok(ConsolidationRequest {
+                        id: row.get(0)?,
+                        session: row.get(1)?,
+                        all_projects: row.get(2)?,
+                        force: row.get(3)?,
+                        cwd: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .context("read consolidation request")
+    }
+
+    /// Drop taken asks, and ledger rows, older than `days`.
+    ///
+    /// # Errors
+    /// Returns an error when the write fails.
+    pub fn purge_consumed_requests(&self, days: i64) -> Result<()> {
+        let cutoff =
+            (jiff::Timestamp::now() - jiff::SignedDuration::from_secs(days * DAY_SECS)).to_string();
+        self.conn
+            .execute(
+                "DELETE FROM consolidation_requests
+                 WHERE consumed_at IS NOT NULL AND consumed_at < ?1",
+                params![cutoff],
+            )
+            .context("purge consolidation requests")?;
+        // The runs ledger goes on the same clock: one row per spawned
+        // invocation, hook-spawned yields included, would otherwise grow forever.
+        self.conn
+            .execute("DELETE FROM consolidation_runs WHERE started < ?1", params![cutoff])
+            .context("purge consolidation runs")?;
+        Ok(())
+    }
+
+    /// Record one `brain consolidate` invocation.
+    ///
+    /// # Errors
+    /// Returns an error when the write fails.
+    pub fn record_consolidation_run(&self, run: &ConsolidationRun) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO consolidation_runs
+                     (started, ended, mode, yielded, sessions, events, failed, rule_based, error)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    run.started,
+                    run.ended,
+                    run.mode,
+                    run.yielded,
+                    run.sessions,
+                    run.events,
+                    run.failed,
+                    run.rule_based,
+                    run.error.as_deref().map(truncate_error),
+                ],
+            )
+            .context("record consolidation run")?;
+        Ok(())
+    }
+
+    /// Invocations that began within the last `secs`, oldest first.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn consolidation_runs_since(&self, secs: i64) -> Result<Vec<ConsolidationRun>> {
+        let cutoff = (jiff::Timestamp::now() - jiff::SignedDuration::from_secs(secs)).to_string();
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT started, ended, mode, yielded, sessions, events, failed, rule_based, error
+                 FROM consolidation_runs WHERE started >= ?1 ORDER BY rowid",
+            )
+            .context("prepare consolidation runs")?;
+        let rows = stmt
+            .query_map(params![cutoff], |row| {
+                Ok(ConsolidationRun {
+                    started: row.get(0)?,
+                    ended: row.get(1)?,
+                    mode: row.get(2)?,
+                    yielded: row.get(3)?,
+                    sessions: row.get(4)?,
+                    events: row.get(5)?,
+                    failed: row.get(6)?,
+                    rule_based: row.get(7)?,
+                    error: row.get(8)?,
+                })
+            })
+            .context("read consolidation runs")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("collect consolidation runs")
     }
 
     /// Sessions in a project with unconsolidated events, oldest first.
@@ -3002,7 +3740,7 @@ impl Store {
     pub fn sessions_pending(&self, project: &str) -> Result<Vec<PendingSession>> {
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare(&format!(
                 // The CLI of the newest event, not MAX(cli), which is
                 // alphabetical: for a session two CLIs touched, "codex" would
                 // beat "claude-code" for no reason but its spelling, and this
@@ -3012,9 +3750,11 @@ impl Store {
                           WHERE session = e.session ORDER BY id DESC LIMIT 1)
                  FROM events e
                  WHERE e.project = ?1 AND e.consolidated = 0 AND e.kind = 'observation'
+                   AND e.session NOT IN ({})
                  GROUP BY e.session
                  ORDER BY MAX(e.id)",
-            )
+                Self::parked_sessions_sql()
+            ))
             .context("prepare pending sessions")?;
         let rows = stmt
             .query_map(params![project], |row| {
@@ -3085,11 +3825,70 @@ impl Store {
                  ON CONFLICT(session) DO UPDATE SET
                      last_run_at = excluded.last_run_at,
                      last_event_id = excluded.last_event_id,
-                     last_tier = excluded.last_tier",
+                     last_tier = excluded.last_tier,
+                     attempts = CASE WHEN excluded.last_tier = 'rule-based' THEN attempts ELSE 0 END,
+                     last_error = CASE WHEN excluded.last_tier = 'rule-based' THEN last_error ELSE NULL END",
                 params![session, project, jiff::Timestamp::now().to_string(), newest_event_id, tier],
             )
             .context("record session run")?;
         Ok(())
+    }
+
+    /// A session stops being retried after this many failed attempts in a row.
+    pub const PARK_AFTER: i64 = 3;
+
+    /// Count one failed attempt on a session and keep why.
+    ///
+    /// Not a run: `last_run_at` and the watermark stay as they were, so a
+    /// failure never makes a later run think the work was done.
+    ///
+    /// # Errors
+    /// Returns an error when the write fails.
+    pub fn record_session_failure(&self, session: &str, project: &str, error: &str) -> Result<()> {
+        let now = jiff::Timestamp::now().to_string();
+        self.conn
+            .execute(
+                "INSERT INTO session_state (session, project, attempts, last_error, last_attempt_at)
+                 VALUES (?1, ?2, 1, ?3, ?4)
+                 ON CONFLICT(session) DO UPDATE SET
+                     attempts = attempts + 1,
+                     last_error = excluded.last_error,
+                     last_attempt_at = excluded.last_attempt_at",
+                params![session, project, truncate_error(error), now],
+            )
+            .context("record session failure")?;
+        Ok(())
+    }
+
+    /// Give a parked session its attempts back; `--session X --force` is the
+    /// one way a person says "try it again".
+    ///
+    /// # Errors
+    /// Returns an error when the write fails.
+    pub fn reset_session_attempts(&self, session: &str) -> Result<()> {
+        self.conn
+            .execute("UPDATE session_state SET attempts = 0 WHERE session = ?1", params![session])
+            .context("reset session attempts")?;
+        Ok(())
+    }
+
+    /// Sessions that have failed at least `min_attempts` times in a row, worst
+    /// first, as (session, attempts, last_error).
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn failing_sessions(&self, min_attempts: i64) -> Result<Vec<(String, i64, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session, attempts, COALESCE(last_error, '') FROM session_state
+                 WHERE attempts >= ?1 ORDER BY attempts DESC, session",
+            )
+            .context("prepare failing sessions")?;
+        let rows = stmt
+            .query_map(params![min_attempts], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .context("run failing sessions")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("read failing sessions")
     }
 
     /// Take exclusive rights to consolidate one session.
@@ -3388,15 +4187,7 @@ impl Store {
         );
         let mut stmt = self.conn.prepare(&sql).context("prepare primer pointers")?;
         let rows = stmt
-            .query_map(params![project, limit as i64, kind], |row| {
-                Ok(Pointer {
-                    id: row.get(0)?,
-                    ts: row.get(1)?,
-                    kind: row.get(2)?,
-                    title: row.get(3)?,
-                    topic: row.get(4)?,
-                })
-            })
+            .query_map(params![project, limit as i64, kind], Self::pointer_row)
             .context("run primer pointers")?;
         rows.collect::<rusqlite::Result<Vec<_>>>().context("read primer pointers")
     }
@@ -3482,17 +4273,105 @@ impl Store {
         );
         let mut stmt = self.conn.prepare(&sql).context("prepare file pointers")?;
         let rows = stmt
-            .query_map(params![project, path, limit as i64], |row| {
-                Ok(Pointer {
-                    id: row.get(0)?,
-                    ts: row.get(1)?,
-                    kind: row.get(2)?,
-                    title: row.get(3)?,
-                    topic: row.get(4)?,
-                })
-            })
+            .query_map(params![project, path, limit as i64], Self::pointer_row)
             .context("run file pointers")?;
         rows.collect::<rusqlite::Result<Vec<_>>>().context("read file pointers")
+    }
+
+    /// Up to `limit` durable entries (knowledge, summaries, notes) that a task
+    /// prompt's words reach, for the prompt-time push.
+    ///
+    /// Lexical only: the raw FTS query first, then the relaxed one
+    /// ([`compile_fts`]), the kind filter in SQL. No vector, no entity, no
+    /// model - this runs on every task prompt, inside the hook's budget, so it
+    /// is held to [`PROMPT_POINTER_DEADLINE`] of wall clock. A query still
+    /// running at the deadline is interrupted and the call is an error: the
+    /// caller injects nothing rather than something late.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails or is interrupted at the deadline.
+    pub fn prompt_pointers(&self, project: &str, query: &str, limit: usize) -> Result<Vec<Pointer>> {
+        self.prompt_pointers_within(project, query, limit, PROMPT_POINTER_DEADLINE)
+    }
+
+    fn prompt_pointers_within(
+        &self,
+        project: &str,
+        query: &str,
+        limit: usize,
+        deadline: std::time::Duration,
+    ) -> Result<Vec<Pointer>> {
+        self.within(deadline, || self.prompt_pointer_rows(project, query, limit))
+    }
+
+    /// Run `work` against this connection, interrupting it at `deadline`.
+    ///
+    /// The interrupt surfaces as an error from `work`, never as a partial
+    /// answer. When the timer thread cannot start there is no guard, so
+    /// `work` does not run and the call is an error.
+    fn within<T>(&self, deadline: std::time::Duration, work: impl FnOnce() -> Result<T>) -> Result<T> {
+        use std::sync::mpsc::{channel, RecvTimeoutError};
+        let handle = self.conn.get_interrupt_handle();
+        let (finished, waiting) = channel::<()>();
+        // Cancelable: dropping `finished` wakes the timer at once, so a query
+        // that completes never leaves a thread sleeping out the deadline, and
+        // never gets interrupted after the fact.
+        let timer = std::thread::Builder::new()
+            .spawn(move || {
+                if waiting.recv_timeout(deadline) == Err(RecvTimeoutError::Timeout) {
+                    handle.interrupt();
+                }
+            })
+            .context("start the lookup deadline timer")?;
+        let result = work();
+        drop(finished);
+        let _ = timer.join();
+        result
+    }
+
+    fn prompt_pointer_rows(&self, project: &str, query: &str, limit: usize) -> Result<Vec<Pointer>> {
+        // A prompt can be a page long; its opening says what the task is, and
+        // a bounded query is a bounded cost.
+        let query: String = query.chars().take(PROMPT_QUERY_CHARS).collect();
+        let mut stmt = self
+            .conn
+            .prepare(
+                // Confidence below zero is a flagged entry: never pushed.
+                "SELECT e.id, e.ts, e.kind, e.title, e.topic
+                 FROM events_fts
+                 JOIN events e ON e.rowid = events_fts.rowid
+                 WHERE events_fts MATCH ?1 AND e.project = ?2 AND e.forgotten = 0
+                       AND e.kind IN ('knowledge', 'session_summary', 'note')
+                       AND e.hook NOT IN ('correct', 'feedback', 'supersede')
+                       AND COALESCE(e.confidence, 0) >= 0
+                 ORDER BY rank
+                 LIMIT ?3",
+            )
+            .context("prepare prompt pointers")?;
+        let mut read = |fts: &str| -> rusqlite::Result<Vec<Pointer>> {
+            stmt.query_map(params![fts, project, limit as i64], Self::pointer_row)?.collect()
+        };
+        let mut pointers = raw_or_phrase(read(&query), || read(&format!("\"{}\"", query.replace('"', " "))))?;
+        if let Some(fts) = compile_fts(&relaxable(&query)) {
+            for pointer in read(&fts).context("read relaxed prompt pointers")? {
+                if !pointers.iter().any(|seen| seen.id == pointer.id) {
+                    pointers.push(pointer);
+                }
+            }
+        }
+        pointers.truncate(limit);
+        Ok(pointers)
+    }
+
+    /// The `id, ts, kind, title, topic` columns as a [`Pointer`].
+    fn pointer_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pointer> {
+        Ok(Pointer {
+            id: row.get(0)?,
+            ts: row.get(1)?,
+            kind: row.get(2)?,
+            title: row.get(3)?,
+            topic: row.get(4)?,
+        })
     }
 
     /// Chronological slice of a project, for `brain_timeline`.
@@ -3745,8 +4624,10 @@ impl Store {
             // `session_state` and `summarizer_health`, the injection and
             // recall counters, the knowledge watermark, and `entities`, which
             // is written by consolidation from a model's reading and cannot
-            // be recomputed by replaying events. Clearing those would not
-            // rebuild them; it would delete them.
+            // be recomputed by replaying events - and the `summarizer_calls`
+            // and `rerank_runs` ledgers, which record spend that already
+            // happened. Clearing those would not rebuild them; it would
+            // delete them.
             .execute_batch("DELETE FROM event_files; DELETE FROM events;")
             .context("clear index")?;
         Ok(())
@@ -3797,6 +4678,31 @@ pub struct PendingSession {
     pub cli: String,
 }
 
+/// An ask to consolidate, as written before the run lock was tried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsolidationRequest {
+    pub id: i64,
+    pub session: Option<String>,
+    pub all_projects: bool,
+    pub force: bool,
+    /// The asker's directory, from which its project is resolved.
+    pub cwd: String,
+}
+
+/// One `brain consolidate` invocation, for the runs ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsolidationRun {
+    pub started: String,
+    pub ended: String,
+    pub mode: String,
+    pub yielded: bool,
+    pub sessions: i64,
+    pub events: i64,
+    pub failed: i64,
+    pub rule_based: i64,
+    pub error: Option<String>,
+}
+
 /// What consolidation last did for a session.
 #[derive(Debug, Clone)]
 pub struct SessionRun {
@@ -3808,6 +4714,46 @@ pub struct SessionRun {
 /// Keep a stored error readable; the full text is in `brain.log`.
 fn truncate_error(error: &str) -> String {
     crate::sanitize::truncate(error, 500)
+}
+
+/// Largest observation body the index keeps. The log keeps the whole line.
+const INDEX_BODY_MAX: usize = 4096;
+
+/// Leaf ceilings tried in turn when the body is a JSON object.
+const INDEX_LEAF_CEILINGS: [usize; 3] = [2048, 1024, 512];
+
+/// The body as the index stores it, and whether it was cut.
+///
+/// Only an observation is cut: a note, summary or lesson is written to be
+/// read whole. A JSON body (a tool call) shrinks leaf by leaf, so it stays
+/// parseable and the result keeps its tail; anything else, or a body whose
+/// structure alone is too big, is cut head and tail. Deterministic, so a
+/// reindex reproduces the same row.
+fn clamp_for_index(event: &Event) -> (String, bool) {
+    if event.kind != EventKind::Observation || event.body.len() <= INDEX_BODY_MAX {
+        return (event.body.clone(), false);
+    }
+    if let Ok(value @ serde_json::Value::Object(_)) = serde_json::from_str(&event.body) {
+        for ceiling in INDEX_LEAF_CEILINGS {
+            let mut shrunk = value.clone();
+            clamp_leaves(&mut shrunk, ceiling);
+            if let Ok(text) = serde_json::to_string(&shrunk) {
+                if text.len() <= INDEX_BODY_MAX {
+                    return (text, true);
+                }
+            }
+        }
+    }
+    (crate::sanitize::truncate_head_tail(&event.body, INDEX_BODY_MAX), true)
+}
+
+fn clamp_leaves(value: &mut serde_json::Value, max: usize) {
+    match value {
+        serde_json::Value::String(text) => *text = crate::sanitize::clamp_leaf(text, max),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(|v| clamp_leaves(v, max)),
+        serde_json::Value::Object(map) => map.values_mut().for_each(|v| clamp_leaves(v, max)),
+        _ => {}
+    }
 }
 
 fn parse_uuid(raw: &str) -> uuid::Uuid {
@@ -3870,6 +4816,243 @@ fn parse_kind(raw: &str) -> EventKind {
 
 #[cfg(test)]
 mod tests {
+    /// A statement that cannot finish by itself.
+    const ENDLESS: &str =
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) SELECT count(*) FROM c";
+
+    #[test]
+    fn a_lookup_still_running_at_its_deadline_is_an_error() {
+        let store = Store::open_memory().unwrap();
+        let ran = store.within(std::time::Duration::from_millis(1), || {
+            let n: i64 = store.conn.query_row(ENDLESS, [], |row| row.get(0))?;
+            Ok(n)
+        });
+        assert!(ran.is_err(), "an endless statement came back: {ran:?}");
+    }
+
+    #[test]
+    fn an_interrupt_in_the_first_read_is_not_retried_as_a_phrase() {
+        let store = Store::open_memory().unwrap();
+        let interrupted = store
+            .within(std::time::Duration::from_millis(1), || {
+                store.conn.query_row(ENDLESS, [], |row| row.get::<_, i64>(0)).map_err(Into::into)
+            })
+            .unwrap_err();
+        let error = interrupted.downcast::<rusqlite::Error>().expect("the SQLite error survives");
+        let mut phrase_ran = false;
+        let found = raw_or_phrase(Err(error), || {
+            phrase_ran = true;
+            Ok(Vec::new())
+        });
+        assert!(found.is_err(), "an interrupted lookup returned pointers");
+        assert!(!phrase_ran, "the phrase read ran after the deadline");
+
+        // A real parse error still falls back.
+        let syntax = store
+            .conn
+            .query_row("SELECT * FROM events_fts WHERE events_fts MATCH 'a\"'", [], |row| row.get::<_, i64>(0))
+            .unwrap_err();
+        let found = raw_or_phrase(Err(syntax), || {
+            phrase_ran = true;
+            Ok(Vec::new())
+        });
+        assert!(found.is_ok() && phrase_ran, "a parse error must fall back to the phrase");
+    }
+
+    #[test]
+    fn quoted_error_text_and_markdown_bold_still_get_the_relaxed_read() {
+        let store = Store::open_memory().unwrap();
+        let project = uuid::Uuid::from_u128(9);
+        let mut entry = Event::new(
+            uuid::Uuid::nil(),
+            project,
+            uuid::Uuid::nil(),
+            Source { cli: "claude-code".into(), hook: "consolidate".into() },
+            EventKind::Knowledge,
+            "Retry backoff jitter is capped at thirty seconds".into(),
+            String::new(),
+        );
+        entry.consolidated = true;
+        store.index(&entry).unwrap();
+        for prompt in [
+            "error: \"retry\" backoff **jitter** capped",
+            "retry AND backoff OR jitter NOT capped extra",
+        ] {
+            let found = store.prompt_pointers(&project.to_string(), prompt, 3).unwrap();
+            assert_eq!(found.len(), 1, "{prompt:?} lost the relaxed read");
+        }
+    }
+
+    /// Two stops can both read the window open; only the first write may win.
+    /// The second handle arrives at the write after the first has claimed.
+    #[test]
+    fn a_stop_that_read_the_window_open_loses_to_the_one_that_wrote_first() {
+        let dir = std::env::temp_dir().join(format!("brain-sweep-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("brain.db");
+        let (a, b) = (Store::open(&db).unwrap(), Store::open(&db).unwrap());
+        let now = jiff::Timestamp::now();
+        let cutoff = (now - jiff::SignedDuration::from_secs(900)).to_string();
+        assert!(a.claim_idle_sweep(now, 900).unwrap(), "the first stop claims the window");
+        // `b` read before `a` wrote, so its read said open; its write must fail.
+        assert!(!b.take_idle_sweep(&now.to_string(), &cutoff).unwrap(), "the window was claimed twice");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A rule-based run is the fall the drain counts as a failed attempt, right
+    /// after `record_session_run`; if that run reset the counter the session
+    /// would sit at 1 forever and never be parked.
+    #[test]
+    fn a_rule_based_run_does_not_reset_attempts_but_a_model_run_does() {
+        let store = Store::open_memory().unwrap();
+        for round in 1..=3 {
+            store.record_session_run("s1", "p1", "01A", "rule-based").unwrap();
+            store.record_session_failure("s1", "p1", "fell to rule-based").unwrap();
+            assert_eq!(store.failing_sessions(1).unwrap()[0].1, round);
+        }
+        store.record_session_run("s1", "p1", "01A", "claude-code").unwrap();
+        assert!(store.failing_sessions(1).unwrap().is_empty());
+    }
+
+    /// Parked means "no new work": an event that arrives after the last failed
+    /// attempt gives the session another try, in all three readers.
+    #[test]
+    fn a_parked_session_is_pending_again_once_a_newer_event_arrives() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let session = Uuid::new_v4();
+        let mut old = event("Edit: a.rs", "{}", project);
+        old.session = session;
+        old.ts = (jiff::Timestamp::now() - jiff::SignedDuration::from_secs(3 * 3600)).to_string();
+        store.index(&old).unwrap();
+        for _ in 0..Store::PARK_AFTER {
+            store.record_session_failure(&session.to_string(), &project.to_string(), "boom").unwrap();
+        }
+        let key = project.to_string();
+        assert!(store.sessions_pending(&key).unwrap().is_empty(), "parked and nothing new");
+        assert!(!store.has_stale_backlog(0).unwrap());
+        assert_eq!(store.oldest_pending_ts().unwrap(), None);
+
+        let mut fresh = event("Edit: b.rs", "{}", project);
+        fresh.session = session;
+        fresh.ts = (jiff::Timestamp::now() + jiff::SignedDuration::from_secs(60)).to_string();
+        store.index(&fresh).unwrap();
+        assert_eq!(store.sessions_pending(&key).unwrap().len(), 1, "a newer event must reopen it");
+        assert!(store.has_stale_backlog(0).unwrap());
+        assert_eq!(store.oldest_pending_ts().unwrap(), Some(old.ts.clone()));
+
+        // One more failure parks it again: the count kept going.
+        store.record_session_failure(&session.to_string(), &key, "boom").unwrap();
+        assert_eq!(store.failing_sessions(1).unwrap()[0].1, Store::PARK_AFTER + 1);
+    }
+
+    #[test]
+    fn a_request_stays_open_until_taken_and_is_taken_once() {
+        let store = Store::open_memory().unwrap();
+        let first = store.add_consolidation_request(Some("s"), false, true, "/w").unwrap();
+        let second = store.add_consolidation_request(None, true, false, "/v").unwrap();
+        let next = store.next_consolidation_request().unwrap().unwrap();
+        assert_eq!(
+            next,
+            ConsolidationRequest {
+                id: first,
+                session: Some("s".into()),
+                all_projects: false,
+                force: true,
+                cwd: "/w".into()
+            }
+        );
+        assert!(store.consume_consolidation_request(first).unwrap());
+        assert!(!store.consume_consolidation_request(first).unwrap(), "taken twice");
+        assert_eq!(store.next_consolidation_request().unwrap().unwrap().id, second);
+        store.release_consolidation_request(first).unwrap();
+        assert_eq!(store.next_consolidation_request().unwrap().unwrap().id, first);
+        // Only a taken row older than a week goes.
+        store.consume_consolidation_request(first).unwrap();
+        let old = (jiff::Timestamp::now() - jiff::SignedDuration::from_secs(8 * DAY_SECS)).to_string();
+        store
+            .conn
+            .execute("UPDATE consolidation_requests SET consumed_at = ?1 WHERE id = ?2", params![old, first])
+            .unwrap();
+        store.purge_consumed_requests(7).unwrap();
+        assert_eq!(store.next_consolidation_request().unwrap().unwrap().id, second);
+        let rows: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM consolidation_requests", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    /// Identical open asks are one piece of work: taking one takes them all, and
+    /// a different ask is left alone.
+    #[test]
+    fn taking_an_ask_takes_its_identical_twins_only() {
+        let store = Store::open_memory().unwrap();
+        let a = store.add_consolidation_request(None, true, false, "/w").unwrap();
+        let twin = store.add_consolidation_request(None, true, false, "/w").unwrap();
+        let other = store.add_consolidation_request(None, true, true, "/w").unwrap();
+        let sess_a = store.add_consolidation_request(Some("s"), false, true, "/w").unwrap();
+        let sess_b = store.add_consolidation_request(Some("s"), false, true, "/w").unwrap();
+        assert!(store.consume_consolidation_request(a).unwrap());
+        assert!(!store.consume_consolidation_request(twin).unwrap(), "twin still open");
+        assert_eq!(store.next_consolidation_request().unwrap().unwrap().id, other);
+        assert!(store.consume_consolidation_request(other).unwrap());
+        assert!(store.consume_consolidation_request(sess_a).unwrap());
+        assert!(!store.consume_consolidation_request(sess_b).unwrap(), "session twin still open");
+        assert!(store.next_consolidation_request().unwrap().is_none());
+    }
+
+    #[test]
+    fn the_runs_ledger_is_pruned_with_the_taken_asks() {
+        let store = Store::open_memory().unwrap();
+        let run = |started: String| ConsolidationRun {
+            started: started.clone(),
+            ended: started,
+            mode: "all".into(),
+            yielded: false,
+            sessions: 0,
+            events: 0,
+            failed: 0,
+            rule_based: 0,
+            error: None,
+        };
+        let now = jiff::Timestamp::now();
+        let old = (now - jiff::SignedDuration::from_secs(8 * DAY_SECS)).to_string();
+        store.record_consolidation_run(&run(old)).unwrap();
+        store.record_consolidation_run(&run(now.to_string())).unwrap();
+        store.purge_consumed_requests(7).unwrap();
+        assert_eq!(store.consolidation_runs_since(30 * DAY_SECS).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn summarizer_calls_since_keeps_only_the_window() {
+        let store = Store::open_memory().unwrap();
+        let call = |session: &str| SummarizerCall {
+            session: session.into(),
+            purpose: "consolidate".into(),
+            cli: "codex".into(),
+            model: "m".into(),
+            prompt_bytes: 1,
+            answer_bytes: 1,
+            ms: 1,
+            outcome: "ok".into(),
+        };
+        store.record_summarizer_call(&call("old")).unwrap();
+        store.record_summarizer_call(&call("new")).unwrap();
+        let three_days_ago =
+            (jiff::Timestamp::now() - jiff::SignedDuration::from_secs(3 * DAY_SECS)).to_string();
+        store
+            .conn
+            .execute("UPDATE summarizer_calls SET ts = ?1 WHERE session = 'old'", params![three_days_ago])
+            .unwrap();
+        let day: Vec<String> =
+            store.summarizer_calls_since(DAY_SECS).unwrap().into_iter().map(|c| c.session).collect();
+        assert_eq!(day, ["new"]);
+        let week: Vec<String> =
+            store.summarizer_calls_since(7 * DAY_SECS).unwrap().into_iter().map(|c| c.session).collect();
+        assert_eq!(week, ["old", "new"]);
+    }
+
     /// Every rerank is written down with what answered and why the faster
     /// engine did not, and comes back in the order it happened.
     #[test]
@@ -3962,6 +5145,134 @@ mod tests {
         );
         event.files = vec!["src/main.rs".to_string()];
         event
+    }
+
+    /// An event the embedder keeps (a prompt), unlike `event`'s tool call.
+    fn prose_event(title: &str, body: &str, project: Uuid) -> Event {
+        let mut event = event(title, body, project);
+        event.source.hook = "user_prompt_submit".into();
+        event
+    }
+
+    fn tool_call_body(stdout: &str) -> String {
+        serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "make"},
+            "tool_response": {"stdout": stdout},
+        })
+        .to_string()
+    }
+
+    fn stored_body(store: &Store, id: &str) -> (String, i32) {
+        store
+            .conn
+            .query_row("SELECT body, clamped FROM events WHERE id = ?1", params![id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn a_big_observation_is_clamped_in_the_index_and_stays_json_with_its_tail() {
+        let store = Store::open_memory().unwrap();
+        let stdout = format!("{}RESULT_TAIL", "output line\n".repeat(1000));
+        let big = event("Bash: make", &tool_call_body(&stdout), Uuid::new_v4());
+        assert!(big.body.len() > 10 * 1024);
+        store.index(&big).unwrap();
+
+        let (body, clamped) = stored_body(&store, &big.id);
+        assert!(body.len() <= 4096, "index kept {} bytes", body.len());
+        assert_eq!(clamped, 1);
+        assert!(store.is_clamped(&big.id).unwrap());
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("still JSON");
+        assert!(parsed["tool_response"]["stdout"].as_str().unwrap().ends_with("RESULT_TAIL"));
+        assert_eq!(parsed["tool_name"], "Bash");
+        // The consolidation path reads through `get`: the bounded body.
+        assert_eq!(store.get(std::slice::from_ref(&big.id)).unwrap()[0].body, body);
+    }
+
+    #[test]
+    fn a_big_body_that_is_not_json_is_cut_head_and_tail() {
+        let store = Store::open_memory().unwrap();
+        let text = format!("HEAD{}TAIL", "y".repeat(10 * 1024));
+        let big = event("prompt", &text, Uuid::new_v4());
+        store.index(&big).unwrap();
+        let (body, clamped) = stored_body(&store, &big.id);
+        assert!(body.len() <= 4096 && clamped == 1);
+        assert!(body.starts_with("HEAD") && body.ends_with("TAIL"));
+    }
+
+    #[test]
+    fn only_an_observation_is_clamped_and_a_small_one_is_untouched() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let mut note = event("note", &"n".repeat(10 * 1024), project);
+        note.kind = EventKind::Note;
+        store.index(&note).unwrap();
+        let (body, clamped) = stored_body(&store, &note.id);
+        assert_eq!((body.len(), clamped), (10 * 1024, 0));
+
+        let small = event("small", &tool_call_body("ok"), project);
+        store.index(&small).unwrap();
+        let (body, clamped) = stored_body(&store, &small.id);
+        assert_eq!((body, clamped), (small.body.clone(), 0));
+        assert!(!store.is_clamped(&small.id).unwrap());
+    }
+
+    #[test]
+    fn a_reindex_clamps_the_same_way_again() {
+        let store = Store::open_memory().unwrap();
+        let big = event("Bash: make", &tool_call_body(&"z".repeat(10 * 1024)), Uuid::new_v4());
+        store.index(&big).unwrap();
+        let first = stored_body(&store, &big.id);
+        store.index(&big).unwrap();
+        assert_eq!(stored_body(&store, &big.id), first);
+        assert_eq!(first.1, 1);
+    }
+
+    #[test]
+    fn a_reindex_clamps_a_legacy_full_body_row() {
+        // A pre-migration row: full body, clamped = 0. Re-indexing must clamp
+        // it AND flag it, which only `clamped = excluded.clamped` does.
+        let store = Store::open_memory().unwrap();
+        let big = event("Bash: make", &tool_call_body(&"z".repeat(10 * 1024)), Uuid::new_v4());
+        store.index(&big).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE events SET body = ?2, clamped = 0 WHERE id = ?1",
+                params![big.id, big.body],
+            )
+            .unwrap();
+        store.index(&big).unwrap();
+        let (body, clamped) = stored_body(&store, &big.id);
+        assert_eq!(clamped, 1);
+        assert!(body.len() <= 4096, "legacy row re-clamped, got {}", body.len());
+    }
+
+    #[test]
+    fn a_retired_clamped_observation_is_no_longer_clamped() {
+        // Retirement empties the body; `clamped` left at 1 would make
+        // brain_get reload the whole line from the log.
+        let store = Store::open_memory().unwrap();
+        let mut big =
+            event("Bash: make", &tool_call_body(&"z".repeat(10 * 1024)), Uuid::new_v4());
+        big.consolidated = true;
+        store.index(&big).unwrap();
+        assert!(store.is_clamped(&big.id).unwrap());
+        let mut retire = Event::new(
+            Uuid::nil(),
+            big.project,
+            Uuid::nil(),
+            Source { cli: "brain".into(), hook: "retire".into() },
+            EventKind::Retire,
+            "Retired 1".into(),
+            String::new(),
+        );
+        retire.links = vec![big.id.clone()];
+        store.index(&retire).unwrap();
+        assert_eq!(stored_body(&store, &big.id), (String::new(), 0));
+        assert!(!store.is_clamped(&big.id).unwrap());
     }
 
     #[test]
@@ -4089,8 +5400,8 @@ mod tests {
         // query - a full index and an empty search, agreeing with each other.
         let store = Store::open_memory().unwrap();
         let project = Uuid::new_v4();
-        let stale = event("Chose SQLite over Postgres", "nothing resident", project);
-        let fresh = event("Wrote the installation guide", "one page", project);
+        let stale = prose_event("Chose SQLite over Postgres", "nothing resident", project);
+        let fresh = prose_event("Wrote the installation guide", "one page", project);
         store.index(&stale).unwrap();
         store.index(&fresh).unwrap();
         store.set_vectors(&[(stale.id.clone(), vec![7u8; crate::embed::DIMS / 2])]).unwrap();
@@ -4110,7 +5421,7 @@ mod tests {
         // quietly hollow out the index of every brain that already existed.
         let store = Store::open_memory().unwrap();
         let project = Uuid::new_v4();
-        let stale = event("Chose SQLite over Postgres", "nothing resident", project);
+        let stale = prose_event("Chose SQLite over Postgres", "nothing resident", project);
         store.index(&stale).unwrap();
         store
             .set_vectors(&[(stale.id.clone(), vec![7u8; crate::embed::DIMS / 2])])
@@ -4132,7 +5443,7 @@ mod tests {
         // against every new query while doctor reports a full index.
         let store = Store::open_memory().unwrap();
         let project = Uuid::new_v4();
-        let old = event("Chose SQLite over Postgres", "nothing resident", project);
+        let old = prose_event("Chose SQLite over Postgres", "nothing resident", project);
         store.index(&old).unwrap();
         store.set_vectors(&[(old.id.clone(), vec![7u8; crate::embed::DIMS])]).unwrap();
         assert_eq!(store.vector_coverage().unwrap(), (1, 1));
@@ -4162,7 +5473,7 @@ mod tests {
         // thousand correct vectors away to be sure.
         let store = Store::open_memory().unwrap();
         let project = Uuid::new_v4();
-        let fresh = event("Wrote the installation guide", "one page", project);
+        let fresh = prose_event("Wrote the installation guide", "one page", project);
         store.index(&fresh).unwrap();
         store.set_vectors(&[(fresh.id.clone(), vec![7u8; crate::embed::DIMS])]).unwrap();
         store.conn.execute("DELETE FROM schema_state WHERE key = 'embedding_model'", []).unwrap();
@@ -4175,6 +5486,121 @@ mod tests {
             "vectors were dropped with no evidence of a model change"
         );
         assert_eq!(recorded_embedding_model(&store), crate::embed::signature());
+    }
+
+    fn event_from(hook: &str, kind: EventKind, title: &str, project: Uuid) -> Event {
+        Event::new(
+            Uuid::nil(),
+            project,
+            Uuid::nil(),
+            Source { cli: "claude-code".into(), hook: hook.into() },
+            kind,
+            title.into(),
+            "body words".into(),
+        )
+    }
+
+    /// Every spelling of a hook that carries a tool call or a lifecycle marker.
+    const SKIPPED_HOOKS: [&str; 8] = [
+        "post_tool_use",
+        "pre_tool_use",
+        "session_start",
+        "session_end",
+        "pre_compact",
+        "after_tool",
+        "pre_compress",
+        "tool_execute_after",
+    ];
+
+    /// Hooks whose events are prose and stay embedded.
+    const KEPT_HOOKS: [&str; 6] =
+        ["user_prompt_submit", "stop", "subagent_stop", "page_update", "knowledge", "note"];
+
+    fn delegate_footstep(project: Uuid) -> Event {
+        let mut e = event_from("stop", EventKind::Observation, "delegate step", project);
+        e.agent = Some("worker".into());
+        e
+    }
+
+    fn delegate_report(project: Uuid) -> Event {
+        let mut e = event_from("subagent_stop", EventKind::Observation, "delegate report", project);
+        e.agent = Some("worker".into());
+        e
+    }
+
+    #[test]
+    fn only_prose_is_queued_for_embedding_and_counted_in_coverage() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let mut skipped: Vec<Event> =
+            SKIPPED_HOOKS.iter().map(|h| event_from(h, EventKind::Observation, h, project)).collect();
+        skipped.push(delegate_footstep(project));
+        let mut kept: Vec<Event> =
+            KEPT_HOOKS.iter().map(|h| event_from(h, EventKind::Observation, h, project)).collect();
+        kept.push(event_from("consolidate", EventKind::SessionSummary, "summed up", project));
+        kept.push(delegate_report(project));
+        for e in skipped.iter().chain(kept.iter()) {
+            store.index(e).unwrap();
+        }
+
+        let pending = store.events_missing_vectors(&project.to_string(), 100).unwrap();
+        let mut ids: Vec<_> = pending.iter().map(|(id, _)| id.clone()).collect();
+        ids.sort();
+        let mut want: Vec<_> = kept.iter().map(|e| e.id.clone()).collect();
+        want.sort();
+        assert_eq!(ids, want, "exactly the prose, including a delegate's subagent_stop report");
+
+        let rows: Vec<_> = want.iter().map(|id| (id.clone(), vec![7u8; crate::embed::DIMS])).collect();
+        store.set_vectors(&rows).unwrap();
+        let total = kept.len() as i64;
+        assert_eq!(store.vector_coverage().unwrap(), (total, total));
+        assert!(store.events_missing_vectors(&project.to_string(), 100).unwrap().is_empty());
+
+        // A vector left on a skipped event must not push coverage past 100%.
+        store.set_vectors(&[(skipped[0].id.clone(), vec![7u8; crate::embed::DIMS])]).unwrap();
+        assert_eq!(store.vector_coverage().unwrap(), (total, total));
+    }
+
+    #[test]
+    fn payload_vectors_are_dropped_in_batches_once_and_the_log_is_left_alone() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let mut skipped: Vec<Event> =
+            SKIPPED_HOOKS.iter().map(|h| event_from(h, EventKind::Observation, h, project)).collect();
+        skipped.push(delegate_footstep(project));
+        let mut kept: Vec<Event> =
+            KEPT_HOOKS.iter().map(|h| event_from(h, EventKind::Observation, h, project)).collect();
+        kept.push(delegate_report(project));
+        let all: Vec<&Event> = skipped.iter().chain(kept.iter()).collect();
+        for e in &all {
+            store.index(e).unwrap();
+        }
+        let rows: Vec<_> = all.iter().map(|e| (e.id.clone(), vec![7u8; crate::embed::DIMS])).collect();
+        store.set_vectors(&rows).unwrap();
+        let count = |sql: &str| -> i64 { store.conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        let marked = || count("SELECT COUNT(*) FROM schema_state WHERE key = 'payload_vectors_dropped'");
+
+        // Opening never does it: the vectors are all still there.
+        store.migrate().unwrap();
+        assert_eq!(count("SELECT COUNT(*) FROM event_vec"), all.len() as i64);
+        assert_eq!(marked(), 0);
+
+        // Bounded: a batch of 4 leaves the rest, and the marker waits for an empty batch.
+        assert_eq!(store.drop_payload_vectors(4).unwrap(), 4);
+        assert_eq!(marked(), 0);
+        let mut guard = 0;
+        while store.drop_payload_vectors(4).unwrap() > 0 {
+            guard += 1;
+            assert!(guard < 10, "the migration did not converge");
+        }
+        assert_eq!(marked(), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM event_vec"), kept.len() as i64);
+        assert_eq!(count("SELECT COUNT(*) FROM events"), all.len() as i64);
+
+        // Once marked, a later vector for a skipped event is not touched.
+        store.set_vectors(&[(skipped[0].id.clone(), vec![7u8; crate::embed::DIMS])]).unwrap();
+        assert_eq!(store.drop_payload_vectors(100).unwrap(), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM event_vec"), kept.len() as i64 + 1, "the migration ran twice");
     }
 
     fn recorded_embedding_model(store: &Store) -> String {
@@ -4230,10 +5656,10 @@ mod tests {
         store.index(&other).unwrap();
 
         let (hits, trace) =
-            store.search_traced(&project.to_string(), "sqlite", None, 10, Recall::Fused).unwrap();
+            store.search_traced(&project.to_string(), "sqlite", None, 10, Recall::Fused, false).unwrap();
 
         let names: Vec<&str> = trace.streams.iter().map(|stream| stream.name).collect();
-        assert_eq!(names, ["keyword", "semantic", "entity", "substring", "graph"]);
+        assert_eq!(names, ["keyword", "semantic", "entity", "substring", "graph", "keyword_relaxed"]);
         assert_eq!(trace.rank_in("keyword", &short.id), Some(1), "{trace:?}");
         assert_eq!(trace.rank_in("keyword", &long.id), Some(2), "{trace:?}");
         assert_eq!(trace.rank_in("keyword", &other.id), None);
@@ -4259,6 +5685,96 @@ mod tests {
     }
 
     #[test]
+    fn a_natural_question_compiles_to_an_or_of_three_term_groups() {
+        let fts = compile_fts("how does the summarizer ladder pick a CLI").expect("a question compiles");
+        for dropped in ["how", "does", "\"the\"", "\"a\""] {
+            assert!(!fts.contains(dropped), "{dropped} survived: {fts}");
+        }
+        // summarizer, ladder, pick, cli: four terms, C(4,3) groups.
+        assert_eq!(fts.matches(" OR ").count(), 3, "{fts}");
+        assert!(fts.contains("(\"summarizer\" \"ladder\" \"pick\")"), "{fts}");
+    }
+
+    #[test]
+    fn a_query_that_speaks_fts_is_left_alone() {
+        for raw in [
+            "\"exact phrase\" here today",
+            "sqlite OR postgres store",
+            "alpha NOT beta gamma",
+            "alpha NEAR(beta gamma) delta",
+            "migrat* the store layer",
+            "two words",
+        ] {
+            assert_eq!(compile_fts(raw), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn thai_terms_and_paths_survive_compilation() {
+        let fts = compile_fts("ทำไม ภาษาไทย ค้นไม่เจอ").unwrap();
+        for term in ["ทำไม", "ภาษาไทย", "ค้นไม่เจอ"] {
+            assert!(fts.contains(&format!("\"{term}\"")), "{term} lost: {fts}");
+        }
+        let fts = compile_fts("why does src/billing.rs fail on retry").unwrap();
+        assert!(fts.contains("\"src/billing.rs\""), "{fts}");
+    }
+
+    #[test]
+    fn more_than_five_terms_keep_the_five_longest() {
+        let fts = compile_fts("aaa bbbb ccccc dddddd eeeeeee ffffffff ggg").unwrap();
+        for kept in ["bbbb", "ccccc", "dddddd", "eeeeeee", "ffffffff"] {
+            assert!(fts.contains(kept), "{kept} dropped: {fts}");
+        }
+        assert!(!fts.contains("aaa") && !fts.contains("ggg"), "{fts}");
+        assert_eq!(fts.matches(" OR ").count(), 9, "C(5,3) = 10 groups: {fts}");
+    }
+
+    #[test]
+    fn a_note_matching_three_of_five_terms_arrives_through_keyword_relaxed() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let mut note = event("Retry policy", "retry backoff jitter keeps the herd apart", project);
+        note.kind = EventKind::Knowledge;
+        let noise = event("Wrote the installation guide", "one page", project);
+        store.index(&note).unwrap();
+        store.index(&noise).unwrap();
+
+        let (hits, trace) = store
+            .search_traced(
+                &project.to_string(),
+                "how does retry backoff jitter get capped by ceiling",
+                None,
+                10,
+                Recall::Fused,
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(trace.rank_in("keyword", &note.id), None, "the raw AND found it: {trace:?}");
+        assert_eq!(trace.rank_in("keyword_relaxed", &note.id), Some(1), "{trace:?}");
+        assert!(hits.iter().any(|hit| hit.id == note.id), "{hits:?}");
+        assert!(trace.streams.last().unwrap().note.is_some());
+    }
+
+    #[test]
+    fn an_fts_query_is_searched_as_written_with_the_relaxed_stream_skipped() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let note = event("Retry policy", "retry backoff jitter keeps the herd apart", project);
+        store.index(&note).unwrap();
+
+        let (_, trace) = store
+            .search_traced(&project.to_string(), "retry OR backoff OR jitter", None, 10, Recall::Fused, false)
+            .unwrap();
+
+        let relaxed = trace.streams.last().unwrap();
+        assert_eq!(relaxed.name, "keyword_relaxed");
+        assert!(relaxed.ranked.is_empty(), "{trace:?}");
+        assert!(relaxed.note.as_deref().unwrap_or("").starts_with("skipped"), "{trace:?}");
+        assert_eq!(trace.rank_in("keyword", &note.id), Some(1), "{trace:?}");
+    }
+
+    #[test]
     fn the_trace_carries_a_human_demotion() {
         let store = Store::open_memory().unwrap();
         let project = Uuid::new_v4();
@@ -4269,11 +5785,140 @@ mod tests {
         store.conn.execute("UPDATE events SET confidence = -1 WHERE id = ?1", params![stale.id]).unwrap();
 
         let (hits, trace) =
-            store.search_traced(&project.to_string(), "sqlite", None, 10, Recall::Fused).unwrap();
+            store.search_traced(&project.to_string(), "sqlite", None, 10, Recall::Fused, false).unwrap();
 
         assert!(trace.fused[&stale.id].demoted, "{trace:?}");
         assert!(!trace.fused[&live.id].demoted);
         assert_eq!(hits.last().unwrap().id, stale.id, "a demoted hit did not sort last: {hits:?}");
+    }
+
+    #[test]
+    fn the_floor_keeps_what_words_or_a_close_cosine_found_and_drops_loose_company() {
+        let tail = Some(SEMANTIC_TOP_KEEP);
+        assert_eq!(floor_reason(bit(KEYWORD), None, None), None, "a keyword hit stays");
+        assert_eq!(floor_reason(bit(RELAXED), None, None), None, "a relaxed keyword hit stays");
+        assert_eq!(floor_reason(bit(SUBSTRING), None, None), None, "a substring hit stays");
+        assert_eq!(floor_reason(bit(SEMANTIC), Some(0.40), tail), None, "a close cosine stays");
+        assert_eq!(floor_reason(bit(SEMANTIC) | bit(ENTITY), Some(0.30), tail), None, "cosine above the nearest floor with entity stays");
+        assert_eq!(floor_reason(bit(SEMANTIC) | bit(GRAPH), Some(0.30), tail), None, "... or with graph");
+        assert_eq!(floor_reason(bit(SEMANTIC), Some(0.30), tail), Some(Dropped::LooseSemantic), "a loose tail cosine alone goes");
+        assert_eq!(floor_reason(bit(SEMANTIC), Some(0.30), Some(SEMANTIC_TOP_KEEP - 1)), None, "the stream's top guesses stay");
+        assert_eq!(floor_reason(bit(ENTITY), None, None), Some(Dropped::Entity));
+        assert_eq!(floor_reason(bit(GRAPH), None, None), Some(Dropped::Graph));
+        assert_eq!(floor_reason(bit(ENTITY) | bit(GRAPH), None, None), Some(Dropped::EntityAndGraph));
+        assert_eq!(Dropped::LooseSemantic.to_string(), "semantic only, below 0.36");
+    }
+
+    #[test]
+    fn the_stream_positions_match_the_stream_names() {
+        for (position, name) in [
+            (KEYWORD, "keyword"),
+            (SEMANTIC, "semantic"),
+            (ENTITY, "entity"),
+            (SUBSTRING, "substring"),
+            (GRAPH, "graph"),
+            (RELAXED, "keyword_relaxed"),
+        ] {
+            assert_eq!(STREAM_NAMES[position], name);
+        }
+    }
+
+    #[test]
+    fn fuse_applies_the_floor_per_stream_combination() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let mut ids = std::collections::HashMap::new();
+        for name in [
+            "sem_below_floor", "sem_top", "sem_close", "sem_rank4", "sem_loose_graph", "entity_graph", "entity",
+            "graph", "keyword", "relaxed", "at_boundary", "just_below",
+        ] {
+            let event = event(&format!("Note {name}"), "body", project);
+            store.index(&event).unwrap();
+            ids.insert(name, event.id);
+        }
+        let hit = |name: &str| store.hits_by_id(&[ids[name].clone()]).unwrap().remove(0);
+        let mut lists: Vec<Vec<Hit>> = vec![Vec::new(); 6];
+        lists[SEMANTIC] = [
+            "sem_below_floor", "sem_top", "sem_close", "sem_rank4", "sem_loose_graph", "at_boundary", "just_below",
+        ]
+        .map(hit)
+        .to_vec();
+        lists[GRAPH] = ["sem_loose_graph", "entity_graph", "graph"].map(hit).to_vec();
+        lists[ENTITY] = ["entity_graph", "entity"].map(hit).to_vec();
+        lists[KEYWORD] = vec![hit("keyword")];
+        lists[RELAXED] = vec![hit("relaxed")];
+        let cosines: std::collections::HashMap<String, f32> = [
+            ("sem_below_floor", NEAREST_FLOOR - 0.03),
+            ("sem_top", 0.30),
+            ("sem_close", 0.40),
+            ("sem_rank4", 0.30),
+            ("sem_loose_graph", 0.30),
+            ("at_boundary", SEMANTIC_MATCH),
+            ("just_below", SEMANTIC_MATCH - 0.001),
+        ]
+        .into_iter()
+        .map(|(name, cosine)| (ids[name].clone(), cosine))
+        .collect();
+
+        let (hits, fused) = store.fuse(&lists, 20, Some(&cosines)).unwrap();
+
+        let kept: std::collections::HashSet<&str> = hits.iter().map(|hit| hit.id.as_str()).collect();
+        let expect = [
+            ("sem_below_floor", Some(Dropped::LooseSemantic)), // index 0, but under NEAREST_FLOOR
+            ("sem_top", None),                                 // index 1, cos 0.30: top-3 keeps it
+            ("sem_close", None),
+            ("sem_rank4", Some(Dropped::LooseSemantic)),       // index 3, cos 0.30: the tail
+            ("sem_loose_graph", None),
+            ("entity_graph", Some(Dropped::EntityAndGraph)),
+            ("entity", Some(Dropped::Entity)),
+            ("graph", Some(Dropped::Graph)),
+            ("keyword", None),
+            ("relaxed", None),
+            ("at_boundary", None),
+            ("just_below", Some(Dropped::LooseSemantic)),
+        ];
+        for (name, dropped) in expect {
+            let id = ids[name].as_str();
+            assert_eq!(fused[id].dropped, dropped, "{name}");
+            assert_eq!(kept.contains(id), dropped.is_none(), "{name} on the page: {hits:?}");
+        }
+
+        let (open_hits, open) = store.fuse(&lists, 20, None).unwrap();
+        assert_eq!(open_hits.len(), 12, "with the floor off nothing leaves the pool");
+        assert!(open.values().all(|entry| entry.dropped.is_none()));
+    }
+
+    #[test]
+    fn an_id_only_the_entity_stream_proposed_stays_off_the_floored_page() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let named = event("Investigated zebrafish assays", "the zebrafish colony", project);
+        let bystander = event("Ordered lunch", "sandwiches and soup", project);
+        store.index(&named).unwrap();
+        store.index(&bystander).unwrap();
+        store
+            .record_entities(&Uuid::nil().to_string(), &project.to_string(), &["zebrafish".to_string()])
+            .unwrap();
+
+        let ask = |floor| {
+            store.search_traced(&project.to_string(), "zebrafish", None, 10, Recall::Fused, floor).unwrap()
+        };
+        let (open, open_trace) = ask(false);
+        assert!(open.iter().any(|hit| hit.id == bystander.id), "entity brings the session along: {open:?}");
+        assert!(open_trace.fused.values().all(|entry| entry.dropped.is_none()), "floor off drops nothing");
+        let (hits, trace) = ask(true);
+        assert!(hits.iter().any(|hit| hit.id == named.id), "{hits:?}");
+        assert!(!hits.iter().any(|hit| hit.id == bystander.id), "{hits:?}");
+        assert_eq!(trace.fused[&bystander.id].dropped, Some(Dropped::Entity), "{trace:?}");
+        assert_eq!(trace.fused[&named.id].dropped, None);
+        // The floored page is a strict subset of the unfloored pool, and the
+        // difference is exactly the ids the trace names as dropped.
+        let floored: std::collections::HashSet<&str> = hits.iter().map(|hit| hit.id.as_str()).collect();
+        let pool: std::collections::HashSet<&str> = open.iter().map(|hit| hit.id.as_str()).collect();
+        let named_dropped: std::collections::HashSet<&str> =
+            trace.fused.iter().filter(|(_, entry)| entry.dropped.is_some()).map(|(id, _)| id.as_str()).collect();
+        assert!(floored.is_subset(&pool) && floored.len() < pool.len(), "{floored:?} vs {pool:?}");
+        assert_eq!(pool.difference(&floored).copied().collect::<std::collections::HashSet<_>>(), named_dropped);
     }
 
     #[test]
@@ -4286,7 +5931,7 @@ mod tests {
         store.index(&only).unwrap();
 
         let (hits, trace) =
-            store.search_traced(&project.to_string(), "sqlite", None, 10, Recall::Lexical).unwrap();
+            store.search_traced(&project.to_string(), "sqlite", None, 10, Recall::Lexical, false).unwrap();
 
         assert_eq!(hits.len(), 1);
         assert_eq!(trace.streams.len(), 1);

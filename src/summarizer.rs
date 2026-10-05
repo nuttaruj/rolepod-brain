@@ -236,6 +236,19 @@ pub enum Tier {
     Headless,
 }
 
+/// What a call is for and whose it is, for the `summarizer_calls` ledger.
+#[derive(Debug, Clone, Copy)]
+pub struct CallContext<'a> {
+    /// `consolidate`, `merge`, `synthesis`, `ingest` or `ingest-merge`.
+    pub purpose: &'a str,
+    /// The session (or, for synthesis, the project) the call works for.
+    pub session: &'a str,
+}
+
+/// The words a timed-out child's error starts with; the ledger reads them
+/// back to tell a timeout from a crash.
+const TIMED_OUT: &str = "timed out after";
+
 /// Picks a rung and runs it.
 pub struct Ladder<'a> {
     store: &'a Store,
@@ -345,14 +358,42 @@ impl<'a> Ladder<'a> {
     /// Run `prompt`, preferring the CLI that produced the observations.
     ///
     /// Returns the model's text and which tier answered, or [`Tier::RuleBased`]
-    /// with no text when every rung is unavailable. Never returns an error for
+    /// with no text when every rung is unavailable, or when a rung answered in
+    /// JSON of the wrong shape (a content failure: no further rung is tried and
+    /// no vendor is charged). Never returns an error for
     /// an unavailable model: that is an expected state, not a fault.
     ///
     /// # Errors
     /// Returns an error only when the health table cannot be read or written.
-    pub fn run<F>(&self, prompt: &str, preferred_cli: &str, usable: F) -> Result<(Tier, String)>
+    pub fn run<F>(
+        &self,
+        ctx: &CallContext<'_>,
+        prompt: &str,
+        preferred_cli: &str,
+        usable: F,
+    ) -> Result<(Tier, String)>
     where
         F: Fn(&str) -> bool,
+    {
+        self.run_with(ctx, prompt, preferred_cli, usable, |spec| self.available(spec), invoke)
+    }
+
+    /// [`Ladder::run`] with the two things that touch the machine - is this
+    /// CLI reachable, and running it - handed in, so a test can drive every
+    /// outcome without a CLI installed.
+    fn run_with<F, A, I>(
+        &self,
+        ctx: &CallContext<'_>,
+        prompt: &str,
+        preferred_cli: &str,
+        usable: F,
+        available: A,
+        invoke: I,
+    ) -> Result<(Tier, String)>
+    where
+        F: Fn(&str) -> bool,
+        A: Fn(&CliSpec) -> Result<bool>,
+        I: Fn(&CliSpec, &str, &str, Duration) -> Result<String>,
     {
         if !self.enabled() {
             return Ok((Tier::RuleBased, String::new()));
@@ -363,15 +404,48 @@ impl<'a> Ladder<'a> {
             if attempts >= self.rungs() {
                 break;
             }
-            if !self.available(spec)? {
+            if !available(spec)? {
                 continue;
             }
             attempts += 1;
 
-            match invoke(spec, self.model_for(spec), prompt, self.timeout) {
-                Ok(text) if usable(&text) => {
+            let model = self.model_for(spec);
+            let started = std::time::Instant::now();
+            let result = invoke(spec, model, prompt, self.timeout);
+            // The bail in `wait_with_timeout` is unwrapped, so it leads the
+            // message; a CLI's own stderr is embedded later and must not match.
+            let good = matches!(&result, Ok(text) if usable(text));
+            let content_failure = matches!(&result, Ok(text) if !good && is_wrong_shape_json(text));
+            let (outcome, answer_bytes) = match &result {
+                Ok(text) if good => ("ok", text.len()),
+                Ok(text) if content_failure => ("unparseable", text.len()),
+                Ok(text) => ("unusable", text.len()),
+                Err(error) if error.to_string().starts_with(TIMED_OUT) => ("timeout", 0),
+                Err(_) => ("spawn_error", 0),
+            };
+            self.ledger(&crate::store::SummarizerCall {
+                session: ctx.session.to_string(),
+                purpose: ctx.purpose.to_string(),
+                cli: spec.cli.to_string(),
+                model: model.to_string(),
+                prompt_bytes: prompt.len() as u64,
+                answer_bytes: answer_bytes as u64,
+                ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                outcome: outcome.to_string(),
+            });
+
+            match result {
+                Ok(text) if good => {
                     self.record(spec.cli, Ok(()))?;
                     return Ok((Tier::Cli(spec.cli.to_string()), text));
+                }
+                Ok(_) if content_failure => {
+                    // The CLI answered, in JSON, with something that does not
+                    // fit this prompt. That is this session's content, not a
+                    // sick vendor: no breaker mark, and no second rung, since
+                    // the next CLI would be handed the same prompt. The caller
+                    // writes the rule-based floor and counts the attempt.
+                    return Ok((Tier::RuleBased, String::new()));
                 }
                 Ok(text) => {
                     // A CLI whose quota is gone often exits 0 and prints a
@@ -389,6 +463,16 @@ impl<'a> Ladder<'a> {
             }
         }
         Ok((Tier::RuleBased, String::new()))
+    }
+
+    /// One row in `summarizer_calls`, unless the call was advisory (a rerank
+    /// has its own table). A ledger that cannot be written never changes what
+    /// the ladder answers, so the write's error is dropped.
+    fn ledger(&self, call: &crate::store::SummarizerCall) {
+        if self.advisory {
+            return;
+        }
+        let _ = self.store.record_summarizer_call(call);
     }
 
     /// Rungs to try, in order.
@@ -448,6 +532,28 @@ impl<'a> Ladder<'a> {
             return Ok(false);
         }
         Ok(!self.store.summarizer_in_cooldown(spec.cli)?)
+    }
+}
+
+/// Is this answer a JSON object a caller rejected, as opposed to a CLI
+/// reporting trouble?
+///
+/// After one code fence is stripped the text must start with `{` and parse.
+/// An object with an `error` key is how a vendor reports a quota or auth
+/// failure in JSON, so it stays a vendor failure.
+fn is_wrong_shape_json(text: &str) -> bool {
+    let mut body = text.trim();
+    if let Some(rest) = body.strip_prefix("```") {
+        // Drop an optional language tag; a newline is not required.
+        body = rest.trim_start_matches(|c: char| c.is_ascii_alphanumeric()).trim();
+        body = body.strip_suffix("```").unwrap_or(body).trim();
+    }
+    if !body.starts_with('{') {
+        return false;
+    }
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(serde_json::Value::Object(map)) => !map.contains_key("error"),
+        _ => false,
     }
 }
 
@@ -802,7 +908,7 @@ fn wait_with_timeout(child: &mut std::process::Child, limit: Duration) -> Result
                 if start.elapsed() > limit {
                     let _ = child.kill();
                     let _ = child.wait();
-                    anyhow::bail!("timed out after {}s", limit.as_secs());
+                    anyhow::bail!("{TIMED_OUT} {}s", limit.as_secs());
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -1106,9 +1212,126 @@ mod tests {
             store.record_summarizer_failure("codex", "rate limited").unwrap();
         }
         assert!(store.summarizer_in_cooldown("codex").unwrap());
-        let (tier, text) = waiting.run("anything", "codex", |_| true).unwrap();
+        let (tier, text) = waiting.run(&CallContext { purpose: "test", session: "" }, "anything", "codex", |_| true).unwrap();
         assert_eq!(tier, Tier::RuleBased, "a benched CLI was substituted for another");
         assert!(text.is_empty());
+    }
+
+    /// Every non-advisory invoke leaves one row: the ones that worked and
+    /// every way one can fail. The ladder's answer is what it always was.
+    #[test]
+    fn every_invoke_leaves_one_row_and_clear_leaves_them_be() {
+        let store = Store::open_memory().unwrap();
+        let ladder = Ladder::new(&store, &config("codex"));
+        let ctx = CallContext { purpose: "consolidate", session: "s1" };
+        let replies = std::cell::RefCell::new(vec![
+            Ok("good answer".to_string()),
+            Ok("usage limit reached".to_string()),
+            Err(anyhow::anyhow!("{TIMED_OUT} 180s")),
+            Err(anyhow::anyhow!("codex exited with 1: boom")),
+            // A CLI's own stderr may say "timed out after": that is the CLI's
+            // network, not this ladder's clock.
+            Err(anyhow::anyhow!("codex exited with 1: request timed out after 30s")),
+        ]);
+        let mut tiers = Vec::new();
+        for _ in 0..5 {
+            let (tier, _) = ladder
+                .run_with(
+                    &ctx,
+                    "prompt",
+                    "codex",
+                    |text| text.starts_with("good"),
+                    |_| Ok(true),
+                    |_, _, _, _| replies.borrow_mut().remove(0),
+                )
+                .unwrap();
+            tiers.push(tier);
+        }
+        assert_eq!(tiers[0], Tier::Cli("codex".to_string()));
+        assert!(tiers[1..].iter().all(|tier| *tier == Tier::RuleBased));
+
+        let calls = store.summarizer_calls_since(60).unwrap();
+        let outcomes: Vec<&str> = calls.iter().map(|call| call.outcome.as_str()).collect();
+        assert_eq!(outcomes, ["ok", "unusable", "timeout", "spawn_error", "spawn_error"]);
+        assert!(calls.iter().all(|c| c.purpose == "consolidate" && c.session == "s1"));
+        assert!(calls.iter().all(|c| c.cli == "codex" && c.prompt_bytes == 6));
+        assert_eq!(calls[0].answer_bytes, 11);
+        assert_eq!(calls[2].answer_bytes, 0);
+
+        // An advisory call is `rerank_runs`' business, not this table's.
+        let waiting = ladder.while_waiting(Duration::from_secs(6));
+        waiting
+            .run_with(&ctx, "p", "codex", |_| true, |_| Ok(true), |_, _, _, _| Ok("x".to_string()))
+            .unwrap();
+        assert_eq!(store.summarizer_calls_since(60).unwrap().len(), 5);
+
+        store.clear().unwrap();
+        assert_eq!(store.summarizer_calls_since(60).unwrap().len(), 5, "clear() ate the ledger");
+    }
+
+    /// Drive one `run_with` over `reply` on an auto ladder where every CLI is
+    /// reachable; returns the tier, how many rungs were invoked, the store.
+    fn run_one_reply(reply: &str) -> (Tier, usize, Store) {
+        let store = Store::open_memory().unwrap();
+        let invoked = std::cell::Cell::new(0usize);
+        let tier = {
+            let ladder = Ladder::new(&store, &config("auto"));
+            let ctx = CallContext { purpose: "consolidate", session: "s1" };
+            ladder
+                .run_with(
+                    &ctx,
+                    "prompt",
+                    "codex",
+                    |text| {
+                        serde_json::from_str::<serde_json::Value>(text)
+                            .ok()
+                            .and_then(|v| v["summary"].as_str().map(|s| !s.trim().is_empty()))
+                            .unwrap_or(false)
+                    },
+                    |_| Ok(true),
+                    |_, _, _, _| {
+                        invoked.set(invoked.get() + 1);
+                        Ok(reply.to_string())
+                    },
+                )
+                .unwrap()
+                .0
+        };
+        (tier, invoked.get(), store)
+    }
+
+    /// A model that answered in JSON of the wrong shape did its job badly; it
+    /// is not down. Charging the vendor would bench it for thirty minutes
+    /// because one session's content did not fit.
+    #[test]
+    fn a_json_answer_of_the_wrong_shape_is_not_a_vendor_failure() {
+        for reply in [
+            "```json\n{\"wrong\":1}\n```",
+            "```{\"wrong\":1}```",
+            "{\"wrong\":1}",
+            "{\"summary\":\"  \"}",
+        ] {
+            let (tier, invoked, store) = run_one_reply(reply);
+            assert_eq!(tier, Tier::RuleBased, "{reply}");
+            assert_eq!(invoked, 1, "{reply}: a second rung was spent on a content failure");
+            assert!(store.summarizer_health().unwrap().is_empty(), "{reply}: the vendor was charged");
+            let calls = store.summarizer_calls_since(60).unwrap();
+            assert_eq!(calls.len(), 1, "{reply}");
+            assert_eq!(calls[0].outcome, "unparseable", "{reply}");
+        }
+    }
+
+    #[test]
+    fn garbage_and_error_objects_still_count_against_the_vendor() {
+        for reply in ["garbage", "{\"error\":{\"message\":\"quota exceeded\"}}", "{not json"] {
+            let (tier, invoked, store) = run_one_reply(reply);
+            assert_eq!(tier, Tier::RuleBased);
+            assert_eq!(invoked, 2, "{reply}: the ladder did not try a second rung");
+            let health = store.summarizer_health().unwrap();
+            assert!(health.iter().all(|row| row.failures == 1) && health.len() == MAX_RUNGS_PER_CALL, "{reply}");
+            let calls = store.summarizer_calls_since(60).unwrap();
+            assert!(calls.iter().all(|call| call.outcome == "unusable"), "{reply}");
+        }
     }
 
     #[test]
@@ -1125,7 +1348,7 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let ladder = Ladder::new(&store, &config("off"));
         assert!(!ladder.enabled());
-        let (tier, text) = ladder.run("anything", "claude-code", |_| true).unwrap();
+        let (tier, text) = ladder.run(&CallContext { purpose: "test", session: "" }, "anything", "claude-code", |_| true).unwrap();
         assert_eq!(tier, Tier::RuleBased);
         assert!(text.is_empty());
     }

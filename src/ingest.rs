@@ -22,7 +22,7 @@ use crate::consolidate::{self, Answer};
 use crate::event::{Event, EventKind, EventLog, Source};
 use crate::ids;
 use crate::store::Store;
-use crate::summarizer::{Ladder, Tier};
+use crate::summarizer::{CallContext, Ladder, Tier};
 
 /// Largest document read in one go. Bigger than any note a person writes,
 /// smaller than a dump nobody meant to summarize.
@@ -118,10 +118,12 @@ pub fn run(file: &Path, force: bool) -> Result<Ingested> {
     let mut summaries: Vec<String> = Vec::new();
     let mut entities: Vec<String> = Vec::new();
     let mut tier = Tier::RuleBased;
+    let session_id = session.to_string();
     for (index, chunk) in chunks.iter().enumerate() {
         let prompt = source_prompt(&title, chunk, index, chunks.len());
+        let ctx = CallContext { purpose: "ingest", session: &session_id };
         let (chunk_tier, answer) =
-            ladder.run(&prompt, &preferred, |text| consolidate::parse_answer(text).is_some())?;
+            ladder.run(&ctx, &prompt, &preferred, |text| consolidate::parse_answer(text).is_some())?;
         if let Tier::Cli(_) = chunk_tier {
             if let Some(parsed) = consolidate::parse_answer(&answer) {
                 entities.extend(parsed.entities().into_iter().map(|e| sanitizer.scrub(&e)));
@@ -133,7 +135,8 @@ pub fn run(file: &Path, force: bool) -> Result<Ingested> {
         summaries.push(opening_of(chunk));
     }
     let summary = if summaries.len() > 1 && matches!(tier, Tier::Cli(_)) {
-        match ladder.run(&merge_prompt(&title, &summaries), &preferred, |text| {
+        let ctx = CallContext { purpose: "ingest-merge", session: &session_id };
+        match ladder.run(&ctx, &merge_prompt(&title, &summaries), &preferred, |text| {
             consolidate::parse_answer(text).is_some()
         })? {
             (Tier::Cli(_), answer) => consolidate::parse_answer(&answer)

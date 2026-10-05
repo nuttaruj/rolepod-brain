@@ -45,6 +45,17 @@
         ]
       }
     ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PATH=\"$HOME/.local/bin:$PATH\" brain hook --cli claude-code --event PostToolUseFailure",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [

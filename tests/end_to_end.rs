@@ -2685,13 +2685,16 @@ fn the_wiki_is_git_versioned() {
 fn an_oversized_session_merges_its_chunks_into_one_narrative() {
     let fixture = Fixture::new("merge");
 
-    // Enough bulk to force more than one chunk.
-    for index in 0..60 {
+    // Enough bulk to force several chunks. A tool call renders as a capped
+    // input plus a capped result, so the bulk sits in the result and the event
+    // count is high enough that the rendered session spans well over one chunk.
+    for index in 0..150 {
         let payload = serde_json::json!({
             "session_id": "0199a1f2-3c4d-7e8f-9012-3456789abcde",
             "cwd": fixture.project,
             "tool_name": "Bash",
-            "tool_input": {"command": format!("run-{index} {}", "x".repeat(1200))}
+            "tool_input": {"command": format!("run-{index} {}", "x".repeat(1200))},
+            "tool_response": {"stdout": format!("out-{index} {}", "y".repeat(1200))}
         })
         .to_string();
         fixture.hook("claude-code", "PostToolUse", &payload);
@@ -2717,7 +2720,8 @@ fn an_oversized_session_merges_its_chunks_into_one_narrative() {
         .trim()
         .parse()
         .unwrap_or(0);
-    assert!(calls > 1, "this session should have split into chunks, saw {calls} call(s)");
+    // At least 3 chunk calls plus the merge call (the fixture yields 5 + 1).
+    assert!(calls > 3, "this session should have split into chunks, saw {calls} call(s)");
 
     let page = fixture.page_text();
     // The last call is the merge pass; its answer is what the page must carry.

@@ -22,7 +22,10 @@ use crate::event::{Event, EventKind, EventLog, Source};
 use crate::ids::{self, AgentKind};
 use crate::inject;
 use crate::invocation;
-use crate::sanitize::{truncate, Sanitizer};
+use crate::sanitize::{
+    clamp_leaf, leaves_private_open, truncate, truncate_head_tail, Sanitizer, FOOTSTEP_BODY_MAX_BYTES,
+    FOOTSTEP_LEAF_MAX_BYTES, LEAF_MAX_BYTES,
+};
 use crate::store::Store;
 
 /// Ceiling for a generated title, before it reaches the primer.
@@ -33,6 +36,24 @@ const TITLE_MAX_BYTES: usize = 120;
 /// Comfortably longer than the consolidation debounce, so an active machine
 /// never triggers this path and a returning one always does.
 pub const STALE_BACKLOG_SECS: i64 = 15 * 60;
+
+/// How long a stop waits before it asks again whether anything sat idle.
+pub const IDLE_SWEEP_DEBOUNCE_SECS: i64 = 15 * 60;
+
+/// How long a session must have been quiet before the idle sweep takes it.
+pub const IDLE_SWEEP_AGE_SECS: i64 = 2 * 3600;
+
+/// Should this stop spawn a `consolidate --idle` for work nobody is waiting on?
+///
+/// A session that goes quiet leaves its backlog until some later `session_start`;
+/// every stop is a live hook, so one asking is the cheaper way to finish it.
+/// The hook only spends the debounce window - a plain read for most stops, one
+/// conditional write for the stop that finds it open. Whether anything is idle
+/// is the spawned run's question: no backlog scan runs on the hook path. A
+/// store error means no sweep.
+fn claim_idle_sweep_window(store: &Store, now: jiff::Timestamp) -> bool {
+    store.claim_idle_sweep(now, IDLE_SWEEP_DEBOUNCE_SECS).unwrap_or(false)
+}
 
 /// Set in every subprocess we spawn into a host CLI.
 ///
@@ -103,7 +124,26 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
         return Ok("{}".to_string());
     }
 
-    let payload: Value = serde_json::from_str(&raw).context("parse hook payload")?;
+    let mut payload: Value = serde_json::from_str(&raw).context("parse hook payload")?;
+
+    let mut hook = normalize_hook(event_name);
+    let failed_call = hook == "post_tool_use_failure";
+    if let Some(object) = payload.as_object_mut() {
+        // The marker is ours alone: a host-sent `failed` must never make a
+        // normal call render as FAILED.
+        object.remove("failed");
+        if failed_call {
+            // A failed tool call is the same observation with a result that
+            // went wrong, so it joins `post_tool_use` and carries the marker;
+            // the host documents the error under different fields, `body_for`
+            // keeps them all.
+            hook = "post_tool_use".to_string();
+            object.insert("failed".to_string(), Value::Bool(true));
+        }
+    }
+    if is_cursor_echo(cli, &hook, &payload) {
+        return Ok("{}".to_string());
+    }
 
     let paths = Paths::resolve()?;
     paths.ensure()?;
@@ -119,7 +159,6 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
     let scope = ids::resolve_scope(&cwd);
 
     let cli_kind = AgentKind::parse(cli);
-    let hook = normalize_hook(event_name);
     let session = ids::session_uuid(
         first_string(&payload, &["session_id", "sessionId", "thread_id", "conversationId"])
             .unwrap_or("unknown-session"),
@@ -149,8 +188,15 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
         })
         .flatten();
 
-    let title = truncate(&sanitizer.scrub(&title_for(&hook, &payload)), TITLE_MAX_BYTES);
-    let mut body = sanitizer.scrub_body(&body_for(&payload));
+    let mut title = title_for(&hook, &payload);
+    if failed_call {
+        title = format!("Failed: {title}");
+    }
+    let title = truncate(&sanitizer.scrub(&title), TITLE_MAX_BYTES);
+    // A delegate's tool call is a footstep: it is summarized away and only
+    // its shape is worth keeping, so it gets a much smaller body.
+    let footstep = is_footstep(delegate.as_deref(), &hook);
+    let mut body = event_body(&payload, &sanitizer, footstep);
     let mut title = title;
     if let Some(answer) = answer {
         // The title carries the answer's opening so the pointer line itself
@@ -215,7 +261,8 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
     // sanitizer explicitly treats as sensitive by convention - .ssh, .aws,
     // .gnupg - and storing it unscrubbed in a parallel array meant the thing
     // being redacted out of the title sat intact in the column beside it.
-    event.files = files_for(&payload, &scope.root)
+    // A failed call changed nothing, so it is not linked to the file it named.
+    event.files = if failed_call { Vec::new() } else { files_for(&payload, &scope.root) }
         .iter()
         .map(|path| sanitizer.scrub(path))
         .filter(|path| !path.is_empty())
@@ -285,16 +332,42 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
         spawn_consolidation(None);
     }
 
+    if hook == "stop" && claim_idle_sweep_window(&store, jiff::Timestamp::now()) {
+        spawn_detached(&["consolidate", "--idle"]);
+    }
+
     if invocation.is_headless() {
         // The whole point: a one-shot run is usually an orchestrated step -
         // a reviewer, a judge - and handing it this project's narrative
         // destroys its independence in a way nothing downstream can see.
         return Ok("{}".to_string());
     }
-    if !answer_is_read(cli_kind.as_str(), &payload) {
+    // A failed call is capture-only: nothing to say about the file it never read.
+    if failed_call || !answer_is_read(cli_kind.as_str(), &payload) {
         return Ok("{}".to_string());
     }
+    if hook == "user_prompt_submit" {
+        let prompt = first_string(&payload, &["prompt"]).unwrap_or("");
+        return Ok(inject_for_prompt(&store, &config, &scope, &session_key, event_name, prompt));
+    }
     Ok(inject_for(&store, &config, &scope, &session_key, &hook, event_name, &event))
+}
+
+/// Is this Cursor's own session, echoed to us through Claude Code's hooks?
+///
+/// Cursor reads Claude Code's hook config and fires those hooks too, so one
+/// Cursor session arrives twice: once from the hooks we wired into Cursor
+/// (`cli == "cursor"`) and once as `claude-code`. Only the `cursor_version`
+/// key tells the second copy apart. The three per-turn hooks are the
+/// duplicated ones; the rest (a delegate's report, session boundaries) have no
+/// Cursor-side twin and pass through.
+fn is_cursor_echo(cli: &str, hook: &str, payload: &Value) -> bool {
+    cli == "claude-code"
+        && matches!(hook, "post_tool_use" | "user_prompt_submit" | "stop")
+        && payload
+            .get("cursor_version")
+            .and_then(Value::as_str)
+            .is_some_and(|version| !version.trim().is_empty())
 }
 
 /// Will anyone read what this hook prints?
@@ -372,7 +445,36 @@ fn inject_for(
         }),
         _ => None,
     };
+    deliver(store, config, session, event_name, injection)
+}
 
+/// The prompt-time push: opt-in (`[injection] prompt_pointers`); off, a
+/// prompt gets nothing back, as it always has. The lookup is lexical and
+/// time-boxed, and a failure is silent like every injection failure.
+fn inject_for_prompt(
+    store: &Store,
+    config: &Config,
+    scope: &crate::ids::ProjectScope,
+    session: &str,
+    event_name: &str,
+    prompt: &str,
+) -> String {
+    if !config.injection.prompt_pointers {
+        return "{}".to_string();
+    }
+    let project = scope.project_id.to_string();
+    let injection = inject::for_prompt(store, &project, session, prompt, &config.injection).ok();
+    deliver(store, config, session, event_name, injection)
+}
+
+/// Record what an injection spent and render it as the hook's output.
+fn deliver(
+    store: &Store,
+    config: &Config,
+    session: &str,
+    event_name: &str,
+    injection: Option<inject::Injection>,
+) -> String {
     let Some(injection) = injection else { return "{}".to_string() };
     if injection.is_empty() {
         return "{}".to_string();
@@ -484,12 +586,17 @@ pub fn consolidation_triggers(cli: &str) -> &'static str {
 /// is fully detached from our stdio and outlives us. If it cannot start, the
 /// catch-up backstop picks the work up later — this is best-effort by design.
 fn spawn_consolidation(session: Option<&str>) {
-    let Ok(exe) = std::env::current_exe() else { return };
-    let args: Vec<&str> = match session {
-        Some(session) => vec!["consolidate", "--session", session],
+    match session {
+        Some(session) => spawn_detached(&["consolidate", "--session", session]),
         // No session: catch up on whatever is stale, anywhere.
-        None => vec!["consolidate", "--all"],
-    };
+        None => spawn_detached(&["consolidate", "--all"]),
+    }
+}
+
+/// Run `brain <args>` as a child with no stdio, and do not wait for it.
+/// Best-effort: a child that cannot start is simply not started.
+fn spawn_detached(args: &[&str]) {
+    let Ok(exe) = std::env::current_exe() else { return };
     let _ = std::process::Command::new(exe)
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -681,13 +788,36 @@ fn title_for(hook: &str, payload: &Value) -> String {
     }
 }
 
+/// A delegate's tool call: summarized away later, so only its shape is kept.
+fn is_footstep(delegate: Option<&str>, hook: &str) -> bool {
+    delegate.is_some() && hook == "post_tool_use"
+}
+
+/// The stored body of an event: shaped leaves, the final scrub and 16 KiB
+/// cap, then the footstep's own 1 KiB clamp.
+fn event_body(payload: &Value, sanitizer: &Sanitizer, footstep: bool) -> String {
+    let body = sanitizer.scrub_body(&body_for(payload, sanitizer, footstep));
+    if footstep {
+        truncate_head_tail(&body, FOOTSTEP_BODY_MAX_BYTES)
+    } else {
+        body
+    }
+}
+
 /// The content worth keeping, as compact JSON.
 ///
 /// Deliberately a subset: a hook payload carries a full transcript path, tool
 /// schemas, and other noise that would bloat every event without ever being
 /// recalled.
-fn body_for(payload: &Value) -> String {
+fn body_for(payload: &Value, sanitizer: &Sanitizer, footstep: bool) -> String {
+    let leaf_max = if footstep { FOOTSTEP_LEAF_MAX_BYTES } else { LEAF_MAX_BYTES };
     let mut kept = serde_json::Map::new();
+    // Set once any leaf ends inside an unclosed `<private>`: nothing after it,
+    // in this leaf or any later one, is safe to keep.
+    let mut private_open = false;
+    // Only a failed call keeps the failure fields; anywhere else they are noise
+    // and a host-sent `failed` must not pass for ours.
+    let failed = payload.get("failed").and_then(Value::as_bool) == Some(true);
     for key in [
         "prompt",
         "tool_name",
@@ -695,20 +825,78 @@ fn body_for(payload: &Value) -> String {
         "toolCall",
         "terminationReason",
         "tool_response",
+        "tool_output",
+        "error",
+        "is_interrupt",
+        "failed",
         "message",
         "reason",
         "source",
         "trigger",
         "custom_instructions",
     ] {
+        if !failed && matches!(key, "tool_output" | "error" | "is_interrupt" | "failed") {
+            continue;
+        }
         if let Some(value) = payload.get(key) {
-            kept.insert(key.to_string(), value.clone());
+            if private_open {
+                kept.insert(key.to_string(), Value::String("[PRIVATE]".into()));
+                continue;
+            }
+            let mut value = value.clone();
+            match key {
+                "tool_response" | "tool_output" | "error" => {
+                    // `tool_response`, or a failure's `tool_output` / `error`
+                    // (a string or an object, by host). The file as it was and
+                    // the patch are copies of what the file itself and the edit
+                    // input already say.
+                    if let Some(object) = value.as_object_mut() {
+                        object.remove("originalFile");
+                        object.remove("structuredPatch");
+                    }
+                    shape_leaves(&mut value, sanitizer, leaf_max, &mut private_open);
+                }
+                "tool_input" if footstep => {
+                    shape_leaves(&mut value, sanitizer, leaf_max, &mut private_open);
+                }
+                "tool_input" => {
+                    if let Some(content) = value.as_object_mut().and_then(|o| o.get_mut("content"))
+                    {
+                        shape_leaves(content, sanitizer, leaf_max, &mut private_open);
+                    }
+                }
+                _ => {}
+            }
+            kept.insert(key.to_string(), value);
         }
     }
     if kept.is_empty() {
         return String::new();
     }
     serde_json::to_string(&Value::Object(kept)).unwrap_or_default()
+}
+
+/// Scrub every string leaf, then clamp it. Scrub first: a clamp that cut a
+/// secret in half would leave both halves past the pattern that finds it.
+/// `private_open` carries an unclosed `<private>` from one leaf to the rest.
+fn shape_leaves(value: &mut Value, sanitizer: &Sanitizer, max: usize, private_open: &mut bool) {
+    match value {
+        Value::String(text) => {
+            if *private_open {
+                *text = "[PRIVATE]".to_string();
+            } else {
+                *private_open = leaves_private_open(text);
+                *text = clamp_leaf(&sanitizer.scrub(text), max);
+            }
+        }
+        Value::Array(items) => {
+            items.iter_mut().for_each(|v| shape_leaves(v, sanitizer, max, private_open));
+        }
+        Value::Object(map) => {
+            map.values_mut().for_each(|v| shape_leaves(v, sanitizer, max, private_open));
+        }
+        _ => {}
+    }
 }
 
 /// File paths this event touched, relative to the project root when possible.
@@ -1289,8 +1477,472 @@ mod tests {
             "transcript_path": "/tmp/very/long/path.jsonl",
             "session_id": "abc",
         });
-        let body = body_for(&payload);
+        let body = body_for(&payload, &Sanitizer::builtin(), false);
         assert!(body.contains("hello"));
         assert!(!body.contains("transcript_path"));
+    }
+
+    fn shaped(payload: &Value, footstep: bool) -> String {
+        body_for(payload, &Sanitizer::builtin(), footstep)
+    }
+
+    #[test]
+    fn an_edit_body_drops_the_file_copies_and_keeps_the_input() {
+        let payload = json!({
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "a.rs", "old_string": "x", "new_string": "y"},
+            "tool_response": {"originalFile": "o".repeat(50_000), "structuredPatch": [{"lines": ["+y"]}], "ok": true},
+        });
+        let body = shaped(&payload, false);
+        assert!(!body.contains("originalFile") && !body.contains("structuredPatch"));
+        assert!(body.contains("tool_input") && body.contains("new_string"));
+        assert!(body.len() < 1000);
+    }
+
+    #[test]
+    fn a_long_stdout_keeps_its_tail_within_the_leaf_cap() {
+        let stdout = format!("{}\nERROR: the-tail-marker", "line of output\n".repeat(700));
+        let body = shaped(&json!({"tool_response": {"stdout": stdout}}), false);
+        let value: Value = serde_json::from_str(&body).unwrap();
+        let leaf = value["tool_response"]["stdout"].as_str().unwrap();
+        assert!(leaf.len() <= 2150, "{}", leaf.len());
+        assert!(leaf.contains("the-tail-marker"));
+    }
+
+    #[test]
+    fn a_base64_run_is_replaced_by_its_size() {
+        let blob = "QUJD".repeat(1280);
+        let body = shaped(&json!({"tool_response": {"image": blob}}), false);
+        assert!(body.contains("[base64 5120 bytes]"), "{body}");
+        assert!(!body.contains("QUJDQUJD"));
+    }
+
+    #[test]
+    fn a_delegates_footstep_body_stays_small() {
+        let payload = json!({
+            "tool_name": "Read",
+            "tool_input": {"file_path": "a.rs", "content": "i".repeat(4000)},
+            "tool_response": {"stdout": format!("{}END", "r".repeat(9000)), "other": "q".repeat(3000)},
+        });
+        let sanitizer = Sanitizer::builtin();
+        assert!(is_footstep(Some("Explore"), "post_tool_use"));
+        let body = event_body(&payload, &sanitizer, true);
+        assert!(body.len() <= 1126, "{}", body.len());
+        // The lead's own call, and a delegate's non-tool event, are not clamped
+        // to a footstep.
+        assert!(!is_footstep(None, "post_tool_use"));
+        assert!(!is_footstep(Some("Explore"), "user_prompt_submit"));
+        let lead = event_body(&payload, &sanitizer, false);
+        assert!(lead.len() > 2000, "{}", lead.len());
+    }
+
+    #[test]
+    fn an_unclosed_private_tag_drops_every_later_leaf() {
+        let sanitizer = Sanitizer::builtin();
+        // In an earlier leaf of the same object, and in an earlier key.
+        let same_object = json!({"tool_response": {"stderr": "<private>client", "stdout": "later-visible"}});
+        let body = event_body(&same_object, &sanitizer, false);
+        assert!(!body.contains("later-visible") && !body.contains("client"), "{body}");
+        let across_keys = json!({
+            "tool_input": {"content": "x <private>client"},
+            "tool_response": {"stdout": "later-visible"},
+            "message": "also-later",
+        });
+        for footstep in [false, true] {
+            let body = event_body(&across_keys, &sanitizer, footstep);
+            assert!(!body.contains("later-visible") && !body.contains("also-later"), "{body}");
+            assert!(!body.contains("client"), "{body}");
+        }
+        // A balanced region drops only itself.
+        let balanced = json!({"tool_response": {"stderr": "<private>c</private>", "stdout": "kept"}});
+        assert!(event_body(&balanced, &sanitizer, false).contains("kept"));
+    }
+
+    #[test]
+    fn a_secret_across_a_leaf_cap_is_redacted_whole() {
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123";
+        let sanitizer = Sanitizer::builtin();
+        for (cap, footstep) in [(LEAF_MAX_BYTES, false), (FOOTSTEP_LEAF_MAX_BYTES, true)] {
+            // Place the secret so the cap's head/tail cut would land inside it.
+            for offset in [cap / 2 - 40, cap / 2 - 24, cap / 2 - 10] {
+                let text = format!("{}{secret}{}", "a ".repeat(offset / 2), "b ".repeat(cap));
+                let body = body_for(&json!({"tool_response": {"stdout": text}}), &sanitizer, footstep);
+                assert!(!body.contains("ghp_"), "{body}");
+                assert!(!body.contains("wxyz0123"), "{body}");
+            }
+            // And across the tail cut: the secret near the end of the leaf, so
+            // the tail window begins inside it.
+            let half = (cap - 48) / 2;
+            for suffix_len in (half - secret.len() + 1)..half {
+                let text = format!("{}{secret}{}", "a ".repeat(cap), "b".repeat(suffix_len));
+                let body = body_for(&json!({"tool_response": {"stdout": text}}), &sanitizer, footstep);
+                assert!(!body.contains("ghp_") && !body.contains("wxyz0123"), "{suffix_len}: {body}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_small_payload_body_is_unchanged() {
+        let payload = json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "tool_response": {"stdout": "a\nb", "stderr": ""},
+        });
+        let expected = serde_json::to_string(&payload).unwrap();
+        assert_eq!(shaped(&payload, false), expected);
+    }
+
+    #[test]
+    fn an_idle_sweep_spawns_once_per_window() {
+        let store = Store::open_memory().unwrap();
+        let now = jiff::Timestamp::now();
+        assert!(claim_idle_sweep_window(&store, now), "window open: spawn");
+        assert!(!claim_idle_sweep_window(&store, now), "window spent: no spawn");
+        let inside = now + jiff::SignedDuration::from_secs(IDLE_SWEEP_DEBOUNCE_SECS - 60);
+        assert!(!claim_idle_sweep_window(&store, inside), "still inside the window");
+        let later = now + jiff::SignedDuration::from_secs(IDLE_SWEEP_DEBOUNCE_SECS + 60);
+        assert!(claim_idle_sweep_window(&store, later), "past the window it asks again");
+    }
+
+    #[test]
+    fn the_stale_backlog_check_still_counts_rule_based_sessions() {
+        let store = Store::open_memory().unwrap();
+        let project = uuid::Uuid::new_v4();
+        let session = uuid::Uuid::new_v4();
+        let mut event = Event::new(
+            uuid::Uuid::nil(),
+            project,
+            session,
+            Source { cli: "claude-code".into(), hook: "post_tool_use".into() },
+            EventKind::Observation,
+            "Edit: a.rs".into(),
+            "{}".into(),
+        );
+        event.ts = (jiff::Timestamp::now() - jiff::SignedDuration::from_secs(3 * 3600)).to_string();
+        store.index(&event).unwrap();
+        store.record_session_run(&session.to_string(), "p", "01A", "rule-based").unwrap();
+        assert!(store.has_stale_backlog(STALE_BACKLOG_SECS).unwrap());
+    }
+
+    /// Run one claude-code hook against a fresh store; return how many events landed.
+    fn events_after(hook: &str, cursor_version: Option<&str>) -> i64 {
+        let _guard =
+            invocation::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!("brain-cursor-echo-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var(crate::config::DATA_DIR_ENV, &home);
+        let mut payload = json!({
+            "session_id": "echo-session",
+            "cwd": home.display().to_string(),
+            "tool_name": "Read",
+            "tool_input": {"file_path": "a.rs"},
+        });
+        if let Some(version) = cursor_version {
+            payload["cursor_version"] = json!(version);
+        }
+        let ack = capture("claude-code", hook, Some(payload.to_string())).unwrap();
+        assert_eq!(ack, "{}");
+        let count = Store::open(&home.join("brain.db")).unwrap().count().unwrap();
+        std::env::remove_var(crate::config::DATA_DIR_ENV);
+        let _ = std::fs::remove_dir_all(&home);
+        count
+    }
+
+    /// Run `f` against a fresh store under the env lock; the store is open
+    /// while `f` runs and the home is gone after.
+    fn with_store<T>(f: impl FnOnce(&std::path::Path, &Store) -> T) -> T {
+        let _guard =
+            invocation::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!("brain-failed-call-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&home).unwrap();
+        // The embed tests find their staged model through this variable, and
+        // they run beside us: lend our home the same models, and put back
+        // whatever the variable held.
+        crate::embed::tests::use_checkout_model();
+        #[cfg(unix)]
+        let _ = std::os::unix::fs::symlink(
+            std::env::temp_dir().join("rolepod-brain-test-home").join("models"),
+            home.join("models"),
+        );
+        let before = std::env::var_os(crate::config::DATA_DIR_ENV);
+        std::env::set_var(crate::config::DATA_DIR_ENV, &home);
+        let out = f(&home, &Store::open(&home.join("brain.db")).unwrap());
+        match before {
+            Some(value) => std::env::set_var(crate::config::DATA_DIR_ENV, value),
+            None => std::env::remove_var(crate::config::DATA_DIR_ENV),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        out
+    }
+
+    fn tool_payload(home: &std::path::Path, session: &str, tool: &str, extra: Value) -> Value {
+        let mut payload = json!({
+            "session_id": session,
+            "cwd": home.display().to_string(),
+            "tool_name": tool,
+            "tool_input": {"file_path": "a.rs", "command": "cargo test"},
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            payload[key] = value.clone();
+        }
+        payload
+    }
+
+    fn only_event(store: &Store, session: &str) -> Event {
+        store.session_events(&ids::session_uuid(session).to_string()).unwrap().remove(0)
+    }
+
+    #[test]
+    fn a_failed_file_call_injects_nothing_where_the_same_success_does() {
+        with_store(|home, store| {
+            let run = |event: &str, session: &str| {
+                let payload = tool_payload(home, session, "Read", json!({"error": "no such file"}));
+                capture("claude-code", event, Some(payload.to_string())).unwrap()
+            };
+            // A prior event on the file gives it memory to inject.
+            run("PostToolUse", "seed");
+            let control = run("PostToolUse", "control");
+            assert!(control.contains("Memory for"), "control must inject: {control}");
+            let ack = run("PostToolUseFailure", "failing");
+            assert_eq!(ack, "{}", "a failure must inject nothing");
+            let session = ids::session_uuid("failing").to_string();
+            assert!(!store.file_already_injected(&session, "a.rs").unwrap());
+            assert_eq!(store.session_injected_bytes(&session).unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn every_failure_shape_lands_in_the_body_with_a_failed_title_and_no_files() {
+        let shapes = [
+            json!({"tool_response": "THE_ERROR_TEXT"}),
+            json!({"tool_output": {"error": "THE_ERROR_TEXT"}}),
+            json!({"error": "THE_ERROR_TEXT", "is_interrupt": true}),
+        ];
+        for (n, shape) in shapes.into_iter().enumerate() {
+            with_store(|home, store| {
+                let payload = tool_payload(home, "s", "Edit", shape.clone());
+                capture("claude-code", "PostToolUseFailure", Some(payload.to_string())).unwrap();
+                let event = only_event(store, "s");
+                assert_eq!(event.source.hook, "post_tool_use");
+                assert!(event.title.starts_with("Failed: "), "{n}: {}", event.title);
+                assert!(event.files.is_empty(), "{n}: {:?}", event.files);
+                let body: Value = serde_json::from_str(&event.body).unwrap();
+                assert_eq!(body["failed"], json!(true), "{n}");
+                assert!(event.body.contains("THE_ERROR_TEXT"), "{n}: {}", event.body);
+            });
+        }
+    }
+
+    #[test]
+    fn a_normal_call_never_carries_failure_fields_even_if_the_host_sends_them() {
+        with_store(|home, store| {
+            let extra = json!({
+                "failed": true, "error": "HOST_ERROR", "tool_output": "HOST_OUT",
+                "is_interrupt": true, "tool_response": "fine",
+            });
+            let payload = tool_payload(home, "s", "Bash", extra);
+            capture("claude-code", "PostToolUse", Some(payload.to_string())).unwrap();
+            let event = only_event(store, "s");
+            assert!(!event.title.starts_with("Failed"), "{}", event.title);
+            assert!(!event.files.is_empty());
+            let body: Value = serde_json::from_str(&event.body).unwrap();
+            for key in ["failed", "error", "tool_output", "is_interrupt"] {
+                assert!(body.get(key).is_none(), "{key} kept on a success: {body}");
+            }
+            assert_eq!(body["tool_response"], json!("fine"));
+        });
+    }
+
+    #[test]
+    fn a_failures_error_is_redacted_and_clamped_like_any_result() {
+        with_store(|home, store| {
+            let error = format!("ghp_abcdefghijklmnopqrstuvwxyz0123 {}END", "x".repeat(20_000));
+            let payload = tool_payload(home, "s", "Bash", json!({"error": error}));
+            capture("claude-code", "PostToolUseFailure", Some(payload.to_string())).unwrap();
+            let event = only_event(store, "s");
+            assert!(!event.body.contains("ghp_"), "secret kept: {}", event.body);
+            assert!(event.body.len() < 5_000, "not clamped: {} bytes", event.body.len());
+        });
+    }
+
+    #[test]
+    fn a_failure_echoed_by_cursor_is_dropped_like_its_other_hooks() {
+        assert_eq!(events_after("PostToolUseFailure", Some("1.7.0")), 0);
+        assert_eq!(events_after("PostToolUseFailure", None), 1);
+    }
+
+    #[test]
+    fn cursor_echo_through_claude_code_is_not_captured_twice() {
+        for hook in ["PostToolUse", "UserPromptSubmit", "Stop"] {
+            assert_eq!(events_after(hook, Some("1.7.0")), 0, "{hook} echo must be dropped");
+        }
+        // Not a Cursor payload: claude-code capture is unchanged.
+        assert_eq!(events_after("PostToolUse", None), 1);
+        assert_eq!(events_after("PostToolUse", Some("")), 1);
+        // A delegate's report is not echoed by Cursor's own hooks.
+        assert_eq!(events_after("SubagentStop", Some("1.7.0")), 1);
+    }
+
+    const KNOWN: &str = "Retry backoff jitter is capped at thirty seconds";
+    const TASK: &str = "how does retry backoff jitter get capped";
+
+    fn scope() -> crate::ids::ProjectScope {
+        crate::ids::ProjectScope {
+            workspace: "default".into(),
+            workspace_id: uuid::Uuid::nil(),
+            project: "p".into(),
+            project_id: uuid::Uuid::from_u128(7),
+            root: std::path::PathBuf::from("/repo"),
+        }
+    }
+
+    fn event_of(kind: EventKind, title: &str, hook: &str) -> Event {
+        Event::new(
+            uuid::Uuid::nil(),
+            uuid::Uuid::from_u128(7),
+            uuid::Uuid::nil(),
+            Source { cli: "claude-code".into(), hook: hook.into() },
+            kind,
+            title.into(),
+            String::new(),
+        )
+    }
+
+    /// A store holding one durable knowledge entry; returns it with the entry's id.
+    fn store_with_knowledge() -> (Store, String) {
+        let store = Store::open_memory().unwrap();
+        let mut entry = event_of(EventKind::Knowledge, KNOWN, "consolidate");
+        entry.consolidated = true;
+        store.index(&entry).unwrap();
+        (store, entry.id)
+    }
+
+    fn prompt_hook(store: &Store, config: &Config, prompt: &str) -> String {
+        inject_for_prompt(store, config, &scope(), "s1", "UserPromptSubmit", prompt)
+    }
+
+    fn on() -> Config {
+        let mut config = Config::default();
+        config.injection.prompt_pointers = true;
+        config
+    }
+
+    fn context_of(output: &str) -> String {
+        let value: Value = serde_json::from_str(output).unwrap();
+        value["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or("").to_string()
+    }
+
+    #[test]
+    fn with_the_flag_off_a_prompt_gets_nothing() {
+        let (store, _) = store_with_knowledge();
+        assert_eq!(prompt_hook(&store, &Config::default(), TASK), "{}");
+    }
+
+    #[test]
+    fn an_acknowledgement_or_a_command_is_not_a_task() {
+        // Every gated prompt is one that WOULD match a seeded entry were it
+        // looked up, so the test goes red with the gate removed.
+        let (store, _) = store_with_knowledge();
+        let acks = ["ok", "okay", "thanks", "yes", "no", "continue", "โอเค", "ครับ", "ค่ะ", "ต่อ", "ขอบคุณ", "ได้"];
+        let mut chatter = event_of(EventKind::Knowledge, &acks.join(" "), "consolidate");
+        chatter.consolidated = true;
+        store.index(&chatter).unwrap();
+        let mut gated: Vec<String> = acks.iter().map(|ack| (*ack).to_string()).collect();
+        gated.extend(["  OK \n".into(), "Thanks".into(), String::new(), "   ".into()]);
+        gated.extend(
+            ["/slash", "<task-notification>", "<scheduled-task", "<command-name>"]
+                .iter()
+                .map(|lead| format!("{lead} {TASK}")),
+        );
+        for prompt in &gated {
+            assert_eq!(prompt_hook(&store, &on(), prompt), "{}", "{prompt:?}");
+            if !prompt.trim().is_empty() {
+                // Prove the prompt would have found something past the gate.
+                let found = store.prompt_pointers(&scope().project_id.to_string(), prompt, 3).unwrap();
+                assert!(!found.is_empty(), "{prompt:?} would match nothing, so it proves no gate");
+            }
+        }
+        assert!(!prompt_hook(&store, &on(), TASK).is_empty());
+    }
+
+    #[test]
+    fn a_title_too_long_for_the_push_is_dropped_whole_not_clipped() {
+        let store = Store::open_memory().unwrap();
+        let long = format!("{KNOWN} {}", "padding ".repeat(60));
+        let mut entry = event_of(EventKind::Knowledge, &long, "consolidate");
+        entry.consolidated = true;
+        store.index(&entry).unwrap();
+        assert_eq!(prompt_hook(&store, &on(), TASK), "{}");
+    }
+
+    #[test]
+    fn a_subagents_prompt_gets_no_pointers_even_with_the_flag_on() {
+        with_store(|home, store| {
+            std::fs::write(home.join("config.toml"), "[injection]\nprompt_pointers = true\n").unwrap();
+            let seed = tool_payload(home, "seed", "Read", json!({}));
+            capture("claude-code", "PostToolUse", Some(seed.to_string())).unwrap();
+            let seeded = only_event(store, "seed");
+            let mut entry = Event::new(
+                seeded.workspace,
+                seeded.project,
+                uuid::Uuid::nil(),
+                Source { cli: "claude-code".into(), hook: "consolidate".into() },
+                EventKind::Knowledge,
+                KNOWN.into(),
+                String::new(),
+            );
+            entry.consolidated = true;
+            store.index(&entry).unwrap();
+            let ask = |session: &str, extra: Value| {
+                let mut payload = json!({"session_id": session, "cwd": home.display().to_string(), "prompt": TASK});
+                for (key, value) in extra.as_object().unwrap() {
+                    payload[key] = value.clone();
+                }
+                capture("claude-code", "UserPromptSubmit", Some(payload.to_string())).unwrap()
+            };
+            assert!(ask("lead", json!({})).contains("KNW"), "the lead's own prompt must get a pointer");
+            let inside = json!({"agent_id": "agent-1", "agent_type": "Explore"});
+            assert_eq!(ask("lead2", inside), "{}");
+        });
+    }
+
+    #[test]
+    fn a_task_that_matches_knowledge_gets_a_short_pointer() {
+        let (store, id) = store_with_knowledge();
+        let output = prompt_hook(&store, &on(), TASK);
+        let context = context_of(&output);
+        assert!(context.contains(&id), "no pointer: {output}");
+        assert!(context.contains("KNW"), "{context}");
+        assert!(context.contains("not instructions"), "no fence: {context}");
+        assert!(context.len() <= 330, "{} bytes: {context}", context.len());
+    }
+
+    #[test]
+    fn a_raw_capture_matching_the_prompt_is_never_pushed() {
+        let (store, id) = store_with_knowledge();
+        let raw = event_of(EventKind::Observation, KNOWN, "post_tool_use");
+        store.index(&raw).unwrap();
+        let found = store.prompt_pointers(&uuid::Uuid::from_u128(7).to_string(), TASK, 10).unwrap();
+        assert_eq!(found.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), [id.as_str()]);
+    }
+
+    #[test]
+    fn a_pointer_already_shown_this_session_is_not_repeated() {
+        let (store, id) = store_with_knowledge();
+        assert_ne!(prompt_hook(&store, &on(), TASK), "{}");
+        assert!(store.already_injected("s1", &id).unwrap(), "first push not recorded");
+        assert_eq!(prompt_hook(&store, &on(), TASK), "{}");
+    }
+
+    #[test]
+    fn a_spent_budget_injects_nothing() {
+        let (store, _) = store_with_knowledge();
+        let mut config = on();
+        config.injection.session_budget = 50;
+        // The session has already spent more than the budget now allows:
+        // nothing injects, and the remaining-budget subtraction is never reached.
+        assert!(store.record_injected("s1", &[], 0, 100, 100).unwrap());
+        assert_eq!(prompt_hook(&store, &config, TASK), "{}");
+        assert_eq!(store.session_injected_bytes("s1").unwrap(), 100);
     }
 }

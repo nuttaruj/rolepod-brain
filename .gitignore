@@ -14,3 +14,4 @@ assets/*/tokenizer.json
 # that actually turn reranking on. `bootstrap.sh --reranker-only`.
 assets/*/model.onnx
 assets/*/model.onnx.data
+docs/rolepod/

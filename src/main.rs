@@ -78,6 +78,11 @@ enum Commands {
         /// Ignore the debounce and the minimum-pending rule.
         #[arg(long)]
         force: bool,
+        /// Only sessions quiet for a long while (see `IDLE_SWEEP_AGE_SECS`, two
+        /// hours), in every project. Writes no ask: when another run holds the
+        /// lock it just exits. Used by the stop hook.
+        #[arg(long, conflicts_with_all = ["session", "all", "force"])]
+        idle: bool,
     },
     /// Wire the host CLIs. Prints a plan; use --apply to perform it.
     Setup {
@@ -283,8 +288,16 @@ fn run(command: Commands) -> Result<()> {
     match command {
         Commands::Hook { .. } => unreachable!("handled in main"),
         Commands::Mcp => mcp::serve(),
-        Commands::Consolidate { session, all, force } => {
-            let outcome = consolidate::run(session.as_deref(), all, force)?;
+        Commands::Consolidate { session, all, force, idle } => {
+            let began = jiff::Timestamp::now();
+            let result = if idle {
+                consolidate::run_idle()
+            } else {
+                consolidate::run(session.as_deref(), all, force)
+            };
+            // Every invocation leaves a row, whichever way `run` returned.
+            consolidate::record_run(session.as_deref(), all, idle, began, &result);
+            let outcome = result?;
             if outcome.embedded > 0 {
                 println!("Embedded {} event(s) for semantic search.", outcome.embedded);
             }
@@ -299,18 +312,26 @@ fn run(command: Commands) -> Result<()> {
                     "Another consolidation run is working; this one stood aside. \
                      Nothing is lost - the work stays pending for whichever run holds it."
                 );
-            } else if outcome.sessions == 0 {
+            } else if outcome.sessions == 0 && outcome.failed == 0 {
                 println!(
                     "Nothing to consolidate ({} session(s) waiting for more events or a debounce).",
                     outcome.skipped
                 );
             } else {
-                println!(
-                    "Consolidated {} session(s), {} event(s) via {}.",
-                    outcome.sessions,
-                    outcome.events,
-                    outcome.tiers.join(", ")
-                );
+                if outcome.sessions > 0 {
+                    println!(
+                        "Consolidated {} session(s), {} event(s) via {}.",
+                        outcome.sessions,
+                        outcome.events,
+                        outcome.tiers.join(", ")
+                    );
+                }
+                if outcome.failed > 0 {
+                    println!(
+                        "{} session(s) failed and were left pending (reasons in brain.log).",
+                        outcome.failed
+                    );
+                }
                 if outcome.quiet > 0 {
                     println!(
                         "{} of them quiet: settled without a model call, a page, or a summary.",
@@ -621,7 +642,10 @@ fn search(query: &str, limit: usize, topic: Option<&str>, rerank: Option<bool>, 
     let project = scope.project_id.to_string();
     // A reranker is worth a wider pool to choose from, as over MCP.
     let pool = if rerank { rerank::LOCAL_POOL.max(limit) } else { limit };
-    let (mut hits, trace) = store.search_traced(&project, query, scoped, pool, store::Recall::Fused)?;
+    // Without a reranker the page is final, so it gets the relevance floor;
+    // a pool going to the reranker is left wide for it to judge (and a rerank
+    // that falls back to "none" returns that wide page unfloored).
+    let (mut hits, trace) = store.search_traced(&project, query, scoped, pool, store::Recall::Fused, !rerank)?;
     let mut rerank_line = None;
     if rerank {
         let ladder = summarizer::Ladder::new(&store, &config.summarizer);
@@ -647,6 +671,14 @@ fn search(query: &str, limit: usize, topic: Option<&str>, rerank: Option<bool>, 
         }
         if let Some(line) = &rerank_line {
             println!("{line}");
+        }
+        let mut cut: std::collections::BTreeMap<store::Dropped, usize> = std::collections::BTreeMap::new();
+        for why in trace.fused.values().filter_map(|fused| fused.dropped) {
+            *cut.entry(why).or_default() += 1;
+        }
+        if !cut.is_empty() {
+            let parts: Vec<String> = cut.iter().map(|(why, count)| format!("{count} {why}")).collect();
+            println!("floor: dropped {}", parts.join(", "));
         }
         println!();
     }
@@ -827,8 +859,51 @@ fn stats() -> Result<()> {
         }
     }
 
+    println!("\nConsolidation spend");
+    for (label, secs) in [("24h", store::DAY_SECS), ("7d", 7 * store::DAY_SECS)] {
+        let calls = store.summarizer_calls_since(secs).unwrap_or_default();
+        println!("  {label:<4} {}", spend_line(&calls));
+    }
+
     println!("\nNothing above leaves this machine.");
     Ok(())
+}
+
+/// Nearest-rank percentile of an ascending, non-empty slice: the smallest
+/// value with at least `p`% of the sample at or below it, so p95 of four
+/// numbers is the largest and one slow outlier is never hidden.
+fn percentile(sorted: &[u64], p: usize) -> u64 {
+    sorted[(sorted.len() * p).div_ceil(100).max(1) - 1]
+}
+
+/// One window of the "Consolidation spend" block: calls per session, how long
+/// a call took, and how the calls ended.
+fn spend_line(calls: &[store::SummarizerCall]) -> String {
+    if calls.is_empty() {
+        return "no model call".to_string();
+    }
+    let mut per_session: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+    for call in calls {
+        *per_session.entry(call.session.as_str()).or_default() += 1;
+    }
+    let mut per_session: Vec<u64> = per_session.into_values().collect();
+    per_session.sort_unstable();
+    let mut ms: Vec<u64> = calls.iter().map(|call| call.ms).collect();
+    ms.sort_unstable();
+    let share = |outcome: &str| {
+        let n = calls.iter().filter(|call| call.outcome == outcome).count();
+        format!("{outcome} {}%", n * 100 / calls.len())
+    };
+    format!(
+        "{} call(s) over {} session(s): {}/session p50, {} p95; {} ms p50, {} p95; {}",
+        calls.len(),
+        per_session.len(),
+        percentile(&per_session, 50),
+        percentile(&per_session, 95),
+        percentile(&ms, 50),
+        percentile(&ms, 95),
+        ["ok", "unusable", "unparseable", "timeout", "spawn_error"].map(share).join(", ")
+    )
 }
 
 /// The rerank section of `brain stats`: per engine, how often it answered
@@ -840,9 +915,6 @@ fn stats() -> Result<()> {
 fn rerank_lines(runs: &[store::RerankRun]) -> Vec<String> {
     fn seconds(ms: u64) -> String {
         format!("{:.1}s", ms as f64 / 1000.0)
-    }
-    fn percentile(sorted: &[u64], p: usize) -> u64 {
-        sorted[(sorted.len() - 1) * p / 100]
     }
     let mut lines = Vec::new();
     for engine in ["local", "cli", "none"] {
@@ -918,6 +990,29 @@ mod tests {
         store::RerankRun { engine: engine.into(), reason: reason.into(), ms, cold }
     }
 
+    #[test]
+    fn the_spend_line_reads_calls_per_session_latency_and_outcomes() {
+        let call = |session: &str, ms: u64, outcome: &str| store::SummarizerCall {
+            session: session.into(),
+            purpose: "consolidate".into(),
+            cli: "codex".into(),
+            model: "m".into(),
+            prompt_bytes: 1,
+            answer_bytes: 1,
+            ms,
+            outcome: outcome.into(),
+        };
+        assert_eq!(spend_line(&[]), "no model call");
+        let calls = [call("a", 100, "ok"), call("a", 300, "unusable"), call("b", 200, "ok"), call("b", 400, "timeout")];
+        assert_eq!(
+            spend_line(&calls),
+            "4 call(s) over 2 session(s): 2/session p50, 2 p95; 200 ms p50, 400 p95; \
+             ok 50%, unusable 25%, unparseable 0%, timeout 25%, spawn_error 0%"
+        );
+        let calls = [call("a", 100, "ok"), call("a", 300, "unparseable")];
+        assert!(spend_line(&calls).ends_with("ok 50%, unusable 0%, unparseable 50%, timeout 0%, spawn_error 0%"));
+    }
+
     /// One line per hit: every stream, its rank or a dash, the cosine where
     /// a stream has one, then the fusion as arithmetic a reader can redo.
     #[test]
@@ -935,7 +1030,7 @@ mod tests {
             ],
             fused: [(
                 "a".to_string(),
-                store::Fused { raw: 0.0328, length: 812, discount: 1.84, score: 0.0178, demoted: true },
+                store::Fused { raw: 0.0328, length: 812, discount: 1.84, score: 0.0178, demoted: true, dropped: None },
             )]
             .into(),
         };

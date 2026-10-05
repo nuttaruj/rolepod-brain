@@ -13,6 +13,12 @@ use regex::Regex;
 /// Ceiling for a stored event body, after redaction.
 pub const BODY_MAX_BYTES: usize = 16 * 1024;
 
+/// Cap on one string leaf of a tool call's response (or written content).
+pub const LEAF_MAX_BYTES: usize = 2 * 1024;
+/// Caps for a subagent's footstep: each leaf, and the body as a whole.
+pub const FOOTSTEP_LEAF_MAX_BYTES: usize = 512;
+pub const FOOTSTEP_BODY_MAX_BYTES: usize = 1024;
+
 /// Credential shapes we redact, most specific first.
 ///
 /// The strings are public facts - each vendor documents the format of its own
@@ -252,6 +258,21 @@ const PRIVATE_CLOSE: &str = "</private>";
 ///   the caller, but the marker still holds at the write boundary.
 #[must_use]
 pub fn strip_private(input: &str) -> String {
+    strip_private_state(input).0
+}
+
+/// Whether `input` ends inside a `<private>` region that never closes.
+///
+/// A caller that scrubs a body piece by piece has to carry this across the
+/// pieces: the rule is "nothing after the opener is safe", and each piece on
+/// its own only knows its own end.
+#[must_use]
+pub fn leaves_private_open(input: &str) -> bool {
+    strip_private_state(input).1
+}
+
+/// [`strip_private`] and whether it hit an unbalanced opener.
+fn strip_private_state(input: &str) -> (String, bool) {
     let mut out = String::with_capacity(input.len());
     let mut cursor = 0usize;
 
@@ -284,13 +305,13 @@ pub fn strip_private(input: &str) -> String {
                     }
                 }
                 // Unbalanced: nothing after this point is safe to keep.
-                None => return out,
+                None => return (out, true),
             }
         }
         cursor = scan;
     }
     out.push_str(&input[cursor..]);
-    out
+    (out, false)
 }
 
 /// Find the next `<private>` or `</private>`, whatever its case.
@@ -395,6 +416,22 @@ pub fn truncate_head_tail(input: &str, max: usize) -> String {
     out.push_str(&format!("\n...[truncated {omitted} bytes]...\n"));
     out.push_str(&input[tail_start..]);
     out
+}
+
+/// Shrink one string leaf: a long base64 run becomes `[base64 <n> bytes]`,
+/// then the rest is clamped head+tail to `max` bytes.
+///
+/// Does not scrub. The caller scrubs the leaf first, so the cut never lands
+/// inside a secret; calling this again on an already-scrubbed body is safe.
+#[must_use]
+pub fn clamp_leaf(input: &str, max: usize) -> String {
+    static BASE64: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let base64 = BASE64
+        .get_or_init(|| Regex::new(r"[A-Za-z0-9+/]{4096,}={0,2}").expect("base64 shape compiles"));
+    let shrunk = base64.replace_all(input, |caps: &regex::Captures<'_>| {
+        format!("[base64 {} bytes]", caps[0].len())
+    });
+    truncate_head_tail(&shrunk, max)
 }
 
 #[cfg(test)]
@@ -587,6 +624,15 @@ mod tests {
         let out = s.scrub_body(&body);
         assert!(out.len() <= BODY_MAX_BYTES);
         assert!(!out.contains(secret));
+    }
+
+    #[test]
+    fn a_leaf_loses_its_base64_and_keeps_both_ends() {
+        let text = format!("head {} tail-marker", "QUJD".repeat(1100));
+        assert_eq!(clamp_leaf(&text, 2048), "head [base64 4400 bytes] tail-marker");
+        let long = format!("{}end-marker", "x ".repeat(5000));
+        let out = clamp_leaf(&long, 2048);
+        assert!(out.len() <= 2048 && out.ends_with("end-marker"));
     }
 
     #[test]
