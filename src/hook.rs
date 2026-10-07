@@ -224,29 +224,24 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
 
     // Classified once per session and remembered: working it out costs a
     // process spawn, and the hook budget does not allow one per event.
-    let store = Store::open(&paths.db())?;
+    //
+    // A read-only peek, not `Store::open`: nothing about the store may stand
+    // before the log append below, and an open migrates, which waits out the
+    // busy timeout when a write lock is held (an index build, the first
+    // migration after an upgrade) - longer than the host lets a hook run. A
+    // store that cannot be read falls back to classifying again.
     let session_key = session.to_string();
-    let invocation = match store.session_invocation(&session_key)? {
-        Some(cached) => invocation::parse(&cached),
-        None => {
-            let classified = invocation::classify();
-            store.record_session_invocation(&session_key, classified.as_str())?;
-            classified
-        }
-    };
+    let remembered = Store::peek_session_invocation(&paths.db(), &session_key);
+    let known = remembered.is_some();
+    let invocation = remembered.map_or_else(invocation::classify, |cached| invocation::parse(&cached));
 
     // A pointer to material consolidation will read and never copy. Claude
     // Code and Codex put it in every payload; Cursor's is accepted when its
     // payload carries one (consolidation finds it by session id otherwise).
     // Not from a delegate: the lead's own hooks record the same path, and
     // the write is last-writer-wins, so a delegate's must never be the last.
-    if let Some(path) = first_string(&payload, &["transcript_path", "transcriptPath"])
-        .filter(|_| delegate.is_none())
-    {
-        if is_transcript_of(cli_kind.as_str(), path) {
-            let _ = store.record_transcript_path(&session_key, path);
-        }
-    }
+    let transcript = first_string(&payload, &["transcript_path", "transcriptPath"])
+        .filter(|path| delegate.is_none() && is_transcript_of(cli_kind.as_str(), path));
 
     let mut event = Event::new(
         scope.workspace_id,
@@ -288,14 +283,36 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
     // only for `Read`, and only so that what we know about a file lands before
     // its contents do; capturing it as well would restore the 96% duplication
     // against `post_tool_use` that took it off the capture list to begin with.
-    if captures(&hook) {
+    let captured = captures(&hook);
+    if captured {
         let project_dir = paths.project_dir(&scope);
         let log = EventLog::open(&project_dir)?;
-        // Log first: it is the source of truth. If indexing then fails, the
-        // event is still durable and `brain reindex` recovers the index.
+        // Log first: it is the source of truth, and nothing about the store
+        // may come before it. If a store write then fails, the event is still
+        // durable: the next consolidation run indexes it from the log, and
+        // `brain reindex` rebuilds the lot.
         log.append(&event)?;
+    }
 
-        store.index(&event)?;
+    // Only now the store, whose open may wait out the busy timeout. Each
+    // failure is reported the way an index failure always was - the caller
+    // logs it and the host still gets its acknowledgement - and none can undo
+    // the append above. The writes are independent, so one failing does not
+    // stop the others; the first error is the one returned.
+    let store = Store::open(&paths.db())?;
+    let mut failed = None;
+    if !known {
+        failed = store.record_session_invocation(&session_key, invocation.as_str()).err();
+    }
+    if let Some(path) = transcript {
+        let _ = store.record_transcript_path(&session_key, path);
+    }
+    if captured {
+        let indexed = store.index_captured(&event);
+        failed = failed.or(indexed.err());
+    }
+    if let Some(err) = failed {
+        return Err(err);
     }
 
     if delegate.is_some() {

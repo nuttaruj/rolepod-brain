@@ -412,9 +412,143 @@ struct Round {
     idle: bool,
 }
 
+/// Most log bytes one run reads while catching the index up. A first catch-up
+/// over a machine's logs (1.2 GB on one) spans several runs; each continues
+/// from its watermark.
+const CATCH_UP_BYTES: u64 = 256 << 20;
+/// How many bytes of the last line read are kept as a watermark's fingerprint.
+/// The head of a line is its id and timestamp, which no other line shares; the
+/// tail is not (`"tier":"rule-based"}` ends many lines alike).
+const PRINT_BYTES: u64 = 64;
+
+/// What one catch-up read and indexed.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CatchUp {
+    read: u64,
+    indexed: usize,
+}
+
+/// The hex of the first bytes of the line that starts at `from` and ends at
+/// `end`, and how many bytes that read.
+fn print_of(file: &mut std::fs::File, from: u64, end: u64) -> std::io::Result<(String, u64)> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    file.seek(SeekFrom::Start(from))?;
+    let mut bytes = Vec::new();
+    file.take((end - from).min(PRINT_BYTES)).read_to_end(&mut bytes)?;
+    let mut hex = String::new();
+    for byte in &bytes {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Ok((hex, bytes.len() as u64))
+}
+
+/// Index the events one log file holds and the index lacks, reading only what
+/// was appended since the last catch-up.
+///
+/// A hook appends to the log first and indexes second, so an index write that
+/// failed (a busy timeout behind a long write) leaves an event only the log
+/// has, and nothing but a full `reindex` would ever bring it in. The
+/// watermark is `<end>:<last line start>:<fingerprint>`: where the last whole
+/// line read ended, where it began, and its first bytes. It is trusted only
+/// while that line is still there; a shorter file, or other bytes at that
+/// place (a log rewritten or merged by sync), means this one file is read
+/// again from the start. Rereading is safe, because only ids the store lacks
+/// are indexed.
+///
+/// The read stops at the length seen when it began, so a concurrent append is
+/// left for the next run, and at a line without its newline, which an append
+/// still in flight (or a crash) leaves. The watermark is written after the
+/// events are indexed, so a crash in between repeats the work and loses none.
+fn catch_up_log(store: &Store, path: &Path, budget: u64) -> Result<CatchUp> {
+    use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
+    let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let len = file.metadata()?.len();
+    let key = format!("log_tail:{}", path.display());
+    let stored = store.log_watermark(&key)?;
+    let mut done = CatchUp::default();
+
+    let (mut start, mut last) = (0, 0);
+    let mut parts = stored.as_deref().unwrap_or_default().splitn(3, ':');
+    if let (Some(Ok(end)), Some(Ok(from)), Some(print)) = (
+        parts.next().map(str::parse::<u64>),
+        parts.next().map(str::parse::<u64>),
+        parts.next(),
+    ) {
+        if from <= end && end <= len {
+            let (now, read) = print_of(&mut file, from, end)?;
+            done.read += read;
+            if now == print {
+                (start, last) = (end, from);
+            }
+        }
+    }
+    if start == len {
+        return Ok(done);
+    }
+
+    file.seek(SeekFrom::Start(start))?;
+    let mut reader = BufReader::new(file.try_clone()?.take(len - start));
+    let mut line = Vec::new();
+    let mut consumed = 0u64;
+    while consumed < budget {
+        line.clear();
+        let n = reader.read_until(b'\n', &mut line)?;
+        if n == 0 || line.last() != Some(&b'\n') {
+            break;
+        }
+        last = start + consumed;
+        consumed += n as u64;
+        // A malformed or blank line is not an event, as in `read_all`.
+        let Ok(event) = serde_json::from_slice::<Event>(&line) else { continue };
+        if !store.has_event(&event.id)? {
+            store.index(&event)?;
+            done.indexed += 1;
+        }
+    }
+    done.read += consumed;
+
+    let end = start + consumed;
+    let (print, read) = print_of(&mut file, last, end)?;
+    done.read += read;
+    store.set_log_watermark(&key, &format!("{end}:{last}:{print}"))?;
+    Ok(done)
+}
+
+/// Catch the index up on the logs of these project directories, within one
+/// run's byte budget; what is left waits for the next run. Best effort per
+/// file: one unreadable log must not hide the others. The lock is touched
+/// between files and the round's deadline ends the pass; the watermark makes
+/// stopping at either safe.
+fn catch_up_index(
+    store: &Store,
+    project_dirs: &[PathBuf],
+    run_lock: Option<&RunLock>,
+    deadline: Option<std::time::Instant>,
+) -> CatchUp {
+    let mut total = CatchUp::default();
+    for dir in project_dirs {
+        let Ok(log) = EventLog::open(dir) else { continue };
+        let Ok(files) = log.files() else { continue };
+        for path in files {
+            let budget = CATCH_UP_BYTES.saturating_sub(total.read);
+            if budget == 0 || deadline.is_some_and(|at| std::time::Instant::now() >= at) {
+                return total;
+            }
+            if let Some(lock) = run_lock {
+                lock.touch();
+            }
+            if let Ok(done) = catch_up_log(store, &path, budget) {
+                total.read += done.read;
+                total.indexed += done.indexed;
+            }
+        }
+    }
+    total
+}
+
 /// Whether an ask is already served: one non-force session whose events are
-/// all consolidated. Its run would list the projects and repeat the
-/// per-project pass only to find that session settled. A force ask is work,
+/// all consolidated. Its run would repeat the per-project pass only to find
+/// that session settled. A force ask is work,
 /// since it reopens a settled session, and an `--all` ask names no session.
 fn nothing_to_serve(store: &Store, request: &ConsolidationRequest) -> Result<bool> {
     match request.session.as_deref() {
@@ -433,13 +567,6 @@ fn execute(
     Round { deadline, began, idle }: Round,
     outcome: &mut Outcome,
 ) -> Result<bool> {
-    // One indexed read, before the project list and the per-project pass. It
-    // also skips the embed, hand-edit and fold upkeep and the daily pack: the
-    // next ask with work does them. Here, not only in `heal_store`, because
-    // an ask written mid-drain reaches a holder that has already healed.
-    if nothing_to_serve(store, request)? {
-        return Ok(true);
-    }
     let session = request.session.as_deref();
     let force = request.force;
 
@@ -455,6 +582,24 @@ fn execute(
         let dir = paths.project_dir(&scope);
         vec![(named_by_dir(scope, &dir), dir)]
     };
+    let dirs: Vec<PathBuf> = projects.iter().map(|(_, dir)| dir.clone()).collect();
+    // The primer's indexes, once. They hold the write lock for seconds on a
+    // large store, so a hook may have failed to index meanwhile: the catch-up
+    // right after brings that in. Best effort; a failed build is retried by
+    // the next run, and the reads it serves are correct without it.
+    if let Ok(true) = store.build_primer_indexes() {
+        run_lock.touch();
+    }
+    // First, so what a failed index write left out of the store is counted as
+    // pending by the read below and by the pass.
+    catch_up_index(store, &dirs, Some(run_lock), deadline);
+    // One indexed read, before the per-project pass. It also skips the embed,
+    // hand-edit and fold upkeep and the daily pack: the next ask with work
+    // does them. Here, not only in `heal_store`, because an ask written
+    // mid-drain reaches a holder that has already healed.
+    if nothing_to_serve(store, request)? {
+        return Ok(true);
+    }
 
     // Semantic vectors, before anything else this run does. Consolidation is
     // where they belong: the model costs ~83ms to construct and this process is
@@ -4890,6 +5035,76 @@ mod tests {
         event.id = format!("01TEST{id_hint:0>20}");
         event.files = vec!["src/auth.rs".to_string()];
         event
+    }
+
+    /// The watermark makes the catch-up O(new bytes): an unchanged log costs
+    /// its fingerprint and nothing else, an append costs the append, and a
+    /// log that was shortened or rewritten is read again from the start.
+    #[test]
+    fn the_log_catch_up_reads_only_what_was_appended() {
+        let (_, dir) = scratch();
+        let store = Store::open_memory().unwrap();
+        let log = EventLog::open(&dir).unwrap();
+        let path = log.file_for(&event("1", "post_tool_use", "a", "").month());
+        let write = |ids: &[&str]| {
+            let _ = std::fs::remove_file(&path);
+            for id in ids {
+                log.append(&event(id, "post_tool_use", &format!("Edit: {id}.rs"), "")).unwrap();
+            }
+        };
+        write(&["1", "2", "3"]);
+        let size = std::fs::metadata(&path).unwrap().len();
+
+        let first = catch_up_log(&store, &path, u64::MAX).unwrap();
+        assert_eq!(first.indexed, 3);
+        assert!(first.read >= size && first.read <= size + 2 * PRINT_BYTES, "read {} of {size}", first.read);
+
+        let again = catch_up_log(&store, &path, u64::MAX).unwrap();
+        assert_eq!(again, CatchUp { read: PRINT_BYTES, indexed: 0 }, "an unchanged log was reread");
+
+        log.append(&event("4", "post_tool_use", "Edit: 4.rs", "")).unwrap();
+        let appended = std::fs::metadata(&path).unwrap().len() - size;
+        let next = catch_up_log(&store, &path, u64::MAX).unwrap();
+        assert_eq!(next.indexed, 1);
+        assert!(next.read <= appended + 2 * PRINT_BYTES, "read {} for {appended} new bytes", next.read);
+
+        // A partial last line (an append in flight) is left for later.
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut file, b"{\"id\":\"01TEST").unwrap();
+        assert_eq!(catch_up_log(&store, &path, u64::MAX).unwrap().indexed, 0);
+
+        // Rewritten at the same length with other events: read again.
+        std::fs::remove_file(&path).unwrap();
+        write(&["5", "6", "7", "8"]);
+        let rewritten = catch_up_log(&store, &path, u64::MAX).unwrap();
+        assert_eq!(rewritten.indexed, 4, "a rewritten log was trusted at its old offset");
+
+        // Shortened: read again from the start, and nothing is added twice.
+        write(&["5"]);
+        let shorter = catch_up_log(&store, &path, u64::MAX).unwrap();
+        assert_eq!(shorter.indexed, 0);
+        assert!(shorter.read > 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A byte budget stops a run part-way; the next run continues from the
+    /// watermark and misses nothing.
+    #[test]
+    fn the_log_catch_up_continues_where_a_capped_run_stopped() {
+        let (_, dir) = scratch();
+        let store = Store::open_memory().unwrap();
+        let log = EventLog::open(&dir).unwrap();
+        let path = log.file_for(&event("1", "post_tool_use", "a", "").month());
+        for id in ["1", "2", "3", "4"] {
+            log.append(&event(id, "post_tool_use", &format!("Edit: {id}.rs"), "")).unwrap();
+        }
+        // A one-byte budget is spent by the first whole line.
+        let first = catch_up_log(&store, &path, 1).unwrap();
+        assert_eq!(first.indexed, 1, "the cap is checked between lines");
+        let rest = catch_up_log(&store, &path, u64::MAX).unwrap();
+        assert_eq!(rest.indexed, 3);
+        assert_eq!(catch_up_index(&store, std::slice::from_ref(&dir), None, None).indexed, 0);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -150,6 +150,117 @@ const RELAXED_STOP_WORDS: [&str; 34] = [
 /// Wall clock a prompt-time lookup may take before it is interrupted.
 const PROMPT_POINTER_DEADLINE: std::time::Duration = std::time::Duration::from_millis(150);
 
+/// Wall clock `related` may take before it is interrupted. It answers an
+/// agent that is waiting, and the old join shape ran over 100 s on the
+/// 115k-event project; the session-grouped shape does far less work, so this
+/// caps a bad plan rather than a normal run.
+const RELATED_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Shared names are counted once per session, before events are touched:
+/// entities are recorded per session, so every event in it shares the same
+/// set, and a per-event join multiplies a session's events by its names
+/// (see `neighbours_of`). Unlike there, the seed's own session stays in - it
+/// is a neighbour here - and only the seed event itself is left out.
+///
+/// Like `neighbours_sql`, the events are ranked from the columns
+/// `events_recall` holds and their rows are read by id once they are down to
+/// the limit: fetching every event of the 45 sharing sessions took 3.4 s cold
+/// on the 115k-event project, counting them in the index 0.12 s. The seed is
+/// looked up by primary key, with `project` only a check.
+const RELATED_SQL: &str = "WITH seed_sessions AS (
+             SELECT DISTINCT session FROM events
+             WHERE id = ?1 AND +project = ?2
+         ),
+         subject AS (
+             SELECT DISTINCT n.name FROM entities n
+             WHERE n.session IN (SELECT session FROM seed_sessions)
+                   AND n.project = ?2
+         ),
+         shared AS (
+             SELECT n.session, COUNT(DISTINCT n.name) AS shared
+             FROM entities n
+             WHERE n.project = ?2 AND n.name IN (SELECT name FROM subject)
+             GROUP BY n.session
+         )
+         SELECT h.id, h.ts, h.cli, h.kind, h.title,
+                substr(COALESCE(h.body, ''), 1, 160), h.session,
+                c.shared
+         FROM (SELECT e.id, s.shared,
+                      CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END AS demoted,
+                      CASE e.kind
+                          WHEN 'knowledge' THEN 0
+                          WHEN 'session_summary' THEN 1
+                          WHEN 'source' THEN 1
+                          ELSE 2
+                      END AS authority
+               FROM events e
+               JOIN shared s ON s.session = e.session
+               WHERE e.project = ?2 AND e.id != ?1
+                     AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
+                     AND e.hook NOT IN ('correct', 'feedback', 'supersede')
+               ORDER BY s.shared DESC, demoted, authority, e.id DESC
+               LIMIT ?3) c
+         JOIN events h ON h.id = c.id
+         ORDER BY c.shared DESC, c.demoted, c.authority, c.id DESC";
+
+/// The statement behind [`Store::nearest`], with the same recall floor every
+/// other read enforces. A memory withdrawn from search has to be withdrawn
+/// from this one too, or the withdrawal was cosmetic.
+const NEAREST_SQL: &str = "SELECT v.event_id, v.vec, e.confidence
+         FROM event_vec v
+         JOIN events e ON e.id = v.event_id
+         WHERE e.project = ?1 AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
+               AND e.hook NOT IN ('correct', 'feedback', 'supersede')
+               AND (?2 IS NULL OR e.topic = ?2)";
+
+/// The keyword stream of [`Store::search_traced`].
+///
+/// Two stages, because relevance alone lets one session own the page. The
+/// window takes each session's best few first, so the pool handed to
+/// `spread_across_sessions` contains the quiet sessions at all - reading a
+/// flat top-N never reaches them when one session holds most of the project.
+///
+/// The demotion is inside the window too: an entry a human called stale must
+/// not be the hit that represents its session. Flagging has to change what
+/// the user SEES, or it is a counter nobody can observe.
+///
+/// The window ranks by rowid, and title, snippet and the rest are read only
+/// for the rows that make the pool. `snippet()` opens each match's body, and a
+/// query whose terms are common matches thousands of rows: 4,450 of them took
+/// 1.5 s cold on the 115k-event project. `pos` carries the pool's own order to
+/// the final read, numbered by an explicit `ORDER BY` so it does not lean on
+/// the order a subquery happens to emit.
+const KEYWORD_SQL: &str = "WITH matched AS (
+         SELECT e.rowid AS rid, e.session,
+                CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END AS demoted,
+                rank AS relevance
+         FROM events_fts
+         JOIN events e ON e.rowid = events_fts.rowid
+         WHERE events_fts MATCH ?1 AND e.project = ?2 AND e.forgotten = 0
+               AND e.kind NOT IN ('tombstone', 'retire')
+               AND e.hook NOT IN ('correct', 'feedback', 'supersede')
+               AND (?5 IS NULL OR e.topic = ?5)
+     ),
+     pool AS (
+         SELECT rid, ROW_NUMBER() OVER (ORDER BY demoted, relevance) AS pos FROM (
+             SELECT rid, demoted, relevance FROM (
+                 SELECT *, ROW_NUMBER() OVER (
+                     PARTITION BY session ORDER BY demoted, relevance
+                 ) AS per_session FROM matched
+             )
+             WHERE per_session <= ?3
+             ORDER BY demoted, relevance
+             LIMIT ?4
+         )
+     )
+     SELECT e.id, e.ts, e.cli, e.kind, e.title,
+            snippet(events_fts, 1, '[', ']', ' … ', 24), e.session
+     FROM events_fts
+     JOIN events e ON e.rowid = events_fts.rowid
+     JOIN pool ON pool.rid = events_fts.rowid
+     WHERE events_fts MATCH ?1
+     ORDER BY pool.pos";
+
 /// How much of a prompt becomes the query.
 const PROMPT_QUERY_CHARS: usize = 400;
 
@@ -605,6 +716,16 @@ impl Store {
         Ok(store)
     }
 
+    /// Run raw SQL on the index, so a test can take a table away and prove
+    /// that a code path never reaches it.
+    ///
+    /// # Errors
+    /// Returns an error when the statement fails.
+    #[cfg(test)]
+    pub fn execute_batch_for_test(&self, sql: &str) -> Result<()> {
+        self.conn.execute_batch(sql).context("test sql")
+    }
+
     fn migrate(&self) -> Result<()> {
         self.conn
             .execute_batch(
@@ -648,6 +769,13 @@ impl Store {
                 );
 
                 CREATE INDEX IF NOT EXISTS events_project_ts ON events(project, ts);
+                -- None by kind here: a store gets `events_session_id`,
+                -- `events_kind_proj` and `events_recall` from
+                -- `build_primer_indexes`, in a consolidate run. Creating them
+                -- here would build them in whichever hook opens an existing
+                -- store first. `events_session` stays beside them: an older
+                -- binary's open recreates it, cold, under the write lock, when
+                -- it is missing.
                 CREATE INDEX IF NOT EXISTS events_session ON events(session);
                 CREATE INDEX IF NOT EXISTS events_unconsolidated
                     ON events(project, consolidated);
@@ -669,12 +797,8 @@ impl Store {
                     INSERT INTO events_fts(events_fts, rowid, title, body)
                     VALUES ('delete', old.rowid, old.title, old.body);
                 END;
-                CREATE TRIGGER IF NOT EXISTS events_au AFTER UPDATE ON events BEGIN
-                    INSERT INTO events_fts(events_fts, rowid, title, body)
-                    VALUES ('delete', old.rowid, old.title, old.body);
-                    INSERT INTO events_fts(rowid, title, body)
-                    VALUES (new.rowid, new.title, new.body);
-                END;
+                -- The update triggers (`events_au`, `events_tri_au`) are made
+                -- by `scope_fts_triggers`, once the schema is in place.
 
                 -- The same titles again, indexed by three-character run
                 -- instead of by word.
@@ -714,11 +838,6 @@ impl Store {
                 CREATE TRIGGER IF NOT EXISTS events_tri_ad AFTER DELETE ON events BEGIN
                     INSERT INTO events_tri(events_tri, rowid, title)
                     VALUES ('delete', old.rowid, old.title);
-                END;
-                CREATE TRIGGER IF NOT EXISTS events_tri_au AFTER UPDATE ON events BEGIN
-                    INSERT INTO events_tri(events_tri, rowid, title)
-                    VALUES ('delete', old.rowid, old.title);
-                    INSERT INTO events_tri(rowid, title) VALUES (new.rowid, new.title);
                 END;
 
                 -- Which file each event touched. Feeds file-keyed injection.
@@ -816,6 +935,11 @@ impl Store {
                     opened   INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (session, event_id)
                 );
+                -- Both are keyed session-first, so the replay's count by
+                -- event id scanned the table once per event. Side tables of
+                -- tens of thousands of rows: the build is a few hundred ms cold, once.
+                CREATE INDEX IF NOT EXISTS injected_by_event ON injected(event_id);
+                CREATE INDEX IF NOT EXISTS recalled_by_event ON recalled(event_id);
 
                 CREATE TABLE IF NOT EXISTS injected_files (
                     session TEXT NOT NULL,
@@ -912,8 +1036,58 @@ impl Store {
             )
             .context("apply schema")?;
         self.add_missing_columns()?;
+        self.scope_fts_triggers()?;
         self.backfill_trigram()?;
         self.reconcile_embedding_model()
+    }
+
+    /// Make the two update triggers fire only when the text they index changes.
+    ///
+    /// Unscoped, they ran on every `UPDATE`, so flipping `consolidated`,
+    /// `injected_count` or `read_count` deleted and re-inserted the row in
+    /// both indexes: 1.6 ms a row, for text that had not changed.
+    ///
+    /// Any future column fed to an index must join its `OF` list, or an edit
+    /// to it leaves the index answering from the old text.
+    ///
+    /// Triggers are DDL and take milliseconds, so this runs at open. The
+    /// marker keeps an existing store from being dropped and recreated on
+    /// every open; a fresh store has nothing to drop and gets the scoped ones
+    /// directly.
+    fn scope_fts_triggers(&self) -> Result<()> {
+        let done: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_state WHERE key = 'fts_triggers_scoped')",
+                [],
+                |row| row.get(0),
+            )
+            .context("check the trigger scope")?;
+        if done {
+            return Ok(());
+        }
+        self.conn
+            .execute_batch(
+                "BEGIN;
+                 DROP TRIGGER IF EXISTS events_au;
+                 DROP TRIGGER IF EXISTS events_tri_au;
+                 CREATE TRIGGER events_au AFTER UPDATE OF title, body ON events BEGIN
+                     INSERT INTO events_fts(events_fts, rowid, title, body)
+                     VALUES ('delete', old.rowid, old.title, old.body);
+                     INSERT INTO events_fts(rowid, title, body)
+                     VALUES (new.rowid, new.title, new.body);
+                 END;
+                 CREATE TRIGGER events_tri_au AFTER UPDATE OF title ON events BEGIN
+                     INSERT INTO events_tri(events_tri, rowid, title)
+                     VALUES ('delete', old.rowid, old.title);
+                     INSERT INTO events_tri(rowid, title) VALUES (new.rowid, new.title);
+                 END;
+                 INSERT OR REPLACE INTO schema_state (key, value)
+                 VALUES ('fts_triggers_scoped', '1');
+                 COMMIT;",
+            )
+            .context("scope the text index triggers")?;
+        Ok(())
     }
 
     /// Drop, one bounded batch, the vectors of events that are no longer
@@ -1147,6 +1321,23 @@ impl Store {
     /// # Errors
     /// Returns an error when the insert fails.
     pub fn index(&self, event: &Event) -> Result<()> {
+        self.index_event(event, true)
+    }
+
+    /// Index an event a hook has just minted.
+    ///
+    /// The same as `index`, minus the two count lookups a replay needs: a
+    /// fresh id has no `recalled` or `injected` row to restore from, and the
+    /// lookups were 76% of a hook's SQL. Anything that can see an id twice -
+    /// a reindex, a catch-up, a team merge - calls `index`.
+    ///
+    /// # Errors
+    /// Returns an error when the insert fails.
+    pub fn index_captured(&self, event: &Event) -> Result<()> {
+        self.index_event(event, false)
+    }
+
+    fn index_event(&self, event: &Event, restore_counts: bool) -> Result<()> {
         let subject = self.subject_files_for(event)?;
         let files = serde_json::to_string(&subject).unwrap_or_else(|_| "[]".to_string());
         // A prompt that ORDERS remembering starts one rung up. Derived from
@@ -1288,6 +1479,11 @@ impl Store {
             _ => {}
         }
 
+        // A hook-minted id has no recalled or injected rows to restore.
+        if restore_counts {
+            self.restore_counts(&event.id)?;
+        }
+
         // Consolidation progress has to survive a rebuild, and it very nearly
         // did not: `mark_consolidated` writes only to this table, so a
         // `reindex` replayed the log, found every observation flagged unread,
@@ -1299,51 +1495,6 @@ impl Store {
         // already here when it arrives. Deriving the flag from the summary
         // rather than storing it separately is what makes the index disposable
         // in fact and not only in the README.
-        // What an agent went back and read outlives the index that recorded
-        // it. `recalled` is deliberately spared by `clear()` - the comment
-        // there says so - but `read_count` sits on the row, which a replay
-        // deletes and re-inserts at its default. So every rebuild quietly
-        // flattened the one signal `rank()` has that is evidence rather than
-        // heuristic, and nothing said a word: measured after two rebuilds in
-        // one day, 0 of 28,854 events had a read to their name while
-        // `recalled` still held 529 rows.
-        //
-        // Counted per session, matching how it is incremented: re-reading an
-        // entry in one conversation says nothing extra about its worth.
-        if let Ok(reads) = self.conn.query_row(
-            "SELECT COUNT(*) FROM recalled WHERE event_id = ?1",
-            params![event.id],
-            |row| row.get::<_, i64>(0),
-        ) {
-            if reads > 0 {
-                self.conn
-                    .execute(
-                        "UPDATE events SET read_count = ?2 WHERE id = ?1",
-                        params![event.id, reads],
-                    )
-                    .context("restore read count")?;
-            }
-        }
-
-        // Same disease, other counter: how often a pointer was offered lives
-        // on the row too, and a replay resets it while `injected` (also
-        // spared by `clear()`) keeps the truth. Without this, every rebuild
-        // hands each stale pointer a fresh five-session decay budget.
-        if let Ok(times) = self.conn.query_row(
-            "SELECT COUNT(*) FROM injected WHERE event_id = ?1",
-            params![event.id],
-            |row| row.get::<_, i64>(0),
-        ) {
-            if times > 0 {
-                self.conn
-                    .execute(
-                        "UPDATE events SET injected_count = ?2 WHERE id = ?1",
-                        params![event.id, times],
-                    )
-                    .context("restore injected count")?;
-            }
-        }
-
         if event.kind == EventKind::SessionSummary && !event.links.is_empty() {
             // Only a model-backed summary finishes its events. The rule-based
             // floor writes a page too, and leaves them pending on purpose so a
@@ -1376,6 +1527,55 @@ impl Store {
                     params![event.id, path, event.project.to_string()],
                 )
                 .context("index event file")?;
+        }
+        Ok(())
+    }
+
+    /// Put back the two counters that sit on the row but are kept in tables
+    /// `clear()` spares.
+    ///
+    /// What an agent went back and read outlives the index that recorded it:
+    /// `read_count` sits on the row, which a replay deletes and re-inserts at
+    /// its default. So every rebuild quietly flattened the one signal `rank()`
+    /// has that is evidence rather than heuristic, and nothing said a word:
+    /// measured after two rebuilds in one day, 0 of 28,854 events had a read
+    /// to their name while `recalled` still held 529 rows.
+    ///
+    /// Counted per session, matching how it is incremented: re-reading an
+    /// entry in one conversation says nothing extra about its worth.
+    ///
+    /// The other counter has the same disease: how often a pointer was
+    /// offered lives on the row too, and a replay resets it while `injected`
+    /// keeps the truth. Without this, every rebuild hands each stale pointer
+    /// a fresh five-session decay budget.
+    fn restore_counts(&self, event_id: &str) -> Result<()> {
+        if let Ok(reads) = self.conn.query_row(
+            "SELECT COUNT(*) FROM recalled WHERE event_id = ?1",
+            params![event_id],
+            |row| row.get::<_, i64>(0),
+        ) {
+            if reads > 0 {
+                self.conn
+                    .execute(
+                        "UPDATE events SET read_count = ?2 WHERE id = ?1",
+                        params![event_id, reads],
+                    )
+                    .context("restore read count")?;
+            }
+        }
+        if let Ok(times) = self.conn.query_row(
+            "SELECT COUNT(*) FROM injected WHERE event_id = ?1",
+            params![event_id],
+            |row| row.get::<_, i64>(0),
+        ) {
+            if times > 0 {
+                self.conn
+                    .execute(
+                        "UPDATE events SET injected_count = ?2 WHERE id = ?1",
+                        params![event_id, times],
+                    )
+                    .context("restore injected count")?;
+            }
         }
         Ok(())
     }
@@ -1472,41 +1672,7 @@ impl Store {
         recall: Recall,
         floor: bool,
     ) -> Result<(Vec<Hit>, Trace)> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                // Two stages, because relevance alone lets one session own
-                // the page. The window takes each session's best few first,
-                // so the pool handed to `spread_across_sessions` contains
-                // the quiet sessions at all - reading a flat top-N never
-                // reaches them when one session holds most of the project.
-                //
-                // The demotion is inside the window too: an entry a human
-                // called stale must not be the hit that represents its
-                // session. Flagging has to change what the user SEES, or it
-                // is a counter nobody can observe.
-                "WITH matched AS (
-                     SELECT e.id, e.ts, e.cli, e.kind, e.title, e.session,
-                            snippet(events_fts, 1, '[', ']', ' … ', 24) AS snip,
-                            CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END AS demoted,
-                            rank AS relevance
-                     FROM events_fts
-                     JOIN events e ON e.rowid = events_fts.rowid
-                     WHERE events_fts MATCH ?1 AND e.project = ?2 AND e.forgotten = 0
-                           AND e.kind NOT IN ('tombstone', 'retire')
-                                 AND e.hook NOT IN ('correct', 'feedback', 'supersede')
-                           AND (?5 IS NULL OR e.topic = ?5)
-                 )
-                 SELECT id, ts, cli, kind, title, snip, session FROM (
-                     SELECT *, ROW_NUMBER() OVER (
-                         PARTITION BY session ORDER BY demoted, relevance
-                     ) AS per_session FROM matched
-                 )
-                 WHERE per_session <= ?3
-                 ORDER BY demoted, relevance
-                 LIMIT ?4",
-            )
-            .context("prepare search")?;
+        let mut stmt = self.conn.prepare(KEYWORD_SQL).context("prepare search")?;
 
         // Read a pool wider than asked for, capped per session: spreading
         // results is only possible if the quiet sessions' hits were fetched
@@ -1807,38 +1973,14 @@ impl Store {
     /// caller is spending to look outward.
     ///
     /// # Errors
-    /// Returns an error when the query fails.
+    /// Returns an error when the query fails or is interrupted at
+    /// [`RELATED_DEADLINE`].
     pub fn related(&self, project: &str, id: &str, limit: usize) -> Result<Vec<Hit>> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "WITH subject AS (
-                     SELECT n.name FROM entities n
-                     JOIN events e ON e.session = n.session AND e.project = n.project
-                     WHERE e.id = ?1 AND n.project = ?2
-                 )
-                 SELECT e.id, e.ts, e.cli, e.kind, e.title,
-                        substr(COALESCE(e.body, ''), 1, 160), e.session,
-                        COUNT(DISTINCT n.name) AS shared
-                 FROM events e
-                 JOIN entities n ON n.session = e.session AND n.project = e.project
-                 WHERE n.name IN (SELECT name FROM subject)
-                       AND e.project = ?2 AND e.id != ?1
-                       AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
-                       AND e.hook NOT IN ('correct', 'feedback', 'supersede')
-                 GROUP BY e.id
-                 ORDER BY shared DESC,
-                          CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END,
-                          CASE e.kind
-                              WHEN 'knowledge' THEN 0
-                              WHEN 'session_summary' THEN 1
-                              WHEN 'source' THEN 1
-                              ELSE 2
-                          END,
-                          e.id DESC
-                 LIMIT ?3",
-            )
-            .context("prepare related")?;
+        self.within(RELATED_DEADLINE, || self.related_rows(project, id, limit))
+    }
+
+    fn related_rows(&self, project: &str, id: &str, limit: usize) -> Result<Vec<Hit>> {
+        let mut stmt = self.conn.prepare(RELATED_SQL).context("prepare related")?;
         let rows = stmt
             .query_map(params![id, project, limit as i64], |row| {
                 Ok(Hit {
@@ -1909,6 +2051,62 @@ impl Store {
         rows.collect::<rusqlite::Result<Vec<_>>>().context("read substring matches")
     }
 
+    /// The statement behind [`Self::entity_matches`] for `tokens` name patterns.
+    ///
+    /// The window ranks sessions' events from columns `events_recall` holds,
+    /// so the recall floor never fetches a row; title and body are read by id
+    /// for the few that make the limit. Carrying them through the window
+    /// fetched every event of every matching session: 2.4 s cold on the
+    /// 115k-event project.
+    fn entity_matches_sql(tokens: usize) -> String {
+        let likes = (0..tokens)
+            .map(|index| format!("n.name LIKE ?{} ESCAPE '\\'", index + 5))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        format!(
+            "WITH matched AS (
+                 SELECT n.session, COUNT(DISTINCT n.name) AS matched
+                 FROM entities n
+                 WHERE n.project = ?1 AND ({likes})
+                 GROUP BY n.session
+             ),
+             candidates AS (
+                 SELECT e.id, e.session, m.matched,
+                        CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END AS demoted,
+                        CASE e.kind
+                            WHEN 'knowledge' THEN 0
+                            WHEN 'session_summary' THEN 1
+                            WHEN 'source' THEN 1
+                            ELSE 2
+                        END AS authority,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY e.session
+                            ORDER BY CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END,
+                                     CASE e.kind
+                                         WHEN 'knowledge' THEN 0
+                                         WHEN 'session_summary' THEN 1
+                                         WHEN 'source' THEN 1
+                                         ELSE 2
+                                     END,
+                                     e.id DESC
+                        ) AS per_session
+                 FROM events e
+                 JOIN matched m ON m.session = e.session
+                 WHERE e.project = ?1 AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
+                       AND e.hook NOT IN ('correct', 'feedback', 'supersede')
+                       AND (?2 IS NULL OR e.topic = ?2)
+             )
+             SELECT h.id, h.ts, h.cli, h.kind, h.title,
+                    substr(COALESCE(h.body, ''), 1, 160), h.session
+             FROM (SELECT id, demoted, matched, authority FROM candidates
+                   WHERE per_session <= ?3
+                   ORDER BY demoted, matched DESC, authority, id DESC
+                   LIMIT ?4) c
+             JOIN events h ON h.id = c.id
+             ORDER BY c.demoted, c.matched DESC, c.authority, c.id DESC"
+        )
+    }
+
     /// Sessions whose DECLARED subjects match the query's words.
     ///
     /// Entities are what consolidation said a session was about - files,
@@ -1943,52 +2141,7 @@ impl Store {
             return Ok(Vec::new());
         }
 
-        let likes = tokens
-            .iter()
-            .enumerate()
-            .map(|(index, _)| format!("n.name LIKE ?{} ESCAPE '\\'", index + 5))
-            .collect::<Vec<_>>()
-            .join(" OR ");
-        let sql = format!(
-            "WITH matched AS (
-                 SELECT n.session, COUNT(DISTINCT n.name) AS matched
-                 FROM entities n
-                 WHERE n.project = ?1 AND ({likes})
-                 GROUP BY n.session
-             ),
-             candidates AS (
-                 SELECT e.id, e.ts, e.cli, e.kind, e.title,
-                        substr(COALESCE(e.body, ''), 1, 160) AS snip, e.session,
-                        m.matched,
-                        CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END AS demoted,
-                        CASE e.kind
-                            WHEN 'knowledge' THEN 0
-                            WHEN 'session_summary' THEN 1
-                            WHEN 'source' THEN 1
-                            ELSE 2
-                        END AS authority,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY e.session
-                            ORDER BY CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END,
-                                     CASE e.kind
-                                         WHEN 'knowledge' THEN 0
-                                         WHEN 'session_summary' THEN 1
-                                         WHEN 'source' THEN 1
-                                         ELSE 2
-                                     END,
-                                     e.id DESC
-                        ) AS per_session
-                 FROM events e
-                 JOIN matched m ON m.session = e.session
-                 WHERE e.project = ?1 AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
-                       AND e.hook NOT IN ('correct', 'feedback', 'supersede')
-                       AND (?2 IS NULL OR e.topic = ?2)
-             )
-             SELECT id, ts, cli, kind, title, snip, session FROM candidates
-             WHERE per_session <= ?3
-             ORDER BY demoted, matched DESC, authority, id DESC
-             LIMIT ?4"
-        );
+        let sql = Self::entity_matches_sql(tokens.len());
         let mut stmt = self.conn.prepare(&sql).context("prepare entity matches")?;
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
             Box::new(project.to_string()),
@@ -2013,6 +2166,63 @@ impl Store {
             })
             .context("run entity matches")?;
         rows.collect::<rusqlite::Result<Vec<_>>>().context("read entity matches")
+    }
+
+    /// The statement behind [`Self::neighbours_of`] for `seeds` seed ids.
+    ///
+    /// The seeds are looked up by primary key: `project` is only a check, and
+    /// left indexable it let the planner walk the whole project through
+    /// `events_recall` to find three ids. The neighbours are ranked from the
+    /// columns that index holds and read by id once they are down to `limit`,
+    /// like [`Self::entity_matches_sql`]: fetching every event of every
+    /// sharing session took 3.2 s cold on the 115k-event project.
+    fn neighbours_sql(seeds: usize) -> String {
+        let holes = |offset: usize| {
+            (0..seeds)
+                .map(|index| format!("?{}", index + offset))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        format!(
+            "WITH seed_sessions AS (
+                 SELECT DISTINCT session FROM events
+                 WHERE id IN ({seed_holes}) AND +project = ?1
+             ),
+             subject AS (
+                 SELECT DISTINCT n.name FROM entities n
+                 WHERE n.session IN (SELECT session FROM seed_sessions)
+                       AND n.project = ?1
+             ),
+             shared AS (
+                 SELECT n.session, COUNT(DISTINCT n.name) AS shared
+                 FROM entities n
+                 WHERE n.project = ?1 AND n.name IN (SELECT name FROM subject)
+                       AND n.session NOT IN (SELECT session FROM seed_sessions)
+                 GROUP BY n.session
+             )
+             SELECT h.id, h.ts, h.cli, h.kind, h.title,
+                    substr(COALESCE(h.body, ''), 1, 160), h.session,
+                    c.shared
+             FROM (SELECT e.id, s.shared,
+                          CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END AS demoted,
+                          CASE e.kind
+                              WHEN 'knowledge' THEN 0
+                              WHEN 'session_summary' THEN 1
+                              WHEN 'source' THEN 1
+                              ELSE 2
+                          END AS authority
+                   FROM events e
+                   JOIN shared s ON s.session = e.session
+                   WHERE e.project = ?1
+                         AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
+                         AND e.hook NOT IN ('correct', 'feedback', 'supersede')
+                         AND (?2 IS NULL OR e.topic = ?2)
+                   ORDER BY s.shared DESC, demoted, authority, e.id DESC
+                   LIMIT ?3) c
+             JOIN events h ON h.id = c.id
+             ORDER BY c.shared DESC, c.demoted, c.authority, c.id DESC",
+            seed_holes = holes(4),
+        )
     }
 
     /// What sits beside the hits another ranking already found.
@@ -2050,50 +2260,7 @@ impl Store {
         if seeds.is_empty() {
             return Ok(Vec::new());
         }
-        let holes = |offset: usize| {
-            (0..seeds.len())
-                .map(|index| format!("?{}", index + offset))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        let sql = format!(
-            "WITH seed_sessions AS (
-                 SELECT DISTINCT session FROM events
-                 WHERE id IN ({seed_holes}) AND project = ?1
-             ),
-             subject AS (
-                 SELECT DISTINCT n.name FROM entities n
-                 WHERE n.session IN (SELECT session FROM seed_sessions)
-                       AND n.project = ?1
-             ),
-             shared AS (
-                 SELECT n.session, COUNT(DISTINCT n.name) AS shared
-                 FROM entities n
-                 WHERE n.project = ?1 AND n.name IN (SELECT name FROM subject)
-                       AND n.session NOT IN (SELECT session FROM seed_sessions)
-                 GROUP BY n.session
-             )
-             SELECT e.id, e.ts, e.cli, e.kind, e.title,
-                    substr(COALESCE(e.body, ''), 1, 160), e.session,
-                    s.shared
-             FROM events e
-             JOIN shared s ON s.session = e.session
-             WHERE e.project = ?1
-                   AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
-                   AND e.hook NOT IN ('correct', 'feedback', 'supersede')
-                   AND (?2 IS NULL OR e.topic = ?2)
-             ORDER BY s.shared DESC,
-                      CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END,
-                      CASE e.kind
-                          WHEN 'knowledge' THEN 0
-                          WHEN 'session_summary' THEN 1
-                          WHEN 'source' THEN 1
-                          ELSE 2
-                      END,
-                      e.id DESC
-             LIMIT ?3",
-            seed_holes = holes(4),
-        );
+        let sql = Self::neighbours_sql(seeds.len());
         let mut stmt = self.conn.prepare(&sql).context("prepare neighbours")?;
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
             Box::new(project.to_string()),
@@ -2349,20 +2516,7 @@ impl Store {
             return Ok(Vec::new());
         }
         self.vectors_are_this_models()?;
-        let mut stmt = self
-            .conn
-            .prepare(
-                // The same recall floor every other read enforces. A memory
-                // withdrawn from search has to be withdrawn from this one too,
-                // or the withdrawal was cosmetic.
-                "SELECT v.event_id, v.vec, e.confidence
-                 FROM event_vec v
-                 JOIN events e ON e.id = v.event_id
-                 WHERE e.project = ?1 AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
-                       AND e.hook NOT IN ('correct', 'feedback', 'supersede')
-                       AND (?2 IS NULL OR e.topic = ?2)",
-            )
-            .context("prepare nearest")?;
+        let mut stmt = self.conn.prepare(NEAREST_SQL).context("prepare nearest")?;
         let mut scored: Vec<(String, f32, bool)> = stmt
             .query_map(params![project, topic], |row| {
                 let id: String = row.get(0)?;
@@ -2384,7 +2538,12 @@ impl Store {
         // Demotion is applied AFTER the floor, not as part of the score: a
         // human flagging an entry stale should push it down the list, never
         // push it off the end of a query it genuinely matches.
-        scored.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| b.1.total_cmp(&a.1)));
+        //
+        // Equal scores are common (a dozen "Session started" summaries embed
+        // alike) and the oldest comes first. Without a tie-break they kept the
+        // order the rows were read in, which is the order of whichever index
+        // the planner walked.
+        scored.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| b.1.total_cmp(&a.1)).then_with(|| a.0.cmp(&b.0)));
         scored.truncate(limit);
         Ok(scored.into_iter().map(|(id, score, _)| (id, score)).collect())
     }
@@ -2486,18 +2645,7 @@ impl Store {
         session: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Hit>> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT id, ts, cli, kind, title, session
-                 FROM events WHERE project = ?1 AND forgotten = 0 AND kind NOT IN ('tombstone', 'retire')
-                       AND hook NOT IN ('correct', 'feedback', 'supersede')
-                       AND (?3 IS NULL OR cli = ?3)
-                       AND (?4 IS NULL OR kind = ?4)
-                       AND (?5 IS NULL OR session = ?5)
-                 ORDER BY id DESC LIMIT ?2",
-            )
-            .context("prepare recent")?;
+        let mut stmt = self.conn.prepare(Self::recent_sql()).context("prepare recent")?;
         let rows = stmt
             .query_map(params![project, limit as i64, cli, kind, session], |row| {
                 Ok(Hit {
@@ -2543,6 +2691,25 @@ impl Store {
         hits.extend(listed);
         hits.truncate(limit);
         Ok(hits)
+    }
+
+    /// The statement behind [`Self::recent`]. The floor, the kind and the
+    /// session are columns of `events_recall`, so the inner select applies
+    /// them without fetching a row; the outer one reads the listed ids
+    /// newest first, fetching rows (and testing `cli`, which the index does
+    /// not hold) only until `limit` are found; a rare `cli` still costs a row
+    /// fetch per skipped id. Before the build the inner
+    /// select reads the project through `events_unconsolidated`, as the
+    /// single select did.
+    fn recent_sql() -> &'static str {
+        "SELECT id, ts, cli, kind, title, session FROM events
+         WHERE id IN (SELECT id FROM events
+                      WHERE project = ?1 AND forgotten = 0 AND kind NOT IN ('tombstone', 'retire')
+                            AND hook NOT IN ('correct', 'feedback', 'supersede')
+                            AND (?4 IS NULL OR kind = ?4)
+                            AND (?5 IS NULL OR session = ?5))
+               AND (?3 IS NULL OR cli = ?3)
+         ORDER BY id DESC LIMIT ?2"
     }
 
     /// Number of indexed events.
@@ -2766,6 +2933,28 @@ impl Store {
             )
             .optional()
             .context("read session invocation")
+    }
+
+    /// What an existing index already knows about how a session was invoked,
+    /// read without opening it for writes.
+    ///
+    /// `open` migrates, and a migration under a held write lock waits out the
+    /// whole busy timeout - longer than a hook is allowed to take. A capture
+    /// needs this answer before it appends to the log, so it asks here, waits
+    /// a moment at most, and treats every failure as "not known".
+    #[must_use]
+    pub fn peek_session_invocation(path: &Path, session: &str) -> Option<String> {
+        let conn =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+        conn.busy_timeout(std::time::Duration::from_millis(200)).ok()?;
+        conn.query_row(
+            "SELECT invocation FROM session_invocation WHERE session = ?1",
+            params![session],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
     }
 
     /// Remember how a session was invoked.
@@ -3496,7 +3685,7 @@ impl Store {
             "{PROJECTS_CTE}
              SELECT 1 FROM projects
              JOIN events e ON e.project = projects.project AND e.consolidated = 0
-             WHERE e.kind = 'observation' AND +e.ts < ?1
+             WHERE +e.kind = 'observation' AND +e.ts < ?1
                AND e.session NOT IN ({})
              LIMIT 1",
             Self::parked_sessions_sql()
@@ -3571,17 +3760,19 @@ impl Store {
     /// Returns an error when the query fails.
     pub fn oldest_pending_ts(&self) -> Result<Option<String>> {
         self.conn
-            .query_row(
-                &format!(
-                    "SELECT MIN(ts) FROM events
-                     WHERE consolidated = 0 AND kind = 'observation'
-                       AND session NOT IN ({})",
-                    Self::parked_sessions_sql()
-                ),
-                [],
-                |row| row.get(0),
-            )
+            .query_row(&Self::oldest_pending_sql(), [], |row| row.get(0))
             .context("read oldest pending event")
+    }
+
+    /// The statement behind [`Self::oldest_pending_ts`]; the unary plus is
+    /// for the reason given at [`Self::sessions_pending_sql`].
+    fn oldest_pending_sql() -> String {
+        format!(
+            "SELECT MIN(ts) FROM events
+             WHERE consolidated = 0 AND +kind = 'observation'
+               AND session NOT IN ({})",
+            Self::parked_sessions_sql()
+        )
     }
 
     /// Write a consolidation ask down. Done before the run lock is tried.
@@ -3822,24 +4013,7 @@ impl Store {
     /// # Errors
     /// Returns an error when the query fails.
     pub fn sessions_pending(&self, project: &str) -> Result<Vec<PendingSession>> {
-        let mut stmt = self
-            .conn
-            .prepare(&format!(
-                // The CLI of the newest event, not MAX(cli), which is
-                // alphabetical: for a session two CLIs touched, "codex" would
-                // beat "claude-code" for no reason but its spelling, and this
-                // value decides whose cheap tier gets asked to summarize.
-                "SELECT e.session, COUNT(*), MAX(e.id),
-                        (SELECT cli FROM events
-                          WHERE session = e.session ORDER BY id DESC LIMIT 1)
-                 FROM events e
-                 WHERE e.project = ?1 AND e.consolidated = 0 AND e.kind = 'observation'
-                   AND e.session NOT IN ({})
-                 GROUP BY e.session
-                 ORDER BY MAX(e.id)",
-                Self::parked_sessions_sql()
-            ))
-            .context("prepare pending sessions")?;
+        let mut stmt = self.conn.prepare(&Self::sessions_pending_sql()).context("prepare pending sessions")?;
         let rows = stmt
             .query_map(params![project], |row| {
                 Ok(PendingSession {
@@ -3851,6 +4025,53 @@ impl Store {
             })
             .context("run pending sessions")?;
         rows.collect::<rusqlite::Result<Vec<_>>>().context("read pending sessions")
+    }
+
+    /// The statement behind [`Self::unconsolidated_sessions`]. The unary plus
+    /// on `kind` keeps the planner off `events_kind_proj`, which would read
+    /// every observation of the project to find the few pending ones; the one
+    /// on `session` keeps it off `events_recall`, whose order serves the
+    /// `GROUP BY` and which then fetched every row of the project.
+    fn unconsolidated_sessions_sql() -> &'static str {
+        "SELECT session, MIN(cli), COUNT(*), MAX(id), MAX(ts) FROM events
+         WHERE project = ?1 AND consolidated = 0 AND forgotten = 0
+               AND +kind = 'observation'
+               AND hook NOT IN ('correct', 'feedback', 'supersede')
+               AND (topic IS NOT NULL
+                    OR files != '[]'
+                    OR hook IN ('user_prompt_submit', 'before_submit_prompt', 'before_agent')
+                    OR (hook = 'stop' AND title != 'Turn finished'))
+               -- A one-shot run is not work someone will come back
+               -- to; naming it as unfinished sends the next session
+               -- to read a reviewer's transcript as the latest work.
+               AND session NOT IN (SELECT session FROM session_invocation
+                                    WHERE invocation = 'headless')
+         GROUP BY +session
+         ORDER BY MAX(id) DESC
+         LIMIT ?2"
+    }
+
+    /// The statement behind [`Self::sessions_pending`]. The unary plus on
+    /// `kind` keeps the planner off `events_kind_proj`, which would read every
+    /// observation of the project to find the few pending ones; the one on
+    /// `session` keeps it off `events_recall`, as at
+    /// [`Self::unconsolidated_sessions_sql`].
+    fn sessions_pending_sql() -> String {
+        format!(
+            // The CLI of the newest event, not MAX(cli), which is
+            // alphabetical: for a session two CLIs touched, "codex" would
+            // beat "claude-code" for no reason but its spelling, and this
+            // value decides whose cheap tier gets asked to summarize.
+            "SELECT e.session, COUNT(*), MAX(e.id),
+                    (SELECT cli FROM events
+                      WHERE session = e.session ORDER BY id DESC LIMIT 1)
+             FROM events e
+             WHERE e.project = ?1 AND e.consolidated = 0 AND +e.kind = 'observation'
+               AND e.session NOT IN ({})
+             GROUP BY +e.session
+             ORDER BY MAX(e.id)",
+            Self::parked_sessions_sql()
+        )
     }
 
     /// Unconsolidated observations for one session, oldest first.
@@ -3883,11 +4104,13 @@ impl Store {
     /// # Errors
     /// Returns an error when the update fails.
     pub fn mark_consolidated(&self, ids: &[String]) -> Result<()> {
+        let transaction = self.conn.unchecked_transaction().context("begin mark consolidated")?;
         for id in ids {
-            self.conn
+            transaction
                 .execute("UPDATE events SET consolidated = 1 WHERE id = ?1", params![id])
                 .context("mark consolidated")?;
         }
+        transaction.commit().context("commit mark consolidated")?;
         Ok(())
     }
 
@@ -4217,7 +4440,8 @@ impl Store {
         )
     }
 
-    /// Ranked pointers for the session-start primer.
+    /// Ranked pointers for the session-start primer's remainder: every kind
+    /// that earns a line, so no observation is read only to be dropped.
     ///
     /// Ranking is kind first, recency second. A consolidated summary is worth
     /// more than a rewritten title, which is worth more than a raw capture —
@@ -4228,7 +4452,7 @@ impl Store {
     /// # Errors
     /// Returns an error when the query fails.
     pub fn primer_pointers(&self, project: &str, limit: usize) -> Result<Vec<Pointer>> {
-        self.ranked_pointers(project, None, limit)
+        self.ranked_pointers(project, Kinds::Pushed, limit)
     }
 
     /// The same ranking, restricted to one kind.
@@ -4247,16 +4471,41 @@ impl Store {
         kind: &str,
         limit: usize,
     ) -> Result<Vec<Pointer>> {
-        self.ranked_pointers(project, Some(kind), limit)
+        self.ranked_pointers(project, Kinds::One(kind), limit)
     }
 
-    fn ranked_pointers(
-        &self,
-        project: &str,
-        kind: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<Pointer>> {
-        let sql = format!(
+    /// The ranked read behind the primer's layers and its remainder.
+    ///
+    /// The primer asks for one kind per layer and for the pushed set.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub(crate) fn ranked_pointers(&self, project: &str, kinds: Kinds<'_>, limit: usize) -> Result<Vec<Pointer>> {
+        let mut stmt = self.conn.prepare(&Self::ranked_pointers_sql(&kinds)).context("prepare primer pointers")?;
+        let rows = match kinds {
+            Kinds::One(kind) => stmt.query_map(params![project, limit as i64, kind], Self::pointer_row),
+            _ => stmt.query_map(params![project, limit as i64], Self::pointer_row),
+        }
+        .context("run primer pointers")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("read primer pointers")
+    }
+
+    /// The statement behind [`Self::ranked_pointers`].
+    ///
+    /// The kind is a plain `kind = ?3` or a fixed `IN` list, never
+    /// `(?3 IS NULL OR kind = ?3)`: that form let no index on `kind` serve
+    /// the read, so each of the primer's three queries walked every row of
+    /// the project (115k of them on the largest) and sorted them, 4.8 to
+    /// 6.0 s cold apiece. The same fixed list is what the primer keeps
+    /// anyway; observations never earn a line of their own.
+    fn ranked_pointers_sql(kinds: &Kinds<'_>) -> String {
+        let kind = match kinds {
+            #[cfg(test)]
+            Kinds::Any => "",
+            Kinds::One(_) => "AND kind = ?3",
+            Kinds::Pushed => "AND kind IN ('knowledge', 'session_summary', 'source', 'note', 'page_update')",
+        };
+        format!(
             // The same floor every other read enforces. Injection is recall
             // too - and the costlier half, because it spends bytes in every
             // future session whether or not anyone asked. A withdrawn memory
@@ -4264,16 +4513,11 @@ impl Store {
             "SELECT id, ts, kind, title, topic FROM events
              WHERE project = ?1 AND forgotten = 0 AND kind NOT IN ('tombstone', 'retire')
                    AND hook NOT IN ('correct', 'feedback', 'supersede')
-                   AND (?3 IS NULL OR kind = ?3)
+                   {kind}
              ORDER BY {}, id DESC
              LIMIT ?2",
             Self::rank("")
-        );
-        let mut stmt = self.conn.prepare(&sql).context("prepare primer pointers")?;
-        let rows = stmt
-            .query_map(params![project, limit as i64, kind], Self::pointer_row)
-            .context("run primer pointers")?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().context("read primer pointers")
+        )
     }
 
     /// Sessions whose captures nothing has summarized yet, newest first.
@@ -4301,24 +4545,7 @@ impl Store {
     pub fn unconsolidated_sessions(&self, project: &str, limit: usize) -> Result<Vec<InFlight>> {
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT session, MIN(cli), COUNT(*), MAX(id), MAX(ts) FROM events
-                 WHERE project = ?1 AND consolidated = 0 AND forgotten = 0
-                       AND kind = 'observation'
-                       AND hook NOT IN ('correct', 'feedback', 'supersede')
-                       AND (topic IS NOT NULL
-                            OR files != '[]'
-                            OR hook IN ('user_prompt_submit', 'before_submit_prompt', 'before_agent')
-                            OR (hook = 'stop' AND title != 'Turn finished'))
-                       -- A one-shot run is not work someone will come back
-                       -- to; naming it as unfinished sends the next session
-                       -- to read a reviewer's transcript as the latest work.
-                       AND session NOT IN (SELECT session FROM session_invocation
-                                            WHERE invocation = 'headless')
-                 GROUP BY session
-                 ORDER BY MAX(id) DESC
-                 LIMIT ?2",
-            )
+            .prepare(Self::unconsolidated_sessions_sql())
             .context("prepare unconsolidated sessions")?;
         let rows = stmt
             .query_map(params![project, limit as i64], |row| {
@@ -4357,22 +4584,31 @@ impl Store {
             .to_string();
         self.conn
             .query_row(
-                "SELECT id, ts, kind, title, topic, cli FROM events
-                 WHERE project = ?1 AND kind = 'session_summary' AND forgotten = 0
-                       AND session != ?2
-                       AND (invocation IS NULL OR invocation != 'headless')
-                       -- A summary event never carries `invocation`; the run
-                       -- is recorded per session, as `unconsolidated_sessions`
-                       -- reads it.
-                       AND session NOT IN (SELECT session FROM session_invocation
-                                            WHERE invocation = 'headless')
-                       AND ts >= ?3
-                 ORDER BY id DESC LIMIT 1",
+                Self::newest_summary_sql(),
                 params![project, exclude_session, cutoff],
                 |row| Ok((Self::pointer_row(row)?, row.get::<_, String>(5)?)),
             )
             .optional()
             .context("read newest summary")
+    }
+
+    /// The statement behind [`Self::newest_summary`]. With `events_kind_proj`
+    /// built, `ORDER BY id DESC LIMIT 1` walks that index from the newest end;
+    /// without it, it sorts every summary of the project.
+    fn newest_summary_sql() -> &'static str {
+        "SELECT id, ts, kind, title, topic, cli FROM events
+         WHERE project = ?1 AND kind = 'session_summary' AND forgotten = 0
+               AND session != ?2
+               AND (invocation IS NULL OR invocation != 'headless')
+               -- A summary event never carries `invocation`; the run
+               -- is recorded per session, as `unconsolidated_sessions`
+               -- reads it.
+               AND session NOT IN (SELECT session FROM session_invocation
+                                    WHERE invocation = 'headless')
+               -- The unary plus keeps the planner off `events_project_ts`, whose
+               -- range on `ts` looks cheaper than it is and then sorts.
+               AND +ts >= ?3
+         ORDER BY id DESC LIMIT 1"
     }
 
     /// The CLI a session was captured through, from its first capture.
@@ -4381,11 +4617,62 @@ impl Store {
     /// Returns an error when the query fails.
     pub fn session_cli(&self, session: &str) -> Result<Option<String>> {
         self.conn
-            .query_row("SELECT cli FROM events WHERE session = ?1 ORDER BY id LIMIT 1", params![session], |row| {
-                row.get(0)
-            })
+            .query_row(Self::session_cli_sql(), params![session], |row| row.get(0))
             .optional()
             .context("read session cli")
+    }
+
+    /// The statement behind [`Self::session_cli`]. `events_session_id` makes
+    /// it one probe; through `events_session` it read every row of the
+    /// session to find the smallest id, 1.4 s cold for a 22k-event session.
+    fn session_cli_sql() -> &'static str {
+        "SELECT cli FROM events WHERE session = ?1 ORDER BY id LIMIT 1"
+    }
+
+    /// Build the indexes the primer's and search's reads need, once.
+    ///
+    /// `events(kind, project, id)` serves the per-kind layers and the hand-off
+    /// line; `events(session, id)` serves `session_cli`. It covers
+    /// `events(session)` for every lookup by session, but that index stays: a
+    /// 0.64.0 binary on the same store would recreate it on its next open,
+    /// 4.7 s cold under the write lock, and its SessionStart took 7.4 to 8.6 s.
+    /// `events_recall` holds every column of the recall floor, so the reads
+    /// that apply it to a project's events (`nearest`, `entity_matches`,
+    /// `neighbours_of`, `related`) filter from the index instead of fetching
+    /// each row; it is 44 MB on a 327k-event store. The builds cost several
+    /// seconds cold on a store of millions of rows, and the write lock for as
+    /// long, so this runs only in a consolidate run, under the run lock, never
+    /// in `open` or a hook. A hook that cannot index meanwhile leaves its
+    /// event to the log catch-up. Until it has run the reads stay correct,
+    /// just slower: nothing names these indexes.
+    ///
+    /// Returns whether it built anything.
+    ///
+    /// # Errors
+    /// Returns an error when a statement fails; the transaction rolls back and
+    /// the next run tries again.
+    pub fn build_primer_indexes(&self) -> Result<bool> {
+        let built: bool = self
+            .conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM schema_state WHERE key = 'primer_indexes_built')", [], |row| {
+                row.get(0)
+            })
+            .context("check the primer indexes")?;
+        if built {
+            return Ok(false);
+        }
+        let transaction = self.conn.unchecked_transaction().context("begin primer indexes")?;
+        transaction
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS events_kind_proj ON events(kind, project, id);
+                 CREATE INDEX IF NOT EXISTS events_session_id ON events(session, id);
+                 CREATE INDEX IF NOT EXISTS events_recall
+                     ON events(project, session, forgotten, kind, hook, topic, confidence, id);
+                 INSERT OR REPLACE INTO schema_state (key, value) VALUES ('primer_indexes_built', '1');",
+            )
+            .context("build primer indexes")?;
+        transaction.commit().context("commit primer indexes")?;
+        Ok(true)
     }
 
     /// Pointers for events that touched one file, best first.
@@ -4753,6 +5040,40 @@ impl Store {
         rows.collect::<rusqlite::Result<Vec<_>>>().context("read topic counts")
     }
 
+    /// Whether the index holds this event id. One primary-key probe.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn has_event(&self, id: &str) -> Result<bool> {
+        self.conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM events WHERE id = ?1)", params![id], |row| row.get(0))
+            .context("probe event id")
+    }
+
+    /// How far the log-tail catch-up has read one log file, under a key naming
+    /// the file. The value is `<end>:<last line start>:<fingerprint>`; the
+    /// catch-up's own doc says what each part is for.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn log_watermark(&self, key: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row("SELECT value FROM schema_state WHERE key = ?1", params![key], |row| row.get(0))
+            .optional()
+            .context("read log watermark")
+    }
+
+    /// Record where the catch-up stopped in one log file.
+    ///
+    /// # Errors
+    /// Returns an error when the write fails.
+    pub fn set_log_watermark(&self, key: &str, value: &str) -> Result<()> {
+        self.conn
+            .execute("INSERT OR REPLACE INTO schema_state (key, value) VALUES (?1, ?2)", params![key, value])
+            .context("write log watermark")?;
+        Ok(())
+    }
+
     /// Delete everything. Safe because the log rebuilds it.
     ///
     /// # Errors
@@ -4768,7 +5089,12 @@ impl Store {
             // and `rerank_runs` ledgers, which record spend that already
             // happened. Clearing those would not rebuild them; it would
             // delete them.
-            .execute_batch("DELETE FROM event_files; DELETE FROM events;")
+            // The log-tail watermarks go too: they say what the index holds,
+            // so after a clear that fails part-way they must not claim a log
+            // is fully read.
+            .execute_batch(
+                "DELETE FROM event_files; DELETE FROM events; DELETE FROM schema_state WHERE key LIKE 'log_tail:%';",
+            )
             .context("clear index")?;
         Ok(())
     }
@@ -4857,6 +5183,18 @@ pub struct InFlight {
     /// The newest of them; the id the primer line is keyed by.
     pub newest_id: String,
     pub newest_ts: String,
+}
+
+/// Which kinds a ranked pointer read covers.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Kinds<'a> {
+    /// Every kind; only the ranking tests ask for it.
+    #[cfg(test)]
+    Any,
+    One(&'a str),
+    /// The kinds that earn a primer line of their own: everything but
+    /// observations (and the bookkeeping kinds no read shows).
+    Pushed,
 }
 
 #[derive(Debug, Clone)]
@@ -5405,6 +5743,579 @@ mod tests {
         }
     }
 
+    /// The plan, one line per step, of a statement taking `args` text values.
+    fn plan_of(store: &Store, sql: &str, args: usize) -> Vec<String> {
+        store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map(rusqlite::params_from_iter(std::iter::repeat_n("x", args)), |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// The primer reads the project's rows by kind, through `events_kind_proj`.
+    /// Through the wrong index each of its three layers read every row of the
+    /// project and sorted them: 4.8 to 6.0 s cold on the 115k-event project,
+    /// where the plan below read 135, 32 and 297 ms. The plans can flip, so
+    /// they are pinned, and so is the one statement an added kind index once
+    /// turned into a scan of every observation.
+    #[test]
+    fn the_primer_reads_go_through_the_kind_index() {
+        let store = Store::open_memory().unwrap();
+        assert!(store.build_primer_indexes().unwrap());
+        for (name, sql, args) in [
+            ("one kind", Store::ranked_pointers_sql(&Kinds::One("knowledge")), 3),
+            ("pushed kinds", Store::ranked_pointers_sql(&Kinds::Pushed), 2),
+            ("newest summary", Store::newest_summary_sql().to_string(), 3),
+        ] {
+            let plan = plan_of(&store, &sql, args);
+            assert!(
+                plan.iter().any(|row| row.starts_with("SEARCH events USING INDEX events_kind_proj (kind=? AND project=?")),
+                "{name} does not read through events_kind_proj: {plan:#?}"
+            );
+            assert!(
+                !plan.iter().any(|row| row.contains("events_unconsolidated")
+                    || row.contains("events_project_ts")
+                    || row.contains("AUTOMATIC")
+                    || row.starts_with("SCAN events")),
+                "{name} reads the project by another index or scans: {plan:#?}"
+            );
+        }
+
+        let plan = plan_of(&store, &Store::stale_backlog_sql(), 1);
+        assert!(
+            plan.iter().any(|row| row.starts_with("SEARCH e ") && row.contains("events_unconsolidated")),
+            "the stale backlog left events_unconsolidated: {plan:#?}"
+        );
+
+        // Each looks for the few pending rows among millions of observations.
+        // With the kind index in reach the planner walked every observation of
+        // the project (or of the store) instead; `+kind` keeps it off.
+        for (name, sql, args) in [
+            ("stale backlog", Store::stale_backlog_sql(), 1),
+            ("sessions pending", Store::sessions_pending_sql(), 1),
+            ("oldest pending", Store::oldest_pending_sql(), 0),
+            ("unconsolidated sessions", Store::unconsolidated_sessions_sql().to_string(), 2),
+        ] {
+            let plan = plan_of(&store, &sql, args);
+            assert!(
+                !plan.iter().any(|row| row.contains("events_kind_proj")
+                    || matches!(
+                        row.strip_prefix("SCAN ").and_then(|rest| rest.split_whitespace().next()),
+                        Some("events" | "e")
+                    )),
+                "{name} reads observations by kind or scans events: {plan:#?}"
+            );
+            // `events_recall` is ordered by session, which `GROUP BY session`
+            // wants, so the planner read the whole project through it and
+            // fetched every row to find the few pending ones: 3.2 s cold on
+            // the 115k-event project, inside `brain_recent`. The oldest
+            // pending event is the one read that names no project.
+            assert!(
+                name == "oldest pending"
+                    || (plan.iter().any(|row| row.contains("events_unconsolidated"))
+                        && !plan.iter().any(|row| row.contains("events_recall"))),
+                "{name} does not read the pending rows through events_unconsolidated: {plan:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_session_cli_is_one_probe_of_the_session_index() {
+        let store = Store::open_memory().unwrap();
+        assert!(store.build_primer_indexes().unwrap());
+        // With `events_session` kept beside it, as the build leaves a store.
+        let kept: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'events_session'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(kept, 1, "events_session is not beside events_session_id");
+        let plan = plan_of(&store, Store::session_cli_sql(), 1);
+        assert!(
+            plan.iter().any(|row| row.starts_with("SEARCH events USING INDEX events_session_id (session=?")),
+            "session_cli does not probe events_session_id: {plan:#?}"
+        );
+        assert!(
+            !plan.iter().any(|row| row.contains("TEMP B-TREE")),
+            "session_cli sorts the session's rows: {plan:#?}"
+        );
+    }
+
+    /// The recall floor for `nearest` and `entity_matches` filters a project's
+    /// events on `forgotten`, `kind`, `hook`, `topic` and `confidence`. Through
+    /// `events_unconsolidated` that fetched every event row of the project to
+    /// test them: 3.4 s and 2.4 s cold on the 115k-event project, against
+    /// ~0.12 s counting the same rows in an index that holds the columns.
+    /// Only the final few hits may fetch a row, by primary key.
+    #[test]
+    fn the_recall_floor_reads_a_covering_index() {
+        let store = Store::open_memory().unwrap();
+        assert!(store.build_primer_indexes().unwrap());
+        for (name, sql, args) in [
+            ("nearest", NEAREST_SQL.to_string(), 2),
+            ("entity matches", Store::entity_matches_sql(3), 7),
+            ("neighbours", Store::neighbours_sql(3), 6),
+            ("related", RELATED_SQL.to_string(), 3),
+        ] {
+            let plan = plan_of(&store, &sql, args);
+            assert!(
+                plan.iter().any(|row| row.starts_with("SEARCH e USING COVERING INDEX events_recall (project=?")),
+                "{name} does not filter through events_recall: {plan:#?}"
+            );
+            assert!(
+                !plan.iter().any(|row| (row.starts_with("SEARCH e ") && !row.contains("COVERING INDEX events_recall"))
+                    || row.starts_with("SCAN e")
+                    || row.contains("events_unconsolidated")
+                    || row.contains("AUTOMATIC COVERING INDEX (project")),
+                "{name} fetches event rows to apply the floor: {plan:#?}"
+            );
+        }
+        for (name, sql, args) in [
+            ("entity matches", Store::entity_matches_sql(3), 7),
+            ("neighbours", Store::neighbours_sql(3), 6),
+            ("related", RELATED_SQL.to_string(), 3),
+        ] {
+            let plan = plan_of(&store, &sql, args);
+            assert!(
+                plan.iter().any(|row| row == "SEARCH h USING INDEX sqlite_autoindex_events_1 (id=?)"),
+                "{name} does not fetch its final rows by id: {plan:#?}"
+            );
+        }
+
+        // A covering index that can answer `id IN (...) AND project = ?` made
+        // the planner walk the project to find three seeds.
+        for (name, sql, args) in [("neighbours", Store::neighbours_sql(3), 6), ("related", RELATED_SQL.to_string(), 3)] {
+            let plan = plan_of(&store, &sql, args);
+            assert!(
+                plan.iter().any(|row| row == "SEARCH events USING INDEX sqlite_autoindex_events_1 (id=?)"),
+                "{name} does not look its seeds up by id: {plan:#?}"
+            );
+            assert!(
+                !plan.iter().any(|row| row.starts_with("SEARCH events ") && row.contains("events_recall")),
+                "{name} walks the project to find its seeds: {plan:#?}"
+            );
+        }
+    }
+
+    /// `brain_recent` lists the newest rows of a project, so it must stop at
+    /// `limit`. With the kind, hook and session filters as plain row tests it
+    /// fetched every row of the project and sorted them: 3.35 to 3.58 s cold on
+    /// the 115k-event project. The floor and the kind and session filters
+    /// are columns of `events_recall`, so they are applied there, and the
+    /// rows are fetched by id in `id DESC` order, which stops at the limit.
+    #[test]
+    fn recent_stops_at_the_limit_instead_of_sorting_the_project() {
+        let store = Store::open_memory().unwrap();
+        assert!(store.build_primer_indexes().unwrap());
+        let plan = plan_of(&store, Store::recent_sql(), 5);
+        assert!(
+            plan.iter().any(|row| row.starts_with("SEARCH events USING COVERING INDEX events_recall (project=?")),
+            "recent does not filter through events_recall: {plan:#?}"
+        );
+        assert!(
+            plan.iter().any(|row| row == "SEARCH events USING INDEX sqlite_autoindex_events_1 (id=?)"),
+            "recent does not fetch its rows by id: {plan:#?}"
+        );
+        assert!(
+            !plan.iter().any(|row| row.contains("TEMP B-TREE")
+                || row.contains("events_unconsolidated")
+                || row.starts_with("SCAN events")),
+            "recent sorts or walks the project's rows: {plan:#?}"
+        );
+    }
+
+    /// The same answers before and after the build, for each filter the tool
+    /// takes, with `k` cutting inside a run of equal filters.
+    #[test]
+    fn recent_answers_the_same_before_and_after_the_build() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let session = Uuid::new_v4();
+        let mut ids = Vec::new();
+        for (n, (kind, cli, hook)) in [
+            (EventKind::Observation, "claude-code", "post_tool_use"),
+            (EventKind::SessionSummary, "codex", "consolidate"),
+            (EventKind::Observation, "codex", "post_tool_use"),
+            (EventKind::Knowledge, "claude-code", "correct"),
+            (EventKind::SessionSummary, "claude-code", "consolidate"),
+            (EventKind::Tombstone, "claude-code", "forget"),
+            (EventKind::Observation, "claude-code", "post_tool_use"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut entry = event(&format!("entry {n}"), "body", project);
+            entry.kind = kind;
+            entry.source.cli = cli.to_string();
+            entry.source.hook = hook.to_string();
+            if n % 2 == 0 {
+                entry.session = session;
+            }
+            entry.id = format!("01RECENT{n:019}");
+            store.index(&entry).unwrap();
+            ids.push(entry.id);
+        }
+        let mut elsewhere = event("not this project", "body", other);
+        elsewhere.id = format!("01RECENT{:019}", 9);
+        store.index(&elsewhere).unwrap();
+        store.conn.execute("UPDATE events SET forgotten = 1 WHERE id = ?1", params![ids[6]]).unwrap();
+
+        let session = session.to_string();
+        let asks = [
+            (None, None, None, 10),
+            (None, None, None, 2),
+            (None, Some("session_summary"), None, 10),
+            (None, Some("observation"), None, 1),
+            (Some("codex"), None, None, 10),
+            (Some("claude-code"), Some("session_summary"), None, 10),
+            (None, None, Some(session.as_str()), 10),
+        ];
+        let read = |store: &Store| -> Vec<Vec<String>> {
+            asks.iter()
+                .map(|(cli, kind, of_session, limit)| {
+                    store
+                        .recent(&project.to_string(), *cli, *kind, *of_session, *limit)
+                        .unwrap()
+                        .into_iter()
+                        .map(|hit| hit.id)
+                        .collect()
+                })
+                .collect()
+        };
+        let before = read(&store);
+        assert_eq!(before[0], [ids[4].clone(), ids[2].clone(), ids[1].clone(), ids[0].clone()], "the floor: no tombstone, correction or forgotten row");
+        assert_eq!(before[1], [ids[4].clone(), ids[2].clone()], "k cuts the newest two");
+        assert_eq!(before[3], [ids[2].clone()]);
+        assert_eq!(before[4], [ids[2].clone(), ids[1].clone()], "cli");
+        assert_eq!(before[6], [ids[4].clone(), ids[2].clone(), ids[0].clone()], "session");
+        assert!(before[2].ends_with(&[ids[4].clone(), ids[1].clone()]), "kind: {:?}", before[2]);
+        assert!(before[5].ends_with(&[ids[4].clone()]), "cli and kind: {:?}", before[5]);
+        assert!(store.build_primer_indexes().unwrap());
+        assert_eq!(read(&store), before, "the build changed an answer");
+    }
+
+    /// Entries that score alike come back oldest first, whichever way the
+    /// index they are read through is ordered. `events_recall` walks a project
+    /// by session, where `events_unconsolidated` walked it in insertion order,
+    /// and the three "Session started" summaries of one project swapped places
+    /// in a query about resuming a session: ties kept the order they were read.
+    #[test]
+    fn nearest_orders_equal_scores_by_age_not_by_index() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let vector = vec![7u8; crate::embed::DIMS];
+        // Oldest first by id, in sessions that sort the other way round.
+        let mut ids = Vec::new();
+        for session in [0xff_u128, 0xcc, 0xaa, 0xdd] {
+            let session = Uuid::from_u128(session);
+            // A ULID is only ordered across milliseconds.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let entry = event_in_session("Session started. No work performed.", "nothing", project, session);
+            store.index(&entry).unwrap();
+            store.set_vectors(&[(entry.id.clone(), vector.clone())]).unwrap();
+            ids.push(entry.id);
+        }
+        assert!(ids.windows(2).all(|pair| pair[0] < pair[1]), "the fixture's ids are not in age order: {ids:?}");
+        for built in [false, true] {
+            if built {
+                assert!(store.build_primer_indexes().unwrap());
+            }
+            let found: Vec<String> =
+                store.nearest(&project.to_string(), &vector, None, 10).unwrap().into_iter().map(|(id, _)| id).collect();
+            assert_eq!(found, ids, "built={built}");
+        }
+    }
+
+    /// `entity_matches` as it was before the floor was applied to columns only:
+    /// every candidate row carried its title and a body snippet through the
+    /// window function.
+    fn old_entity_matches_sql(tokens: usize) -> String {
+        let likes = (0..tokens)
+            .map(|index| format!("n.name LIKE ?{} ESCAPE '\\'", index + 5))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        format!(
+            "WITH matched AS (
+                 SELECT n.session, COUNT(DISTINCT n.name) AS matched
+                 FROM entities n
+                 WHERE n.project = ?1 AND ({likes})
+                 GROUP BY n.session
+             ),
+             candidates AS (
+                 SELECT e.id, e.ts, e.cli, e.kind, e.title,
+                        substr(COALESCE(e.body, ''), 1, 160) AS snip, e.session,
+                        m.matched,
+                        CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END AS demoted,
+                        CASE e.kind
+                            WHEN 'knowledge' THEN 0
+                            WHEN 'session_summary' THEN 1
+                            WHEN 'source' THEN 1
+                            ELSE 2
+                        END AS authority,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY e.session
+                            ORDER BY CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END,
+                                     CASE e.kind
+                                         WHEN 'knowledge' THEN 0
+                                         WHEN 'session_summary' THEN 1
+                                         WHEN 'source' THEN 1
+                                         ELSE 2
+                                     END,
+                                     e.id DESC
+                        ) AS per_session
+                 FROM events e
+                 JOIN matched m ON m.session = e.session
+                 WHERE e.project = ?1 AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
+                       AND e.hook NOT IN ('correct', 'feedback', 'supersede')
+                       AND (?2 IS NULL OR e.topic = ?2)
+             )
+             SELECT id, ts, cli, kind, title, snip, session FROM candidates
+             WHERE per_session <= ?3
+             ORDER BY demoted, matched DESC, authority, id DESC
+             LIMIT ?4"
+        )
+    }
+
+    /// Three sessions that share one, three and two of the names `src/alpha.rs`,
+    /// `src/beta.rs` and `src/gamma.rs`, each holding every kind of event the
+    /// recall floor and the ranking tell apart: knowledge, a summary, captures,
+    /// a forgotten event, a demoted one, a correction, a tombstone and a topic.
+    /// Returns the store, the project and the first capture of the first session.
+    fn recall_floor_fixture() -> (Store, Uuid, String) {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let key = project.to_string();
+        let names: Vec<String> = ["src/alpha.rs", "src/beta.rs", "src/gamma.rs"].map(String::from).to_vec();
+        let mut seed = String::new();
+        for (n, shared) in [3usize, 1, 2].into_iter().enumerate() {
+            let session = Uuid::new_v4();
+            let mut events = Vec::new();
+            for k in 0..3 {
+                events.push(event_in_session(&format!("Capture {n}.{k}"), "a capture", project, session));
+            }
+            if n == 0 {
+                seed = events[0].id.clone();
+            }
+            let mut lesson = event_in_session(&format!("Lesson {n}"), "kept", project, session);
+            lesson.kind = EventKind::Knowledge;
+            let mut summary = event_in_session(&format!("Summary {n}"), "what happened", project, session);
+            summary.kind = EventKind::SessionSummary;
+            let mut demoted = event_in_session(&format!("Demoted {n}"), "flagged stale", project, session);
+            demoted.kind = EventKind::Knowledge;
+            let forgotten = event_in_session(&format!("Forgotten {n}"), "withdrawn", project, session);
+            let mut correction = event_in_session(&format!("Correction {n}"), "fixes one", project, session);
+            correction.source.hook = "correct".to_string();
+            let mut gone = event_in_session(&format!("Tombstone {n}"), "", project, session);
+            gone.kind = EventKind::Tombstone;
+            let topical = event_in_session(&format!("Topical {n}"), "on a topic", project, session);
+            events.extend([lesson, summary, demoted.clone(), forgotten.clone(), correction, gone, topical.clone()]);
+            for event in &events {
+                store.index(event).unwrap();
+            }
+            store.conn.execute("UPDATE events SET confidence = -1 WHERE id = ?1", params![demoted.id]).unwrap();
+            store.conn.execute("UPDATE events SET forgotten = 1 WHERE id = ?1", params![forgotten.id]).unwrap();
+            store.conn.execute("UPDATE events SET topic = 'billing' WHERE id = ?1", params![topical.id]).unwrap();
+            store.record_entities(&session.to_string(), &key, &names[..shared]).unwrap();
+        }
+        (store, project, seed)
+    }
+
+    /// Reading the floor from the index must not change which events pass it
+    /// or in what order.
+    #[test]
+    fn entity_matches_returns_what_the_row_fetching_query_returned() {
+        let (store, project, _) = recall_floor_fixture();
+        let key = project.to_string();
+        let old = |topic: Option<&str>, per_session: usize, pool: usize| -> Vec<String> {
+            let mut stmt = store.conn.prepare(&old_entity_matches_sql(2)).unwrap();
+            let rows = stmt
+                .query_map(params![key, topic, per_session as i64, pool as i64, "%src/alpha%", "%src/beta%"], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap();
+            rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        };
+        for built in [false, true] {
+            if built {
+                assert!(store.build_primer_indexes().unwrap());
+            }
+            for (topic, per_session, pool) in [(None, 2, 20), (None, 1, 20), (None, 4, 5), (Some("billing"), 2, 20)] {
+                let new: Vec<String> = store
+                    .entity_matches(&key, "src/alpha src/beta", topic, per_session, pool)
+                    .unwrap()
+                    .into_iter()
+                    .map(|hit| hit.id)
+                    .collect();
+                let expected = old(topic, per_session, pool);
+                assert!(!expected.is_empty(), "the fixture matched nothing for {topic:?}");
+                assert_eq!(new, expected, "built={built} topic={topic:?} per_session={per_session} pool={pool}");
+            }
+        }
+    }
+
+    /// `neighbours_of` as it was before its rows were fetched last.
+    const OLD_NEIGHBOURS: &str = "WITH seed_sessions AS (
+             SELECT DISTINCT session FROM events WHERE id = ?4 AND project = ?1
+         ),
+         subject AS (
+             SELECT DISTINCT n.name FROM entities n
+             WHERE n.session IN (SELECT session FROM seed_sessions) AND n.project = ?1
+         ),
+         shared AS (
+             SELECT n.session, COUNT(DISTINCT n.name) AS shared
+             FROM entities n
+             WHERE n.project = ?1 AND n.name IN (SELECT name FROM subject)
+                   AND n.session NOT IN (SELECT session FROM seed_sessions)
+             GROUP BY n.session
+         )
+         SELECT e.id FROM events e
+         JOIN shared s ON s.session = e.session
+         WHERE e.project = ?1
+               AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
+               AND e.hook NOT IN ('correct', 'feedback', 'supersede')
+               AND (?2 IS NULL OR e.topic = ?2)
+         ORDER BY s.shared DESC,
+                  CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END,
+                  CASE e.kind
+                      WHEN 'knowledge' THEN 0
+                      WHEN 'session_summary' THEN 1
+                      WHEN 'source' THEN 1
+                      ELSE 2
+                  END,
+                  e.id DESC
+         LIMIT ?3";
+
+    #[test]
+    fn neighbours_of_returns_what_the_row_fetching_query_returned() {
+        let (store, project, seed) = recall_floor_fixture();
+        let key = project.to_string();
+        for built in [false, true] {
+            if built {
+                assert!(store.build_primer_indexes().unwrap());
+            }
+            for (topic, limit) in [(None, 50), (None, 3), (Some("billing"), 50)] {
+                let new: Vec<String> = store
+                    .neighbours_of(&key, std::slice::from_ref(&seed), topic, limit)
+                    .unwrap()
+                    .into_iter()
+                    .map(|hit| hit.id)
+                    .collect();
+                let mut stmt = store.conn.prepare(OLD_NEIGHBOURS).unwrap();
+                let old: Vec<String> = stmt
+                    .query_map(params![key, topic, limit as i64, seed], |row| row.get(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                assert!(!old.is_empty(), "the fixture matched nothing for {topic:?}");
+                assert_eq!(new, old, "built={built} topic={topic:?} limit={limit}");
+            }
+        }
+    }
+
+    /// The keyword stream as it was before its snippet was computed for the
+    /// pool only: every match carried its title and snippet through the window.
+    const OLD_KEYWORD: &str = "WITH matched AS (
+             SELECT e.id, e.ts, e.cli, e.kind, e.title, e.session,
+                    snippet(events_fts, 1, '[', ']', ' … ', 24) AS snip,
+                    CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END AS demoted,
+                    rank AS relevance
+             FROM events_fts
+             JOIN events e ON e.rowid = events_fts.rowid
+             WHERE events_fts MATCH ?1 AND e.project = ?2 AND e.forgotten = 0
+                   AND e.kind NOT IN ('tombstone', 'retire')
+                   AND e.hook NOT IN ('correct', 'feedback', 'supersede')
+                   AND (?5 IS NULL OR e.topic = ?5)
+         )
+         SELECT id, ts, cli, kind, title, snip, session FROM (
+             SELECT *, ROW_NUMBER() OVER (
+                 PARTITION BY session ORDER BY demoted, relevance
+             ) AS per_session FROM matched
+         )
+         WHERE per_session <= ?3
+         ORDER BY demoted, relevance
+         LIMIT ?4";
+
+    #[test]
+    fn the_keyword_stream_returns_what_the_snippet_per_match_query_returned() {
+        let (store, project, _) = recall_floor_fixture();
+        let key = project.to_string();
+        let run = |sql: &str, query: &str, topic: Option<&str>, per_session: usize, pool: usize| -> Vec<(String, String)> {
+            let mut stmt = store.conn.prepare(sql).unwrap();
+            stmt.query_map(params![query, key, per_session as i64, pool as i64, topic], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(5)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        let query = "capture OR kept OR happened OR flagged OR stale OR topic OR withdrawn OR fixes";
+        for (topic, per_session, pool) in [(None, 2, 20), (None, 1, 20), (None, 4, 5), (Some("billing"), 2, 20)] {
+            let expected = run(OLD_KEYWORD, query, topic, per_session, pool);
+            assert!(expected.len() > 2, "the fixture matched too little for {topic:?}: {expected:?}");
+            assert_eq!(
+                run(KEYWORD_SQL, query, topic, per_session, pool),
+                expected,
+                "topic={topic:?} per_session={per_session} pool={pool}"
+            );
+        }
+    }
+
+    /// The build is once-only and changes no answer; before it the reads work.
+    #[test]
+    fn the_primer_indexes_build_once_and_change_no_answer() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let key = project.to_string();
+        let session = Uuid::new_v4();
+        let mut summary = event("a summary", "body", project);
+        summary.kind = EventKind::SessionSummary;
+        summary.session = session;
+        let mut lesson = event("a lesson", "body", project);
+        lesson.kind = EventKind::Knowledge;
+        let capture = event("a capture", "body", project);
+        for each in [&summary, &lesson, &capture] {
+            store.index(each).unwrap();
+        }
+        let read = |store: &Store| {
+            (
+                store.ranked_pointers(&key, Kinds::Pushed, 10).unwrap().into_iter().map(|p| p.id).collect::<Vec<_>>(),
+                store.pointers_of_kind(&key, "knowledge", 10).unwrap().into_iter().map(|p| p.id).collect::<Vec<_>>(),
+                store.session_cli(&session.to_string()).unwrap(),
+                store.newest_summary(&key, "other", std::time::Duration::from_secs(3600)).unwrap().map(|(p, cli)| (p.id, cli)),
+            )
+        };
+        let index_names = |store: &Store| -> Vec<String> {
+            store
+                .conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'events' ORDER BY name")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert!(!index_names(&store).iter().any(|name| name.starts_with("events_kind")), "open built the kind index");
+
+        let before = read(&store);
+        assert_eq!(before.0.len(), 2, "the pushed set is the summary and the lesson, not the capture");
+        assert!(!before.0.contains(&capture.id), "an observation is in the pushed set");
+        assert_eq!(before.2.as_deref(), Some("claude-code"));
+
+        assert!(store.build_primer_indexes().unwrap());
+        assert!(!store.build_primer_indexes().unwrap(), "the marker did not hold");
+        assert_eq!(read(&store), before, "the build changed an answer");
+        let names = index_names(&store);
+        assert!(names.contains(&"events_kind_proj".to_string()) && names.contains(&"events_session_id".to_string()));
+        assert!(names.contains(&"events_session".to_string()), "the build dropped events_session: {names:?}");
+
+        // An open leaves the set as the build left it.
+        store.migrate().unwrap();
+        assert_eq!(index_names(&store), names);
+    }
+
     #[test]
     fn the_runs_ledger_is_pruned_with_the_taken_asks() {
         let store = Store::open_memory().unwrap();
@@ -5758,6 +6669,93 @@ mod tests {
             1,
             "opening the store did not fill an index that was empty"
         );
+    }
+
+    #[test]
+    fn a_flag_only_update_does_not_touch_the_text_indexes() {
+        // An FTS trigger on every UPDATE rewrote both indexes for a row
+        // whose title and body had not changed: 1.6 ms a row to flip
+        // `consolidated`. `total_changes` counts trigger writes too, so one
+        // change means the row alone was written.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let e = event("Asked: flag only", "body", project);
+        store.index(&e).unwrap();
+
+        for set in ["consolidated = 1", "injected_count = 5", "read_count = 5"] {
+            let before = store.conn.total_changes();
+            store
+                .conn
+                .execute(&format!("UPDATE events SET {set} WHERE id = ?1"), params![e.id])
+                .unwrap();
+            assert_eq!(store.conn.total_changes() - before, 1, "`{set}` fired an FTS trigger");
+        }
+    }
+
+    #[test]
+    fn a_title_or_body_update_still_reaches_both_text_indexes() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let e = event("Asked: alpha", "bravo", project);
+        store.index(&e).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE events SET title = 'Asked: ประสิทธิภาพ', body = 'charlie' WHERE id = ?1",
+                params![e.id],
+            )
+            .unwrap();
+
+        let find = |q: &str| store.search(&project.to_string(), q, None, 10, Recall::Fused).unwrap().len();
+        assert_eq!(find("charlie"), 1, "the new body is not in the word index");
+        assert_eq!(find("ประสิทธิภาพ"), 1, "the new title is not in the substring index");
+        assert_eq!(find("bravo"), 0, "the old body is still in the word index");
+    }
+
+    #[test]
+    fn a_store_with_the_unscoped_triggers_is_moved_to_the_scoped_ones_once() {
+        let store = Store::open_memory().unwrap();
+        store
+            .conn
+            .execute_batch(
+                "DROP TRIGGER events_au; DROP TRIGGER events_tri_au;
+                 CREATE TRIGGER events_au AFTER UPDATE ON events BEGIN
+                     INSERT INTO events_fts(events_fts, rowid, title, body)
+                     VALUES ('delete', old.rowid, old.title, old.body);
+                     INSERT INTO events_fts(rowid, title, body)
+                     VALUES (new.rowid, new.title, new.body);
+                 END;
+                 DELETE FROM schema_state WHERE key = 'fts_triggers_scoped';",
+            )
+            .unwrap();
+        store.migrate().unwrap();
+        let sql: String = store
+            .conn
+            .query_row("SELECT sql FROM sqlite_master WHERE name = 'events_au'", [], |r| r.get(0))
+            .unwrap();
+        assert!(sql.contains("UPDATE OF title, body"), "{sql}");
+        let sql: String = store
+            .conn
+            .query_row("SELECT sql FROM sqlite_master WHERE name = 'events_tri_au'", [], |r| r.get(0))
+            .unwrap();
+        assert!(sql.contains("UPDATE OF title"), "{sql}");
+    }
+
+    #[test]
+    fn marking_events_consolidated_flips_every_flag() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let events: Vec<Event> = (0..3).map(|i| event(&format!("Asked: n{i}"), "b", project)).collect();
+        for e in &events {
+            store.index(e).unwrap();
+        }
+        let ids: Vec<String> = events.iter().map(|e| e.id.clone()).collect();
+        store.mark_consolidated(&ids).unwrap();
+        let left: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM events WHERE consolidated = 0", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0);
     }
 
     #[test]
@@ -6617,6 +7615,121 @@ mod tests {
         );
     }
 
+    /// `related` as it was before the shared-name count moved to the session:
+    /// the join runs per event, so a session's events multiply by its names.
+    const OLD_RELATED: &str = "WITH subject AS (
+             SELECT n.name FROM entities n
+             JOIN events e ON e.session = n.session AND e.project = n.project
+             WHERE e.id = ?1 AND n.project = ?2
+         )
+         SELECT e.id, e.ts, e.cli, e.kind, e.title,
+                substr(COALESCE(e.body, ''), 1, 160), e.session,
+                COUNT(DISTINCT n.name) AS shared
+         FROM events e
+         JOIN entities n ON n.session = e.session AND n.project = e.project
+         WHERE n.name IN (SELECT name FROM subject)
+               AND e.project = ?2 AND e.id != ?1
+               AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
+               AND e.hook NOT IN ('correct', 'feedback', 'supersede')
+         GROUP BY e.id
+         ORDER BY shared DESC,
+                  CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END,
+                  CASE e.kind
+                      WHEN 'knowledge' THEN 0
+                      WHEN 'session_summary' THEN 1
+                      WHEN 'source' THEN 1
+                      ELSE 2
+                  END,
+                  e.id DESC
+         LIMIT ?3";
+
+    /// A seed session with `names` entities and `chores` events, and a few
+    /// sessions that share some of those names.
+    fn related_fixture(chores: usize, names: usize) -> (Store, Uuid, String) {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let busy = Uuid::new_v4();
+        let seed = event_in_session("The seed", "where it starts", project, busy);
+        let seed_id = seed.id.clone();
+        store.index(&seed).unwrap();
+        for n in 0..chores {
+            store.index(&event_in_session(&format!("Chore {n}"), "same session", project, busy)).unwrap();
+        }
+        let all: Vec<String> = (0..names).map(|n| format!("src/file{n}.rs")).collect();
+        store.record_entities(&busy.to_string(), &project.to_string(), &all).unwrap();
+        // The three branches of the recall floor and the ranking that a plain
+        // capture never reaches: knowledge, a withdrawn event, a demoted one.
+        let mixed = |label: &str, session: Uuid| {
+            let mut lesson = event_in_session(&format!("Lesson {label}"), "kept", project, session);
+            lesson.kind = EventKind::Knowledge;
+            let forgotten = event_in_session(&format!("Forgotten {label}"), "withdrawn", project, session);
+            let demoted = event_in_session(&format!("Demoted {label}"), "flagged stale", project, session);
+            for event in [&lesson, &forgotten, &demoted] {
+                store.index(event).unwrap();
+            }
+            store.conn.execute("UPDATE events SET forgotten = 1 WHERE id = ?1", params![forgotten.id]).unwrap();
+            store.conn.execute("UPDATE events SET confidence = -1 WHERE id = ?1", params![demoted.id]).unwrap();
+        };
+        mixed("seed", busy);
+        for (n, shared) in [3usize, 1, 2, 3].into_iter().enumerate() {
+            let other = Uuid::new_v4();
+            for k in 0..2 {
+                store
+                    .index(&event_in_session(&format!("Neighbour {n}.{k}"), "elsewhere", project, other))
+                    .unwrap();
+            }
+            mixed(&n.to_string(), other);
+            store.record_entities(&other.to_string(), &project.to_string(), &all[..shared]).unwrap();
+        }
+        (store, project, seed_id)
+    }
+
+    fn old_related(store: &Store, project: Uuid, id: &str, limit: usize) -> Vec<String> {
+        let mut stmt = store.conn.prepare(OLD_RELATED).unwrap();
+        let rows = stmt
+            .query_map(params![id, project.to_string(), limit as i64], |row| row.get::<_, String>(0))
+            .unwrap();
+        rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    }
+
+    #[test]
+    fn related_returns_what_the_per_event_join_returned() {
+        let (store, project, seed) = related_fixture(4, 5);
+        for built in [false, true] {
+            if built {
+                assert!(store.build_primer_indexes().unwrap());
+            }
+            let new: Vec<String> =
+                store.related(&project.to_string(), &seed, 50).unwrap().into_iter().map(|hit| hit.id).collect();
+            let old = old_related(&store, project, &seed, 50);
+            assert!(old.len() > 8, "the fixture is too thin to compare: {}", old.len());
+            assert_eq!(new, old, "built={built}");
+            for limit in [3, 7] {
+                let few: Vec<String> = store
+                    .related(&project.to_string(), &seed, limit)
+                    .unwrap()
+                    .into_iter()
+                    .map(|hit| hit.id)
+                    .collect();
+                assert_eq!(few, old_related(&store, project, &seed, limit), "built={built} limit={limit}");
+            }
+        }
+    }
+
+    #[test]
+    fn related_does_not_multiply_a_session_by_its_shared_names() {
+        let (store, project, seed) = related_fixture(40, 30);
+        let steps = |sql: &str| -> i32 {
+            let mut stmt = store.conn.prepare(sql).unwrap();
+            let mut rows = stmt.query(params![seed, project.to_string(), 50_i64]).unwrap();
+            while rows.next().unwrap().is_some() {}
+            drop(rows);
+            stmt.get_status(rusqlite::StatementStatus::VmStep)
+        };
+        let (old, new) = (steps(OLD_RELATED), steps(RELATED_SQL));
+        assert!(new * 3 < old, "related still scales with events x names: {new} steps against {old}");
+    }
+
     #[test]
     fn a_forgotten_event_never_returns_through_the_entity_stream() {
         // brain_forget's contract: forgotten means recall stops returning it,
@@ -6893,6 +8006,64 @@ mod tests {
     }
 
     #[test]
+    fn a_captured_event_runs_no_count_query() {
+        // A hook mints the id a moment ago, so no `recalled` or `injected`
+        // row can name it. Those two counts were 76% of a hook's SQL. The
+        // rows are planted for an id the store has not seen - the only way to
+        // tell a skipped count from a count that found nothing - and the
+        // replay path, which does need them, is the test above.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let event = event("just captured", "body", project);
+        store.record_recalled("session-a", std::iter::once(event.id.as_str())).unwrap();
+        store.record_injected("session-a", std::slice::from_ref(&event.id), 0, 10, usize::MAX).unwrap();
+
+        store.index_captured(&event).unwrap();
+
+        let (reads, offers): (i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT read_count, injected_count FROM events WHERE id = ?1",
+                [&event.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((reads, offers), (0, 0), "the capture path still ran a count query");
+
+        // Control: the planted rows are real, so the replay path counts them.
+        store.index(&event).unwrap();
+        let (reads, offers): (i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT read_count, injected_count FROM events WHERE id = ?1",
+                [&event.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((reads, offers), (1, 1), "the planted rows were never reachable");
+    }
+
+    #[test]
+    fn the_replay_count_lookups_use_an_index_on_event_id() {
+        // Both tables are keyed (session, event_id), so a lookup by event_id
+        // alone scanned the whole table once per replayed event.
+        let store = Store::open_memory().unwrap();
+        for table in ["recalled", "injected"] {
+            let plan: Vec<String> = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN SELECT COUNT(*) FROM {table} WHERE event_id = ?1"))
+                .unwrap()
+                .query_map(["x"], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let plan = plan.join(" | ");
+            assert!(plan.contains("USING COVERING INDEX") || plan.contains("USING INDEX"), "{table}: {plan}");
+            assert!(!plan.contains("SCAN"), "{table} is scanned: {plan}");
+        }
+    }
+
+    #[test]
     fn a_pointer_pushed_five_sessions_unread_stops_outranking_fresh_lines() {
         // The push-side twin of read_count: `injected` records every offer,
         // and five sessions of offers with zero pulls is the budget saying
@@ -7099,7 +8270,7 @@ mod tests {
         store.index(&plain).unwrap();
         store.index(&order).unwrap();
 
-        let pointers = store.primer_pointers(&project.to_string(), 10).unwrap();
+        let pointers = store.ranked_pointers(&project.to_string(), Kinds::Any, 10).unwrap();
         assert_eq!(
             pointers[0].id, order.id,
             "an explicit order to remember must outrank ordinary prompts"
@@ -7165,6 +8336,16 @@ mod tests {
         store.clear().unwrap();
         assert_eq!(store.count().unwrap(), 0);
         assert!(store.search(&project.to_string(), "gone", None, 10, Recall::Fused).unwrap().is_empty());
+    }
+
+    #[test]
+    fn clear_drops_the_log_watermarks() {
+        let store = Store::open_memory().unwrap();
+        store.set_log_watermark("log_tail:/a.jsonl", "1:0:ab").unwrap();
+        store.set_log_watermark("other", "kept").unwrap();
+        store.clear().unwrap();
+        assert_eq!(store.log_watermark("log_tail:/a.jsonl").unwrap(), None);
+        assert_eq!(store.log_watermark("other").unwrap().as_deref(), Some("kept"));
     }
 
     #[test]

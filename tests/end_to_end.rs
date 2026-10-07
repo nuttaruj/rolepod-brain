@@ -215,6 +215,12 @@ impl Fixture {
     }
 
     fn hook(&self, cli: &str, event: &str, payload: &str) -> std::process::Output {
+        self.spawn_hook(cli, event, payload).wait_with_output().expect("hook output")
+    }
+
+    /// The hook, started and fed its payload but not waited for, so a test can
+    /// look at what it has done while it is still running.
+    fn spawn_hook(&self, cli: &str, event: &str, payload: &str) -> std::process::Child {
         let mut command = Command::new(BRAIN);
         command
             .args(["hook", "--cli", cli, "--event", event])
@@ -231,8 +237,9 @@ impl Fixture {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn hook");
-        child.stdin.as_mut().unwrap().write_all(payload.as_bytes()).unwrap();
-        child.wait_with_output().expect("hook output")
+        // Closed after the write: the hook reads its payload to the end.
+        child.stdin.take().unwrap().write_all(payload.as_bytes()).unwrap();
+        child
     }
 
     /// A Claude Code hook run the way a delegate runs it: under `claude -p`.
@@ -2753,6 +2760,99 @@ fn a_model_override_reaches_the_spawned_command_line() {
     assert!(argv.contains("--model sonnet"), "the override never reached the spawn: {argv}");
     assert!(!argv.contains("haiku"), "the cheap default leaked through anyway: {argv}");
     assert!(fixture.page_text().contains("quality paid for"), "the summary was not written");
+}
+
+/// Whether the index holds this event id.
+fn index_has(fixture: &Fixture, id: &str) -> bool {
+    let output = Command::new("sqlite3")
+        .arg(fixture.home.join("brain.db"))
+        .arg(format!("SELECT COUNT(*) FROM events WHERE id = '{id}';"))
+        .output()
+        .expect("query event");
+    String::from_utf8_lossy(&output.stdout).trim() == "1"
+}
+
+#[test]
+fn an_event_the_index_missed_is_indexed_by_the_next_run() {
+    let fixture = Fixture::new("log-catch-up");
+    fixture.seed_session(3);
+
+    // What a hook leaves when its index write fails: the line is in the log
+    // and the row is not in the store.
+    let log = std::fs::read_dir(fixture.project_dirs()[0].join("events"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .expect("a month's log");
+    let text = std::fs::read_to_string(&log).unwrap();
+    let mut missed: serde_json::Value =
+        serde_json::from_str(text.lines().last().unwrap()).unwrap();
+    let id = ulid::Ulid::new().to_string();
+    missed["id"] = serde_json::Value::String(id.clone());
+    missed["title"] = serde_json::Value::String("Edit: missed.rs".into());
+    let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+    writeln!(file, "{missed}").unwrap();
+    let appended_to = std::fs::metadata(&log).unwrap().len();
+    assert!(!index_has(&fixture, &id), "precondition: the index lacks it");
+    assert_eq!(fixture.pending_count(), 3);
+
+    let out = fixture.brain(&["consolidate", "--force"]);
+    assert!(out.status.success(), "consolidate failed: {out:?}");
+    assert!(index_has(&fixture, &id), "the run did not index what the log had and the index lacked");
+    assert_eq!(fixture.pending_count(), 4, "the caught-up event is pending work");
+
+    // A second run finds the watermark at the end of the log and adds nothing.
+    let out = fixture.brain(&["consolidate", "--force"]);
+    assert!(out.status.success(), "second consolidate failed: {out:?}");
+    assert_eq!(fixture.pending_count(), 4);
+    let marks = Command::new("sqlite3")
+        .arg(fixture.home.join("brain.db"))
+        .arg("SELECT value FROM schema_state WHERE key LIKE 'log_tail:%';")
+        .output()
+        .unwrap();
+    let marks = String::from_utf8_lossy(&marks.stdout).into_owned();
+    // The run's own summary events were appended after the catch-up read, so
+    // the mark may trail the log's end, but never the line that was missed.
+    let offset: u64 = marks.split(':').next().unwrap().parse().unwrap();
+    assert!(offset >= appended_to, "the watermark stops before the missed line: {marks}");
+    assert!(offset <= std::fs::metadata(&log).unwrap().len(), "the watermark is past the log: {marks}");
+}
+
+/// The primer's indexes cost seconds on a large store, so no hook builds them:
+/// a store has none until a consolidate run, which builds them once and drops
+/// the index they cover.
+#[test]
+fn a_consolidate_run_builds_the_primer_indexes_once() {
+    let fixture = Fixture::new("primer-indexes");
+    fixture.seed_session(2);
+    let indexes = |fixture: &Fixture| {
+        let out = Command::new("sqlite3")
+            .arg(fixture.home.join("brain.db"))
+            .arg("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'events' ORDER BY name;")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let before = indexes(&fixture);
+    assert!(!before.contains("events_kind_proj"), "a hook built the kind index: {before}");
+    assert!(!before.contains("events_session_id"), "a hook built the session index: {before}");
+    assert!(!before.contains("events_recall"), "a hook built the recall index: {before}");
+
+    let out = fixture.brain(&["consolidate", "--force"]);
+    assert!(out.status.success(), "consolidate failed: {out:?}");
+    let after = indexes(&fixture);
+    assert!(
+        after.contains("events_kind_proj") && after.contains("events_session_id") && after.contains("events_recall"),
+        "not built: {after}"
+    );
+    // An older binary on this store would recreate it, cold, under the write
+    // lock its next open takes, so the build leaves it where it is.
+    assert!(after.lines().any(|name| name == "events_session"), "the build dropped events_session: {after}");
+
+    // A later open (a hook, the next run) leaves it that way.
+    let out = fixture.brain(&["consolidate", "--force"]);
+    assert!(out.status.success(), "second consolidate failed: {out:?}");
+    assert_eq!(indexes(&fixture), after);
 }
 
 #[test]
@@ -7101,4 +7201,124 @@ fn a_dispatch_goes_out_exactly_as_the_lead_wrote_it() {
     let primer = String::from_utf8_lossy(&fixture.hook("claude-code", "SessionStart", &start).stdout).to_string();
     assert!(primer.contains("webhook secret rotates"), "the lead lost the note: {primer}");
     assert!(!primer.contains("brain_seed"), "the primer still points at a removed tool: {primer}");
+}
+
+/// Take the store's write lock, the way a long index build holds it, and keep
+/// it until the returned connection is committed or dropped.
+fn hold_write_lock(fixture: &Fixture) -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open(fixture.home.join("brain.db")).expect("open brain.db");
+    conn.busy_timeout(std::time::Duration::from_secs(1)).unwrap();
+    conn.execute_batch("BEGIN IMMEDIATE").expect("take the write lock");
+    conn
+}
+
+/// How many indexed events name this marker in their title.
+fn indexed_with(fixture: &Fixture, marker: &str) -> i64 {
+    let conn = rusqlite::Connection::open_with_flags(
+        fixture.home.join("brain.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("open brain.db read-only");
+    conn.query_row("SELECT COUNT(*) FROM events WHERE title LIKE ?1", [format!("%{marker}%")], |row| row.get(0))
+        .expect("count events")
+}
+
+/// One capture of an edit to `file`, as the session the test names.
+fn edit_payload(fixture: &Fixture, session: &str, file: &str) -> String {
+    serde_json::json!({
+        "session_id": session,
+        "cwd": fixture.project,
+        "tool_name": "Edit",
+        "tool_input": {"file_path": fixture.project.join(file)}
+    })
+    .to_string()
+}
+
+#[test]
+fn a_first_capture_of_a_new_session_reaches_the_log_while_the_store_is_locked() {
+    // The first capture of a session writes its invocation row before it
+    // writes the log. A write lock held past the busy timeout (the one-time
+    // index build holds it for seconds) used to fail that row, and the event
+    // went nowhere: not in the log, so not for the catch-up to recover.
+    let fixture = Fixture::new("capture-locked-new");
+    // The store exists, as it does on any machine that has captured before.
+    fixture.seed_session_as("0199a1f2-3c4d-7e8f-9012-3456789abcde", &["src/earlier.rs"]);
+
+    let lock = hold_write_lock(&fixture);
+    let payload = edit_payload(&fixture, "0199c000-0000-7000-8000-00000000a901", "src/lockedfirst.rs");
+    let out = fixture.hook("claude-code", "PostToolUse", &payload);
+    assert!(out.status.success(), "the host saw a failing hook: {out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "{}");
+    lock.execute_batch("COMMIT").unwrap();
+
+    assert!(
+        fixture.log_text().contains("lockedfirst.rs"),
+        "the capture never reached the log, so nothing can recover it"
+    );
+    assert_eq!(indexed_with(&fixture, "lockedfirst.rs"), 0, "precondition: the index write was locked out");
+
+    // Any later consolidation run catches the index up from the log.
+    assert!(fixture.brain(&["consolidate", "--session", "nonexistent-session"]).status.success());
+    assert_eq!(indexed_with(&fixture, "lockedfirst.rs"), 1, "the catch-up did not index the event");
+}
+
+#[test]
+fn a_capture_of_a_known_session_reaches_the_log_while_the_store_is_locked() {
+    // The same lock, for a session whose invocation row already exists: only
+    // the index write fails, and the log must have the event before it does.
+    let fixture = Fixture::new("capture-locked-known");
+    let session = "0199c000-0000-7000-8000-00000000a902";
+    fixture.seed_session_as(session, &["src/earlier.rs"]);
+
+    let lock = hold_write_lock(&fixture);
+    let payload = edit_payload(&fixture, session, "src/lockedlater.rs");
+    let out = fixture.hook("claude-code", "PostToolUse", &payload);
+    assert!(out.status.success(), "the host saw a failing hook: {out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "{}");
+    lock.execute_batch("COMMIT").unwrap();
+
+    assert!(fixture.log_text().contains("lockedlater.rs"), "the capture never reached the log");
+    assert_eq!(indexed_with(&fixture, "lockedlater.rs"), 0, "precondition: the index write was locked out");
+    assert!(fixture.brain(&["consolidate", "--session", "nonexistent-session"]).status.success());
+    assert_eq!(indexed_with(&fixture, "lockedlater.rs"), 1, "the catch-up did not index the event");
+}
+
+#[test]
+fn a_capture_reaches_the_log_when_the_store_cannot_even_be_opened() {
+    // The first open after an upgrade runs the once-only migrations, which
+    // write. With the lock held past the busy timeout the open itself fails;
+    // the event must still be on the log by then.
+    let fixture = Fixture::new("capture-locked-open");
+    fixture.seed_session_as("0199a1f2-3c4d-7e8f-9012-3456789abcde", &["src/earlier.rs"]);
+    {
+        // An older store: a column a later version added is not there yet.
+        let conn = rusqlite::Connection::open(fixture.home.join("brain.db")).unwrap();
+        conn.execute_batch("ALTER TABLE events DROP COLUMN clamped").unwrap();
+    }
+
+    let lock = hold_write_lock(&fixture);
+    let payload = edit_payload(&fixture, "0199c000-0000-7000-8000-00000000a903", "src/lockedopen.rs");
+    let child = fixture.spawn_hook("claude-code", "PostToolUse", &payload);
+    // The host kills a hook at 3 s (SessionEnd) to 5 s, and the open waits out
+    // a 5 s busy timeout: the log has to have the event long before that, while
+    // the hook is still stuck on the store.
+    let started = std::time::Instant::now();
+    while !fixture.log_text().contains("lockedopen.rs") && started.elapsed() < std::time::Duration::from_secs(2) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let reached_log = fixture.log_text().contains("lockedopen.rs");
+    let out = child.wait_with_output().expect("hook output");
+    assert!(reached_log, "the capture was not on the log within 2 s, before the store was touched");
+    assert!(out.status.success(), "the host saw a failing hook: {out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "{}");
+    lock.execute_batch("COMMIT").unwrap();
+
+    let brain_log = std::fs::read_to_string(fixture.home.join("brain.log")).unwrap_or_default();
+    assert!(
+        brain_log.contains("PostToolUse") && brain_log.contains("claude-code"),
+        "the failure was not recorded where doctor looks: {brain_log}"
+    );
+    // The next open migrates; the catch-up then brings the event in.
+    assert!(fixture.brain(&["consolidate", "--session", "nonexistent-session"]).status.success());
+    assert_eq!(indexed_with(&fixture, "lockedopen.rs"), 1, "the catch-up did not index the event");
 }

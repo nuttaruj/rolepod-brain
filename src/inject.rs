@@ -60,6 +60,18 @@ impl Injection {
 /// # Errors
 /// Returns an error when the index cannot be queried.
 pub fn primer(store: &Store, project: &str, session: &str, config: &InjectionConfig) -> Result<Injection> {
+    // `for_file` reads this too, so both writers honour the ceiling. A context wipe
+    // resets the count to zero, but a plain re-entry to session_start -
+    // Claude Code's own "resume" source is one - keeps the session id and the
+    // running total both, and a primer that ignored it rebuilt a full
+    // primer_budget on top of whatever earlier calls had already spent. It is
+    // read first because a spent session gets nothing, and the queries below
+    // cost seconds cold; `record_injected` still enforces the cap atomically.
+    let spent = store.session_injected_bytes(session)?;
+    if spent >= config.session_budget {
+        return Ok(Injection::default());
+    }
+
     // Work still in flight comes first - as one line per session, never as
     // the captures themselves. A session killed mid-task, or one the
     // backstop has not reached yet, is the one thing the ranking below
@@ -126,18 +138,6 @@ pub fn primer(store: &Store, project: &str, session: &str, config: &InjectionCon
         .filter(|pointer| seen.insert(pointer.id.clone()))
         .collect();
     if flight.is_empty() && handoff.is_empty() && summaries.is_empty() && knowledge.is_empty() && rest.is_empty() {
-        return Ok(Injection::default());
-    }
-
-    // `for_file` has always read this; the primer never did. A context wipe
-    // resets the count to zero, but a plain re-entry to session_start -
-    // Claude Code's own "resume" source is one - keeps the session id and the
-    // running total both, and a primer that ignored it rebuilt a full
-    // primer_budget on top of whatever earlier calls had already spent. The
-    // session ceiling exists to bound one continuous context; it cannot do
-    // that if only one of its two writers reads it.
-    let spent = store.session_injected_bytes(session)?;
-    if spent >= config.session_budget {
         return Ok(Injection::default());
     }
 
@@ -638,6 +638,22 @@ mod tests {
             store.index(&summary).unwrap();
         }
         store
+    }
+
+    /// A session at its ceiling gets nothing, so the primer must not pay for
+    /// six queries to find that out: on a real store they cost 18.8 s cold,
+    /// on every SessionStart of a session that was always going to get an
+    /// empty answer. With `events` gone, any query that reaches it errors.
+    #[test]
+    fn a_spent_session_gets_no_primer_and_runs_no_primer_query() {
+        let project = Uuid::new_v4();
+        let store = store_with(project, 3);
+        let config = InjectionConfig::default();
+        assert!(store.record_injected("s1", &[], 0, config.session_budget, config.session_budget).unwrap());
+        store.execute_batch_for_test("DROP TABLE events").unwrap();
+
+        let opening = primer(&store, &project.to_string(), "s1", &config).unwrap();
+        assert!(opening.is_empty(), "a spent session was handed a primer: {}", opening.text);
     }
 
     #[test]
@@ -1234,8 +1250,8 @@ mod tests {
         }
         // Observations no longer take primer lines of their own, so the
         // ranking is checked where it still decides things: search, layer
-        // 3, and whatever else reads `primer_pointers`.
-        let pointers = store.primer_pointers(&project.to_string(), 10).unwrap();
+        // 3, and whatever else reads the ranking.
+        let pointers = store.ranked_pointers(&project.to_string(), crate::store::Kinds::Any, 10).unwrap();
         let titles: Vec<&str> = pointers.iter().map(|p| p.title.as_str()).collect();
         assert_eq!(titles, vec!["from a person", "from a one-shot run"], "a headless run outranked a person's session");
     }
