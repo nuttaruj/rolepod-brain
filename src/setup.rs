@@ -2439,8 +2439,10 @@ mod tests {
         assert!(claude.contains("--cli claude-code"), "Claude Code's hooks tag the wrong CLI");
         assert!(!claude.contains("--cli codex"), "Codex's wiring leaked into Claude Code's file");
 
-        let codex_hooks = std::fs::read_to_string(root.join("hooks/codex-hooks.json"))
-            .expect("hooks/codex-hooks.json");
+        // Codex's commands only run a script in the plugin (Codex trusts a
+        // hook by a hash of its command text), so the tag is in the script.
+        let codex_hooks = std::fs::read_to_string(root.join("hooks/codex-hook.sh"))
+            .expect("hooks/codex-hook.sh");
         assert!(codex_hooks.contains("--cli codex"), "Codex's hooks tag the wrong CLI");
         assert!(
             !codex_hooks.contains("--cli claude-code"),

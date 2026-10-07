@@ -41,10 +41,16 @@ struct Fixture {
 
 impl Fixture {
     fn new(name: &str) -> Self {
+        Self::with_checkout(name, "checkout")
+    }
+
+    /// The same, with the checkout's directory named by the test: a repo's
+    /// directory name is the project name a capture resolves.
+    fn with_checkout(name: &str, checkout: &str) -> Self {
         let base = std::env::temp_dir().join(format!("brain-e2e-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let home = base.join("home");
-        let project = base.join("checkout");
+        let project = base.join(checkout);
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&project).unwrap();
         // A git root is what makes every worktree of one repo share a brain,
@@ -71,6 +77,18 @@ impl Fixture {
     /// Run with a controlled `PATH`, so the summarizer ladder sees exactly the
     /// CLIs a test wants it to see - and never the real ones on this machine.
     fn brain_with_path(&self, args: &[&str], path: Option<&Path>) -> std::process::Output {
+        self.brain_with_env(args, path, &[])
+    }
+
+    /// The same, with extra environment on top: a trace file, a hostile git
+    /// setting, a leaked `GIT_DIR` - whatever the test is proving brain
+    /// survives.
+    fn brain_with_env(
+        &self,
+        args: &[&str],
+        path: Option<&Path>,
+        env: &[(&str, &str)],
+    ) -> std::process::Output {
         let mut command = Command::new(BRAIN);
         command
             .args(args)
@@ -82,12 +100,24 @@ impl Fixture {
             // machine - so the fixture owns HOME too, and nothing here can
             // reach a config a person is actually using.
             .env("HOME", self.home.parent().unwrap());
+        self.own_git_config(&mut command);
         match path {
             // `git` still has to be reachable: consolidation commits the wiki.
             Some(dir) => command.env("PATH", format!("{}:/usr/bin:/bin", dir.display())),
             None => command.env("PATH", "/usr/bin:/bin"),
         };
+        command.envs(env.iter().copied());
         command.output().expect("run brain")
+    }
+
+    /// Git reads config from HOME, from XDG_CONFIG_HOME and from the system
+    /// file. These pin the last two to the fixture, so together with the
+    /// fixture's HOME a wiki commit sees git's defaults, not this machine's.
+    fn own_git_config(&self, command: &mut Command) {
+        let base = self.home.parent().unwrap();
+        command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("XDG_CONFIG_HOME", base.join(".config"));
     }
 
     /// Install a fake host CLI that responds however the test needs.
@@ -117,6 +147,26 @@ impl Fixture {
         String::from_utf8_lossy(&output.stdout).trim().parse().unwrap_or(-1)
     }
 
+    /// The mode of every `brain consolidate` run on record, oldest first.
+    /// Read-only, so a test that polls never holds up the run it watches.
+    fn consolidation_modes(&self) -> Vec<String> {
+        let Ok(conn) = rusqlite::Connection::open_with_flags(
+            self.home.join("brain.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) else {
+            return Vec::new();
+        };
+        let _ = conn.busy_timeout(std::time::Duration::from_secs(2));
+        let Ok(mut statement) = conn.prepare("SELECT mode FROM consolidation_runs ORDER BY rowid")
+        else {
+            return Vec::new();
+        };
+        statement
+            .query_map([], |row| row.get(0))
+            .map(|rows| rows.filter_map(Result::ok).collect())
+            .unwrap_or_default()
+    }
+
     /// Every consolidated page on disk.
     /// The wiki directory, whichever name this fixture's brain gave it.
     fn wiki(&self) -> PathBuf {
@@ -144,12 +194,20 @@ impl Fixture {
 
     /// Capture enough events that consolidation will not debounce them away.
     fn seed_session(&self, count: usize) {
-        for index in 0..count {
+        let files: Vec<String> = (0..count).map(|index| format!("src/file{index}.rs")).collect();
+        let files: Vec<&str> = files.iter().map(String::as_str).collect();
+        self.seed_session_as("0199a1f2-3c4d-7e8f-9012-3456789abcde", &files);
+    }
+
+    /// The same, as the session the test names, editing the files it names:
+    /// two sessions over the same files is what gives those files entity pages.
+    fn seed_session_as(&self, session_id: &str, files: &[&str]) {
+        for file in files {
             let payload = serde_json::json!({
-                "session_id": "0199a1f2-3c4d-7e8f-9012-3456789abcde",
+                "session_id": session_id,
                 "cwd": self.project,
                 "tool_name": "Edit",
-                "tool_input": {"file_path": self.project.join(format!("src/file{index}.rs"))}
+                "tool_input": {"file_path": self.project.join(file)}
             })
             .to_string();
             self.hook("claude-code", "PostToolUse", &payload);
@@ -157,14 +215,17 @@ impl Fixture {
     }
 
     fn hook(&self, cli: &str, event: &str, payload: &str) -> std::process::Output {
-        let mut child = Command::new(BRAIN)
+        let mut command = Command::new(BRAIN);
+        command
             .args(["hook", "--cli", cli, "--event", event])
             .current_dir(&self.project)
             .env("ROLEPOD_BRAIN_HOME", &self.home)
             // Same reason brain_with_path owns HOME: the capture path reads
             // $HOME too, and a fixture that leaves it pointing at the real
             // machine is testing the machine, not the fixture.
-            .env("HOME", self.home.parent().unwrap())
+            .env("HOME", self.home.parent().unwrap());
+        self.own_git_config(&mut command);
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -172,6 +233,57 @@ impl Fixture {
             .expect("spawn hook");
         child.stdin.as_mut().unwrap().write_all(payload.as_bytes()).unwrap();
         child.wait_with_output().expect("hook output")
+    }
+
+    /// A Claude Code hook run the way a delegate runs it: under `claude -p`.
+    ///
+    /// To `ps`, a hook running under a process whose argv reads `claude -p …`
+    /// is a hook under a headless Claude. A symlink to bash by that name, in
+    /// privileged mode, is exactly that - a symlink rather than a copy, because
+    /// macOS kills a copied system binary.
+    fn hook_under_headless_claude(&self, event: &str, payload: &str) {
+        let fake = self.home.parent().unwrap().join("delegate-bin");
+        std::fs::create_dir_all(&fake).unwrap();
+        let claude = fake.join("claude");
+        if claude.symlink_metadata().is_err() {
+            std::os::unix::fs::symlink("/bin/bash", &claude).unwrap();
+        }
+        // Two commands, so bash forks for the first instead of exec-ing into
+        // it: the `claude -p` parent has to still exist when brain looks up.
+        let script = format!("'{BRAIN}' hook --cli claude-code --event {event}; exit $?");
+        let mut command = Command::new(&claude);
+        command
+            .args(["-p", "-c", &script])
+            .current_dir(&self.project)
+            .env("ROLEPOD_BRAIN_HOME", &self.home)
+            .env("HOME", self.home.parent().unwrap());
+        self.own_git_config(&mut command);
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the fake claude");
+        child.stdin.as_mut().unwrap().write_all(payload.as_bytes()).unwrap();
+        let out = child.wait_with_output().expect("hook output");
+        assert!(out.status.success(), "hook failed: {out:?}");
+    }
+
+    /// A whole delegated review under `claude -p`: a start, three prompts and
+    /// one file read.
+    fn seed_headless_session(&self, session_id: &str) {
+        self.hook_under_headless_claude("SessionStart", &start_payload(&self.project, session_id, "startup"));
+        for prompt in ["Review the auth change adversarially", "Now the tests", "Report what you found"] {
+            let payload = serde_json::json!({"session_id": session_id, "cwd": self.project, "prompt": prompt});
+            self.hook_under_headless_claude("UserPromptSubmit", &payload.to_string());
+        }
+        let payload = serde_json::json!({
+            "session_id": session_id,
+            "cwd": self.project,
+            "tool_name": "Read",
+            "tool_input": {"file_path": self.project.join("src/auth.rs")}
+        });
+        self.hook_under_headless_claude("PostToolUse", &payload.to_string());
     }
 
     /// One JSON-RPC round trip against a freshly spawned MCP server.
@@ -185,11 +297,14 @@ impl Fixture {
             || "/usr/bin:/bin".to_string(),
             |dir| format!("{}:/usr/bin:/bin", dir.display()),
         );
-        let mut child = Command::new(BRAIN)
+        let mut command = Command::new(BRAIN);
+        command
             .arg("mcp")
             .current_dir(&self.project)
             .env("ROLEPOD_BRAIN_HOME", &self.home)
-            .env("PATH", path)
+            .env("PATH", path);
+        self.own_git_config(&mut command);
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -309,6 +424,71 @@ fn run_in(dir: &Path, program: &str, args: &[&str]) {
         .current_dir(dir)
         .output()
         .unwrap_or_else(|_| panic!("run {program}"));
+}
+
+/// What a test-side git command printed; empty when it failed.
+fn git_stdout(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git").args(args).current_dir(dir).output().expect("run git");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Every event git wrote to a `GIT_TRACE2_EVENT` file, one JSON object a line.
+fn trace2(path: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+fn trace_argv(event: &serde_json::Value) -> Vec<String> {
+    event["argv"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|arg| arg.as_str().map(str::to_string))
+        .collect()
+}
+
+/// The `start` events of git processes something other than git started.
+/// trace2 nests a child's session id under its parent's with a `/`, so a
+/// top-level one has none.
+fn top_level_starts(events: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+    events
+        .iter()
+        .filter(|event| event["event"] == "start")
+        .filter(|event| event["sid"].as_str().is_some_and(|sid| !sid.contains('/')))
+        .collect()
+}
+
+/// The argv of every git process brain's wiki guard built: it is the only
+/// caller that passes `maintenance.auto=false`.
+fn wiki_git_starts(events: &[serde_json::Value]) -> Vec<Vec<String>> {
+    top_level_starts(events)
+        .into_iter()
+        .map(trace_argv)
+        .filter(|argv| argv.iter().any(|arg| arg == "maintenance.auto=false"))
+        .collect()
+}
+
+/// The children a traced git started that maintain the repository in some
+/// form - the processes that, one per commit, made the storm.
+fn spawned(events: &[serde_json::Value]) -> Vec<Vec<String>> {
+    const MAINTENANCE: [&str; 7] = [
+        "maintenance",
+        "gc",
+        "repack",
+        "pack-objects",
+        "multi-pack-index",
+        "commit-graph",
+        "fsmonitor--daemon",
+    ];
+    events
+        .iter()
+        .filter(|event| event["event"] == "child_start")
+        .map(trace_argv)
+        .filter(|argv| argv.iter().any(|arg| MAINTENANCE.contains(&arg.as_str())))
+        .collect()
 }
 
 fn claude_payload(cwd: &Path) -> String {
@@ -483,6 +663,45 @@ fn a_named_workspace_keeps_its_own_level() {
         Path::new("work/api"),
         "a named workspace nests and the project name is clean"
     );
+}
+
+/// A run for one checkout took the project's name from the checkout
+/// (`WalnutZite`); `--all` took it from the wiki folder (`walnutzite`). Each
+/// switch between them rewrote the hub, topic and entity pages, and on
+/// 2026-10-06 that was 14,730 commits. Every run now names a project after
+/// its folder.
+#[test]
+fn a_project_keeps_one_name_whichever_run_writes_it() {
+    let fixture = Fixture::with_checkout("onename", "WalnutZite");
+    let bin = fixture.fake_cli("claude", GOOD_CLI);
+    let names = || {
+        let hub = std::fs::read_to_string(fixture.wiki().join("walnutzite/walnutzite.md"))
+            .expect("the hub is named after the folder");
+        hub.lines()
+            .filter(|line| line.starts_with("title:") || line.starts_with("# "))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+
+    fixture.seed_session(4);
+    let output = fixture.brain_with_path(&["consolidate", "--force"], Some(&bin));
+    assert!(output.status.success(), "consolidate failed: {output:?}");
+    let from_checkout = names();
+
+    fixture.seed_session(4);
+    let output = fixture.brain_with_path(&["consolidate", "--all", "--force"], Some(&bin));
+    assert!(output.status.success(), "consolidate --all failed: {output:?}");
+    let from_all = names();
+
+    // A document read from the checkout writes the hub too.
+    std::fs::write(fixture.project.join("notes.md"), "# Notes\n\nThe deploy runs nightly.\n").unwrap();
+    let output = fixture.brain_with_path(&["ingest", "notes.md"], Some(&bin));
+    assert!(output.status.success(), "ingest failed: {output:?}");
+    let from_ingest = names();
+
+    assert_eq!(from_checkout, ["title: walnutzite", "# walnutzite"], "the checkout's spelling leaked");
+    assert_eq!(from_all, from_checkout, "--all renamed the project");
+    assert_eq!(from_ingest, from_checkout, "ingest renamed the project");
 }
 
 #[test]
@@ -2679,6 +2898,689 @@ fn the_wiki_is_git_versioned() {
         .expect("git log");
     let log = String::from_utf8_lossy(&log.stdout);
     assert!(log.contains("consolidate"), "page should be committed: {log}");
+}
+
+/// The keys every wiki git call carries on its command line.
+const WIKI_GIT_GUARD: [&str; 6] = [
+    "maintenance.auto=false",
+    "maintenance.autoDetach=false",
+    "gc.auto=0",
+    "gc.autoDetach=false",
+    "core.fsmonitor=",
+    "commit.gpgSign=false",
+];
+
+/// Since git 2.29 every `git commit` starts `git maintenance run --auto`, which
+/// recent git detaches, and brain committed once per page: on 2026-10-07 that
+/// was tens of concurrent repacks and a hung machine. Every wiki git call now carries
+/// a guard on its command line, so no commit brain makes starts one.
+#[test]
+fn the_wiki_never_starts_gits_own_maintenance() {
+    let fixture = Fixture::new("nomaint");
+    fixture.seed_session(4);
+    let bin = fixture.fake_cli("claude", GOOD_CLI);
+    let trace = fixture.home.parent().unwrap().join("t.json");
+    let output = fixture.brain_with_env(
+        &["consolidate", "--force"],
+        Some(&bin),
+        &[("GIT_TRACE2_EVENT", trace.to_str().unwrap())],
+    );
+    assert!(output.status.success(), "consolidate failed: {output:?}");
+
+    let events = trace2(&trace);
+    // Without this, a git with no trace2 support would pass by saying nothing.
+    assert!(
+        top_level_starts(&events).into_iter().any(|event| trace_argv(event).contains(&"commit".into())),
+        "no commit in the trace - is trace2 supported by this git?"
+    );
+    assert_eq!(spawned(&events), Vec::<Vec<String>>::new(), "a wiki commit started maintenance");
+
+    // Every git that ran in the wiki, not only the ones that already carry
+    // the guard: one built by hand would show up here without it.
+    let wiki = std::fs::canonicalize(fixture.wiki()).unwrap();
+    let in_wiki: std::collections::HashSet<&str> = events
+        .iter()
+        .filter(|event| event["event"] == "def_repo")
+        .filter(|event| event["worktree"].as_str().is_some_and(|tree| Path::new(tree) == wiki))
+        .filter_map(|event| event["sid"].as_str())
+        .collect();
+    let starts: Vec<Vec<String>> = top_level_starts(&events)
+        .into_iter()
+        .filter(|event| event["sid"].as_str().is_some_and(|sid| in_wiki.contains(sid)))
+        .map(trace_argv)
+        .collect();
+    assert!(!starts.is_empty(), "no git ran in the wiki");
+    // The calls that write the wiki are also found by name, so a git that
+    // never reported its repository cannot slip past both checks.
+    let writes: Vec<Vec<String>> = top_level_starts(&events)
+        .into_iter()
+        .map(trace_argv)
+        .filter(|argv| argv.iter().any(|arg| ["init", "add", "commit"].contains(&arg.as_str())))
+        .collect();
+    for argv in starts.iter().chain(&writes) {
+        for key in WIKI_GIT_GUARD {
+            assert!(
+                argv.windows(2).any(|pair| pair[0] == "-c" && pair[1] == key),
+                "a wiki git ran without -c {key}: {argv:?}"
+            );
+        }
+    }
+    assert_eq!(wiki_git_starts(&events).len(), starts.len(), "a guarded git ran outside the wiki");
+}
+
+/// The same, against a person whose own git config asks for everything the
+/// guard turns off: auto-maintenance in the global file and in the
+/// environment, an fsmonitor daemon, and signed commits through a signer that
+/// always fails. Brain still commits, and still starts nothing.
+#[test]
+fn the_wiki_never_starts_gits_own_maintenance_under_a_hostile_config() {
+    let fixture = Fixture::new("nomaint-hostile");
+    fixture.seed_session(4);
+    let bin = fixture.fake_cli("claude", GOOD_CLI);
+    let base = fixture.home.parent().unwrap();
+    std::fs::write(
+        base.join(".gitconfig"),
+        "[maintenance]\n\tauto = true\n\tstrategy = incremental\n[gc]\n\tauto = 1\n\
+         [core]\n\tfsmonitor = true\n[commit]\n\tgpgSign = true\n[gpg]\n\tprogram = /bin/false\n",
+    )
+    .unwrap();
+    let trace = base.join("t.json");
+    let output = fixture.brain_with_env(
+        &["consolidate", "--force"],
+        Some(&bin),
+        &[
+            ("GIT_TRACE2_EVENT", trace.to_str().unwrap()),
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "maintenance.auto"),
+            ("GIT_CONFIG_VALUE_0", "true"),
+        ],
+    );
+    let wiki = fixture.wiki();
+    let log = git_stdout(&wiki, &["log", "--oneline"]);
+    // Only a failing run starts a daemon, and it would outlive the test.
+    let _ = Command::new("git")
+        .args(["fsmonitor--daemon", "stop"])
+        .current_dir(&wiki)
+        .output();
+
+    assert!(output.status.success(), "consolidate failed: {output:?}");
+    assert!(wiki.join(".git").is_dir(), "the wiki has no repository");
+    assert!(log.contains("consolidate"), "a hostile config stopped the commit: {log}");
+    let events = trace2(&trace);
+    assert!(
+        top_level_starts(&events).into_iter().any(|event| trace_argv(event).contains(&"commit".into())),
+        "no commit in the trace - is trace2 supported by this git?"
+    );
+    assert_eq!(spawned(&events), Vec::<Vec<String>>::new(), "a wiki git started maintenance");
+}
+
+/// A hook runs inside whatever git the host CLI is running, and git exports
+/// `GIT_INDEX_FILE` and friends to its own hooks. The detached consolidate
+/// inherits that environment; unscrubbed, its wiki commits went into the
+/// person's checkout through the person's index.
+#[test]
+fn a_leaked_git_environment_cannot_redirect_wiki_commits() {
+    let fixture = Fixture::new("leakedenv");
+    fixture.seed_session(4);
+    let bin = fixture.fake_cli("claude", GOOD_CLI);
+    let checkout = fixture.project.clone();
+    let git_dir = checkout.join(".git");
+    let output = fixture.brain_with_env(
+        &["consolidate", "--force"],
+        Some(&bin),
+        &[
+            ("GIT_DIR", git_dir.to_str().unwrap()),
+            ("GIT_WORK_TREE", checkout.to_str().unwrap()),
+            ("GIT_INDEX_FILE", git_dir.join("index").to_str().unwrap()),
+        ],
+    );
+    assert!(output.status.success(), "consolidate failed: {output:?}");
+
+    let wiki = fixture.wiki();
+    assert!(wiki.join(".git").is_dir(), "the wiki has no repository");
+    let log = git_stdout(&wiki, &["log", "--oneline"]);
+    assert!(log.contains("consolidate"), "the wiki has no consolidate commit: {log}");
+    let tracked = git_stdout(&checkout, &["ls-files"]);
+    assert!(tracked.trim().is_empty(), "wiki pages were staged in the checkout: {tracked}");
+    let head = Command::new("git")
+        .args(["rev-parse", "-q", "--verify", "HEAD"])
+        .current_dir(&checkout)
+        .output()
+        .expect("run git");
+    assert!(!head.status.success(), "a commit landed in the checkout");
+}
+
+/// The guard on brain's own command lines does nothing for a commit something
+/// else makes in the wiki: an older brain still holding the run lock, a second
+/// binary wired in by path, Obsidian Git, the person. Those read the
+/// repository's own config, so brain turns maintenance off there too - before
+/// it asks for the run lock, so a run that stands aside still does it.
+#[test]
+fn the_wiki_repo_turns_git_maintenance_off_for_every_committer() {
+    let fixture = Fixture::new("repopolicy");
+    fixture.seed_session(4);
+    let bin = fixture.fake_cli("claude", GOOD_CLI);
+    let output = fixture.brain_with_path(&["consolidate", "--force"], Some(&bin));
+    assert!(output.status.success(), "consolidate failed: {output:?}");
+
+    let wiki = fixture.wiki();
+    // `--local`: the repository's own file, never what this machine set.
+    let policy = || {
+        ["maintenance.auto", "gc.auto", "brain.policy"]
+            .map(|key| git_stdout(&wiki, &["config", "--local", "--get", key]).trim().to_string())
+    };
+    assert_eq!(policy(), ["false", "0", "1"], "the wiki's own config leaves maintenance on");
+
+    // A commit brain did not build, on git's defaults otherwise.
+    let base = fixture.home.parent().unwrap();
+    let trace = base.join("t.json");
+    let mut commit = Command::new("git");
+    commit
+        .args(["commit", "--allow-empty", "-q", "-m", "x"])
+        .current_dir(&wiki)
+        .env("HOME", base)
+        .env("GIT_TRACE2_EVENT", &trace);
+    fixture.own_git_config(&mut commit);
+    assert!(commit.status().expect("run git").success(), "a plain commit in the wiki failed");
+    let events = trace2(&trace);
+    assert!(
+        top_level_starts(&events).into_iter().any(|event| trace_argv(event).contains(&"commit".into())),
+        "no commit in the trace - is trace2 supported by this git?"
+    );
+    assert_eq!(spawned(&events), Vec::<Vec<String>>::new(), "a plain wiki commit started maintenance");
+
+    // A wiki a 0.63 brain left, while another run holds the lock: this run
+    // stands aside, and has written the policy back first. The idle sweep
+    // takes the lock by its own path, so it is checked on its own.
+    let lock = fixture.home.join(".brain-consolidate.lock");
+    std::fs::write(&lock, std::process::id().to_string()).unwrap();
+    fixture.seed_session(4);
+    for args in [["consolidate", "--force"], ["consolidate", "--idle"]] {
+        for key in ["maintenance.auto", "gc.auto", "brain.policy"] {
+            git_stdout(&wiki, &["config", "--local", "--unset", key]);
+        }
+        assert_eq!(policy(), ["", "", ""], "the policy was not removed");
+        let output = fixture.brain_with_path(&args, Some(&bin));
+        assert!(output.status.success(), "{args:?} failed: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("stood aside"),
+            "{args:?} did not yield to the held lock: {output:?}"
+        );
+        assert_eq!(policy(), ["false", "0", "1"], "{args:?} stood aside and left maintenance on");
+    }
+    std::fs::remove_file(&lock).unwrap();
+
+    // With the marker in place, a run with nothing new starts no git at all.
+    fixture.brain_with_path(&["consolidate", "--force"], Some(&bin));
+    let trace = base.join("nothing-new.json");
+    let output = fixture.brain_with_env(
+        &["consolidate", "--force"],
+        Some(&bin),
+        &[("GIT_TRACE2_EVENT", trace.to_str().unwrap())],
+    );
+    assert!(output.status.success(), "consolidate failed: {output:?}");
+    assert_eq!(
+        wiki_git_starts(&trace2(&trace)),
+        Vec::<Vec<String>>::new(),
+        "a run with nothing new started git in the wiki"
+    );
+}
+
+/// A consolidated session is one commit: its page together with every hub,
+/// topic and entity page it changed. Brain used to commit each page on its
+/// own, four or five git processes a page, and a real session came to about a
+/// hundred commits - each of which started git's maintenance.
+#[test]
+fn one_consolidated_session_is_one_commit() {
+    let fixture = Fixture::new("onecommit");
+    // Two sessions over the same files, so the second one brings entity
+    // pages and `entities.md` into its commit.
+    let files = ["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs", "src/e.rs", "src/f.rs"];
+    fixture.seed_session_as("0199a1f2-3c4d-7e8f-9012-0000000000a1", &files);
+    fixture.seed_session_as("0199a1f2-3c4d-7e8f-9012-0000000000b2", &files);
+    let bin = fixture.fake_cli("claude", GOOD_CLI);
+    let base = fixture.home.parent().unwrap();
+    let trace = base.join("t.json");
+    let output = fixture.brain_with_env(
+        &["consolidate", "--force"],
+        Some(&bin),
+        &[("GIT_TRACE2_EVENT", trace.to_str().unwrap())],
+    );
+    assert!(output.status.success(), "consolidate failed: {output:?}");
+
+    let wiki = fixture.wiki();
+    let log = git_stdout(&wiki, &["log", "--format=%H %s"]);
+    // Two sessions, and the front page once for the run.
+    assert_eq!(log.lines().count(), 3, "not one commit per session: {log}");
+    let events = trace2(&trace);
+    let starts = wiki_git_starts(&events);
+    // init 1, identity 2, maintenance policy 3, then add, diff and commit
+    // for each session and once for the front page.
+    assert!(starts.len() <= 15, "{} wiki git processes: {starts:?}", starts.len());
+    assert_eq!(spawned(&events), Vec::<Vec<String>>::new(), "a wiki commit started maintenance");
+
+    let sessions: Vec<(&str, &str)> = log
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .filter(|(_, subject)| subject.contains("/pages/sessions/"))
+        .collect();
+    assert_eq!(sessions.len(), 2, "a session commit is missing or misnamed: {log}");
+    let mut derived = Vec::new();
+    for (hash, subject) in sessions {
+        let page = subject
+            .strip_prefix("consolidate ")
+            .and_then(|rest| rest.rsplit_once(" ("))
+            .map_or(subject, |(page, _)| page);
+        let changed = git_stdout(&wiki, &["show", "--name-only", "--format=", hash]);
+        let changed: Vec<&str> = changed.lines().collect();
+        assert!(changed.contains(&page), "{subject} left its own page out: {changed:?}");
+        assert!(changed.contains(&"checkout/checkout.md"), "{subject} left the hub out: {changed:?}");
+        derived.extend(changed.into_iter().map(str::to_string));
+    }
+    assert!(
+        derived.iter().any(|path| path == "checkout/entities.md"),
+        "no session commit carried the entity index: {derived:?}"
+    );
+    assert!(
+        derived.iter().any(|path| path.starts_with("checkout/entities/")),
+        "no session commit carried an entity page: {derived:?}"
+    );
+    // One commit for a session is all or nothing: a page the run wrote and
+    // left out of it would sit in the tree with no history at all. The
+    // capture log is the hooks' file, and no consolidation commits it.
+    let status = git_stdout(&wiki, &["status", "--porcelain", "--untracked-files=all"]);
+    let left: Vec<&str> = status.lines().filter(|line| !line.contains("/events/")).collect();
+    assert_eq!(left, Vec::<&str>::new(), "the run left pages uncommitted");
+
+    // Nothing new: no git at all, and no commit.
+    let trace = base.join("nothing-new.json");
+    let output = fixture.brain_with_env(
+        &["consolidate", "--force"],
+        Some(&bin),
+        &[("GIT_TRACE2_EVENT", trace.to_str().unwrap())],
+    );
+    assert!(output.status.success(), "consolidate failed: {output:?}");
+    assert_eq!(
+        wiki_git_starts(&trace2(&trace)),
+        Vec::<Vec<String>>::new(),
+        "a run with nothing new started git in the wiki"
+    );
+    assert_eq!(
+        git_stdout(&wiki, &["rev-list", "--count", "HEAD"]).trim(),
+        "3",
+        "a run with nothing new committed"
+    );
+}
+
+/// The machines the storm hit were hard-rebooted while brain committed about
+/// once a second, and the repacks it had started were killed. What those gits
+/// left behind - a lock that makes every later commit fail, gigabytes of
+/// half-written packs - stays until something removes it. The next run does,
+/// and leaves anything a git could still be working on alone.
+#[test]
+fn a_killed_gits_leftovers_are_cleared_and_live_ones_are_not() {
+    let fixture = Fixture::new("heal");
+    fixture.seed_session(4);
+    let bin = fixture.fake_cli("claude", GOOD_CLI);
+    let output = fixture.brain_with_path(&["consolidate", "--force"], Some(&bin));
+    assert!(output.status.success(), "consolidate failed: {output:?}");
+    let wiki = fixture.wiki();
+    let git = wiki.join(".git");
+    assert!(git.is_dir(), "the wiki has no repository");
+    let commits = || git_stdout(&wiki, &["rev-list", "--count", "HEAD"]).trim().parse::<usize>().unwrap();
+    let before = commits();
+
+    let branch = git_stdout(&wiki, &["symbolic-ref", "--short", "HEAD"]).trim().to_string();
+    assert!(!branch.is_empty(), "the wiki has no branch");
+    let pack = git.join("objects").join("pack");
+    std::fs::create_dir_all(git.join("refs/heads/brain")).unwrap();
+    let plant = |path: &Path, bytes: usize, age: std::time::Duration| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, vec![0u8; bytes]).unwrap();
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - age).unwrap();
+    };
+    let two_hours = std::time::Duration::from_secs(2 * 60 * 60);
+    // What a killed git leaves: half-written packs nobody has touched for an
+    // hour, and the locks that make the next commit fail.
+    let dead = [
+        pack.join("tmp_pack_dead"),
+        pack.join(".tmp-4242-pack-dead.pack"),
+        git.join("index.lock"),
+        git.join("HEAD.lock"),
+        git.join("config.lock"),
+        git.join("refs/heads").join(format!("{branch}.lock")),
+        git.join("refs/heads/brain/old.lock"),
+    ];
+    for path in &dead {
+        let bytes = if path.ends_with("tmp_pack_dead") { 1 << 20 } else { 0 };
+        plant(path, bytes, two_hours);
+    }
+    // What a running git could still be writing.
+    let live = [pack.join("tmp_pack_live"), git.join("refs/heads/brain/live.lock")];
+    for path in &live {
+        plant(path, 0, std::time::Duration::ZERO);
+    }
+    // What is git's own business rather than a leftover, however old: a
+    // finished pack, and the files only its maintenance reads.
+    let owned = [pack.join("pack-deadbeef.pack"), git.join("objects/maintenance.lock"), git.join("gc.pid")];
+    for path in &owned {
+        plant(path, 0, two_hours);
+    }
+
+    fixture.seed_session_as("0199a1f2-3c4d-7e8f-9012-0000000000c3", &["src/later.rs", "src/next.rs"]);
+    let output = fixture.brain_with_path(&["consolidate", "--force"], Some(&bin));
+    assert!(output.status.success(), "consolidate failed: {output:?}");
+
+    let left: Vec<&PathBuf> = dead.iter().filter(|path| path.exists()).collect();
+    assert_eq!(left, Vec::<&PathBuf>::new(), "a killed git's leftovers are still there");
+    for path in live.iter().chain(&owned) {
+        assert!(path.exists(), "{} was removed", path.display());
+    }
+    assert!(commits() > before, "no commit landed after the leftovers: {output:?}");
+
+    // The idle sweep takes the run lock by its own path, so it heals too.
+    plant(&git.join("index.lock"), 0, two_hours);
+    let output = fixture.brain_with_path(&["consolidate", "--idle"], Some(&bin));
+    assert!(output.status.success(), "the idle sweep failed: {output:?}");
+    assert!(!git.join("index.lock").exists(), "the idle sweep left a dead index.lock");
+}
+
+/// Loose objects in a repository, counted the way git names them: a file
+/// under `objects/<2 hex>/` whose name is the rest of the hash. It mirrors
+/// the SHA-1 half of brain's own `count_loose`, the only hash a fixture uses.
+fn loose_objects(git: &Path) -> usize {
+    (0..=255u8)
+        .flat_map(|byte| std::fs::read_dir(git.join("objects").join(format!("{byte:02x}"))).into_iter().flatten())
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.len() == 38 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .count()
+}
+
+/// With git's own maintenance off, brain packs the wiki itself: when enough
+/// has piled up loose, at most once a day, in one foreground repack that packs
+/// only what is not packed yet. Never a gc, a prune or a detached run - the
+/// shapes the storm was made of.
+#[test]
+fn brain_packs_its_wiki_once_a_day_in_one_bounded_pass() {
+    let fixture = Fixture::new("maintain");
+    fixture.seed_session(4);
+    let bin = fixture.fake_cli("claude", GOOD_CLI);
+    let output = fixture.brain_with_path(&["consolidate", "--force"], Some(&bin));
+    assert!(output.status.success(), "consolidate failed: {output:?}");
+    let wiki = fixture.wiki();
+    let git = wiki.join(".git");
+    assert!(git.is_dir(), "the wiki has no repository");
+    let base = fixture.home.parent().unwrap();
+
+    // Committed, so history reaches them: a repack that packs only what is
+    // unpacked leaves an unreachable object where it is.
+    let plant = |batch: &str| {
+        let dir = wiki.join("planted").join(batch);
+        std::fs::create_dir_all(&dir).unwrap();
+        for index in 0..2_100 {
+            std::fs::write(dir.join(format!("{index}.md")), format!("{batch} {index}\n")).unwrap();
+        }
+        for args in [&["add", "planted"][..], &["commit", "-q", "-m", batch]] {
+            let mut command = Command::new("git");
+            command
+                .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
+                .args(args)
+                .current_dir(&wiki)
+                .env("HOME", base);
+            fixture.own_git_config(&mut command);
+            assert!(command.status().expect("run git").success(), "planting {batch} failed");
+        }
+        assert!(loose_objects(&git) >= 2_000, "planting {batch} left too few loose objects");
+    };
+    let consolidate = |session: &str, trace: &str| {
+        fixture.seed_session_as(session, &["src/later.rs", "src/next.rs", "src/more.rs", "src/last.rs"]);
+        let trace = base.join(trace);
+        let output = fixture.brain_with_env(
+            &["consolidate", "--force"],
+            Some(&bin),
+            &[("GIT_TRACE2_EVENT", trace.to_str().unwrap())],
+        );
+        assert!(output.status.success(), "consolidate failed: {output:?}");
+        trace2(&trace)
+    };
+    let repacks = |events: &[serde_json::Value]| -> Vec<Vec<String>> {
+        top_level_starts(events)
+            .into_iter()
+            .map(trace_argv)
+            .filter(|argv| argv.iter().any(|arg| arg == "repack"))
+            .collect()
+    };
+
+    plant("first");
+    let events = consolidate("0199a1f2-3c4d-7e8f-9012-0000000000d4", "first.json");
+    let starts = repacks(&events);
+    assert_eq!(starts.len(), 1, "not one repack: {starts:?}");
+    let argv = &starts[0];
+    for bound in ["pack.threads=1", "-d"] {
+        assert!(argv.iter().any(|arg| arg == bound), "the repack lacks {bound}: {argv:?}");
+    }
+    for unbounded in ["--detach", "-a", "-A", "--cruft"] {
+        assert!(!argv.iter().any(|arg| arg == unbounded), "the repack has {unbounded}: {argv:?}");
+    }
+    assert!(!argv.iter().any(|arg| arg.starts_with("--geometric")), "a geometric repack: {argv:?}");
+    let forbidden: Vec<Vec<String>> = events
+        .iter()
+        .filter(|event| event["event"] == "start" || event["event"] == "child_start")
+        .map(trace_argv)
+        .filter(|argv| argv.iter().any(|arg| ["gc", "prune", "maintenance"].contains(&arg.as_str())))
+        .collect();
+    assert_eq!(forbidden, Vec::<Vec<String>>::new(), "brain's maintenance ran a gc, prune or maintenance");
+    let loose = loose_objects(&git);
+    assert!(loose < 100, "{loose} objects are still loose after the repack");
+    let stamp = std::fs::read_to_string(git.join("brain-maintenance")).unwrap_or_default();
+    assert!(stamp.starts_with("done "), "the maintenance stamp does not record a finished pass: {stamp:?}");
+    assert!(stamp.contains("outcome=ok"), "the repack did not succeed: {stamp:?}");
+    assert!(!git.join("brain-maintenance.err").exists(), "a clean repack kept its error file");
+    let mut fsck = Command::new("git");
+    fsck.args(["fsck", "--connectivity-only"]).current_dir(&wiki).env("HOME", base);
+    fixture.own_git_config(&mut fsck);
+    let fsck = fsck.output().expect("run git");
+    assert!(fsck.status.success(), "the packed wiki fails fsck: {fsck:?}");
+
+    // As much piles up again the same day: the stamp holds it to one pass.
+    plant("second");
+    let events = consolidate("0199a1f2-3c4d-7e8f-9012-0000000000e5", "second.json");
+    assert_eq!(repacks(&events), Vec::<Vec<String>>::new(), "a second repack within the day");
+}
+
+/// The plugin's hooks directory, which Codex names `${PLUGIN_ROOT}/hooks`.
+fn plugin_hooks_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/rolepod-brain/hooks")
+}
+
+/// A plugin hook command run the way its host runs it: through `/bin/sh`,
+/// with `${PLUGIN_ROOT}` already replaced by the plugin's directory as Codex
+/// does, from the fixture's checkout, and with only `bin` ahead of the
+/// system's own tools on `PATH`. No git setting comes in from the caller, so
+/// whatever git reads under it came from the hook.
+fn plugin_hook_shell(fixture: &Fixture, command: &str, bin: &Path) -> Command {
+    let root = plugin_hooks_dir().parent().unwrap().display().to_string();
+    let mut shell = Command::new("/bin/sh");
+    shell
+        .args(["-c", &command.replace("${PLUGIN_ROOT}", &root)])
+        .current_dir(&fixture.project)
+        .env("HOME", fixture.home.parent().unwrap())
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_CONFIG_COUNT");
+    fixture.own_git_config(&mut shell);
+    shell
+}
+
+/// The plugin updates apart from the binary, so a person can run this
+/// release's hooks with an older brain that still commits once per page. The
+/// guard rides in the hook's environment, which `brain hook` and the
+/// consolidate it starts both inherit, so even that binary's commits start no
+/// maintenance. Codex's commands only run a script in the plugin, and the
+/// script sets the guard: Codex trusts a hook by a hash of its command text,
+/// so the guard lives where a later change needs no new approval.
+#[test]
+fn every_plugin_hook_turns_git_maintenance_off() {
+    const GUARD: &str = r#"GIT_CONFIG_PARAMETERS="'maintenance.auto=false' 'gc.auto=0'""#;
+    let hooks_dir = plugin_hooks_dir();
+    // Each file's event count beside the commands found in it that run brain
+    // (`marker`): one per event, so a command the filter misses cannot leave
+    // an event unchecked.
+    let commands = |file: &str, marker: &str| -> (usize, Vec<String>) {
+        let text = std::fs::read_to_string(hooks_dir.join(file)).expect("the hook file ships");
+        let manifest: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        let events = manifest["hooks"].as_object().expect("a hooks table");
+        let mut found = Vec::new();
+        for groups in events.values() {
+            for group in groups.as_array().into_iter().flatten() {
+                for hook in group["hooks"].as_array().into_iter().flatten() {
+                    found.extend(hook["command"].as_str().map(str::to_string));
+                }
+            }
+        }
+        found.retain(|command| command.contains(marker));
+        (events.len(), found)
+    };
+
+    let (events, claude) = commands("hooks.json", "brain hook");
+    assert_eq!(claude.len(), events, "a Claude Code event does not run brain once");
+    // A stand-in brain answers with what git reads, so the test proves the
+    // quoting survives the shell, not only that the text is there. Its
+    // `where` points at a model that is present and `curl` always fails, so
+    // SessionStart never fetches anything.
+    let fixture = Fixture::new("plugin-env");
+    let base = fixture.home.parent().unwrap();
+    std::fs::write(base.join("model-int8.safetensors"), "present").unwrap();
+    fixture.fake_cli(
+        "brain",
+        "[ \"$1\" = where ] && { echo \"$HOME\"; exit 0; }\n\
+         git config --get maintenance.auto\n\
+         git config --get gc.auto",
+    );
+    let bin = fixture.fake_cli("curl", "exit 1");
+    for command in &claude {
+        // After `brain hook` it would be an argument, not the environment.
+        assert!(
+            command.find(GUARD).is_some_and(|at| at < command.find("brain hook").unwrap()),
+            "a hook runs brain without the maintenance guard ahead of it: {command}"
+        );
+        let output = plugin_hook_shell(&fixture, command, &bin).output().expect("run the hook");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "false\n0\n",
+            "git does not see maintenance off under: {command}"
+        );
+    }
+
+    let (events, codex) = commands("codex-hooks.json", "/hooks/codex-hook.sh");
+    assert_eq!(codex.len(), events, "a Codex event does not run the hook script once");
+    let script = std::fs::read_to_string(hooks_dir.join("codex-hook.sh")).expect("it ships");
+    assert!(
+        script
+            .find(&format!("export {GUARD}"))
+            .is_some_and(|at| at < script.find("brain hook").unwrap()),
+        "the Codex hook script runs brain before it exports the maintenance guard"
+    );
+    for command in &codex {
+        let output = plugin_hook_shell(&fixture, command, &bin).output().expect("run the hook");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "false\n0\n",
+            "git does not see maintenance off under: {command}"
+        );
+    }
+}
+
+/// Codex runs a plugin hook only while a hash of its command text matches
+/// what the person approved, and it takes that hash before it substitutes
+/// `${PLUGIN_ROOT}`. So each command is one fixed line that runs a script in
+/// the plugin: the script can change in any release without asking anyone to
+/// approve the hooks again, and the line itself must never change. The
+/// events, groups and timeouts are 0.63.0's, so the trust keys Codex files
+/// them under stay the same.
+#[test]
+fn the_codex_hooks_run_through_the_plugin_script() {
+    const TABLE: [(&str, u64); 7] = [
+        ("SessionStart", 120),
+        ("UserPromptSubmit", 5),
+        ("PostToolUse", 5),
+        ("Stop", 5),
+        ("SubagentStop", 5),
+        ("PreCompact", 5),
+        ("SessionEnd", 3),
+    ];
+    let line = |event: &str| format!(r#"sh "${{PLUGIN_ROOT}}/hooks/codex-hook.sh" {event}"#);
+    let hooks_dir = plugin_hooks_dir();
+    let text = std::fs::read_to_string(hooks_dir.join("codex-hooks.json")).expect("the file ships");
+    let manifest: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+    let table = manifest["hooks"].as_object().expect("a hooks table");
+    let mut events: Vec<&str> = table.keys().map(String::as_str).collect();
+    let mut expected: Vec<&str> = TABLE.iter().map(|(event, _)| *event).collect();
+    events.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(events, expected, "the Codex events changed");
+    for (event, timeout) in TABLE {
+        let groups = table[event].as_array().expect("a list of groups");
+        assert_eq!(groups.len(), 1, "{event} has more than one group");
+        // The whole group, so a matcher or another field added later fails
+        // here too: 0.63.0's groups had no matcher.
+        assert_eq!(
+            groups[0],
+            serde_json::json!({"hooks": [{"type": "command", "command": line(event), "timeout": timeout}]}),
+            "{event}'s group is not the one fixed line"
+        );
+    }
+
+    // A stand-in brain answers with what git reads and with the arguments it
+    // was given. Its `where` points at a model that is present and `curl`
+    // always fails, so SessionStart never fetches anything.
+    let fixture = Fixture::new("codex-script");
+    let base = fixture.home.parent().unwrap();
+    std::fs::write(base.join("model-int8.safetensors"), "present").unwrap();
+    fixture.fake_cli(
+        "brain",
+        "[ \"$1\" = where ] && { echo \"$HOME\"; exit 0; }\n\
+         git config --get maintenance.auto\n\
+         git config --get gc.auto\n\
+         echo \"$@\"",
+    );
+    let bin = fixture.fake_cli("curl", "exit 1");
+    for (event, _) in TABLE {
+        let output = plugin_hook_shell(&fixture, &line(event), &bin).output().expect("run it");
+        assert!(output.status.success(), "{event} failed: {output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            format!("false\n0\nhook --cli codex --event {event}\n"),
+            "{event} did not run brain under the maintenance guard"
+        );
+    }
+
+    // With no binary yet, SessionStart says it is fetching one, and still
+    // answers Codex with an empty result when the fetch fails.
+    std::fs::remove_file(bin.join("brain")).unwrap();
+    let output = plugin_hook_shell(&fixture, &line("SessionStart"), &bin).output().expect("run it");
+    assert!(output.status.success(), "a missing binary failed SessionStart: {output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "{}\n");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("the brain binary is not installed yet"),
+        "no install notice: {output:?}"
+    );
+
+    // Codex runs it through `sh`, but a person reading or running it by hand
+    // should find a script that runs as it is.
+    let script = hooks_dir.join("codex-hook.sh");
+    let mode = std::fs::metadata(&script).unwrap().permissions();
+    assert_eq!(
+        std::os::unix::fs::PermissionsExt::mode(&mode) & 0o111,
+        0o111,
+        "the script is not executable"
+    );
+    assert!(std::fs::read_to_string(&script).unwrap().starts_with("#!/bin/sh\n"));
 }
 
 #[test]
@@ -5645,45 +6547,8 @@ fn a_quiet_session_is_settled_without_a_model_call_or_a_page() {
 #[test]
 fn a_delegated_run_keeps_its_captures_and_never_costs_a_summary() {
     let fixture = Fixture::new("delegate");
-    // To `ps`, a hook running under a process whose argv reads `claude -p …`
-    // is a hook under a headless Claude. A symlink to bash by that name, in
-    // privileged mode, is exactly that - a symlink rather than a copy, because
-    // macOS kills a copied system binary.
-    let fake = fixture.home.parent().unwrap().join("delegate-bin");
-    std::fs::create_dir_all(&fake).unwrap();
-    let claude = fake.join("claude");
-    std::os::unix::fs::symlink("/bin/bash", &claude).unwrap();
     let session = "0199d000-0000-7000-8000-00000000d001";
-    let hook_under_headless_claude = |event: &str, payload: &str| {
-        // Two commands, so bash forks for the first instead of exec-ing into
-        // it: the `claude -p` parent has to still exist when brain looks up.
-        let script = format!("'{BRAIN}' hook --cli claude-code --event {event}; exit $?");
-        let mut child = Command::new(&claude)
-            .args(["-p", "-c", &script])
-            .current_dir(&fixture.project)
-            .env("ROLEPOD_BRAIN_HOME", &fixture.home)
-            .env("HOME", fixture.home.parent().unwrap())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn the fake claude");
-        child.stdin.as_mut().unwrap().write_all(payload.as_bytes()).unwrap();
-        let out = child.wait_with_output().expect("hook output");
-        assert!(out.status.success(), "hook failed: {out:?}");
-    };
-    hook_under_headless_claude("SessionStart", &start_payload(&fixture.project, session, "startup"));
-    for prompt in ["Review the auth change adversarially", "Now the tests", "Report what you found"] {
-        let payload = serde_json::json!({"session_id": session, "cwd": fixture.project, "prompt": prompt});
-        hook_under_headless_claude("UserPromptSubmit", &payload.to_string());
-    }
-    let payload = serde_json::json!({
-        "session_id": session,
-        "cwd": fixture.project,
-        "tool_name": "Read",
-        "tool_input": {"file_path": fixture.project.join("src/auth.rs")}
-    });
-    hook_under_headless_claude("PostToolUse", &payload.to_string());
+    fixture.seed_headless_session(session);
 
     // Before anything consolidates: the captures are reachable, and the
     // summary list does not offer them as work left in flight.
@@ -5728,6 +6593,108 @@ fn a_delegated_run_keeps_its_captures_and_never_costs_a_summary() {
     assert!(counter.exists(), "force is the one way to ask the model: {stdout}");
     assert!(fixture.log_text().contains("a delegate summarized"), "{stdout}");
     assert_eq!(fixture.pending_count(), 0);
+}
+
+/// A quiet or a headless session is settled without a word in the log, so a
+/// rebuild replays its events unconsolidated. Its verdict survives in the
+/// store, and every later run read that verdict as "already done" and passed
+/// over the session for good: 170 sessions on one machine, and a backstop
+/// that stayed stale because of them.
+#[cfg(unix)]
+#[test]
+fn a_reindex_does_not_strand_settled_sessions() {
+    let fixture = Fixture::new("restrand");
+    // Q: opened, ran two commands that touched nothing.
+    let quiet = "0199e000-0000-7000-8000-00000000e001";
+    fixture.hook("claude-code", "SessionStart", &start_payload(&fixture.project, quiet, "startup"));
+    for command in ["ls", "pwd"] {
+        let payload = serde_json::json!({
+            "session_id": quiet,
+            "cwd": fixture.project,
+            "tool_name": "Bash",
+            "tool_input": {"command": command}
+        });
+        fixture.hook("claude-code", "PostToolUse", &payload.to_string());
+    }
+    // H: a `claude -p` run.
+    fixture.seed_headless_session("0199e000-0000-7000-8000-00000000e002");
+
+    let counter = fixture.home.parent().unwrap().join("restrand-calls");
+    let bin = fixture.fake_cli(
+        "claude",
+        &format!(
+            "N=$(cat {c} 2>/dev/null || echo 0); N=$((N+1)); echo $N > {c}\n\
+             echo '{{\"summary\":\"a settled session summarized\",\"titles\":[]}}'",
+            c = counter.display()
+        ),
+    );
+    let out = fixture.brain_with_path(&["consolidate"], Some(&bin));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "consolidate failed: {out:?}");
+    assert!(stdout.contains("2 of them quiet"), "not both settled: {stdout}");
+    assert_eq!(fixture.pending_count(), 0, "settled before the rebuild");
+    assert!(!counter.exists(), "settling costs no model call");
+
+    let out = fixture.brain(&["reindex"]);
+    assert!(out.status.success(), "reindex failed: {out:?}");
+    assert_eq!(fixture.pending_count(), 0, "the rebuild reopened sessions that were settled");
+
+    let out = fixture.brain_with_path(&["consolidate"], Some(&bin));
+    assert!(out.status.success(), "consolidate failed: {out:?}");
+    assert_eq!(fixture.pending_count(), 0);
+    assert!(!counter.exists(), "a rebuild must not turn a settled session into a model call");
+}
+
+/// A one-shot run never gets a summary, yet its start, its stops and its end
+/// each started a detached consolidate: 1,578 of the 1,783 spawns one machine
+/// made in a day, nearly all of them standing aside for the run that already
+/// held the lock. Its events wait for the next run a person's session starts.
+#[cfg(unix)]
+#[test]
+fn a_one_shot_run_starts_no_consolidation() {
+    let fixture = Fixture::new("oneshot");
+    let lock = fixture.home.join(".brain-consolidate.lock");
+
+    let headless = "0199f000-0000-7000-8000-00000000f001";
+    fixture.hook_under_headless_claude("SessionStart", &start_payload(&fixture.project, headless, "startup"));
+    let read = serde_json::json!({
+        "session_id": headless,
+        "cwd": fixture.project,
+        "tool_name": "Read",
+        "tool_input": {"file_path": fixture.project.join("src/auth.rs")}
+    });
+    fixture.hook_under_headless_claude("PostToolUse", &read.to_string());
+    let stop = serde_json::json!({"session_id": headless, "cwd": fixture.project});
+    fixture.hook_under_headless_claude("Stop", &stop.to_string());
+    let end = serde_json::json!({"session_id": headless, "cwd": fixture.project, "reason": "other"});
+    fixture.hook_under_headless_claude("SessionEnd", &end.to_string());
+
+    // A spawned run would hold the lock for its whole pass and leave a ledger
+    // row when it ends, a yield included; a few seconds covers both.
+    let watch_until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < watch_until {
+        assert!(!lock.exists(), "a one-shot run started a consolidation");
+        assert_eq!(fixture.consolidation_modes(), Vec::<String>::new(), "a one-shot run left a run");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // The control: a person's session end still starts its own run. Plain
+    // `fixture.hook` is classified from the test runner's own ancestry, so
+    // this holds only when the suite runs under a person's session or no CLI
+    // at all. Under `claude -p` or `codex exec` it reads as headless, and a
+    // stand-in interactive `claude` would not help: any agent above a CLI
+    // makes that CLI a delegate.
+    let person = "0199f000-0000-7000-8000-00000000f002";
+    fixture.hook("claude-code", "SessionStart", &start_payload(&fixture.project, person, "startup"));
+    let end = serde_json::json!({"session_id": person, "cwd": fixture.project, "reason": "other"});
+    fixture.hook("claude-code", "SessionEnd", &end.to_string());
+    let wait_until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut modes = fixture.consolidation_modes();
+    while modes.is_empty() && std::time::Instant::now() < wait_until {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        modes = fixture.consolidation_modes();
+    }
+    assert_eq!(modes, ["session"], "an interactive session end must still consolidate");
 }
 
 #[test]
@@ -6050,6 +7017,62 @@ fn a_rebuild_lands_in_the_vaults_history_and_leaves_a_persons_own_notes_alone() 
         !String::from_utf8_lossy(&again.stdout).contains("Committed the rebuild"),
         "an unchanged rebuild made an empty commit"
     );
+}
+
+/// The hub writer returns the pages it removes, so their deletions are
+/// committed. A removed path must not fail the commit that stages it. A
+/// topic note a killed run never committed is not in the index, and reindex's
+/// `add -u` has already taken a committed one out of it, so a plain
+/// `git add` of either exits with "pathspec did not match".
+#[test]
+fn a_page_brain_removes_does_not_fail_the_commit() {
+    let fixture = Fixture::new("removed-page");
+    fixture.seed_session(3);
+    let bin = fixture.fake_cli("claude", "echo '{\"summary\":\"Edited three files.\",\"titles\":[]}'");
+    assert!(fixture.brain_with_path(&["consolidate", "--force"], Some(&bin)).status.success());
+    let project = fixture
+        .project_dirs()
+        .into_iter()
+        .find(|dir| dir.join("checkout.md").is_file())
+        .expect("a project hub");
+
+    // Consolidation: a topic note left in the work tree by a run that died
+    // before its commit, for a topic no session has.
+    let orphan = project.join("decisions.md");
+    std::fs::write(&orphan, "---\ntitle: decision\ntags: [topic, decision]\n---\n").unwrap();
+    for index in 0..3 {
+        let payload = serde_json::json!({
+            "session_id": "0199a1f2-3c4d-7e8f-9012-3456789abcdf",
+            "cwd": fixture.project,
+            "tool_name": "Edit",
+            "tool_input": {"file_path": fixture.project.join(format!("src/later{index}.rs"))}
+        })
+        .to_string();
+        fixture.hook("claude-code", "PostToolUse", &payload);
+    }
+    let out = fixture.brain_with_path(&["consolidate", "--force"], Some(&bin));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!orphan.exists(), "a topic note nothing feeds is removed");
+    assert!(stdout.contains("Consolidated 1 session(s)"), "{stdout}");
+    assert!(!stdout.contains("failed"), "removing a page failed the session: {stdout}");
+
+    // Reindex: an index.md an older version wrote and committed. The vault's
+    // own root index.md is a different file, so match the whole path.
+    let wiki = fixture.wiki();
+    let stale = project.join("index.md");
+    let relative = stale.strip_prefix(&wiki).unwrap().to_string_lossy().into_owned();
+    let tracked = || git_stdout(&wiki, &["ls-files"]).lines().any(|line| line == relative);
+    std::fs::write(&stale, "# checkout\n\nwritten by an older version\n").unwrap();
+    git_stdout(&wiki, &["add", "--", &relative]);
+    git_stdout(&wiki, &["commit", "-q", "-m", "an older version's index"]);
+    assert!(tracked(), "the stale index.md was not planted");
+
+    let out = fixture.brain(&["reindex"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "reindex failed: {out:?}");
+    assert!(!stale.exists(), "the old unnamed hub is removed");
+    assert!(stdout.contains("Committed the rebuild"), "{stdout}");
+    assert!(!tracked(), "its deletion was not committed");
 }
 
 #[test]

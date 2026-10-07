@@ -146,9 +146,13 @@ pub fn run_idle() -> Result<Outcome> {
 fn run_idle_in(paths: &Paths, cwd: &Path) -> Result<Outcome> {
     let lock_path = paths.db().with_file_name(".brain-consolidate.lock");
     let store = Store::open(&paths.db())?;
+    // Before the lock and best effort, for the reasons given in `run_in`.
+    let _ = ensure_wiki_git_config(&paths.wiki());
     let Some(run_lock) = RunLock::take(&lock_path)? else {
         return Ok(Outcome { yielded: true, ..Outcome::default() });
     };
+    heal_wiki_repo(&paths.wiki());
+    heal_store(&store);
     let config = Config::load(&paths.config_file())?;
     let ladder = Ladder::new(&store, &config.summarizer);
     let mut outcome = Outcome::default();
@@ -267,6 +271,13 @@ fn run_in(
     let store = Store::open(&paths.db())?;
     let id =
         store.add_consolidation_request(session, all_projects, force, &cwd.to_string_lossy())?;
+    // Before the lock, so a run that stands aside has still turned git's own
+    // maintenance off for whoever holds it, an older brain included. Best
+    // effort: the guard on every wiki git command line is the defence that
+    // matters, a lost race on `config.lock` is retried by the next run, and
+    // nothing is logged, because doctor counts every brain.log line as a
+    // failure.
+    let _ = ensure_wiki_git_config(&paths.wiki());
     let Some(run_lock) = RunLock::take(&lock_path)? else {
         return Ok(Outcome { yielded: true, ..Outcome::default() });
     };
@@ -277,6 +288,9 @@ fn run_in(
         store.purge_consumed_requests(REQUEST_KEEP_DAYS)?;
         return Ok(Outcome { yielded: true, ..Outcome::default() });
     }
+    // Once per run, before the first commit it would otherwise block.
+    heal_wiki_repo(&paths.wiki());
+    heal_store(&store);
     let config = Config::load(&paths.config_file())?;
     let ladder = Ladder::new(&store, &config.summarizer);
     let mut outcome = Outcome::default();
@@ -398,6 +412,17 @@ struct Round {
     idle: bool,
 }
 
+/// Whether an ask is already served: one non-force session whose events are
+/// all consolidated. Its run would list the projects and repeat the
+/// per-project pass only to find that session settled. A force ask is work,
+/// since it reopens a settled session, and an `--all` ask names no session.
+fn nothing_to_serve(store: &Store, request: &ConsolidationRequest) -> Result<bool> {
+    match request.session.as_deref() {
+        Some(session) if !request.force => Ok(!store.session_has_pending(session)?),
+        _ => Ok(false),
+    }
+}
+
 /// Carry out one ask under the lock. `Ok(false)` when the deadline stopped it.
 fn execute(
     paths: &Paths,
@@ -408,6 +433,13 @@ fn execute(
     Round { deadline, began, idle }: Round,
     outcome: &mut Outcome,
 ) -> Result<bool> {
+    // One indexed read, before the project list and the per-project pass. It
+    // also skips the embed, hand-edit and fold upkeep and the daily pack: the
+    // next ask with work does them. Here, not only in `heal_store`, because
+    // an ask written mid-drain reaches a holder that has already healed.
+    if nothing_to_serve(store, request)? {
+        return Ok(true);
+    }
     let session = request.session.as_deref();
     let force = request.force;
 
@@ -421,7 +453,7 @@ fn execute(
     } else {
         let scope = ids::resolve_scope(Path::new(&request.cwd));
         let dir = paths.project_dir(&scope);
-        vec![(scope, dir)]
+        vec![(named_by_dir(scope, &dir), dir)]
     };
 
     // Semantic vectors, before anything else this run does. Consolidation is
@@ -465,9 +497,12 @@ fn execute(
     // The vault's front page is derived from every project, so it is
     // refreshed whenever any of them moved.
     if outcome.sessions > sessions_before {
-        for path in write_root(paths)? {
-            commit_wiki(&paths.wiki(), &path, "index")?;
-        }
+        commit_pages(&paths.wiki(), &write_root(paths)?, "consolidate index.md (index)")?;
+    }
+    // Last, so it never holds up a session, and only after a pass that got to
+    // the end: one its deadline cut short hands its ask back to a later run.
+    if finished {
+        maintain_wiki_repo(paths, run_lock);
     }
     Ok(finished)
 }
@@ -879,9 +914,9 @@ fn consolidate_session(
     if is_quiet(&narrated) {
         // Settled, not summarized. Marking the events done is what keeps
         // this from being asked again; the run record is what `doctor` and
-        // `should_wait` read. Nothing reaches the log: a rebuild finds the
-        // same events, asks the same question, and settles them the same
-        // way, for free.
+        // `should_wait` read. Nothing reaches the log: a rebuild replays the
+        // events unconsolidated, and `reindex` settles them again from this
+        // run record through `Store::resettle_replayed`, for free.
         let ids: Vec<String> = events.iter().map(|event| event.id.clone()).collect();
         store.mark_consolidated(&ids)?;
         store.record_session_run(
@@ -1089,13 +1124,17 @@ fn consolidate_session(
 
     let hubs = write_hubs(project_dir, scope, store)?;
 
-    commit_wiki(&paths.wiki(), &page_path, &tier_label)?;
-    for hub in &hubs {
-        commit_wiki(&paths.wiki(), hub, "hub")?;
-    }
-    for page in &knowledge {
-        commit_wiki(&paths.wiki(), page, "knowledge")?;
-    }
+    // One commit for the session and everything derived from it. The subject
+    // names the session page, as it did when each page was its own commit.
+    // The body counts the pages handed in, changed or not.
+    let wiki = paths.wiki();
+    let relative = page_path.strip_prefix(&wiki).unwrap_or(&page_path).display().to_string();
+    let mut pages = vec![page_path];
+    pages.extend(hubs);
+    pages.extend(knowledge);
+    let message =
+        format!("consolidate {relative} ({tier_label})\n\n+{} derived page(s)", pages.len() - 1);
+    commit_pages(&wiki, &pages, &message)?;
     Ok(tier)
 }
 
@@ -1951,6 +1990,23 @@ pub(crate) fn hub_stem(scope: &ProjectScope) -> String {
     ids::slugify(&scope.project)
 }
 
+/// The scope, named after the wiki folder its memory lives in.
+///
+/// A run for one checkout used to take the name from the checkout
+/// (`WalnutZite`) and `--all` from the folder (`walnutzite`), so every switch
+/// between the two rewrote the hub, topic and entity pages of the project: on
+/// 2026-10-06 that was 14,730 commits. The folder is the one name every run
+/// can see - `--all`, `--idle` and reindex never see a checkout. Every folder
+/// brain creates is already the slug, so `hub_stem` and every link stay where
+/// they were. An older or hand-made folder keeps its own spelling as the name,
+/// which is what `--all` has always shown for it.
+pub(crate) fn named_by_dir(mut scope: ProjectScope, dir: &Path) -> ProjectScope {
+    if let Some(name) = dir.file_name() {
+        scope.project = ids::strip_dir_suffix(&name.to_string_lossy()).to_string();
+    }
+    scope
+}
+
 /// Lexical normalization, which is the whole matching strategy.
 ///
 /// Lowercase, collapse whitespace, drop surrounding punctuation. No stemming,
@@ -2192,14 +2248,19 @@ pub fn write_hubs(project_dir: &Path, scope: &ProjectScope, store: &Store) -> Re
     }
 
     let hub_path = project_dir.join(format!("{}.md", hub_stem(scope)));
-    std::fs::write(&hub_path, hub).with_context(|| format!("write {}", hub_path.display()))?;
+    write_if_changed(&hub_path, &hub)?;
     written.push(hub_path);
 
     // A topic note whose topic no longer has sessions is a dot in the graph
     // pointing at nothing - and an orphan, since the hub stopped naming it.
+    // Its path is returned once it is gone, so the deletion is committed with
+    // the rest of the round instead of left behind in the work tree.
     for topic in ["decision", "bugfix", "feature", "discovery", "config", "test"] {
         if !by_kind.contains_key(topic) {
-            let _ = std::fs::remove_file(project_dir.join(format!("{}.md", kind_stem(topic))));
+            let path = project_dir.join(format!("{}.md", kind_stem(topic)));
+            if std::fs::remove_file(&path).is_ok() {
+                written.push(path);
+            }
         }
     }
 
@@ -2224,7 +2285,7 @@ pub fn write_hubs(project_dir: &Path, scope: &ProjectScope, store: &Store) -> Re
             );
         }
         let path = project_dir.join(format!("{}.md", kind_stem(kind)));
-        std::fs::write(&path, note).with_context(|| format!("write {}", path.display()))?;
+        write_if_changed(&path, &note)?;
         written.push(path);
     }
 
@@ -2232,10 +2293,10 @@ pub fn write_hubs(project_dir: &Path, scope: &ProjectScope, store: &Store) -> Re
     written.extend(lint_pages);
 
     // An index.md from an earlier version is now a second, unnamed hub in the
-    // graph saying the same thing.
+    // graph saying the same thing. Returned once removed, like a topic note.
     let stale = project_dir.join("index.md");
-    if stale.is_file() {
-        let _ = std::fs::remove_file(&stale);
+    if stale.is_file() && std::fs::remove_file(&stale).is_ok() {
+        written.push(stale);
     }
 
     Ok(written)
@@ -2288,16 +2349,18 @@ fn write_entity_pages(
             // Match a session to its page through the frontmatter, which is
             // the only stable link between an id and a filename that may have
             // been named from a title.
+            //
+            // The line shows that file name, not the title and date: a page
+            // keeps its file name for life, while every re-consolidation
+            // retitles and redates it. Showing the title rewrote every entity
+            // page the session touched - most of a session commit's changed
+            // files, kept forever in the vault's history.
             if let Some(meta) = pages.iter().find(|meta| meta.session.as_deref() == Some(session)) {
-                let _ = writeln!(
-                    page,
-                    "- {} [[pages/sessions/{}|{}]]",
-                    meta.date, meta.stem, meta.title
-                );
+                let _ = writeln!(page, "- [[pages/sessions/{}|{}]]", meta.stem, meta.stem);
             }
         }
         let path = dir.join(format!("{}.md", entity_stem(name)));
-        std::fs::write(&path, page).with_context(|| format!("write {}", path.display()))?;
+        write_if_changed(&path, &page)?;
 
         written.push(path);
     }
@@ -2350,8 +2413,7 @@ fn write_entity_pages(
         }
     }
     let index_path = project_dir.join("entities.md");
-    std::fs::write(&index_path, index)
-        .with_context(|| format!("write {}", index_path.display()))?;
+    write_if_changed(&index_path, &index)?;
     written.push(index_path);
     Ok(written)
 }
@@ -2486,13 +2548,30 @@ pub fn write_root(paths: &Paths) -> Result<Vec<PathBuf>> {
         ("CLAUDE.md", "@AGENTS.md\n".to_string()),
     ] {
         let path = wiki.join(name);
-        if std::fs::read_to_string(&path).is_ok_and(|current| current == body) {
-            continue;
+        if write_if_changed(&path, &body)? {
+            written.push(path);
         }
-        std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
-        written.push(path);
     }
     Ok(written)
+}
+
+/// Write a derived page only when its text changed, and say whether it did.
+///
+/// Every round renders every hub, topic, entity and lint page again, and most
+/// come out byte for byte the same. Rewriting those anyway moved each one's
+/// modification time, so git re-hashed it on the next `add` and Obsidian
+/// re-indexed it. A page whose text is the same is left as it is.
+///
+/// The hub writers still return a page they own when it did not change. The
+/// hub's `Entities:` and `Flagged:` lines are decided from those lists, and a
+/// commit that stages every returned path also picks up a page a killed run
+/// left uncommitted. [`write_root`] returns only what changed.
+fn write_if_changed(path: &Path, body: &str) -> Result<bool> {
+    if std::fs::read_to_string(path).is_ok_and(|current| current == body) {
+        return Ok(false);
+    }
+    std::fs::write(path, body).with_context(|| format!("write {}", path.display()))?;
+    Ok(true)
 }
 
 /// What a walk over the vault found.
@@ -2671,7 +2750,7 @@ fn write_lint_page(
         );
     }
 
-    std::fs::write(&path, page).with_context(|| format!("write {}", path.display()))?;
+    write_if_changed(&path, &page)?;
     Ok(vec![path])
 }
 
@@ -2731,57 +2810,48 @@ fn page_meta(path: &Path) -> Option<PageMeta> {
     })
 }
 
-/// Commit the wiki, so history is the wiki's own.
+/// Commit one unit of work to the wiki, so history is the wiki's own: a
+/// consolidated session with every page derived from it, an ingested
+/// document, the front page.
+///
+/// One commit for all of it, not one per page. A session hands back its page
+/// plus every hub, topic, entity and knowledge page its project owns - about
+/// two hundred on a real vault - and committing each on its own cost four or
+/// five git processes a page and a hundred commits a session. History per page
+/// is still there, through `git log -- <page>`.
 ///
 /// Serialized with a lock file, because two consolidation runs committing at
 /// once corrupts a git index. The lock is stolen if it is stale — a crashed
 /// run must not wedge consolidation forever.
-pub(crate) fn commit_wiki(wiki: &Path, page: &Path, tier: &str) -> Result<()> {
-    if !wiki.is_dir() {
-        return Ok(());
+///
+/// Returns whether anything was committed.
+pub(crate) fn commit_pages(wiki: &Path, pages: &[PathBuf], message: &str) -> Result<bool> {
+    if !wiki.is_dir() || pages.is_empty() {
+        return Ok(false);
     }
     let _guard = LockFile::acquire(&wiki.join(".brain-git.lock"))?;
 
-    if !wiki.join(".git").exists() {
-        run_git(wiki, &["init", "-q"])?;
-        // Identity is per-repo so the machine's global git config is untouched.
-        run_git(wiki, &["config", "user.name", "rolepod-brain"])?;
-        run_git(wiki, &["config", "user.email", "brain@localhost"])?;
-    }
+    init_if_missing(wiki)?;
     ensure_repo_policy(wiki)?;
-
-    let relative = page.strip_prefix(wiki).unwrap_or(page);
-    run_git(wiki, &["add", "--", &relative.to_string_lossy()])?;
-    for policy in [".gitattributes", ".gitignore"] {
-        if wiki.join(policy).is_file() {
-            run_git(wiki, &["add", "--", policy])?;
-        }
+    stage(wiki, &relative_to_wiki(wiki, pages))?;
+    if nothing_staged(wiki)? {
+        return Ok(false);
     }
 
-    // Nothing staged means nothing changed; committing would be noise.
-    let status = std::process::Command::new("git")
-        .args(["diff", "--cached", "--quiet"])
-        .current_dir(wiki)
-        .status()
-        .context("check staged changes")?;
-    if status.success() {
-        return Ok(());
-    }
-
-    run_git(
-        wiki,
-        &["commit", "-q", "-m", &format!("consolidate {} ({tier})", relative.display())],
-    )
+    // `--no-verify`: a person's own pre-commit and commit-msg hooks are for
+    // their commits, and rejecting a machine commit here would only lose the
+    // page's history.
+    run_git(wiki, &["commit", "-q", "--no-verify", "-m", message])?;
+    Ok(true)
 }
 
 /// Commit a whole rebuild at once: every tracked page this run rewrote or
 /// removed, plus the files it created.
 ///
-/// [`commit_wiki`] names one path because consolidation writes one page at a
-/// time and each deserves its own line of history. A rebuild rewrites the
-/// vault - hundreds of pages in one pass - and leaving that uncommitted put
-/// the newest wording of every one of them outside the history
-/// `brain history` reads, on every machine where anyone ran `brain reindex`.
+/// A rebuild rewrites the vault - hundreds of pages in one pass - and leaving
+/// that uncommitted put the newest wording of every one of them outside the
+/// history `brain history` reads, on every machine where anyone ran `brain
+/// reindex`.
 ///
 /// `git add -u` rather than `-A`: tracked files only. A person may keep
 /// their own notes beside their memory - the README says they may - and
@@ -2797,34 +2867,68 @@ pub fn commit_rebuild(wiki: &Path, created: &[PathBuf], message: &str) -> Result
         return Ok(false);
     }
     let _guard = LockFile::acquire(&wiki.join(".brain-git.lock"))?;
-    if !wiki.join(".git").exists() {
-        run_git(wiki, &["init", "-q"])?;
-        run_git(wiki, &["config", "user.name", "rolepod-brain"])?;
-        run_git(wiki, &["config", "user.email", "brain@localhost"])?;
-    }
+    init_if_missing(wiki)?;
     ensure_repo_policy(wiki)?;
 
     run_git(wiki, &["add", "-u"])?;
-    for path in created {
-        let relative = path.strip_prefix(wiki).unwrap_or(path);
-        run_git(wiki, &["add", "--", &relative.to_string_lossy()])?;
-    }
-    for policy in [".gitattributes", ".gitignore"] {
-        if wiki.join(policy).is_file() {
-            run_git(wiki, &["add", "--", policy])?;
-        }
-    }
-
-    let status = std::process::Command::new("git")
-        .args(["diff", "--cached", "--quiet"])
-        .current_dir(wiki)
-        .status()
-        .context("check staged changes")?;
-    if status.success() {
+    stage(wiki, &relative_to_wiki(wiki, created))?;
+    if nothing_staged(wiki)? {
         return Ok(false);
     }
-    run_git(wiki, &["commit", "-q", "-m", message])?;
+    run_git(wiki, &["commit", "-q", "--no-verify", "-m", message])?;
     Ok(true)
+}
+
+/// Paths per `git add` or `git rm`. A Windows command line holds 32K
+/// characters, and 64 entity pages with names up to about 130 characters each
+/// stay well under it.
+const ADD_CHUNK: usize = 64;
+
+/// Pages as the wiki names them, with the repository's own policy files,
+/// sorted and once each: one page can come back from two writers.
+fn relative_to_wiki(wiki: &Path, pages: &[PathBuf]) -> Vec<String> {
+    let mut relative: Vec<String> = pages
+        .iter()
+        .map(|page| page.strip_prefix(wiki).unwrap_or(page).to_string_lossy().into_owned())
+        .collect();
+    for policy in [".gitattributes", ".gitignore"] {
+        if wiki.join(policy).is_file() {
+            relative.push(policy.to_string());
+        }
+    }
+    relative.sort();
+    relative.dedup();
+    relative
+}
+
+/// Stage wiki paths, whether this round wrote them or removed them.
+///
+/// The hub writer returns the pages it removed, so their deletions are
+/// committed too. `git add` of a missing path fails with "pathspec did not
+/// match" when the index does not hold it - a page a killed run never
+/// committed, or one `add -u` already took out - and takes every other path
+/// on its command line down with it. So the missing ones go to `rm --cached`
+/// instead, which stages the deletion of a tracked page and passes over a
+/// path the index never held.
+fn stage(wiki: &Path, relative: &[String]) -> Result<()> {
+    let (present, gone): (Vec<&str>, Vec<&str>) =
+        relative.iter().map(String::as_str).partition(|path| wiki.join(path).exists());
+    for chunk in present.chunks(ADD_CHUNK) {
+        run_git(wiki, &[&["add", "--"][..], chunk].concat())?;
+    }
+    for chunk in gone.chunks(ADD_CHUNK) {
+        run_git(wiki, &[&["rm", "--cached", "-q", "--ignore-unmatch", "--"][..], chunk].concat())?;
+    }
+    Ok(())
+}
+
+/// Nothing staged means nothing changed, and a commit would be noise.
+fn nothing_staged(wiki: &Path) -> Result<bool> {
+    let status = wiki_git(wiki)
+        .args(["diff", "--cached", "--quiet"])
+        .status()
+        .context("check staged changes")?;
+    Ok(status.success())
 }
 
 /// Policy files the wiki repository needs, written idempotently.
@@ -2869,10 +2973,398 @@ fn ensure_repo_policy(wiki: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Make the wiki a repository the first time anything is committed to it.
+///
+/// Identity is per-repo so the machine's global git config is untouched. The
+/// maintenance policy is written here as well, because a repository that did
+/// not exist yet had no config for the check before the run lock to find.
+fn init_if_missing(wiki: &Path) -> Result<()> {
+    if wiki.join(".git").exists() {
+        return Ok(());
+    }
+    run_git(wiki, &["init", "-q"])?;
+    run_git(wiki, &["config", "user.name", "rolepod-brain"])?;
+    run_git(wiki, &["config", "user.email", "brain@localhost"])?;
+    let _ = ensure_wiki_git_config(wiki);
+    Ok(())
+}
+
+/// Turn git's own auto-maintenance off in the wiki repository's config.
+///
+/// [`wiki_git`] covers every git brain starts. This covers the ones it does
+/// not: a commit by an older brain that still holds the run lock, by a second
+/// binary a CLI was wired to by path, by Obsidian Git, by the person. Each of
+/// those reads the repository's config, and without `maintenance.auto=false`
+/// there each of their commits starts a detached maintenance run of its own.
+/// `gc.auto=0` does the same for git before 2.29.
+///
+/// `brain.policy` is written last and is the only thing checked, so a run
+/// killed halfway writes all three again next time, and a run that finds it
+/// starts no process at all. It also means a person who turns maintenance
+/// back on in this repository keeps their setting.
+fn ensure_wiki_git_config(wiki: &Path) -> Result<()> {
+    let config = wiki.join(".git").join("config");
+    if !config.is_file() {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(&config)
+        .with_context(|| format!("read {}", config.display()))?;
+    if has_policy_marker(&text) {
+        return Ok(());
+    }
+    run_git(wiki, &["config", "maintenance.auto", "false"])?;
+    run_git(wiki, &["config", "gc.auto", "0"])?;
+    run_git(wiki, &["config", "brain.policy", "1"])
+}
+
+/// Does this git config carry `policy = 1` in its `[brain]` section?
+///
+/// Read section by section rather than matched as text: git adds a key at the
+/// end of its section, wherever that section already sits, so the marker need
+/// not follow its header, and another section's `policy` must not count. Only
+/// git's own spelling is recognised, so a hand-edited marker means the three
+/// keys are written again on every run.
+fn has_policy_marker(text: &str) -> bool {
+    let mut in_brain = false;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_brain = line.eq_ignore_ascii_case("[brain]");
+        } else if in_brain && line == "policy = 1" {
+            return true;
+        }
+    }
+    false
+}
+
+/// A temporary pack untouched this long belongs to a git that is gone: a live
+/// pack-objects keeps writing to its file, and git's own prune expires `tmp_`
+/// files by the same rule.
+const TEMP_PACK_STALE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+/// A git lock held this long belongs to a git that died holding it. Every
+/// commit brain makes takes and lets go of these within a second.
+const GIT_LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Clear what killed gits left in the wiki repository.
+///
+/// The storm ended in hard reboots while brain committed about once a second,
+/// and with up to ninety repacks killed mid-write. A stale `index.lock`,
+/// `HEAD.lock`, `config.lock` or branch lock makes every later commit fail, so
+/// a wiki stopped recording history without anything looking broken; the
+/// repacks' temporary packs held 2 GiB on one machine. Git never removes a
+/// stale lock, and removes temporary packs only in a gc's prune, which brain
+/// no longer lets it run.
+///
+/// Called once per run under the run lock; it takes the commit lock itself, so
+/// no commit of brain's can be holding what this removes. A commit lock still
+/// busy after its wait skips the heal until the next run. Only names a dead git
+/// leaves are touched, and only once they are old enough that a living one
+/// would have written or let go of them: never a `pack-*` file, the
+/// multi-pack-index, `maintenance.lock` or `gc.pid`, which only git's own
+/// maintenance reads. No git is started, so a wedged repository is healed
+/// without asking it anything. Nothing is logged, because doctor reads every
+/// brain.log line as a failure and this is the repair, not one.
+fn heal_wiki_repo(wiki: &Path) {
+    let git = wiki.join(".git");
+    if !git.is_dir() {
+        return;
+    }
+    let Ok(_guard) = LockFile::acquire(&wiki.join(".brain-git.lock")) else { return };
+    // `tmp_*` are what a killed pack-objects or index-pack was writing, and
+    // `.tmp-<pid>-pack-*` are packs a killed repack finished and never renamed.
+    for entry in std::fs::read_dir(git.join("objects").join("pack")).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("tmp_") || name.starts_with(".tmp-") {
+            remove_if_older(&entry.path(), TEMP_PACK_STALE);
+        }
+    }
+    for name in ["index.lock", "HEAD.lock", "config.lock"] {
+        remove_if_older(&git.join(name), GIT_LOCK_STALE);
+    }
+    remove_branch_locks(&git.join("refs").join("heads"));
+}
+
+/// Every `*.lock` under `refs/heads`, at any depth: a branch named `a/b` is
+/// locked at `refs/heads/a/b.lock`. Symlinks are not followed.
+fn remove_branch_locks(dir: &Path) {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let Ok(kind) = entry.file_type() else { continue };
+        let path = entry.path();
+        if kind.is_dir() {
+            remove_branch_locks(&path);
+        } else if path.extension().is_some_and(|ext| ext == "lock") {
+            remove_if_older(&path, GIT_LOCK_STALE);
+        }
+    }
+}
+
+/// Remove a file nothing has modified for longer than `age`. A missing file, a
+/// directory or a clock that runs backwards removes nothing.
+fn remove_if_older(path: &Path, age: std::time::Duration) {
+    let old = std::fs::symlink_metadata(path)
+        .and_then(|meta| meta.modified())
+        .is_ok_and(|at| at.elapsed().is_ok_and(|elapsed| elapsed > age));
+    if old {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Repair what earlier versions left in the store, once per run under the run
+/// lock: bounded statements, with no model, no page and no git.
+///
+/// Best effort, like [`heal_wiki_repo`]: a heal that fails is retried by the
+/// next holder, and the run it rides on still has its own work to do. Never
+/// called from a hook, `Store::open`, ingest or MCP, which a person waits on.
+fn heal_store(store: &Store) {
+    // A `reindex` before 0.64.0 reopened every quiet and headless session it
+    // replayed, and nothing settled them again.
+    let _ = store.resettle_replayed_once();
+    // Asks for sessions with nothing pending, before they each cost a drain
+    // round. On every holder, since every session boundary writes another.
+    let _ = store.drop_stale_asks();
+}
+
+/// Brain packs the wiki at most this often.
+const MAINTAIN_EVERY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+/// Loose objects it takes before a pack is worth a pass. A busy day of
+/// sessions leaves ten to fifteen thousand; a quiet wiki may never get here.
+const LOOSE_TRIGGER: usize = 2_000;
+/// A repack still running after this is killed, with everything it started.
+const MAINTAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// One thread and fixed memory for brain's repack, whatever the person's own
+/// config asks for: it runs beside their work. Bitmaps serve fetches, which a
+/// wiki does not, and writing one walks every object.
+const REPACK_LIMITS: [&str; 12] = [
+    "-c",
+    "pack.threads=1",
+    "-c",
+    "pack.windowMemory=64m",
+    "-c",
+    "pack.deltaCacheSize=16m",
+    "-c",
+    "core.deltaBaseCacheLimit=32m",
+    "-c",
+    "core.bigFileThreshold=16m",
+    "-c",
+    "repack.writeBitmaps=false",
+];
+
+/// Pack the wiki's loose objects, at most once a day, in one bounded pass.
+///
+/// [`wiki_git`] keeps git's own maintenance from running in the wiki, so
+/// something has to do its job: each session still adds objects as its pages
+/// change, and nothing else would ever pack them. This is the smallest repack
+/// git has. Without `-a` it packs only objects no pack holds yet, so the big
+/// packs, and the history already in them, are left as they are; `-d` drops
+/// the loose copies it packed. It runs in the foreground, on one thread with
+/// capped memory, and is killed after [`MAINTAIN_TIMEOUT`]. Never a gc, a
+/// prune, or a cruft or geometric repack: those are what the storm escalated
+/// to.
+///
+/// Called at the end of a finished run, under the run lock, so a machine runs
+/// one at a time. The stamp is written before the repack starts, so a crash or
+/// a kill still holds the next one off for a day. Below [`LOOSE_TRIGGER`]
+/// nothing is written and nothing is started. A repack that fails or overruns
+/// is logged with the last line git wrote, because that is a failure doctor
+/// should show; the rest stays in `.git/brain-maintenance.err` until the next
+/// pass.
+///
+/// It does not take `.brain-git.lock`, on purpose. A commit beside it is safe,
+/// since this repack only adds a pack and drops loose copies a pack already
+/// holds, and holding the lock would stall every commit for as long as the
+/// repack runs. If brain itself is killed meanwhile, the repack runs on to its
+/// own end, still under [`REPACK_LIMITS`].
+fn maintain_wiki_repo(paths: &Paths, run_lock: &RunLock) {
+    let wiki = paths.wiki();
+    let git = wiki.join(".git");
+    if !git.is_dir() {
+        return;
+    }
+    let stamp = git.join("brain-maintenance");
+    let recent = std::fs::metadata(&stamp)
+        .and_then(|meta| meta.modified())
+        .is_ok_and(|at| at.elapsed().is_ok_and(|age| age < MAINTAIN_EVERY));
+    if recent {
+        return;
+    }
+    let loose_before = count_loose(&git);
+    if loose_before < LOOSE_TRIGGER {
+        return;
+    }
+    let _ = std::fs::write(&stamp, format!("started {} loose={loose_before}\n", jiff::Timestamp::now()));
+    run_lock.touch();
+
+    let started = std::time::Instant::now();
+    // A file, not a pipe: git blocks once a pipe nobody reads is full, and
+    // this child is only polled until it ends.
+    let errors = git.join("brain-maintenance.err");
+    let stderr = std::fs::File::create(&errors)
+        .map_or_else(|_| std::process::Stdio::null(), std::process::Stdio::from);
+    let mut repack = wiki_git(&wiki);
+    repack
+        .args(REPACK_LIMITS)
+        .args(["repack", "-d", "-l", "-q"])
+        .stdout(std::process::Stdio::null())
+        .stderr(stderr);
+    let failure = match run_bounded(repack, MAINTAIN_TIMEOUT) {
+        Ok(Bounded::Exited(status)) if status.success() => None,
+        Ok(Bounded::Exited(status)) => Some(format!("ended with {status}")),
+        Ok(Bounded::TimedOut) => Some(format!("killed after {}s", MAINTAIN_TIMEOUT.as_secs())),
+        Err(error) => Some(format!("did not start: {error:#}")),
+    };
+    let said = String::from_utf8_lossy(&std::fs::read(&errors).unwrap_or_default())
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_owned);
+    if failure.is_none() {
+        let _ = std::fs::remove_file(&errors);
+    }
+    let failure = failure.map(|why| match said {
+        Some(line) => format!("{why}: {line}"),
+        None => why,
+    });
+    let _ = std::fs::write(
+        &stamp,
+        format!(
+            "done {} took_ms={} loose_before={loose_before} loose_after={} outcome={}\n",
+            jiff::Timestamp::now(),
+            started.elapsed().as_millis(),
+            count_loose(&git),
+            failure.as_deref().unwrap_or("ok"),
+        ),
+    );
+    if let Some(why) = failure {
+        log_session_failure(paths, "wiki maintenance", &format!("repack {why}"));
+    }
+}
+
+/// Loose objects in a repository, counted exactly and without git: the files
+/// under `objects/<2 hex>/` named by the rest of their hash, 38 hex characters
+/// for SHA-1 and 62 for SHA-256.
+fn count_loose(git_dir: &Path) -> usize {
+    let objects = git_dir.join("objects");
+    (0..=255u8)
+        .flat_map(|byte| std::fs::read_dir(objects.join(format!("{byte:02x}"))).into_iter().flatten().flatten())
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            matches!(name.len(), 38 | 62) && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .count()
+}
+
+/// How a child run by [`run_bounded`] ended.
+#[derive(Debug)]
+enum Bounded {
+    Exited(std::process::ExitStatus),
+    TimedOut,
+}
+
+/// Run a child until it exits or `limit` passes. Where its output goes is the
+/// caller's to set.
+///
+/// On unix the child leads a process group of its own, and an overrun kills
+/// the whole group: a repack does its work in a `pack-objects` it starts, and
+/// killing only the repack would leave that one running. A child that can no
+/// longer be polled is killed the same way, since nothing could time it any
+/// more. Windows has no group to kill from here, so there only the child goes.
+fn run_bounded(mut command: std::process::Command, limit: std::time::Duration) -> Result<Bounded> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().context("spawn a bounded child")?;
+    let started = std::time::Instant::now();
+    let ended = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(Bounded::Exited(status)),
+            Ok(None) if started.elapsed() < limit => std::thread::sleep(std::time::Duration::from_millis(250)),
+            Ok(None) => break Ok(Bounded::TimedOut),
+            Err(error) => break Err(anyhow::Error::from(error).context("poll a bounded child")),
+        }
+    };
+    // The same shell-out as `holder_is_alive`, since this crate has no unsafe
+    // code to send a signal with. The child is not reaped yet, so its pid,
+    // which names the group, cannot have been reused.
+    #[cfg(unix)]
+    let _ = std::process::Command::new("pkill")
+        .args(["-KILL", "-g", &child.id().to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let _ = child.kill();
+    let _ = child.wait();
+    ended
+}
+
+/// Config every wiki git call carries on its command line.
+const WIKI_GIT_CONFIG: [&str; 12] = [
+    "-c",
+    "maintenance.auto=false",
+    "-c",
+    "maintenance.autoDetach=false",
+    "-c",
+    "gc.auto=0",
+    "-c",
+    "gc.autoDetach=false",
+    "-c",
+    "core.fsmonitor=",
+    "-c",
+    "commit.gpgSign=false",
+];
+
+/// Variables that point git at some other repository. Git exports some of
+/// them to every hook it runs, and brain inherits whatever environment its
+/// host CLI was started in.
+const LEAKED_GIT_ENV: [&str; 6] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+];
+
+/// A git command in the wiki, guarded. Every wiki git call starts here.
+///
+/// Since git 2.29 every `git commit` starts `git maintenance run --auto`, and
+/// recent git detaches it. Brain committed once per page, and nothing makes
+/// those detached runs wait for one another; on a large wiki each one
+/// escalated from a geometric repack to a full cruft repack, and on 2026-10-07
+/// up to 91 of them ran at once, took 17-22 GiB and hung the machine twice.
+/// `maintenance.auto` stops that child, and `gc.auto` stops the `gc --auto`
+/// older git runs instead; the two `autoDetach` keys keep any maintenance a
+/// future git still starts in the foreground, one at a time. They go on the command line
+/// because that scope beats every config file and the `GIT_CONFIG_*`
+/// environment, so no setting of the person's can turn them back on. Git
+/// before 2.29 ignores the keys it does not know.
+///
+/// `core.fsmonitor` is set empty, which every git reads as off: a global
+/// `core.fsmonitor=true` would otherwise leave a resident daemon behind every
+/// commit. Signing is off, because a signer that prompts or fails would hang
+/// or break a commit nobody is there to see.
+///
+/// The environment is scrubbed of the variables that redirect git. A leaked
+/// `GIT_INDEX_FILE` alone recorded a wiki commit that dropped every other
+/// tracked page, and a leaked `GIT_DIR` sends the commit into the person's
+/// own repository. With no terminal and no stdin, a git that wants to ask
+/// something fails instead of waiting forever.
+pub(crate) fn wiki_git(dir: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    command.args(WIKI_GIT_CONFIG).current_dir(dir);
+    for name in LEAKED_GIT_ENV {
+        command.env_remove(name);
+    }
+    command.env("GIT_TERMINAL_PROMPT", "0").stdin(std::process::Stdio::null());
+    command
+}
+
 fn run_git(dir: &Path, args: &[&str]) -> Result<()> {
-    let output = std::process::Command::new("git")
+    let output = wiki_git(dir)
         .args(args)
-        .current_dir(dir)
         .output()
         .with_context(|| format!("run git {}", args.join(" ")))?;
     anyhow::ensure!(
@@ -3172,17 +3664,18 @@ fn commit_layout_migration(wiki: &Path, count: usize) -> Result<()> {
     // Policy before `add -A`, or the lock file itself lands in the commit.
     ensure_repo_policy(wiki)?;
     run_git(wiki, &["add", "-A"])?;
-    let staged = std::process::Command::new("git")
-        .args(["diff", "--cached", "--quiet"])
-        .current_dir(wiki)
-        .status()
-        .context("check staged changes")?;
-    if staged.success() {
+    if nothing_staged(wiki)? {
         return Ok(());
     }
     run_git(
         wiki,
-        &["commit", "-q", "-m", &format!("layout: human-first homes for {count} project(s)")],
+        &[
+            "commit",
+            "-q",
+            "--no-verify",
+            "-m",
+            &format!("layout: human-first homes for {count} project(s)"),
+        ],
     )
 }
 
@@ -3191,22 +3684,18 @@ fn commit_layout_migration(wiki: &Path, count: usize) -> Result<()> {
 /// The ids come from the log, which is the source of truth for them. The names
 /// come from the directory, which is where they were written - with the
 /// `--<id>` suffix stripped, because that suffix is part of the directory's
-/// name, not the project's.
+/// name, not the project's. One event is enough for the ids.
 fn scope_from_log(project_dir: &Path, workspace: &str) -> Option<ProjectScope> {
-    let log = EventLog::open(project_dir).ok()?;
-    let (events, _) = log.read_all().ok()?;
-    let first = events.first()?;
+    let first = EventLog::open(project_dir).ok()?.first_event()?;
 
-    let dir_name = project_dir.file_name()?.to_string_lossy().into_owned();
-    let project = crate::ids::strip_dir_suffix(&dir_name);
-
-    Some(ProjectScope {
+    let scope = ProjectScope {
         workspace: workspace.to_string(),
         workspace_id: first.workspace,
-        project: project.to_string(),
+        project: String::new(),
         project_id: first.project,
         root: project_dir.to_path_buf(),
-    })
+    };
+    Some(named_by_dir(scope, project_dir))
 }
 
 fn read_dirs(path: &Path) -> Vec<PathBuf> {
@@ -3926,6 +4415,106 @@ mod tests {
         assert_eq!(shape, [("project", false, false), ("all", true, false), ("project", false, true)]);
         assert!(runs[2].error.as_deref().unwrap().contains("disk full"));
         assert!(std::fs::read_to_string(paths.log_file()).unwrap().contains("disk full"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A store a past `reindex` left with its quiet and headless sessions
+    /// reopened is put back by the first run that holds the lock, whatever it
+    /// was asked for: no project here is even known to it. The marker keeps
+    /// that to one run; after it, a replay is settled by `reindex` itself.
+    #[test]
+    fn the_first_holder_settles_a_replayed_store_once() {
+        let (paths, dir) = scratch();
+        let store = Store::open(&paths.db()).unwrap();
+        let project = Uuid::new_v4();
+        let key = project.to_string();
+        let (quiet, headless, floor) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        store.record_session_invocation(&headless.to_string(), "headless").unwrap();
+        // The state a replay leaves: every event pending, every verdict kept.
+        let mut replayed = Vec::new();
+        for (n, (session, tier)) in
+            [(quiet, "quiet"), (headless, "headless"), (floor, "rule-based")].into_iter().enumerate()
+        {
+            for i in 0..3 {
+                let mut e = event(&format!("{n}{i}"), "post_tool_use", "Bash: ls", "{}");
+                e.project = project;
+                e.session = session;
+                store.index(&e).unwrap();
+                replayed.push(e);
+            }
+            let newest = &replayed.last().unwrap().id;
+            store.record_session_run(&session.to_string(), &key, newest, tier).unwrap();
+        }
+        let pending = |store: &Store| -> Vec<(String, i64)> {
+            store.sessions_pending(&key).unwrap().into_iter().map(|p| (p.session, p.pending)).collect()
+        };
+        assert_eq!(pending(&store).len(), 3);
+
+        assert!(!run_in(&paths, None, true, false, Path::new("/work")).unwrap().yielded);
+        assert_eq!(pending(&store), [(floor.to_string(), 3)], "the replayed verdicts were not put back");
+        let marked: bool = rusqlite::Connection::open(paths.db())
+            .unwrap()
+            .query_row("SELECT EXISTS(SELECT 1 FROM schema_state WHERE key = 'replayed_settled')", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(marked, "the heal left no marker");
+
+        // Stranded again after the heal: the next run leaves it alone.
+        store.index(&replayed[0]).unwrap();
+        assert!(!run_in(&paths, None, true, false, Path::new("/work")).unwrap().yielded);
+        assert!(
+            pending(&store).contains(&(quiet.to_string(), 1)),
+            "the heal ran a second time: {:?}",
+            pending(&store)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A per-session ask whose session has nothing pending is done before it
+    /// starts: no project list and no per-project pass. A force ask, a pending
+    /// session and an `--all` ask are work. The holder drops such asks before
+    /// it drains, so they cost no round either, and one written mid-drain,
+    /// after that drop, starts no pass in `execute`.
+    #[test]
+    fn a_stale_session_ask_is_served_at_once() {
+        let (paths, dir) = scratch();
+        let store = Store::open(&paths.db()).unwrap();
+        let (done, busy) = (Uuid::new_v4().to_string(), Uuid::new_v4().to_string());
+        let mut e = event("1", "post_tool_use", "Edit: a.rs", "{}");
+        e.session = busy.parse().unwrap();
+        store.index(&e).unwrap();
+        let request = |session: Option<&str>, all, force| ConsolidationRequest {
+            id: 0,
+            session: session.map(str::to_string),
+            all_projects: all,
+            force,
+            cwd: "/work".into(),
+        };
+        assert!(nothing_to_serve(&store, &request(Some(&done), false, false)).unwrap());
+        assert!(!nothing_to_serve(&store, &request(Some(&busy), false, false)).unwrap(), "pending");
+        assert!(!nothing_to_serve(&store, &request(Some(&done), false, true)).unwrap(), "force");
+        assert!(!nothing_to_serve(&store, &request(None, true, false)).unwrap(), "--all");
+
+        let stale = ask(&store, Some(&done), false, false);
+        assert!(!run_in(&paths, None, true, false, Path::new("/work")).unwrap().yielded);
+        let left: i64 = rusqlite::Connection::open(paths.db())
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM consolidation_requests WHERE id = ?1", [stale.id], |row| row.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "the holder drained the stale ask instead of dropping it");
+
+        // The per-project pass touches the lock before anything else it does.
+        let lock_path = paths.db().with_file_name(".brain-consolidate.lock");
+        let lock = RunLock::take(&lock_path).unwrap().unwrap();
+        std::fs::write(&lock_path, "untouched").unwrap();
+        let config = crate::config::SummarizerConfig { mode: "off".into(), ..Default::default() };
+        let ladder = Ladder::new(&store, &config);
+        let round = Round { deadline: None, began: jiff::Timestamp::now(), idle: false };
+        let late = request(Some(&done), false, false);
+        assert!(execute(&paths, &store, &ladder, &late, &lock, round, &mut Outcome::default()).unwrap());
+        assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), "untouched", "a project pass ran");
+        drop(lock);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -5369,7 +5958,9 @@ mod tests {
         assert!(dir.join("bugfixes.md").is_file());
         assert!(!dir.join("features.md").is_file(), "an empty topic hub is a dot meaning nothing");
         assert!(!dir.join("index.md").exists(), "the old unnamed hub should be gone");
-        assert_eq!(written.len(), 3, "project hub plus two topic hubs");
+        // Returned once removed, so the commit stages its deletion.
+        assert!(written.contains(&dir.join("index.md")), "{written:?}");
+        assert_eq!(written.len(), 4, "project hub, two topic hubs and the removed index.md");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -5481,6 +6072,146 @@ mod tests {
         let billing = entities.find("billing").unwrap();
         let older = entities.find("older").unwrap();
         assert!(billing < older, "counted entities lead:\n{entities}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hubs_leave_an_unchanged_page_untouched() {
+        let dir = std::env::temp_dir().join(format!("brain-hub-unchanged-{}", ulid::Ulid::new()));
+        let pages = dir.join("pages/sessions");
+        std::fs::create_dir_all(&pages).unwrap();
+        for (stem, session) in [("2026-08-23 chose-sqlite", "s1"), ("2026-08-24 added-wal", "s2")] {
+            std::fs::write(
+                pages.join(format!("{stem}.md")),
+                format!(
+                    "---\ntitle: {stem}\ndate: {}\nsession: {session}\ntags: [decision]\n---\n",
+                    &stem[..10]
+                ),
+            )
+            .unwrap();
+        }
+        let scope = scope_in(&dir);
+        let store = Store::open_memory().unwrap();
+        let project = scope.project_id.to_string();
+        for session in ["s1", "s2"] {
+            store.record_entities(session, &project, &["src/a.rs".to_string()]).unwrap();
+        }
+        // A flagged entry, so the lint page is written too.
+        let source = |hook: &str| Source { cli: "brain".to_string(), hook: hook.to_string() };
+        let (workspace, project_id) = (scope.workspace_id, scope.project_id);
+        let lesson = Event::new(
+            workspace,
+            project_id,
+            uuid::Uuid::nil(),
+            source("gotcha"),
+            EventKind::Knowledge,
+            "WAL needs a checkpoint".to_string(),
+            String::new(),
+        );
+        store.index(&lesson).unwrap();
+        let mut flag = Event::new(
+            workspace,
+            project_id,
+            uuid::Uuid::nil(),
+            source("feedback"),
+            EventKind::Note,
+            "Flagged: WAL needs a checkpoint".to_string(),
+            String::new(),
+        );
+        flag.links = vec![lesson.id.clone()];
+        store.index(&flag).unwrap();
+
+        let first = write_hubs(&dir, &scope, &store).unwrap();
+        assert!(first.contains(&dir.join("entities.md")), "the entity pages are part of this: {first:?}");
+        assert!(first.contains(&dir.join("_lint/flagged.md")), "and the lint page: {first:?}");
+        // 2001-01-01: far enough back that a rewrite, however quick, shows.
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(978_307_200);
+        for path in &first {
+            std::fs::File::options().write(true).open(path).unwrap().set_modified(old).unwrap();
+        }
+
+        let second = write_hubs(&dir, &scope, &store).unwrap();
+        assert_eq!(second, first, "a writer still returns every page it owns");
+        for path in &second {
+            let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+            assert_eq!(modified, old, "rewritten with nothing changed: {}", path.display());
+        }
+        let hub = std::fs::read_to_string(dir.join("my-proj.md")).unwrap();
+        assert!(hub.contains("Entities: [[entities|"), "{hub}");
+        assert!(hub.contains("Flagged: [[_lint/flagged|"), "{hub}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_removed_topic_note_is_returned_for_staging() {
+        let dir = std::env::temp_dir().join(format!("brain-hub-removed-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(dir.join("pages/sessions")).unwrap();
+        std::fs::write(
+            dir.join("pages/sessions/2026-08-23 fixed-wal.md"),
+            "---\ntitle: Fixed WAL\ndate: 2026-08-23\nsession: s1\ntags: [bugfix]\n---\n",
+        )
+        .unwrap();
+        // A decision note from a round whose sessions no longer say "decision".
+        let planted = dir.join("decisions.md");
+        std::fs::write(&planted, "---\ntitle: decision\ntags: [topic, decision]\n---\n").unwrap();
+
+        let store = Store::open_memory().unwrap();
+        let written = write_hubs(&dir, &scope_in(&dir), &store).unwrap();
+        assert!(!planted.exists(), "a topic note nothing feeds is removed");
+        assert!(written.contains(&planted), "its deletion must reach the commit: {written:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_entity_page_does_not_change_when_a_session_is_retitled() {
+        let dir = std::env::temp_dir().join(format!("brain-entity-retitle-{}", ulid::Ulid::new()));
+        let pages = dir.join("pages/sessions");
+        std::fs::create_dir_all(&pages).unwrap();
+        let first = pages.join("2026-08-23 chose-sqlite.md");
+        std::fs::write(&first, "---\ntitle: Chose SQLite\ndate: 2026-08-23\nsession: s1\n---\n")
+            .unwrap();
+        std::fs::write(
+            pages.join("2026-08-24 added-wal.md"),
+            "---\ntitle: Added WAL\ndate: 2026-08-24\nsession: s2\n---\n",
+        )
+        .unwrap();
+        let scope = scope_in(&dir);
+        let store = Store::open_memory().unwrap();
+        let project = scope.project_id.to_string();
+        for session in ["s1", "s2"] {
+            store.record_entities(session, &project, &["src/a.rs".to_string()]).unwrap();
+        }
+        let entity = dir.join("entities").join(format!("{}.md", entity_stem("src/a.rs")));
+
+        write_hubs(&dir, &scope, &store).unwrap();
+        let before = std::fs::read_to_string(&entity).unwrap();
+
+        // Re-consolidating a session rewrites its title and date in place,
+        // under the file name it was first given.
+        std::fs::write(
+            &first,
+            "---\ntitle: Picked SQLite over Postgres\ndate: 2026-08-24\nsession: s1\n---\n",
+        )
+        .unwrap();
+        write_hubs(&dir, &scope, &store).unwrap();
+        let after = std::fs::read_to_string(&entity).unwrap();
+
+        assert_eq!(after, before, "a retitle rewrote every entity page the session touched");
+        // Both sessions are listed, still in session order.
+        assert!(
+            after.contains(
+                "- [[pages/sessions/2026-08-23 chose-sqlite|2026-08-23 chose-sqlite]]\n\
+                 - [[pages/sessions/2026-08-24 added-wal|2026-08-24 added-wal]]\n"
+            ),
+            "{after}"
+        );
+        // The hub is one file a session commit rewrites anyway: it keeps the
+        // title a person reads.
+        let hub = std::fs::read_to_string(dir.join("my-proj.md")).unwrap();
+        assert!(hub.contains("|Picked SQLite over Postgres]]"), "{hub}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -5644,6 +6375,114 @@ mod tests {
         assert!(!path.exists(), "lock must be released when the guard drops");
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// Staging goes in chunks, and one failing path takes its whole chunk
+    /// down with it. More pages than two chunks hold, with a removed page and
+    /// a page no commit ever held on the same call, must all land.
+    #[test]
+    fn a_commit_stages_every_page_across_chunks_and_removals() {
+        let wiki = std::env::temp_dir().join(format!("brain-stage-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(wiki.join("p")).unwrap();
+        let pages: Vec<PathBuf> =
+            (0..2 * ADD_CHUNK + 2).map(|index| wiki.join(format!("p/page{index:03}.md"))).collect();
+        for page in &pages {
+            std::fs::write(page, "first\n").unwrap();
+        }
+        let git = |args: &[&str]| {
+            let output = wiki_git(&wiki).args(args).output().unwrap();
+            assert!(output.status.success(), "git {args:?} failed: {output:?}");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        let untracked = ["status", "--porcelain", "--untracked-files=all"];
+
+        assert!(commit_pages(&wiki, &pages, "first").unwrap());
+        assert_eq!(git(&untracked), "", "a page was left out of the first commit");
+
+        // One page rewritten, one removed, and one that never existed at all.
+        std::fs::write(&pages[0], "second\n").unwrap();
+        std::fs::remove_file(&pages[1]).unwrap();
+        let mut round = pages.clone();
+        round.push(wiki.join("p/never-committed.md"));
+        assert!(commit_pages(&wiki, &round, "second").unwrap());
+        assert_eq!(git(&untracked), "", "a change was left out of the second commit");
+        assert_eq!(
+            git(&["show", "--name-status", "--format=", "HEAD"]),
+            "M\tp/page000.md\nD\tp/page001.md\n"
+        );
+        assert_eq!(git(&["rev-list", "--count", "HEAD"]).trim(), "2");
+        std::fs::remove_dir_all(&wiki).ok();
+    }
+
+    /// A wiki git call built by hand skips the guard, and one unguarded
+    /// commit is enough to start git's detached maintenance again. The one
+    /// allowed spelling is the one inside `wiki_git` itself.
+    #[test]
+    fn every_wiki_git_call_goes_through_the_guard() {
+        // Spelled in two halves so this test's own text does not count.
+        let needle = ["Command::new(", "\"git\")"].concat();
+        for (name, source, allowed) in [
+            ("consolidate.rs", include_str!("consolidate.rs"), 1),
+            ("history.rs", include_str!("history.rs"), 0),
+            ("ingest.rs", include_str!("ingest.rs"), 0),
+        ] {
+            assert_eq!(
+                source.matches(needle.as_str()).count(),
+                allowed,
+                "{name} starts git without wiki_git's guard"
+            );
+        }
+    }
+
+    /// The wiki's repack is killed when it overruns, and so is everything it
+    /// started: a `pack-objects` left running would keep the memory the limit
+    /// is there to bound.
+    #[cfg(unix)]
+    #[test]
+    fn a_bounded_child_is_killed_with_its_children() {
+        let dir = std::env::temp_dir().join(format!("brain-bounded-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("pid");
+        // The shell leads its own group, so its pid names the group, and the
+        // sleep it backgrounds stays in it.
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg(format!("echo $$ > '{}'; sleep 30 & wait", pid_file.display()));
+        let started = std::time::Instant::now();
+        // A whole second, so even a loaded machine has run the shell's first
+        // line before the kill.
+        let outcome = run_bounded(command, std::time::Duration::from_secs(1)).unwrap();
+        let took = started.elapsed();
+        let group = std::fs::read_to_string(&pid_file).unwrap_or_default().trim().to_string();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(matches!(outcome, Bounded::TimedOut), "an overrun was not stopped: {outcome:?}");
+        assert!(took < std::time::Duration::from_secs(3), "the kill took {took:?}");
+        assert!(!group.is_empty(), "the shell never wrote its pid");
+
+        // A killed process is listed until it is reaped, so give the orphaned
+        // sleep a moment to be.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let found = std::process::Command::new("pgrep").args(["-g", &group]).output().unwrap();
+            if found.stdout.is_empty() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                // Not left behind for the rest of the suite.
+                let _ = std::process::Command::new("pkill").args(["-KILL", "-g", &group]).status();
+                panic!("the group outlived the kill: {}", String::from_utf8_lossy(&found.stdout));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn the_policy_marker_counts_only_in_its_own_section() {
+        // Git spells section names in any case, and adds a key at the end of
+        // its section, so the marker can sit anywhere under the header.
+        assert!(has_policy_marker("[core]\n\tbare = false\n[Brain]\n\tother = x\n\tpolicy = 1\n"));
+        assert!(!has_policy_marker("[brain]\n\tpolicy = 0\n"));
+        assert!(!has_policy_marker("[other]\n\tpolicy = 1\n[brain]\n"));
+        assert!(!has_policy_marker("[brain \"x\"]\n\tpolicy = 1\n"));
+    }
 }
 
 #[cfg(test)]
@@ -5684,5 +6523,58 @@ mod naming_tests {
         );
 
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn a_later_unreadable_month_does_not_hide_a_project() {
+        // Only the first event is needed for the ids, so a month after it
+        // that cannot be read must not cost the project its place in
+        // `known_projects`. A directory named like a log stands in for any
+        // file that `files()` lists and a read then fails on.
+        let base = std::env::temp_dir().join(format!("brain-first-event-{}", ulid::Ulid::new()));
+        let project = base.join("walnutzite");
+        let (workspace_id, project_id) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let mut event = Event::new(
+            workspace_id,
+            project_id,
+            uuid::Uuid::new_v4(),
+            Source { cli: "claude-code".into(), hook: "post_tool_use".into() },
+            EventKind::Observation,
+            "t".into(),
+            String::new(),
+        );
+        event.ts = "2026-09-15T00:00:00Z".into();
+        EventLog::open(&project).unwrap().append(&event).unwrap();
+        std::fs::create_dir_all(project.join("events").join("2026-10.jsonl")).unwrap();
+
+        let scope = scope_from_log(&project, "default").expect("the project must still be found");
+        assert_eq!(scope.workspace_id, workspace_id);
+        assert_eq!(scope.project_id, project_id);
+        assert_eq!(scope.project, "walnutzite");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn named_by_dir_uses_the_folder_without_its_suffix() {
+        let scope = || ProjectScope {
+            workspace: "default".into(),
+            workspace_id: uuid::Uuid::nil(),
+            project: "WalnutZite".into(),
+            project_id: uuid::Uuid::nil(),
+            root: PathBuf::from("/work/WalnutZite"),
+        };
+        let wiki = Path::new("/home/Rolepod Brain");
+        assert_eq!(named_by_dir(scope(), &wiki.join("walnutzite")).project, "walnutzite");
+        assert_eq!(
+            named_by_dir(scope(), &wiki.join("walnutzite--1a2b3c4d")).project,
+            "walnutzite",
+            "the --<id> suffix is the folder's, not the project's"
+        );
+        assert_eq!(
+            named_by_dir(scope(), &wiki.join("Walnut-Zite--1a2b3c4d")).project,
+            "Walnut-Zite",
+            "a folder that is not a slug keeps its own spelling, as --all shows it"
+        );
     }
 }

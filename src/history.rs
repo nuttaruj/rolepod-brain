@@ -59,10 +59,9 @@ fn matching_pages(wiki: &Path, query: &str) -> Vec<PathBuf> {
 /// Returns an error when git cannot be run.
 pub fn revisions(wiki: &Path, page: &Path) -> Result<Vec<Revision>> {
     let relative = page.strip_prefix(wiki).unwrap_or(page);
-    let output = std::process::Command::new("git")
+    let output = crate::consolidate::wiki_git(wiki)
         .args(["log", "--format=%h%x1f%ad%x1f%s", "--date=format:%Y-%m-%d %H:%M", "--"])
         .arg(relative)
-        .current_dir(wiki)
         .output()
         .context("run git log")?;
     if !output.status.success() {
@@ -87,10 +86,9 @@ pub fn revisions(wiki: &Path, page: &Path) -> Result<Vec<Revision>> {
 /// Returns an error when git cannot be run.
 pub fn diff(wiki: &Path, page: &Path, commit: &str) -> Result<String> {
     let relative = page.strip_prefix(wiki).unwrap_or(page);
-    let output = std::process::Command::new("git")
+    let output = crate::consolidate::wiki_git(wiki)
         .args(["show", "--format=", "--unified=1", commit, "--"])
         .arg(relative)
-        .current_dir(wiki)
         .output()
         .context("run git show")?;
     Ok(String::from_utf8_lossy(&output.stdout).to_string())

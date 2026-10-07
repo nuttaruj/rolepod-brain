@@ -58,6 +58,8 @@ pub fn run(file: &Path, force: bool) -> Result<Ingested> {
     paths.ensure()?;
     let scope = ids::resolve_scope(&std::env::current_dir().unwrap_or_default());
     let project_dir = paths.project_dir(&scope);
+    // The same name every consolidation gives it, or this run rewrites the hub.
+    let scope = consolidate::named_by_dir(scope, &project_dir);
     let store = Store::open(&paths.db())?;
     let config = Config::load(&paths.config_file())?;
     let ladder = Ladder::new(&store, &config.summarizer);
@@ -255,14 +257,16 @@ pub fn run(file: &Path, force: bool) -> Result<Ingested> {
     let hubs = consolidate::write_hubs(&project_dir, &scope, &store)?;
     let root = consolidate::write_root(&paths)?;
 
-    let wiki = paths.wiki();
-    consolidate::commit_wiki(&wiki, &raw_path, "ingest")?;
-    consolidate::commit_wiki(&wiki, &page_path, &tier_label)?;
-    for path in knowledge.iter().chain(hubs.iter()).chain(root.iter()) {
-        consolidate::commit_wiki(&wiki, path, "hub")?;
-    }
+    // One commit for the reading: the copy, its page and what they changed.
+    let page = vault_relative(&paths, &page_path);
+    let message = format!("consolidate {} ({tier_label})", page.display());
+    let mut pages = vec![raw_path, page_path];
+    pages.extend(knowledge);
+    pages.extend(hubs);
+    pages.extend(root);
+    consolidate::commit_pages(&paths.wiki(), &pages, &message)?;
 
-    Ok(Ingested { title, page: vault_relative(&paths, &page_path), tier: tier_label, unchanged: false })
+    Ok(Ingested { title, page, tier: tier_label, unchanged: false })
 }
 
 fn vault_relative(paths: &Paths, path: &Path) -> PathBuf {

@@ -318,21 +318,19 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
         store.reset_injection_state(&session_key)?;
     }
 
-    if is_session_boundary(cli_kind.as_str(), &hook) {
-        // Compaction is the last moment this session's detail exists. Kicking
-        // consolidation here means the primer that lands seconds later carries
-        // a real narrative rather than a list of raw commands. Detached and
-        // idempotent, so an extra run costs nothing.
-        spawn_consolidation(Some(&session_key));
-    } else if hook == "session_start" && store.has_stale_backlog(STALE_BACKLOG_SECS).unwrap_or(false)
-    {
-        // The backstop, without a background agent: a session opening is
-        // exactly when older unconsolidated work becomes worth finishing,
-        // because this session is the one that will read it.
-        spawn_consolidation(None);
+    let summoned = summons(
+        cli_kind.as_str(),
+        &hook,
+        invocation.is_headless(),
+        || store.has_stale_backlog(STALE_BACKLOG_SECS).unwrap_or(false),
+        || claim_idle_sweep_window(&store, jiff::Timestamp::now()),
+    );
+    match summoned.run {
+        Some(Run::Session) => spawn_consolidation(Some(&session_key)),
+        Some(Run::All) => spawn_consolidation(None),
+        None => {}
     }
-
-    if hook == "stop" && claim_idle_sweep_window(&store, jiff::Timestamp::now()) {
+    if summoned.idle {
         spawn_detached(&["consolidate", "--idle"]);
     }
 
@@ -578,6 +576,64 @@ pub fn consolidation_triggers(cli: &str) -> &'static str {
         "gemini-cli" => "backstop only (no boundary event reaches us)",
         _ => "backstop only",
     }
+}
+
+/// The detached run a hook starts on its way out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Run {
+    /// `consolidate --session`, for the session this hook belongs to.
+    Session,
+    /// `consolidate --all`: the backstop.
+    All,
+}
+
+/// What a hook starts: at most one run, plus the idle sweep.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Summons {
+    run: Option<Run>,
+    /// `consolidate --idle`, for sessions nobody came back to.
+    idle: bool,
+}
+
+/// Decide what this hook starts.
+///
+/// A one-shot run (`claude -p`, `codex exec`) starts nothing, because nothing
+/// waits on its consolidation: it never gets a summary (`consolidate_session`
+/// settles it as headless, with no model call), and the in-flight list leaves
+/// it out (`Store::unconsolidated_sessions`). Yet its start, its stops and its
+/// end each started a detached run: 88% of the 1,783 spawns one machine made
+/// in a day, nearly all of them standing aside for the run that already held
+/// the lock. Its events settle in the next `--all` or idle pass that a
+/// person's session starts, at no model cost.
+///
+/// The two questions are closures so that a one-shot run asks neither: the
+/// backlog question is a read on the hook path, and claiming the idle window
+/// is a write.
+fn summons(
+    cli: &str,
+    hook: &str,
+    headless: bool,
+    stale: impl FnOnce() -> bool,
+    idle_window: impl FnOnce() -> bool,
+) -> Summons {
+    if headless {
+        return Summons::default();
+    }
+    let run = if is_session_boundary(cli, hook) {
+        // Compaction is the last moment this session's detail exists. Kicking
+        // consolidation here means the primer that lands seconds later carries
+        // a real narrative rather than a list of raw commands. Detached and
+        // idempotent, so an extra run costs nothing.
+        Some(Run::Session)
+    } else if hook == "session_start" && stale() {
+        // The backstop, without a background agent: a session opening is
+        // exactly when older unconsolidated work becomes worth finishing,
+        // because this session is the one that will read it.
+        Some(Run::All)
+    } else {
+        None
+    };
+    Summons { run, idle: hook == "stop" && idle_window() }
 }
 
 /// Start consolidation in a detached child and return immediately.
@@ -1710,6 +1766,49 @@ mod tests {
         assert!(!claim_idle_sweep_window(&store, inside), "still inside the window");
         let later = now + jiff::SignedDuration::from_secs(IDLE_SWEEP_DEBOUNCE_SECS + 60);
         assert!(claim_idle_sweep_window(&store, later), "past the window it asks again");
+    }
+
+    /// A one-shot run never gets a summary, so none of its hooks may start a
+    /// consolidation, and none may pay to ask: the backlog question is a read
+    /// on the hook path and the idle window is a write.
+    #[test]
+    fn a_one_shot_run_summons_nothing_and_reads_nothing() {
+        let stale_asked = std::cell::Cell::new(false);
+        let window_asked = std::cell::Cell::new(false);
+        for cli in ["claude-code", "codex", "cursor", "opencode"] {
+            for hook in ["session_start", "session_end", "pre_compact", "stop"] {
+                let summoned = summons(
+                    cli,
+                    hook,
+                    true,
+                    || {
+                        stale_asked.set(true);
+                        true
+                    },
+                    || {
+                        window_asked.set(true);
+                        true
+                    },
+                );
+                assert_eq!(summoned, Summons::default(), "{cli}/{hook} summoned a run");
+            }
+        }
+        assert!(!stale_asked.get(), "a one-shot run read the backlog");
+        assert!(!window_asked.get(), "a one-shot run spent the idle window");
+
+        // A person's session keeps every rule it had.
+        let session = Summons { run: Some(Run::Session), idle: false };
+        assert_eq!(summons("claude-code", "session_end", false, || true, || true), session);
+        assert_eq!(
+            summons("claude-code", "session_start", false, || true, || true),
+            Summons { run: Some(Run::All), idle: false }
+        );
+        assert_eq!(summons("claude-code", "session_start", false, || false, || true), Summons::default());
+        assert_eq!(summons("cursor", "stop", false, || true, || false), session);
+        assert_eq!(
+            summons("cursor", "stop", false, || true, || true),
+            Summons { run: Some(Run::Session), idle: true }
+        );
     }
 
     #[test]

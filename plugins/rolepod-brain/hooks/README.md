@@ -22,8 +22,35 @@ where PostToolUse fires thousands of times and is the path a person waits on.
 The `Setup` event is NOT an install hook - it fires on --init/--maintenance -
 so it cannot be the thing that puts the binary in place.
 
+Every command sets `GIT_CONFIG_PARAMETERS` to turn git's auto-maintenance
+off. The plugin updates apart from the binary, and a brain older than 0.64.0
+commits once per wiki page; each commit starts `git maintenance run --auto`,
+which recent git detaches, and that is how a machine ended up with hundreds of
+git processes on 2026-10-07. `brain hook` and the consolidate it starts inherit
+the variable, so even an old binary's commits start nothing.
+
 ## codex-hooks.json — Codex
 
 Declared explicitly in `.codex-plugin/plugin.json` rather than discovered, so
-the name is free. Codex clears the environment before running a hook, which is
-why each command sets `PATH` itself.
+the name is free.
+
+Every command is the same fixed line, `sh "${PLUGIN_ROOT}/hooks/codex-hook.sh"
+<Event>`, and the work happens in `codex-hook.sh`. Codex trusts a hook by a
+sha256 of its event, command and timeout (`hooks.state.<key>.trusted_hash` in
+`config.toml`), taken before it substitutes `${PLUGIN_ROOT}`, so a changed
+command reads as modified and stops running until the person approves it
+again. The line holds no version and no path, so the hash stays the same while
+the script changes.
+
+Moving to the script in 0.64.0 changed every command once. Each Codex user is
+asked once to review the hooks ("Hooks need review"), and brain captures
+nothing from Codex until they choose Trust. That one approval was accepted on
+2026-10-07 in exchange for never needing another.
+
+The rule from here on: a fix goes into `codex-hook.sh`, never into the command
+text, the event names or the timeouts in `codex-hooks.json`.
+
+The script sets what the commands used to set: `PATH` (Codex clears the
+environment before running a hook) and the same `GIT_CONFIG_PARAMETERS` guard
+as `hooks.json`. SessionStart still fetches a missing binary and the model,
+and answers `{}` when there is no binary to run.

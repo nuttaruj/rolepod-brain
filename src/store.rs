@@ -34,6 +34,18 @@ fn embeddable(alias: &str) -> String {
     )
 }
 
+/// A `WITH` clause naming each project in `events` once, as
+/// `projects(project)`, found by skipping through an index from one name to
+/// the next rather than by reading rows. A statement that joins it to
+/// `events e ON e.project = projects.project AND e.consolidated = 0` reads
+/// only pending rows, through `events_unconsolidated`: a few reads per
+/// project on a settled store, where any other path reads every row.
+const PROJECTS_CTE: &str = "WITH RECURSIVE projects(project) AS (
+     SELECT MIN(project) FROM events
+     UNION ALL
+     SELECT (SELECT MIN(project) FROM events WHERE project > projects.project)
+     FROM projects WHERE projects.project IS NOT NULL)";
+
 /// How much wider than the caller's limit a search reads before spreading
 /// results across sessions. Four deep enough that a busy session cannot fill
 /// the pool by itself, shallow enough that the query stays one index scan.
@@ -3462,22 +3474,33 @@ impl Store {
             .to_string();
         let found: Option<i64> = self
             .conn
-            .query_row(
-                // A parked session is not work a run can finish, so it must
-                // not summon one: that is the loop this guard exists to stop.
-                &format!(
-                    "SELECT 1 FROM events
-                     WHERE consolidated = 0 AND kind = 'observation' AND ts < ?1
-                       AND session NOT IN ({})
-                     LIMIT 1",
-                    Self::parked_sessions_sql()
-                ),
-                params![cutoff],
-                |row| row.get(0),
-            )
+            .query_row(&Self::stale_backlog_sql(), params![cutoff], |row| row.get(0))
             .optional()
             .context("check stale backlog")?;
         Ok(found.is_some())
+    }
+
+    /// The statement behind [`Self::has_stale_backlog`]: list each project
+    /// once by skipping through the index, then read only that project's
+    /// pending rows through `events_unconsolidated`.
+    ///
+    /// The plain form, one `SELECT` over `events`, scanned every row: 4 s on
+    /// a clean store of 321k rows, inside a hook with a 5 s budget. It was
+    /// fast only while an old pending row happened to match early in the
+    /// scan. `+e.ts` keeps the planner from walking `events_project_ts` over
+    /// every old row of a project instead.
+    fn stale_backlog_sql() -> String {
+        // A parked session is not work a run can finish, so it must
+        // not summon one: that is the loop this guard exists to stop.
+        format!(
+            "{PROJECTS_CTE}
+             SELECT 1 FROM projects
+             JOIN events e ON e.project = projects.project AND e.consolidated = 0
+             WHERE e.kind = 'observation' AND +e.ts < ?1
+               AND e.session NOT IN ({})
+             LIMIT 1",
+            Self::parked_sessions_sql()
+        )
     }
 
     /// Take the idle-sweep window: true when the last sweep check is older
@@ -3603,7 +3626,10 @@ impl Store {
         }
         // Identical open asks are one piece of work: this run serves them all,
         // so they must not each cost a drain round and a full pass. They stay
-        // behind this one if it is handed back, since it stands for them.
+        // behind this one if it is handed back, since it stands for them. An
+        // `--all` ask covers every known project from any directory, so its
+        // cwd does not make it different work: 51 open `--all` asks from six
+        // directories once cost six rounds.
         self.conn
             .execute(
                 "UPDATE consolidation_requests SET consumed_at = ?2
@@ -3611,11 +3637,69 @@ impl Store {
                    AND session IS (SELECT session FROM consolidation_requests WHERE id = ?1)
                    AND all_projects = (SELECT all_projects FROM consolidation_requests WHERE id = ?1)
                    AND force = (SELECT force FROM consolidation_requests WHERE id = ?1)
-                   AND cwd = (SELECT cwd FROM consolidation_requests WHERE id = ?1)",
+                   AND (all_projects = 1
+                        OR cwd = (SELECT cwd FROM consolidation_requests WHERE id = ?1))",
                 params![id, jiff::Timestamp::now().to_string()],
             )
             .context("consume identical consolidation requests")?;
         Ok(true)
+    }
+
+    /// Delete the open asks that have no work left: a non-force ask for a
+    /// session with nothing pending. Returns how many it deleted.
+    ///
+    /// Such an ask is written after its events are indexed, so a later run
+    /// settled them, or the session was settled when it was asked for. Left
+    /// open, each one costs a holder a drain round: 572 of 629 open asks were
+    /// this kind on one machine. A force ask stays, because it reopens a
+    /// settled session, and so does an `--all` ask, which names no session.
+    /// A session that gets new events is asked for again at its next
+    /// boundary, or by the backstop.
+    ///
+    /// # Errors
+    /// Returns an error when the delete fails.
+    pub fn drop_stale_asks(&self) -> Result<usize> {
+        self.conn
+            .execute(&Self::drop_stale_asks_sql(), [])
+            .context("drop stale consolidation requests")
+    }
+
+    /// The statement behind [`Self::drop_stale_asks`]: the sessions with
+    /// pending work, read by project through `events_unconsolidated`, are
+    /// what an ask must name to stay. Looked up per ask through
+    /// `events_session`, it read each asked session's events cold: 1.1 s on
+    /// one store, under the write lock a hook waits on; this form took
+    /// 15 ms. `CROSS JOIN` keeps the projects first: with a plain join
+    /// inside the `DELETE`, SQLite built an automatic index on `consolidated`
+    /// instead, a scan of the whole table (6.0 s). `+e.kind` keeps any index
+    /// on kind out of the plan.
+    fn drop_stale_asks_sql() -> String {
+        format!(
+            "DELETE FROM consolidation_requests
+             WHERE consumed_at IS NULL AND session IS NOT NULL AND force = 0
+               AND session NOT IN (
+                   {PROJECTS_CTE}
+                   SELECT e.session FROM projects
+                   CROSS JOIN events e ON e.project = projects.project AND e.consolidated = 0
+                   WHERE +e.kind = 'observation')"
+        )
+    }
+
+    /// Whether a session has an observation no run has consolidated yet. One
+    /// read through the `events_session` index. A parked session counts: its
+    /// events are set aside, not settled, so its ask stays as it did before.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn session_has_pending(&self, session: &str) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events
+                     WHERE session = ?1 AND consolidated = 0 AND kind = 'observation')",
+                params![session],
+                |row| row.get(0),
+            )
+            .context("read pending session events")
     }
 
     /// Hand an ask back, for a run that took it and could not finish it.
@@ -4688,6 +4772,77 @@ impl Store {
             .context("clear index")?;
         Ok(())
     }
+
+    /// Mark settled again what a replay reopened: each quiet or headless
+    /// session's observations up to the event its verdict covered. Returns how
+    /// many events it marked.
+    ///
+    /// Those two verdicts are written only to `session_state`, never to the
+    /// log, and [`Self::clear`] keeps that table. A replay sets every flag to
+    /// the log's, which is unconsolidated, and `should_wait` then finds the
+    /// session's newest event already covered by its last run and passes over
+    /// it on every run after: pending for good, and old enough to keep the
+    /// backstop asking. A model run is not affected, because its summary's
+    /// links set its flags back as the log is read.
+    ///
+    /// This restores the verdict exactly, with no model and no page. Events
+    /// newer than the verdict stay pending: they are work.
+    ///
+    /// # Errors
+    /// Returns an error when the update fails.
+    pub fn resettle_replayed(&self) -> Result<usize> {
+        self.conn
+            .execute(&Self::resettle_replayed_sql(), [])
+            .context("resettle replayed sessions")
+    }
+
+    /// The statement behind [`Self::resettle_replayed`]: pending rows, read
+    /// by project through `events_unconsolidated`, then kept when their
+    /// session's verdict is quiet or headless. Read by session through
+    /// `events_session`, it walked every event of the 3,539 quiet and
+    /// headless sessions on one store cold: 3.3 s, under the write lock a
+    /// hook waits on for 5 s; this form took 90 ms. `CROSS JOIN` keeps the
+    /// projects first, and `+e.kind` keeps any index on kind out of the plan.
+    fn resettle_replayed_sql() -> String {
+        format!(
+            "UPDATE events SET consolidated = 1 WHERE id IN (
+                 {PROJECTS_CTE}
+                 SELECT e.id FROM projects
+                 CROSS JOIN events e ON e.project = projects.project AND e.consolidated = 0
+                 JOIN session_state ss ON ss.session = e.session
+                 WHERE ss.last_tier IN ('quiet', 'headless')
+                   AND +e.kind = 'observation' AND e.id <= ss.last_event_id)"
+        )
+    }
+
+    /// [`Self::resettle_replayed`], once per store, for a store a `reindex`
+    /// stranded before that command settled its own replay. Returns 0 once
+    /// `replayed_settled` is recorded, which makes every later call a single
+    /// indexed read.
+    ///
+    /// Never run from `open`: the update holds the write lock that hooks
+    /// wait on. The run that holds the consolidation lock calls it instead.
+    ///
+    /// # Errors
+    /// Returns an error when a query fails.
+    pub fn resettle_replayed_once(&self) -> Result<usize> {
+        let done: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_state WHERE key = 'replayed_settled')",
+                [],
+                |row| row.get(0),
+            )
+            .context("check replayed sessions")?;
+        if done {
+            return Ok(0);
+        }
+        let settled = self.resettle_replayed()?;
+        self.conn
+            .execute("INSERT OR IGNORE INTO schema_state (key, value) VALUES ('replayed_settled', '1')", [])
+            .context("mark replayed sessions settled")?;
+        Ok(settled)
+    }
 }
 
 /// A memory pointer: everything an injection may carry, and nothing more.
@@ -5002,6 +5157,120 @@ mod tests {
         assert_eq!(store.failing_sessions(1).unwrap()[0].1, Store::PARK_AFTER + 1);
     }
 
+    /// The backstop runs inside every `session_start` hook. On a clean store
+    /// a plan that scans `events` reads every row before it can say no, so the
+    /// question must reach pending rows through their own index.
+    #[test]
+    fn the_backstop_question_reads_only_pending_rows() {
+        let store = Store::open_memory().unwrap();
+        let (mut a, mut b) = (Uuid::new_v4(), Uuid::new_v4());
+        if a.to_string() > b.to_string() {
+            std::mem::swap(&mut a, &mut b);
+        }
+        let old = (jiff::Timestamp::now() - jiff::SignedDuration::from_secs(2 * 3600)).to_string();
+        let mut done = Vec::new();
+        for project in [a, b] {
+            for i in 0..50 {
+                let mut settled = event(&format!("Edit: {i}.rs"), "{}", project);
+                settled.ts.clone_from(&old);
+                store.index(&settled).unwrap();
+                done.push(settled.id);
+            }
+        }
+        store.mark_consolidated(&done).unwrap();
+        assert!(!store.has_stale_backlog(900).unwrap(), "every row is settled");
+
+        // The one pending row sits in the project that sorts last.
+        let mut pending = event("Edit: late.rs", "{}", b);
+        pending.ts = old;
+        store.index(&pending).unwrap();
+        assert!(store.has_stale_backlog(900).unwrap(), "the pending row in B was missed");
+        store.mark_consolidated(std::slice::from_ref(&pending.id)).unwrap();
+        assert!(!store.has_stale_backlog(900).unwrap());
+
+        // The answers above hold on a full scan too; the plan is what guards the cost.
+        let plan: Vec<String> = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", Store::stale_backlog_sql()))
+            .unwrap()
+            .query_map(params!["now"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|row| row.starts_with("SEARCH e ") && row.contains("events_unconsolidated")),
+            "pending rows are not read through events_unconsolidated: {plan:#?}"
+        );
+        assert!(
+            !plan.iter().any(|row| matches!(
+                row.strip_prefix("SCAN ").and_then(|rest| rest.split_whitespace().next()),
+                Some("events" | "e")
+            )),
+            "the backstop scans the events table: {plan:#?}"
+        );
+    }
+
+    /// A rebuild replays every line with its flag as the log has it: cleared.
+    /// A model run gets its flag back from its summary's links; a quiet or
+    /// headless verdict lives only in `session_state`, which the rebuild
+    /// keeps, so those sessions came back pending and every later run passed
+    /// over them as already done.
+    #[test]
+    fn a_rebuild_keeps_quiet_and_headless_sessions_settled() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let key = project.to_string();
+        let (s1, s2, s3, s4) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        store.record_session_invocation(&s2.to_string(), "headless").unwrap();
+        // Ids in minting order, one millisecond apart, so "newer" is not left
+        // to the random half of a ULID.
+        let start = u64::try_from(jiff::Timestamp::now().as_millisecond()).unwrap() - 60_000;
+        let mut minted = 0;
+        let mut mint = |session: Uuid| {
+            minted += 1;
+            let mut event = event_in_session("Bash: ls", "{}", project, session);
+            event.id = ulid::Ulid::from_parts(start + minted, 0).to_string();
+            event
+        };
+        let mut log = Vec::new();
+        for (session, tier) in [(s1, "quiet"), (s2, "headless"), (s3, "rule-based"), (s4, "quiet")] {
+            let events: Vec<Event> = (0..3).map(|_| mint(session)).collect();
+            let ids: Vec<String> = events.iter().map(|event| event.id.clone()).collect();
+            for event in &events {
+                store.index(event).unwrap();
+            }
+            // A rule-based floor leaves its events pending on purpose.
+            if tier != "rule-based" {
+                store.mark_consolidated(&ids).unwrap();
+            }
+            store.record_session_run(&session.to_string(), &key, ids.last().unwrap(), tier).unwrap();
+            log.extend(events);
+        }
+        // s4 went on working after its quiet verdict.
+        let later = mint(s4);
+        store.index(&later).unwrap();
+        log.push(later);
+
+        // What `reindex` does: the same lines, each unconsolidated in the log.
+        store.clear().unwrap();
+        for event in &log {
+            assert!(!event.consolidated);
+            store.index(event).unwrap();
+        }
+        let pending = |store: &Store| {
+            let mut found: Vec<(String, i64)> =
+                store.sessions_pending(&key).unwrap().into_iter().map(|p| (p.session, p.pending)).collect();
+            found.sort();
+            found
+        };
+        assert_eq!(pending(&store).len(), 4, "the replay did not reopen the settled sessions");
+
+        assert_eq!(store.resettle_replayed().unwrap(), 9, "3 events each for s1, s2 and s4");
+        let mut left = vec![(s3.to_string(), 3), (s4.to_string(), 1)];
+        left.sort();
+        assert_eq!(pending(&store), left, "only the floor and s4's newer event are work");
+    }
+
     #[test]
     fn a_request_stays_open_until_taken_and_is_taken_once() {
         let store = Store::open_memory().unwrap();
@@ -5056,6 +5325,84 @@ mod tests {
         assert!(store.consume_consolidation_request(sess_a).unwrap());
         assert!(!store.consume_consolidation_request(sess_b).unwrap(), "session twin still open");
         assert!(store.next_consolidation_request().unwrap().is_none());
+    }
+
+    /// An `--all` pass covers every known project wherever it was asked from,
+    /// so the directory does not make two `--all` asks different work. Before,
+    /// each directory cost a drain round and a full pass of its own.
+    #[test]
+    fn an_all_projects_ask_takes_its_twins_from_any_directory() {
+        let store = Store::open_memory().unwrap();
+        let here = store.add_consolidation_request(None, true, false, "/a").unwrap();
+        let there = store.add_consolidation_request(None, true, false, "/b").unwrap();
+        let forced = store.add_consolidation_request(None, true, true, "/a").unwrap();
+        assert!(store.consume_consolidation_request(here).unwrap());
+        assert!(!store.consume_consolidation_request(there).unwrap(), "the /b twin still open");
+        assert_eq!(store.next_consolidation_request().unwrap().unwrap().id, forced, "force is other work");
+    }
+
+    /// A non-force ask for a session with nothing pending has no work left:
+    /// the run that would serve it only repeats a pass. A force ask reopens
+    /// settled sessions and an `--all` ask names none, so both stay.
+    #[test]
+    fn a_session_ask_with_nothing_pending_is_dropped() {
+        let store = Store::open_memory().unwrap();
+        let (done, busy) = (Uuid::new_v4(), Uuid::new_v4());
+        store.index(&event_in_session("Edit: a.rs", "{}", Uuid::new_v4(), busy)).unwrap();
+        let stale = store.add_consolidation_request(Some(&done.to_string()), false, false, "/w").unwrap();
+        let pending = store.add_consolidation_request(Some(&busy.to_string()), false, false, "/w").unwrap();
+        let forced = store.add_consolidation_request(Some(&done.to_string()), false, true, "/w").unwrap();
+        let all = store.add_consolidation_request(None, true, false, "/w").unwrap();
+        assert!(!store.session_has_pending(&done.to_string()).unwrap());
+        assert!(store.session_has_pending(&busy.to_string()).unwrap());
+
+        assert_eq!(store.drop_stale_asks().unwrap(), 1);
+        let open: Vec<i64> = store
+            .conn
+            .prepare("SELECT id FROM consolidation_requests WHERE consumed_at IS NULL ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(open, [pending, forced, all], "only the stale ask {stale} goes");
+    }
+
+    /// The heal runs in every run that holds the lock, inside the write lock
+    /// a hook's write waits on for at most 5 s. Reached by session, its two
+    /// statements read every quiet session's events cold: 3.3 s and 1.1 s on
+    /// one store. Pending rows have their own index. Which rows change is
+    /// pinned by the existing tests of each function; the plan guards the cost.
+    #[test]
+    fn the_heal_reads_only_pending_rows() {
+        let store = Store::open_memory().unwrap();
+        for (name, sql) in [
+            ("resettle_replayed", Store::resettle_replayed_sql()),
+            ("drop_stale_asks", Store::drop_stale_asks_sql()),
+        ] {
+            let plan: Vec<String> = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|row| row == "SEARCH e USING INDEX events_unconsolidated (project=? AND consolidated=?)"),
+                "{name} does not read pending rows through events_unconsolidated: {plan:#?}"
+            );
+            assert!(
+                !plan.iter().any(|row| row.contains("events_session")
+                    || row.contains("AUTOMATIC")
+                    || matches!(
+                        row.strip_prefix("SCAN ").and_then(|rest| rest.split_whitespace().next()),
+                        Some("events" | "e")
+                    )),
+                "{name} walks events by session or scans them: {plan:#?}"
+            );
+        }
     }
 
     #[test]

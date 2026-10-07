@@ -569,6 +569,10 @@ fn reindex() -> Result<()> {
         }
     }
 
+    // A quiet or headless verdict is kept in the store, not the log, so the
+    // replay above reopened those sessions; put them back as they were.
+    store.resettle_replayed()?;
+
     // Hub notes are derived from the pages exactly as the index is derived
     // from the log, and they were only ever refreshed when a project happened
     // to consolidate something. A project with no pending work would keep

@@ -9,7 +9,7 @@
 //! per line, append-only, fsynced per event.
 
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -337,6 +337,33 @@ impl EventLog {
         Ok(files)
     }
 
+    /// The first event of the oldest month, reading no further than it.
+    ///
+    /// Every line in one project's log carries that project's ids, so its
+    /// first event names the project - the rule `dir_belongs_to` already
+    /// uses. Reading one line instead of the whole log matters because the
+    /// callers run on every consolidation, and one machine's logs held 1.2 GB.
+    /// Blank and malformed lines are skipped, as in [`Self::read_all`]. Lines
+    /// are read as bytes, so one that is not valid UTF-8 is just another
+    /// malformed line. A file that cannot be read ends only its own scan: a
+    /// later month that fails must not hide the earlier ones.
+    #[must_use]
+    pub fn first_event(&self) -> Option<Event> {
+        for path in self.files().ok()? {
+            let Ok(file) = fs::File::open(&path) else { continue };
+            for line in BufReader::new(file).split(b'\n') {
+                // A read error repeats on every retry (a directory named like
+                // a log keeps failing), so it ends this file, not the search.
+                let Ok(line) = line else { break };
+                // A blank line fails to parse too, so it is skipped here.
+                if let Ok(event) = serde_json::from_slice::<Event>(&line) {
+                    return Some(event);
+                }
+            }
+        }
+        None
+    }
+
     /// Read every event in order.
     ///
     /// A malformed line is skipped rather than aborting the read: one corrupt
@@ -478,6 +505,20 @@ mod tests {
         let (events, skipped) = log.read_all().unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(skipped, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_first_event_is_found_past_lines_that_do_not_parse() {
+        // A blank line, a half-written line and a line that is not UTF-8
+        // must not stop the search for the event that names the project.
+        let dir = std::env::temp_dir().join(format!("brain-test-{}", Ulid::new()));
+        let log = EventLog::open(&dir).unwrap();
+        let event = sample();
+        let path = log.file_for(&event.month());
+        std::fs::write(&path, b"\n{ this is not json\n\xff\xfe\n").unwrap();
+        log.append(&event).unwrap();
+        assert_eq!(log.first_event().map(|first| first.id), Some(event.id));
         std::fs::remove_dir_all(&dir).ok();
     }
 
