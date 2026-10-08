@@ -23,6 +23,8 @@ mod mcp;
 mod portable;
 mod rerank;
 #[cfg(feature = "local-rerank")]
+mod onnx_external;
+#[cfg(feature = "local-rerank")]
 mod xencoder;
 mod revise;
 mod sanitize;
@@ -114,6 +116,11 @@ enum Commands {
     },
     /// Rebuild the SQLite index from the event log.
     Reindex,
+    /// Give the index file back the space dropped bodies left in it.
+    ///
+    /// Rewrites the database, so it waits for ten quiet minutes and for free
+    /// disk of twice the index. Nothing runs it for you.
+    Compact,
     /// Read a markdown or text document into this project's memory.
     Ingest {
         /// The file to read. Markdown or plain text; it is copied unchanged
@@ -307,6 +314,12 @@ fn run(command: Commands) -> Result<()> {
                     outcome.adopted
                 );
             }
+            if outcome.dropped > 0 {
+                println!(
+                    "Dropped the index copy of the body of {} old observation(s); the log keeps them.",
+                    outcome.dropped
+                );
+            }
             if outcome.yielded {
                 println!(
                     "Another consolidation run is working; this one stood aside. \
@@ -366,6 +379,7 @@ fn run(command: Commands) -> Result<()> {
         }
         Commands::Uninstall { apply, wipe } => uninstall(apply, wipe),
         Commands::Reindex => reindex(),
+        Commands::Compact => compact(),
         Commands::Ingest { file, force } => {
             let done = ingest::run(&file, force)?;
             if done.unchanged {
@@ -532,6 +546,106 @@ fn run(command: Commands) -> Result<()> {
         }
         Commands::Where { models, reranker } => where_am_i(models, reranker),
     }
+}
+
+/// Give the index file back the space dropped bodies left in it: fold the text
+/// indexes, rewrite the database, cut the log, then index what a hook missed.
+///
+/// Refuses unless no hook has written for ten minutes and the disk has room
+/// for a second copy. Never automatic: a rewrite holds the database to itself
+/// for as long as it takes.
+///
+/// The quiet check reads the event logs, so it sees hooks that append. A
+/// read-path write to the usage ledgers (an injection or a recall count) leaves
+/// no log line; one that meets the rewrite loses its count, which retention
+/// reads only as "never surfaced". Run it when the machine is idle.
+fn compact() -> Result<()> {
+    let paths = Paths::resolve()?;
+    anyhow::ensure!(paths.db().is_file(), "no index at {} to compact", paths.db().display());
+
+    // Every refusal comes before the index is opened: a refused run touches
+    // nothing.
+    let quiet = newest_log_write_age(&paths)?;
+    anyhow::ensure!(
+        quiet.is_none_or(|age| age >= COMPACT_QUIET),
+        "a hook wrote to the event log {} s ago; compact needs {} quiet minutes, since a hook \
+         waiting on the database while it is rewritten gives up and leaves its event for the \
+         next catch-up. Try again later.",
+        quiet.map_or(0, |age| age.as_secs()),
+        COMPACT_QUIET.as_secs() / 60
+    );
+    let before = index_bytes(&paths);
+    let free = free_disk_bytes(&paths.data_dir)
+        .context("could not read the free disk space, so compact will not start")?;
+    anyhow::ensure!(
+        free >= before.saturating_mul(2),
+        "free disk is {} KB; compact rewrites the index ({} KB) beside itself and needs twice that",
+        free / 1024,
+        before / 1024
+    );
+    let Some(lock) = consolidate::RunLock::take(&consolidate::run_lock_path(&paths))? else {
+        anyhow::bail!("a consolidation run is working; compact will not rewrite the index under it");
+    };
+
+    let store = Store::open(&paths.db())?;
+    let (pages, free_pages) = store.page_use()?;
+    store.optimize_text_indexes()?;
+    lock.touch();
+    store.vacuum()?;
+    lock.touch();
+    let truncated = store.truncate_wal()?;
+    let after = index_bytes(&paths);
+    println!(
+        "Index {before} bytes -> {after} bytes ({} KB given back; {free_pages} of {pages} pages were free).",
+        before.saturating_sub(after) / 1024
+    );
+    if !truncated {
+        println!("A reader kept the write-ahead log from being cut; the next checkpoint will.");
+    }
+    // A hook that met the rewrite and gave up left its event in the log only.
+    let caught = consolidate::catch_up_all(&paths, &store, &lock)?;
+    if caught > 0 {
+        println!("Indexed {caught} event(s) the log held and the index lacked.");
+    }
+    Ok(())
+}
+
+/// How long the event logs must have been untouched before `brain compact`.
+const COMPACT_QUIET: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Bytes the index takes on disk: the database and its write-ahead log.
+fn index_bytes(paths: &Paths) -> u64 {
+    let db = paths.db();
+    let mut wal = db.clone().into_os_string();
+    wal.push("-wal");
+    [db, wal.into()]
+        .iter()
+        .map(|file| std::fs::metadata(file).map_or(0, |meta| meta.len()))
+        .sum()
+}
+
+/// How long ago any project's event log was last appended to. A capture hook
+/// appends before it does anything else, so this is the age of the last hook;
+/// `None` when no log exists yet.
+fn newest_log_write_age(paths: &Paths) -> Result<Option<std::time::Duration>> {
+    let mut newest = None;
+    for (_, dir) in consolidate::known_projects(paths)? {
+        for file in EventLog::open(&dir)?.files()? {
+            if let Ok(modified) = std::fs::metadata(&file).and_then(|meta| meta.modified()) {
+                newest = newest.max(Some(modified));
+            }
+        }
+    }
+    // A clock set back reads as "just now": refuse rather than guess.
+    Ok(newest.map(|at| at.elapsed().unwrap_or_default()))
+}
+
+/// Bytes free on the disk holding `dir`, from `df`; `None` when it cannot say.
+fn free_disk_bytes(dir: &std::path::Path) -> Option<u64> {
+    let out = std::process::Command::new("df").arg("-Pk").arg(dir).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let kilobytes: u64 = text.lines().nth(1)?.split_whitespace().nth(3)?.parse().ok()?;
+    kilobytes.checked_mul(1024)
 }
 
 /// Rebuild every index row from the log.

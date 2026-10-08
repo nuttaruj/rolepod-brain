@@ -33,6 +33,38 @@ pub struct Config {
     pub search: SearchConfig,
     pub sync: SyncConfig,
     pub team: TeamConfig,
+    pub retention: RetentionConfig,
+}
+
+/// How long an observation nobody ever surfaced keeps its body in the index.
+///
+/// Only the index forgets: the event log keeps every line, `brain_get` reads
+/// the whole body back from it, and a reindex restores the bodies for the next
+/// pass to drop again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RetentionConfig {
+    /// Days before a consolidated, never-surfaced observation loses its index
+    /// body. `0` switches retention off.
+    pub days: u32,
+}
+
+impl RetentionConfig {
+    /// The shortest window that is honoured. A typo such as `days = 1` must not
+    /// drop the bodies of last week's work.
+    pub const MIN_DAYS: u32 = 7;
+
+    /// The window to apply, or `None` when retention is off.
+    #[must_use]
+    pub fn effective_days(&self) -> Option<u32> {
+        (self.days > 0).then(|| self.days.max(Self::MIN_DAYS))
+    }
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self { days: 30 }
+    }
 }
 
 /// What happens after the index has answered.
@@ -359,6 +391,25 @@ mod tests {
         let config: Config = toml::from_str("[summarizer]\nmode = \"off\"\n").unwrap();
         assert_eq!(config.summarizer.mode, "off");
         assert_eq!(config.injection.primer_budget, 4096);
+    }
+
+    #[test]
+    fn retention_defaults_to_thirty_days_and_zero_is_off() {
+        assert_eq!(Config::default().retention.effective_days(), Some(30));
+        let off: Config = toml::from_str("[retention]\ndays = 0\n").unwrap();
+        assert_eq!(off.retention.effective_days(), None);
+        let ninety: Config = toml::from_str("[retention]\ndays = 90\n").unwrap();
+        assert_eq!(ninety.retention.effective_days(), Some(90));
+    }
+
+    #[test]
+    fn a_retention_window_under_a_week_is_raised_to_a_week() {
+        for days in 1..7 {
+            let config: Config = toml::from_str(&format!("[retention]\ndays = {days}\n")).unwrap();
+            assert_eq!(config.retention.effective_days(), Some(7), "days = {days}");
+        }
+        let week: Config = toml::from_str("[retention]\ndays = 7\n").unwrap();
+        assert_eq!(week.retention.effective_days(), Some(7));
     }
 
     #[test]

@@ -109,6 +109,10 @@ pub struct Outcome {
     pub embedded: usize,
     /// Knowledge pages withdrawn for duplicating an older one.
     pub folded: usize,
+    /// Old observations whose body the index let go of (the log keeps it).
+    pub dropped: usize,
+    /// The retention pass has had its turn this invocation.
+    retention_ran: bool,
     /// Another run held the lock, so this one did nothing.
     ///
     /// Distinct from an empty backlog, and the report has to say which: a run
@@ -144,7 +148,7 @@ pub fn run_idle() -> Result<Outcome> {
 }
 
 fn run_idle_in(paths: &Paths, cwd: &Path) -> Result<Outcome> {
-    let lock_path = paths.db().with_file_name(".brain-consolidate.lock");
+    let lock_path = run_lock_path(paths);
     let store = Store::open(&paths.db())?;
     // Before the lock and best effort, for the reasons given in `run_in`.
     let _ = ensure_wiki_git_config(&paths.wiki());
@@ -267,7 +271,7 @@ fn run_in(
     // down first. A run that stood aside used to take its request with it, and
     // a `--session X --force` that met a running `--all` was simply gone. The
     // holder reads what is still unconsumed once it lets go of the lock.
-    let lock_path = paths.db().with_file_name(".brain-consolidate.lock");
+    let lock_path = run_lock_path(paths);
     let store = Store::open(&paths.db())?;
     let id =
         store.add_consolidation_request(session, all_projects, force, &cwd.to_string_lossy())?;
@@ -546,6 +550,133 @@ fn catch_up_index(
     total
 }
 
+/// Where the whole-run lock lives; `brain compact` takes it too, so no
+/// consolidation writes while the database is being rewritten.
+pub(crate) fn run_lock_path(paths: &Paths) -> PathBuf {
+    paths.db().with_file_name(".brain-consolidate.lock")
+}
+
+/// Catch the index up on every project's log, as far as one run's byte budget
+/// goes. Returns how many events it indexed.
+pub(crate) fn catch_up_all(paths: &Paths, store: &Store, run_lock: &RunLock) -> Result<usize> {
+    let dirs: Vec<PathBuf> = known_projects(paths)?.into_iter().map(|(_, dir)| dir).collect();
+    Ok(catch_up_index(store, &dirs, Some(run_lock), None).indexed)
+}
+
+/// The time one run may spend dropping old bodies from the index, checked
+/// between slices; a slice in flight is not cut short.
+const RETENTION_BUDGET: std::time::Duration = std::time::Duration::from_millis(2_500);
+/// Bodies one write transaction empties. Each one rewrites the row's text-index
+/// entry, so this is what keeps a hook's wait on the write lock short.
+const RETENTION_CHUNK: usize = 200;
+/// Rowids one read of the pass looks across; see [`Store::retention_step`].
+const RETENTION_SPAN: i64 = 20_000;
+/// Rowids `brain doctor` counts pending bodies across: five reads of the pass.
+pub(crate) const RETENTION_COUNT_SPAN: i64 = 5 * RETENTION_SPAN;
+/// Text-index pages merged after a run that dropped bodies.
+const RETENTION_MERGE_PAGES: i64 = 200;
+/// A finished pass is not repeated before this long has passed.
+pub(crate) const RETENTION_REPEAT_SECS: i64 = 24 * 3600;
+
+/// What one run of the retention pass did.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Retention {
+    dropped: usize,
+    /// The pass reached the end of the table, so the day is spent.
+    finished: bool,
+    /// Why the merge or checkpoint after the slices failed. The bodies are
+    /// already dropped and the day recorded, so this is a report, not a failure.
+    settle_error: Option<String>,
+}
+
+/// Empty the index's copy of the bodies of observations that are `days` old
+/// and were never surfaced, a bounded slice at a time.
+///
+/// The log is not touched and nothing is appended to it: a retire event would
+/// travel to other machines whose people did read those bodies, while the
+/// ledgers that say so stay local. Here the rule is deterministic, so a
+/// reindex that restores the bodies is followed by a pass that drops the same
+/// ones.
+///
+/// A run takes the next slices from where the last one stopped, for at least
+/// one slice and then until `budget` is spent. Only a pass that reached the end
+/// of the table records the day; one cut short must not, or a backlog larger
+/// than a run's budget would never finish.
+fn drop_old_bodies(
+    store: &Store,
+    days: u32,
+    now: jiff::Timestamp,
+    budget: std::time::Duration,
+    run_lock: Option<&RunLock>,
+    (chunk, span): (usize, i64),
+) -> Result<Retention> {
+    let mut done = Retention::default();
+    if let Some(last) = store.retention_done_at()?.and_then(|at| at.parse::<jiff::Timestamp>().ok()) {
+        if now.as_second() - last.as_second() < RETENTION_REPEAT_SECS {
+            return Ok(done);
+        }
+    }
+    let cutoff = now
+        .checked_sub(jiff::SignedDuration::from_secs(i64::from(days) * 24 * 3600))
+        .context("compute the retention cutoff")?
+        .to_string();
+    let began = std::time::Instant::now();
+    let mut cursor = store.retention_cursor()?;
+    loop {
+        if let Some(lock) = run_lock {
+            lock.touch();
+        }
+        let step = store.retention_step(&cutoff, cursor, span, chunk)?;
+        done.dropped += store.commit_retention_step(&step.ids, step.next)?;
+        cursor = step.next;
+        if step.end {
+            store.finish_retention_pass(&now.to_string())?;
+            done.finished = true;
+            break;
+        }
+        if began.elapsed() >= budget {
+            break;
+        }
+    }
+    if done.dropped > 0 {
+        // Not counted in the budget: a merge of a fixed page count, 0 to 26 ms
+        // measured. Best effort, since the work above is committed.
+        if let Err(error) = store.settle_after_retention(RETENTION_MERGE_PAGES) {
+            done.settle_error = Some(format!("{error:#}"));
+        }
+    }
+    Ok(done)
+}
+
+/// The retention pass as one run takes it: the configured window, this run's
+/// budget, and a failure logged rather than raised, since an index that keeps
+/// a few more bodies is not a reason to fail a consolidation.
+fn run_retention(paths: &Paths, store: &Store, run_lock: &RunLock) -> usize {
+    // A config that cannot be read is no licence to drop anything.
+    let Ok(config) = Config::load(&paths.config_file()) else { return 0 };
+    let Some(days) = config.retention.effective_days() else { return 0 };
+    let result = drop_old_bodies(
+        store,
+        days,
+        jiff::Timestamp::now(),
+        RETENTION_BUDGET,
+        Some(run_lock),
+        (RETENTION_CHUNK, RETENTION_SPAN),
+    );
+    match result {
+        Ok(done) => {
+            if let Some(error) = &done.settle_error {
+                log_session_failure(paths, "retention", error);
+            }
+            done.dropped
+        }
+        Err(error) => {
+            log_session_failure(paths, "retention", &format!("{error:#}"));
+            0
+        }
+    }
+}
+
 /// Whether an ask is already served: one non-force session whose events are
 /// all consolidated. Its run would repeat the per-project pass only to find
 /// that session settled. A force ask is work,
@@ -593,6 +724,11 @@ fn execute(
     // First, so what a failed index write left out of the store is counted as
     // pending by the read below and by the pass.
     catch_up_index(store, &dirs, Some(run_lock), deadline);
+    // Before the early return below, so every kind of run spends its small
+    // budget on it; once per invocation, not once per drained ask.
+    if !std::mem::replace(&mut outcome.retention_ran, true) {
+        outcome.dropped += run_retention(paths, store, run_lock);
+    }
     // One indexed read, before the per-project pass. It also skips the embed,
     // hand-edit and fold upkeep and the daily pack: the next ask with work
     // does them. Here, not only in `heal_store`, because an ask written
@@ -3530,7 +3666,7 @@ fn run_git(dir: &Path, args: &[&str]) -> Result<()> {
 /// progress for half an hour" rather than "started half an hour ago": a
 /// backlog can legitimately take longer than any fixed timeout, and a crashed
 /// run must not block the next one forever.
-struct RunLock {
+pub(crate) struct RunLock {
     path: PathBuf,
 }
 
@@ -3538,7 +3674,7 @@ impl RunLock {
     const STALE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
     /// `None` when another run holds it.
-    fn take(path: &Path) -> Result<Option<Self>> {
+    pub(crate) fn take(path: &Path) -> Result<Option<Self>> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -3591,7 +3727,7 @@ impl RunLock {
 
     /// Say the run is still moving, so a long backlog is not mistaken for a
     /// crash by whatever starts next.
-    fn touch(&self) {
+    pub(crate) fn touch(&self) {
         let _ = std::fs::write(&self.path, std::process::id().to_string());
     }
 }
@@ -4357,6 +4493,81 @@ fn knowledge_prompt(summaries: &[Event], clusters: &[Vec<&Event>], known: &[Stri
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    /// A pass whose budget ran out has not finished: it resumes where it
+    /// stopped, and only the run that reaches the end spends the day.
+    #[test]
+    fn a_retention_pass_cut_by_its_budget_resumes_and_does_not_spend_the_day() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let ids: Vec<String> = (0..5)
+            .map(|n| {
+                let mut old = Event::new(
+                    Uuid::nil(),
+                    project,
+                    Uuid::nil(),
+                    Source { cli: "claude-code".into(), hook: "post_tool_use".into() },
+                    EventKind::Observation,
+                    format!("old {n}"),
+                    "an old body".into(),
+                );
+                old.ts = "2020-01-01T00:00:00.000000Z".to_string();
+                old.consolidated = true;
+                store.index(&old).unwrap();
+                old.id
+            })
+            .collect();
+        let bodies = || -> usize {
+            ids.iter().filter(|id| !store.get(std::slice::from_ref(id)).unwrap()[0].body.is_empty()).count()
+        };
+        let now: jiff::Timestamp = "2026-10-08T12:00:00Z".parse().unwrap();
+        let sizes = (2, 100);
+
+        // No budget at all still takes one slice, so a run always makes progress.
+        let cut = drop_old_bodies(&store, 30, now, std::time::Duration::ZERO, None, sizes).unwrap();
+        assert_eq!(cut, Retention { dropped: 2, ..Retention::default() });
+        assert_eq!(bodies(), 3);
+        assert_eq!(store.retention_done_at().unwrap(), None, "a cut pass spent the day");
+
+        let rest = drop_old_bodies(&store, 30, now, std::time::Duration::from_secs(60), None, sizes).unwrap();
+        assert_eq!(rest, Retention { dropped: 3, finished: true, ..Retention::default() });
+        assert_eq!(bodies(), 0);
+        assert!(store.retention_done_at().unwrap().is_some());
+        assert_eq!(store.retention_dropped().unwrap(), 5);
+
+        let same_day = now.checked_add(jiff::SignedDuration::from_hours(23)).unwrap();
+        let none = drop_old_bodies(&store, 30, same_day, std::time::Duration::from_secs(60), None, sizes);
+        assert_eq!(none.unwrap(), Retention::default(), "a second pass ran inside 24 hours");
+
+        let next_day = now.checked_add(jiff::SignedDuration::from_hours(25)).unwrap();
+        let again = drop_old_bodies(&store, 30, next_day, std::time::Duration::from_secs(60), None, sizes).unwrap();
+        assert_eq!(again, Retention { finished: true, ..Retention::default() }, "tomorrow's pass starts over");
+    }
+
+    /// The window counts back from the pass, not from the data: a body is
+    /// kept until it is `days` old.
+    #[test]
+    fn a_retention_pass_keeps_bodies_younger_than_the_window() {
+        let store = Store::open_memory().unwrap();
+        let mut young = Event::new(
+            Uuid::nil(),
+            Uuid::new_v4(),
+            Uuid::nil(),
+            Source { cli: "claude-code".into(), hook: "post_tool_use".into() },
+            EventKind::Observation,
+            "ten days old".into(),
+            "a body".into(),
+        );
+        young.ts = "2026-09-28T12:00:00.000000Z".to_string();
+        young.consolidated = true;
+        store.index(&young).unwrap();
+        let now: jiff::Timestamp = "2026-10-08T12:00:00Z".parse().unwrap();
+        let budget = std::time::Duration::from_secs(60);
+
+        assert_eq!(drop_old_bodies(&store, 30, now, budget, None, (10, 100)).unwrap().dropped, 0);
+        store.finish_retention_pass("2020-01-01T00:00:00Z").unwrap();
+        assert_eq!(drop_old_bodies(&store, 7, now, budget, None, (10, 100)).unwrap().dropped, 1);
+    }
 
     #[test]
     fn only_cursor_falls_back_to_a_lookup_and_a_stored_path_wins() {

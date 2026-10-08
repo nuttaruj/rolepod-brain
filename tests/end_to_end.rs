@@ -1807,6 +1807,38 @@ fn mcp_recall_returns_what_was_captured() {
     assert_eq!(fetched[0]["result"]["structuredContent"]["count"], 1);
 }
 
+/// Retention empties the index's copy of a body and says the log holds it
+/// (`clamped = 1`); the event log itself is not touched. `brain_get` is the way
+/// back to the whole body.
+#[test]
+fn brain_get_returns_the_body_of_a_row_whose_index_body_was_dropped() {
+    let fixture = Fixture::new("get-dropped");
+    fixture.hook("claude-code", "PostToolUse", &claude_payload(&fixture.project));
+    let log_before = fixture.log_text();
+    let db = fixture.home.join("brain.db");
+    let (id, body): (String, String) = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row("SELECT id, body FROM events WHERE hook = 'post_tool_use'", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    assert!(body.contains("fn check()"), "precondition: the capture is indexed with its body");
+    // The crate is a bin, so this cannot call `Store::drop_index_bodies`; the
+    // UPDATE must stay the same as the one there.
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute("UPDATE events SET body = '', clamped = 1 WHERE id = ?1", [&id])
+        .unwrap();
+
+    let fetched = fixture.mcp(&[&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"brain_get","arguments":{{"ids":["{id}"]}}}}}}"#
+    )]);
+    let events = fetched[0]["result"]["structuredContent"]["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1, "{fetched:?}");
+    assert_eq!(events[0]["body"], body.as_str(), "the log's whole body did not come back");
+    assert_eq!(fixture.log_text(), log_before, "reading a body must not touch the log");
+}
+
 /// One brain holds every CLI's work, and until now nothing could ask it which
 /// CLI did what. The column was always there; the question was unaskable, so
 /// the answer came from raw SQL against an index the project itself calls
@@ -2330,6 +2362,243 @@ fn retire_drops_only_the_bodies_nobody_ever_needed() {
     assert!(reindexed.status.success(), "reindex failed: {reindexed:?}");
     let after = String::from_utf8_lossy(&fixture.brain(&["search", "zeta"]).stdout).into_owned();
     assert!(!after.contains("zeta"), "reindex resurrected a retired body: {after}");
+}
+
+impl Fixture {
+    /// Capture one prompt as its own session and return its event id.
+    fn prompt_event(&self, n: u32, text: &str) -> String {
+        let payload = serde_json::json!({
+            "session_id": format!("0199a1f2-3c4d-7e8f-9012-3456789abd{n:02}"),
+            "cwd": self.project,
+            "prompt": text
+        })
+        .to_string();
+        self.hook("claude-code", "UserPromptSubmit", &payload);
+        self.sql_one(&format!("SELECT id FROM events WHERE body LIKE '%{text}%'"))
+    }
+
+    /// One text value out of the index, read with a plain connection.
+    fn sql_one(&self, sql: &str) -> String {
+        rusqlite::Connection::open(self.home.join("brain.db"))
+            .unwrap()
+            .query_row(sql, [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn sql_run(&self, sql: &str) {
+        rusqlite::Connection::open(self.home.join("brain.db")).unwrap().execute_batch(sql).unwrap();
+    }
+
+    /// Settle every observation and push the named events far into the past in
+    /// the index only: the two things the retention rule asks of a row besides
+    /// never being seen. The log still says otherwise, so `brain_get` cannot be
+    /// asked about these.
+    fn age(&self, ids: &[&String]) {
+        self.sql_run("UPDATE events SET consolidated = 1 WHERE kind = 'observation'");
+        for id in ids {
+            self.sql_run(&format!(
+                "UPDATE events SET ts = '2020-01-01T00:00:00.000000Z' WHERE id = '{id}'"
+            ));
+        }
+    }
+
+    /// The same in the log, where a timestamp also names the month file the
+    /// line lives in, then a rebuild of the index from it.
+    fn age_in_log(&self, ids: &[&String]) {
+        for file in self.log_files() {
+            let old = file.with_file_name("2020-01.jsonl");
+            let (mut kept, mut moved) = (String::new(), String::new());
+            for line in std::fs::read_to_string(&file).unwrap().lines() {
+                let mut event: serde_json::Value = serde_json::from_str(line).unwrap();
+                if event["kind"] == "observation" {
+                    event["consolidated"] = true.into();
+                }
+                let target = if ids.iter().any(|id| event["id"] == id.as_str()) {
+                    event["ts"] = "2020-01-01T00:00:00.000000Z".into();
+                    &mut moved
+                } else {
+                    &mut kept
+                };
+                target.push_str(&format!("{event}\n"));
+            }
+            std::fs::write(&file, kept).unwrap();
+            if !moved.is_empty() {
+                let mut old_file = std::fs::OpenOptions::new().create(true).append(true).open(old).unwrap();
+                old_file.write_all(moved.as_bytes()).unwrap();
+            }
+        }
+        let rebuilt = self.brain(&["reindex"]);
+        assert!(rebuilt.status.success(), "reindex failed: {rebuilt:?}");
+    }
+
+    fn index_body(&self, id: &str) -> String {
+        self.sql_one(&format!("SELECT body FROM events WHERE id = '{id}'"))
+    }
+
+    fn get_body(&self, id: &str) -> String {
+        let fetched = self.mcp(&[&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"brain_get","arguments":{{"ids":["{id}"]}}}}}}"#
+        )]);
+        fetched[0]["result"]["structuredContent"]["events"][0]["body"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+}
+
+#[test]
+fn consolidate_drops_the_index_body_of_old_unsurfaced_observations_and_only_those() {
+    // Automatic retention is index-only: the log is the record, so a body
+    // dropped from the index must come back through `brain_get`, and nothing
+    // may be appended that another machine's sync could copy.
+    let fixture = Fixture::new("retention");
+    let surfaced = fixture.prompt_event(1, "the alpha rendezvous cipher value");
+    let opened = fixture.prompt_event(2, "the beta rendezvous cipher value");
+    let recent = fixture.prompt_event(3, "the gamma rendezvous cipher value");
+    let plain = fixture.prompt_event(4, "the zeta rendezvous cipher value");
+    let plain_body = fixture.index_body(&plain);
+    assert!(plain_body.contains("zeta"), "precondition: indexed with its body");
+
+    let search = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"brain_search","arguments":{"query":"alpha"}}}"#;
+    let found = serde_json::to_string(&fixture.mcp(&[search])).unwrap();
+    assert!(found.contains("alpha"), "the search never surfaced alpha: {found}");
+    assert!(fixture.get_body(&opened).contains("beta"), "precondition: opened");
+
+    // A body goes only after its vector exists. This run embeds with retention
+    // off, so it does not spend the day the real pass needs.
+    std::fs::write(fixture.home.join("config.toml"), "[retention]\ndays = 0\n").unwrap();
+    let embedded = fixture.brain(&["consolidate"]);
+    assert!(embedded.status.success(), "consolidate failed: {embedded:?}");
+    std::fs::remove_file(fixture.home.join("config.toml")).unwrap();
+
+    fixture.age_in_log(&[&surfaced, &opened, &plain]);
+    let log_before = fixture.log_text();
+
+    let done = fixture.brain(&["consolidate"]);
+    assert!(done.status.success(), "consolidate failed: {done:?}");
+
+    assert!(fixture.index_body(&surfaced).contains("alpha"), "an offered body was dropped");
+    assert!(fixture.index_body(&opened).contains("beta"), "an opened body was dropped");
+    assert!(fixture.index_body(&recent).contains("gamma"), "a recent body was dropped");
+    assert_eq!(fixture.index_body(&plain), "", "the old unsurfaced body stayed in the index");
+    assert_eq!(fixture.get_body(&plain), plain_body, "brain_get did not restore it from the log");
+    assert_eq!(fixture.log_text(), log_before, "retention touched the log");
+    assert!(!fixture.log_text().contains("\"kind\":\"retire\""), "retention wrote a retire event");
+
+    let doctor = fixture.brain(&["doctor"]);
+    let report = String::from_utf8_lossy(&doctor.stdout).into_owned();
+    let line = report.lines().find(|line| line.contains(" retention ")).unwrap_or_default();
+    assert!(line.contains("30 days") && line.contains("dropped so far 1"), "doctor's retention line: {line:?}");
+    assert!(!line.contains("never"), "doctor does not know a pass finished: {line:?}");
+
+    // The pass finished, so the day is spent: a body that turns old and
+    // unseen after it waits for tomorrow's pass.
+    let later = fixture.prompt_event(5, "the omega rendezvous cipher value");
+    fixture.age(&[&later]);
+    let again = fixture.brain(&["consolidate"]);
+    assert!(again.status.success(), "second consolidate failed: {again:?}");
+    assert!(fixture.index_body(&later).contains("omega"), "a second pass ran inside 24 hours");
+}
+
+#[test]
+fn retention_days_zero_switches_it_off_without_spending_the_day() {
+    let fixture = Fixture::new("retention-off");
+    let old = fixture.prompt_event(1, "the zeta rendezvous cipher value");
+    fixture.age(&[&old]);
+    std::fs::write(fixture.home.join("config.toml"), "[retention]\ndays = 0\n").unwrap();
+
+    let off = fixture.brain(&["consolidate"]);
+    assert!(off.status.success(), "consolidate failed: {off:?}");
+    assert!(fixture.index_body(&old).contains("zeta"), "days = 0 still dropped a body");
+
+    // Switching it on afterwards must not wait out a day nobody spent.
+    std::fs::write(fixture.home.join("config.toml"), "[retention]\ndays = 30\n").unwrap();
+    let on = fixture.brain(&["consolidate"]);
+    assert!(on.status.success(), "consolidate failed: {on:?}");
+    assert_eq!(fixture.index_body(&old), "", "turning retention on dropped nothing");
+}
+
+impl Fixture {
+    /// Bytes the index occupies on disk: the database and its write-ahead log.
+    fn index_bytes(&self) -> u64 {
+        ["brain.db", "brain.db-wal"]
+            .iter()
+            .map(|name| std::fs::metadata(self.home.join(name)).map_or(0, |meta| meta.len()))
+            .sum()
+    }
+
+    /// Make the event logs look untouched for an hour, so `brain compact` sees
+    /// a machine no hook has used lately.
+    fn quiet_logs(&self) {
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for file in self.log_files() {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(file)
+                .unwrap()
+                .set_modified(hour_ago)
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+fn compact_gives_back_the_space_of_dropped_bodies_and_search_still_answers() {
+    let fixture = Fixture::new("compact");
+    let filler = "lorem ipsum dolor sit amet ".repeat(120);
+    let ids: Vec<String> = (1..=60)
+        .map(|n| fixture.prompt_event(n, &format!("marker{n:02}kestrel {filler}")))
+        .collect();
+    let full_body = fixture.index_body(&ids[0]);
+    assert!(full_body.len() > 3000, "precondition: a body worth dropping");
+
+    std::fs::write(fixture.home.join("config.toml"), "[retention]\ndays = 0\n").unwrap();
+    assert!(fixture.brain(&["consolidate"]).status.success(), "embedding run failed");
+    std::fs::remove_file(fixture.home.join("config.toml")).unwrap();
+    let all: Vec<&String> = ids.iter().collect();
+    fixture.age_in_log(&all);
+    let done = fixture.brain(&["consolidate"]);
+    assert!(done.status.success(), "consolidate failed: {done:?}");
+    assert_eq!(fixture.index_body(&ids[0]), "", "precondition: the body left the index");
+    let rowids = fixture.sql_one("SELECT group_concat(id || r) FROM (SELECT id, rowid AS r FROM events ORDER BY id)");
+
+    fixture.quiet_logs();
+    let free_pages = "SELECT CAST(freelist_count AS TEXT) FROM pragma_freelist_count";
+    assert_ne!(fixture.sql_one(free_pages), "0", "precondition: dropped bodies left free pages");
+    let before = fixture.index_bytes();
+    let compacted = fixture.brain(&["compact"]);
+    let said = String::from_utf8_lossy(&compacted.stdout).into_owned();
+    assert!(compacted.status.success(), "compact failed: {compacted:?}");
+    assert_eq!(fixture.sql_one(free_pages), "0", "VACUUM left free pages behind");
+    let after = fixture.index_bytes();
+    assert!(after < before, "the index did not shrink: {before} -> {after} ({said})");
+    assert!(said.contains(&before.to_string()) && said.contains(&after.to_string()), "it did not say the sizes: {said}");
+
+    // The text index is keyed by rowid, so VACUUM must not have moved one.
+    let kept = fixture.sql_one("SELECT group_concat(id || r) FROM (SELECT id, rowid AS r FROM events ORDER BY id)");
+    assert_eq!(kept, rowids, "compact renumbered the rows");
+    fixture.sql_run("INSERT INTO events_fts(events_fts) VALUES ('integrity-check')");
+    fixture.sql_run("INSERT INTO events_tri(events_tri) VALUES ('integrity-check')");
+    let found = String::from_utf8_lossy(&fixture.brain(&["search", "marker07kestrel"]).stdout).into_owned();
+    assert!(found.contains("marker07kestrel"), "search lost the row after compact: {found}");
+    assert!(fixture.get_body(&ids[6]).contains("marker07kestrel"), "brain_get lost the body after compact");
+}
+
+#[test]
+fn compact_refuses_while_a_hook_has_run_in_the_last_ten_minutes() {
+    let fixture = Fixture::new("compact-busy");
+    fixture.prompt_event(1, "the zeta rendezvous cipher value");
+    let before = fixture.index_bytes();
+
+    let refused = fixture.brain(&["compact"]);
+    let said = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert!(!refused.status.success(), "compact ran under a live hook: {refused:?}");
+    assert!(said.contains("hook"), "the refusal does not say why: {said}");
+    assert_eq!(fixture.index_bytes(), before, "a refused compact still touched the index");
+
+    fixture.quiet_logs();
+    let allowed = fixture.brain(&["compact"]);
+    assert!(allowed.status.success(), "compact refused a quiet machine: {allowed:?}");
 }
 
 #[test]

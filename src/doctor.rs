@@ -90,6 +90,9 @@ pub fn run() -> Result<Vec<Check>> {
     checks.push(taxonomy_check(&paths));
     checks.extend(summarizer_checks(&paths));
     checks.push(semantic_check(&paths));
+    checks.push(retention_check(&paths));
+    let space = Store::open(&paths.db()).ok().and_then(|store| store.page_use().ok());
+    checks.extend(space.and_then(|(pages, free)| space_check(pages, free)));
     checks.push(reranker_check(&paths));
     checks.extend(hook_checks());
     checks.extend(trigger_checks());
@@ -302,6 +305,69 @@ fn reranker_check(paths: &Paths) -> Check {
         "reranker",
         "not fetched yet - the first rerank asks the CLI and starts the download",
     )
+}
+
+/// Automatic retention: the window, when a pass last finished, how many bodies
+/// the index has let go of, and how many the rule would drop now.
+///
+/// Information only. Pending is counted over one bounded window of rowids from
+/// the pass's cursor, since reading the whole table costs seconds on a large
+/// store, so it is a floor; a pass that finished within the last day left
+/// nothing pending that the next one would not take, so then no count is made.
+fn retention_check(paths: &Paths) -> Check {
+    let Ok(store) = Store::open(&paths.db()) else {
+        return Check::fail("retention", "index unreadable");
+    };
+    let Ok(config) = Config::load(&paths.config_file()) else {
+        return Check::fail("retention", "config unreadable, so retention is not running");
+    };
+    let dropped = store.retention_dropped().unwrap_or(0);
+    let last = store.retention_done_at().ok().flatten().unwrap_or_else(|| "never".to_string());
+    let Some(days) = config.retention.effective_days() else {
+        return Check::pass(
+            "retention",
+            format!("off (retention.days = 0) · last pass {last} · dropped so far {dropped}"),
+        );
+    };
+    let now = jiff::Timestamp::now();
+    let spent = store
+        .retention_done_at()
+        .ok()
+        .flatten()
+        .and_then(|at| at.parse::<jiff::Timestamp>().ok())
+        .is_some_and(|at| now.as_second() - at.as_second() < crate::consolidate::RETENTION_REPEAT_SECS);
+    let pending = if spent {
+        "none until the next pass".to_string()
+    } else {
+        now.checked_sub(jiff::SignedDuration::from_secs(i64::from(days) * 24 * 3600))
+            .ok()
+            .zip(store.retention_cursor().ok())
+            .and_then(|(cutoff, cursor)| {
+                store.retention_pending(&cutoff.to_string(), cursor, crate::consolidate::RETENTION_COUNT_SPAN).ok()
+            })
+            .map_or_else(|| "unknown".to_string(), |pending| format!("at least {pending}"))
+    };
+    Check::pass(
+        "retention",
+        format!("{days} days · last pass {last} · dropped so far {dropped} · pending {pending}"),
+    )
+}
+
+/// The index file's free pages. A row only when at least a quarter of the
+/// pages hold nothing, since below that a rewrite buys little; it says what to
+/// run and never runs it.
+fn space_check(pages: i64, free: i64) -> Option<Check> {
+    if pages <= 0 || free * 4 < pages {
+        return None;
+    }
+    Some(Check::pass(
+        "index space",
+        format!(
+            "{}% of the index file's pages are free · `brain compact` gives them back \
+             (it waits for ten quiet minutes)",
+            free * 100 / pages
+        ),
+    ))
 }
 
 /// How much of the corpus can be searched by meaning rather than by words.
@@ -987,6 +1053,15 @@ pub fn render(checks: &[Check]) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doctor_suggests_compact_only_when_a_quarter_of_the_pages_are_free() {
+        assert!(space_check(1000, 249).is_none(), "just under a quarter is not worth a rewrite");
+        let row = space_check(1000, 250).unwrap();
+        assert!(row.ok, "free pages are a suggestion, not a failure");
+        assert!(row.detail.contains("25%") && row.detail.contains("brain compact"), "{}", row.detail);
+        assert!(space_check(0, 0).is_none(), "an empty file has nothing to give back");
+    }
 
     #[test]
     fn render_marks_failures_and_reports_overall_status() {

@@ -515,15 +515,16 @@ fn call_tool(
             // forgotten events pending forever.
             let mut events = store.get(&ids)?;
             events.retain(|event| store.event_exists(&event.id).unwrap_or(false));
-            // The index keeps an observation bounded; the log has the whole
-            // line, and this is the one reader that wants it. Not found (a
-            // pruned or moved log) leaves the clamped body.
-            let mut known = None;
+            // The index keeps an observation bounded, or empty once retention
+            // dropped it; the log has the whole line, and this is the one
+            // reader that wants it. Not found (a pruned or moved log) leaves
+            // what the index has.
+            let clamped: Vec<&crate::event::Event> =
+                events.iter().filter(|event| store.is_clamped(&event.id).unwrap_or(false)).collect();
+            let mut bodies = full_bodies_from_log(paths, &clamped);
             for event in &mut events {
-                if store.is_clamped(&event.id).unwrap_or(false) {
-                    if let Some(full) = full_body_from_log(paths, event, &mut known) {
-                        event.body = full;
-                    }
+                if let Some(full) = bodies.remove(&event.id) {
+                    event.body = full;
                 }
             }
             // Not `record_recalled`: asking for a body, having seen only the
@@ -703,39 +704,94 @@ fn write_note(paths: &Paths, text: &str, files: &[String], client: Option<&str>)
     Ok(event.id)
 }
 
-/// The un-clamped body of an event, read from its monthly log line.
+/// The un-clamped bodies of these events, read from their monthly log lines.
 ///
-/// The project directory comes from the event's own project id, found among
-/// the known projects, so an id surfaced from another project still resolves.
-fn full_body_from_log(
+/// One pass per project and month, however many ids it holds. The project
+/// directory comes from the event's own project id, found among the known
+/// projects, so an id surfaced from another project still resolves. An id the
+/// log no longer has is simply absent from the result.
+fn full_bodies_from_log(
     paths: &Paths,
-    event: &crate::event::Event,
-    known: &mut Option<Vec<(crate::ids::ProjectScope, std::path::PathBuf)>>,
-) -> Option<String> {
-    let month = format!("{}.jsonl", event.month());
-    // The current scope first - the common case, no wiki walk. Only an id
-    // from another project falls back to the scan, done once per call.
+    events: &[&crate::event::Event],
+) -> std::collections::HashMap<String, String> {
+    let mut by_month: std::collections::BTreeMap<(uuid::Uuid, String), std::collections::HashSet<String>> =
+        std::collections::BTreeMap::new();
+    for event in events {
+        by_month.entry((event.project, event.month())).or_default().insert(event.id.clone());
+    }
+    let mut found = std::collections::HashMap::new();
+    if by_month.is_empty() {
+        return found;
+    }
     let current = ids::resolve_scope(&std::env::current_dir().unwrap_or_default());
-    let mut dirs = Vec::new();
-    if current.project_id == event.project {
-        dirs.push(paths.project_dir(&current));
+    let current_dir = paths.project_dir(&current);
+    let mut known = None;
+    for ((project, month), mut wanted) in by_month {
+        let file = format!("{month}.jsonl");
+        // The current scope first - the common case, no wiki walk. Only an id
+        // from another project falls back to the scan, done once per call.
+        if current.project_id == project {
+            scan_month_file(&current_dir.join("events").join(&file), &mut wanted, &mut found);
+        }
+        if wanted.is_empty() {
+            continue;
+        }
+        let projects: &Vec<(crate::ids::ProjectScope, std::path::PathBuf)> = known
+            .get_or_insert_with(|| crate::consolidate::known_projects(paths).unwrap_or_default());
+        // The directory already read is skipped: an id it lacked is not
+        // there, and the file can be hundreds of megabytes.
+        let skip = current.project_id == project;
+        for (_, dir) in projects
+            .iter()
+            .filter(|(scope, dir)| scope.project_id == project && !(skip && *dir == current_dir))
+        {
+            scan_month_file(&dir.join("events").join(&file), &mut wanted, &mut found);
+            if wanted.is_empty() {
+                break;
+            }
+        }
     }
-    let read = |dir: &std::path::Path| -> Option<String> {
-        let text = std::fs::read_to_string(dir.join("events").join(&month)).ok()?;
-        text.lines()
-            .filter(|line| line.contains(&event.id))
-            .filter_map(|line| serde_json::from_str::<crate::event::Event>(line).ok())
-            .find(|logged| logged.id == event.id)
-            .map(|logged| logged.body)
-    };
-    if let Some(body) = dirs.iter().find_map(|dir| read(dir)) {
-        return Some(body);
+    found
+}
+
+fn scan_month_file(
+    path: &std::path::Path,
+    wanted: &mut std::collections::HashSet<String>,
+    found: &mut std::collections::HashMap<String, String>,
+) {
+    if let Ok(file) = std::fs::File::open(path) {
+        scan_log_for_bodies(std::io::BufReader::new(file), wanted, found);
     }
-    known
-        .get_or_insert_with(|| crate::consolidate::known_projects(paths).unwrap_or_default())
-        .iter()
-        .filter(|(scope, _)| scope.project_id == event.project)
-        .find_map(|(_, dir)| read(dir))
+}
+
+/// Move each wanted id's body from a month's lines into `found`, and stop at
+/// the last one.
+///
+/// A month file reaches hundreds of megabytes, so it is read a line at a time
+/// and a line is only parsed when it mentions a wanted id - a retire or a
+/// correction that merely cites one still has to be told apart from the event.
+/// A read error or a line that is not UTF-8 ends or skips only itself, as in
+/// the event log's own reader.
+fn scan_log_for_bodies(
+    reader: impl std::io::BufRead,
+    wanted: &mut std::collections::HashSet<String>,
+    found: &mut std::collections::HashMap<String, String>,
+) {
+    for line in reader.split(b'\n') {
+        if wanted.is_empty() {
+            return;
+        }
+        let Ok(line) = line else { return };
+        let Ok(text) = std::str::from_utf8(&line) else { continue };
+        if !wanted.iter().any(|id| text.contains(id.as_str())) {
+            continue;
+        }
+        if let Ok(logged) = serde_json::from_str::<crate::event::Event>(text) {
+            if wanted.remove(&logged.id) {
+                found.insert(logged.id, logged.body);
+            }
+        }
+    }
 }
 
 /// Kinds a caller may ask for, and the one alias that has to work.
@@ -1058,6 +1114,137 @@ mod tests {
         let text = got.to_string();
         assert!(!text.contains("END_OF_OUTPUT"), "retired body came back from the log");
         std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    /// Retention drops bodies from the index and writes nothing to the log, so
+    /// `brain_get` is the only way back to them.
+    #[test]
+    fn brain_get_returns_the_full_body_of_a_row_whose_body_the_index_dropped() {
+        let data_dir = std::env::temp_dir().join(format!("brain-mcp-drop-{}", ulid::Ulid::new()));
+        let paths = Paths { data_dir };
+        let (scope, first) = big_observation_in(&paths, true);
+        let mut second = first.clone();
+        second.id = ulid::Ulid::new().to_string();
+        second.body = "plain old observation, no clamp".to_string();
+        crate::event::EventLog::open(&paths.project_dir(&scope)).unwrap().append(&second).unwrap();
+        let store = Store::open(&paths.db()).unwrap();
+        store.index(&second).unwrap();
+        let ids = vec![first.id.clone(), second.id.clone()];
+        assert_eq!(store.drop_index_bodies(&ids).unwrap(), 2);
+        assert!(store.get(&ids).unwrap().iter().all(|event| event.body.is_empty()));
+
+        let got = call_tool(
+            &paths,
+            &scope.project_id.to_string(),
+            "s",
+            None,
+            &json!({"name": "brain_get", "arguments": {"ids": ids}}),
+        )
+        .unwrap();
+        let events = got["structuredContent"]["events"].as_array().unwrap().clone();
+        assert_eq!(events.len(), 2);
+        let body_of = |id: &str| {
+            events.iter().find(|event| event["id"] == id).unwrap()["body"].as_str().unwrap().to_string()
+        };
+        assert!(body_of(&first.id).contains("END_OF_OUTPUT") && body_of(&first.id).len() > 10 * 1024);
+        assert_eq!(body_of(&second.id), second.body);
+        std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    /// A reader that counts the bytes pulled through it.
+    struct Counting<R> {
+        inner: R,
+        bytes: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl<R: std::io::Read> std::io::Read for Counting<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.bytes.set(self.bytes.get() + n);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn the_month_scan_stops_reading_once_every_wanted_id_is_found() {
+        // ~8 MB of lines; the two wanted ids sit near the front. A retire line
+        // that merely cites the first id must not be taken for the event.
+        let wanted = ["01WANTED0000000000000000AA", "01WANTED0000000000000000BB"];
+        let mut log = String::new();
+        let line = |id: &str, body: &str| {
+            let mut event = crate::event::Event::new(
+                uuid::Uuid::nil(),
+                uuid::Uuid::nil(),
+                uuid::Uuid::nil(),
+                crate::event::Source { cli: "claude-code".into(), hook: "post_tool_use".into() },
+                crate::event::EventKind::Observation,
+                "t".to_string(),
+                body.to_string(),
+            );
+            event.id = id.to_string();
+            serde_json::to_string(&event).unwrap()
+        };
+        let mut cite = serde_json::from_str::<serde_json::Value>(&line("01CITE", "")).unwrap();
+        cite["links"] = json!([wanted[0]]);
+        log.push_str(&format!("{cite}\n"));
+        log.push_str("not json but mentions 01WANTED0000000000000000AA\n");
+        log.push_str(&format!("{}\n", line(wanted[0], "first body")));
+        log.push_str(&format!("{}\n", line(wanted[1], "second body")));
+        let filler = "f".repeat(1000);
+        for n in 0..8_000 {
+            log.push_str(&format!("{}\n", line(&format!("01FILL{n:020}"), &filler)));
+        }
+        assert!(log.len() > 8_000_000);
+
+        let bytes = std::rc::Rc::new(std::cell::Cell::new(0));
+        let reader = std::io::BufReader::new(Counting {
+            inner: std::io::Cursor::new(log.clone().into_bytes()),
+            bytes: bytes.clone(),
+        });
+        let mut ids: std::collections::HashSet<String> = wanted.iter().map(|id| id.to_string()).collect();
+        let mut found = std::collections::HashMap::new();
+        scan_log_for_bodies(reader, &mut ids, &mut found);
+
+        assert!(ids.is_empty(), "ids left unfound: {ids:?}");
+        assert_eq!(found[wanted[0]], "first body");
+        assert_eq!(found[wanted[1]], "second body");
+        assert!(bytes.get() < 100_000, "read {} of {} bytes", bytes.get(), log.len());
+    }
+
+    #[test]
+    fn the_month_scan_finds_a_late_id_and_leaves_an_absent_one_wanted() {
+        let event_line = |id: &str, body: &str| {
+            let mut event = crate::event::Event::new(
+                uuid::Uuid::nil(),
+                uuid::Uuid::nil(),
+                uuid::Uuid::nil(),
+                crate::event::Source { cli: "claude-code".into(), hook: "post_tool_use".into() },
+                crate::event::EventKind::Observation,
+                "t".to_string(),
+                body.to_string(),
+            );
+            event.id = id.to_string();
+            serde_json::to_string(&event).unwrap()
+        };
+        let late = "01LATE00000000000000000000";
+        let absent = "01ABSENT000000000000000000";
+        // A line that cites the absent id without being that event.
+        let mut cite = serde_json::from_str::<serde_json::Value>(&event_line("01CITE", "")).unwrap();
+        cite["links"] = json!([absent]);
+        let mut log = format!("{cite}\n");
+        for n in 0..500 {
+            log.push_str(&format!("{}\n", event_line(&format!("01FILL{n:020}"), "filler")));
+        }
+        log.push_str(&event_line(late, "the last line"));
+
+        let mut wanted: std::collections::HashSet<String> =
+            [late, absent].iter().map(|id| id.to_string()).collect();
+        let mut found = std::collections::HashMap::new();
+        scan_log_for_bodies(std::io::Cursor::new(log.into_bytes()), &mut wanted, &mut found);
+
+        assert_eq!(found[late], "the last line");
+        assert!(!found.contains_key(absent));
+        assert_eq!(wanted.into_iter().collect::<Vec<_>>(), vec![absent.to_string()]);
     }
 
     #[test]

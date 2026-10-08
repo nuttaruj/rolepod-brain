@@ -660,6 +660,17 @@ impl Trace {
     }
 }
 
+/// One bounded slice of the retention pass; see [`Store::retention_step`].
+#[derive(Debug, PartialEq, Eq)]
+pub struct RetentionStep {
+    /// The events whose bodies the rule drops, oldest rowid first.
+    pub ids: Vec<String>,
+    /// The rowid the next slice starts after.
+    pub next: i64,
+    /// Nothing is left past `next`: the pass has seen the whole table.
+    pub end: bool,
+}
+
 /// The derived index.
 pub struct Store {
     conn: Connection,
@@ -2548,9 +2559,35 @@ impl Store {
         Ok(scored.into_iter().map(|(id, score, _)| (id, score)).collect())
     }
 
-    /// Was this row's body cut down when it was indexed?
+    /// Drop the index's copy of these rows' bodies and say the log holds them.
     ///
-    /// The log still holds the whole line; `brain_get` reads it from there.
+    /// The row stays: title, topic, files and links keep it findable. Unlike a
+    /// retirement this writes nothing to the log, so it is index state only -
+    /// a reindex restores the body, and `clamped = 1` is what sends `brain_get`
+    /// back to the log for it while the body is gone. Rows already empty are
+    /// left alone. Returns how many rows changed; the caller owns the
+    /// transaction, so a chunk of ids is one commit.
+    ///
+    /// # Errors
+    /// Returns an error when an update fails.
+    pub fn drop_index_bodies(&self, ids: &[String]) -> Result<usize> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("UPDATE events SET body = '', clamped = 1 WHERE id = ?1 AND body != ''")
+            .context("prepare body drop")?;
+        let mut changed = 0;
+        for id in ids {
+            changed += stmt.execute(params![id]).context("drop index body")?;
+        }
+        Ok(changed)
+    }
+
+    /// Is the log the only place this row's whole body lives?
+    ///
+    /// True when the body was cut down on the way into the index, or dropped
+    /// from it later. The log still holds the whole line; `brain_get` reads it
+    /// from there. A retirement clears the flag: it withdrew the body on
+    /// purpose, and the log must not hand it back.
     /// Separate from [`Store::get`] on purpose: consolidation reads through
     /// `get` and wants the bounded body.
     ///
@@ -3283,6 +3320,271 @@ impl Store {
             bytes += len;
         }
         Ok((ids, bytes))
+    }
+
+    /// Who the retention pass drops, as one `WHERE` clause over `events`;
+    /// `?1` is the cutoff.
+    ///
+    /// The same rule as [`Self::retirable`] and every project at once, written
+    /// with `NOT EXISTS` so a NULL in a usage table cannot empty the answer,
+    /// and with the timestamp first so a recent row is rejected before its
+    /// body is read. `+kind` keeps `events_kind_proj` out of the plan: the pass
+    /// walks rowids, and an index on kind would send it through every
+    /// observation's row in id order instead.
+    ///
+    /// A prose row also needs its vector first. The embed backlog encodes
+    /// `title || ' ' || body`, so a body dropped before its vector exists
+    /// leaves a vector made from the title alone, and nothing ever redoes it.
+    /// A row the embedder skips has no vector to wait for. The cost is that
+    /// retention trails the backlog, and a store without the model keeps its
+    /// bodies.
+    fn retention_rule() -> String {
+        format!(
+            "ts < ?1 AND +kind = 'observation' AND consolidated = 1
+             AND forgotten = 0 AND read_count = 0 AND body != ''
+             AND NOT EXISTS (SELECT 1 FROM injected i WHERE i.event_id = events.id)
+             AND NOT EXISTS (SELECT 1 FROM recalled r WHERE r.event_id = events.id)
+             AND (NOT ({}) OR EXISTS (
+                 SELECT 1 FROM event_vec v WHERE v.event_id = events.id AND length(v.vec) = {}))",
+            embeddable("events"),
+            crate::embed::DIMS
+        )
+    }
+
+    fn retention_step_sql() -> String {
+        format!(
+            "SELECT rowid, id FROM events
+             WHERE rowid > ?2 AND rowid <= ?3 AND {}
+             ORDER BY rowid LIMIT ?4",
+            Self::retention_rule()
+        )
+    }
+
+    /// Read the next bounded slice of the retention pass: up to `limit` rows
+    /// the rule drops among the `span` rowids after `after`.
+    ///
+    /// The window is what bounds the read. Scanning the table for the next
+    /// match would read all of it when few rows match, 7 to 9 s cold on a
+    /// 1.8 GB store, and nothing can interrupt a statement; a window of rowids
+    /// is a sequential read of a known size, and the caller checks its clock
+    /// between windows.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn retention_step(&self, cutoff: &str, after: i64, span: i64, limit: usize) -> Result<RetentionStep> {
+        let mut stmt = self.conn.prepare_cached(&Self::retention_step_sql()).context("prepare retention step")?;
+        let rows = stmt
+            .query_map(params![cutoff, after, after.saturating_add(span), limit as i64], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .context("run retention step")?;
+        let mut ids = Vec::new();
+        let mut last = after;
+        for row in rows {
+            let (rowid, id) = row.context("read retention row")?;
+            last = rowid;
+            ids.push(id);
+        }
+        // A full slice stopped at its last match; a short one saw its whole window.
+        let next = if ids.len() == limit { last } else { after.saturating_add(span) };
+        let newest: Option<i64> = self
+            .conn
+            .query_row("SELECT MAX(rowid) FROM events", [], |row| row.get(0))
+            .context("read the newest rowid")?;
+        Ok(RetentionStep { ids, next, end: newest.is_none_or(|newest| next >= newest) })
+    }
+
+    /// How many of the `span` rowids after `after` the retention rule would
+    /// drop now.
+    ///
+    /// Bounded like a step: counting the rest of the table reads all of it,
+    /// 5 to 9 s cold on 1.9 GB, and `brain doctor` asks. So the answer is a
+    /// floor for the table past the window, exact inside it.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn retention_pending(&self, cutoff: &str, after: i64, span: i64) -> Result<i64> {
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM events WHERE rowid > ?2 AND rowid <= ?3 AND {}",
+                    Self::retention_rule()
+                ),
+                params![cutoff, after, after.saturating_add(span)],
+                |row| row.get(0),
+            )
+            .context("count retirable bodies")
+    }
+
+    fn state(&self, key: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row("SELECT value FROM schema_state WHERE key = ?1", params![key], |row| row.get(0))
+            .optional()
+            .with_context(|| format!("read {key}"))
+    }
+
+    /// The rowid the retention pass resumes after; 0 starts a pass.
+    ///
+    /// # Errors
+    /// Returns an error when the read fails.
+    pub fn retention_cursor(&self) -> Result<i64> {
+        Ok(self.state("retention_cursor")?.and_then(|value| value.parse().ok()).unwrap_or(0))
+    }
+
+    /// When the last full retention pass finished, as written by
+    /// [`Self::finish_retention_pass`].
+    ///
+    /// # Errors
+    /// Returns an error when the read fails.
+    pub fn retention_done_at(&self) -> Result<Option<String>> {
+        self.state("retention_done_at")
+    }
+
+    /// Bodies the retention pass has dropped from this index so far.
+    ///
+    /// # Errors
+    /// Returns an error when the read fails.
+    pub fn retention_dropped(&self) -> Result<i64> {
+        Ok(self.state("retention_dropped")?.and_then(|value| value.parse().ok()).unwrap_or(0))
+    }
+
+    /// Drop one slice's bodies and move the cursor past them, in one
+    /// transaction: a crash repeats the slice, which changes nothing the
+    /// second time. Returns how many bodies it emptied.
+    ///
+    /// The rule is not asked again here: a row surfaced between the step's
+    /// read and this commit loses its index body too. The window is
+    /// milliseconds, and `brain_get` still returns the whole body from the log.
+    ///
+    /// # Errors
+    /// Returns an error when a write fails; the transaction rolls back.
+    pub fn commit_retention_step(&self, ids: &[String], cursor: i64) -> Result<usize> {
+        let transaction = self.conn.unchecked_transaction().context("begin retention step")?;
+        let dropped = self.drop_index_bodies(ids)?;
+        self.conn
+            .execute(
+                "INSERT INTO schema_state (key, value) VALUES ('retention_cursor', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![cursor.to_string()],
+            )
+            .context("move the retention cursor")?;
+        self.conn
+            .execute(
+                "INSERT INTO schema_state (key, value) VALUES ('retention_dropped', ?1)
+                 ON CONFLICT(key) DO UPDATE
+                 SET value = CAST(value AS INTEGER) + CAST(excluded.value AS INTEGER)",
+                params![dropped.to_string()],
+            )
+            .context("count the dropped bodies")?;
+        transaction.commit().context("commit retention step")?;
+        Ok(dropped)
+    }
+
+    /// Record that a pass reached the end of the table: the next one waits for
+    /// a day to pass, and starts from the first row.
+    ///
+    /// # Errors
+    /// Returns an error when the write fails.
+    pub fn finish_retention_pass(&self, now: &str) -> Result<()> {
+        let transaction = self.conn.unchecked_transaction().context("begin retention finish")?;
+        self.conn
+            .execute("DELETE FROM schema_state WHERE key = 'retention_cursor'", [])
+            .context("clear the retention cursor")?;
+        self.conn
+            .execute(
+                "INSERT INTO schema_state (key, value) VALUES ('retention_done_at', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![now],
+            )
+            .context("record the retention pass")?;
+        transaction.commit().context("commit retention finish")
+    }
+
+    /// Give the pages a retention step freed back to the files: merge a bounded
+    /// amount of the text index, then checkpoint the WAL.
+    ///
+    /// Emptying a body writes delete markers into the text index, and only a
+    /// merge folds them away. `merge` with a page count does at most that much
+    /// work, so it fits the same bound as a step. The checkpoint is PASSIVE
+    /// and never waits for a reader; when it caught up completely a TRUNCATE
+    /// follows with no busy timeout, so a hook holding the database sends it
+    /// away instead of waiting on it. Neither `optimize` nor VACUUM belongs
+    /// here: both rewrite more than a run may spend.
+    ///
+    /// # Errors
+    /// Returns an error when the merge or the checkpoint fails.
+    pub fn settle_after_retention(&self, merge_pages: i64) -> Result<()> {
+        self.conn
+            .execute("INSERT INTO events_fts(events_fts, rank) VALUES ('merge', ?1)", params![merge_pages])
+            .context("merge the text index")?;
+        let (busy, log, done): (i64, i64, i64) = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .context("checkpoint the WAL")?;
+        if busy == 0 && log > 0 && log == done {
+            self.conn.busy_timeout(std::time::Duration::ZERO).context("drop the busy timeout")?;
+            let truncated = self
+                .conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get::<_, i64>(0))
+                .context("truncate the WAL");
+            self.conn
+                .busy_timeout(std::time::Duration::from_millis(u64::from(BUSY_TIMEOUT_MS)))
+                .context("restore the busy timeout")?;
+            truncated?;
+        }
+        Ok(())
+    }
+
+    /// Pages in the database file and how many of them hold nothing.
+    ///
+    /// Dropped bodies leave their pages on the free list, where SQLite reuses
+    /// them but never hands them back to the filesystem.
+    ///
+    /// # Errors
+    /// Returns an error when a pragma cannot be read.
+    pub fn page_use(&self) -> Result<(i64, i64)> {
+        let pages = self.conn.pragma_query_value(None, "page_count", |row| row.get(0)).context("read page_count")?;
+        let free =
+            self.conn.pragma_query_value(None, "freelist_count", |row| row.get(0)).context("read freelist_count")?;
+        Ok((pages, free))
+    }
+
+    /// Fold both text indexes into one segment each, so the delete markers a
+    /// dropped body left behind stop taking room. Rewrites the whole index:
+    /// `brain compact` only, never a hook or a consolidation.
+    ///
+    /// # Errors
+    /// Returns an error when an index cannot be optimized.
+    pub fn optimize_text_indexes(&self) -> Result<()> {
+        for table in ["events_fts", "events_tri"] {
+            self.conn
+                .execute(&format!("INSERT INTO {table}({table}) VALUES ('optimize')"), [])
+                .with_context(|| format!("optimize {table}"))?;
+        }
+        Ok(())
+    }
+
+    /// Rewrite the database file without its free pages. Needs the whole file
+    /// to itself and room for a second copy; `brain compact` checks both.
+    ///
+    /// # Errors
+    /// Returns an error when the rewrite fails, e.g. a hook held the database
+    /// past the busy timeout. The file is unchanged then.
+    pub fn vacuum(&self) -> Result<()> {
+        self.conn.execute_batch("VACUUM").context("vacuum")
+    }
+
+    /// Empty the write-ahead log into the database file and cut it to nothing.
+    /// False when a reader kept it from finishing; the next checkpoint will.
+    ///
+    /// # Errors
+    /// Returns an error when the checkpoint itself fails.
+    pub fn truncate_wal(&self) -> Result<bool> {
+        let busy: i64 = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+            .context("truncate the WAL")?;
+        Ok(busy == 0)
     }
 
     /// Record what a session was about.
@@ -5091,9 +5393,12 @@ impl Store {
             // delete them.
             // The log-tail watermarks go too: they say what the index holds,
             // so after a clear that fails part-way they must not claim a log
-            // is fully read.
+            // is fully read. So do the retention marks: the replay restores
+            // every body, and a cursor or a spent day left behind would hide
+            // them from the next pass.
             .execute_batch(
-                "DELETE FROM event_files; DELETE FROM events; DELETE FROM schema_state WHERE key LIKE 'log_tail:%';",
+                "DELETE FROM event_files; DELETE FROM events;
+                 DELETE FROM schema_state WHERE key LIKE 'log_tail:%' OR key LIKE 'retention\\_%' ESCAPE '\\';",
             )
             .context("clear index")?;
         Ok(())
@@ -6587,6 +6892,39 @@ mod tests {
         store.index(&retire).unwrap();
         assert_eq!(stored_body(&store, &big.id), (String::new(), 0));
         assert!(!store.is_clamped(&big.id).unwrap());
+    }
+
+    #[test]
+    fn a_dropped_index_body_points_at_the_log_until_retired_or_reindexed() {
+        let store = Store::open_memory().unwrap();
+        let mut note = event("Bash: make", "built fine, 3 warnings", Uuid::new_v4());
+        note.consolidated = true;
+        store.index(&note).unwrap();
+        let ids = vec![note.id.clone()];
+
+        assert_eq!(store.drop_index_bodies(&ids).unwrap(), 1);
+        assert_eq!(stored_body(&store, &note.id), (String::new(), 1));
+        assert!(store.is_clamped(&note.id).unwrap());
+        assert_eq!(store.drop_index_bodies(&ids).unwrap(), 0, "an empty body is not dropped twice");
+
+        // The log was never touched, so indexing the same line again restores it.
+        store.index(&note).unwrap();
+        assert_eq!(stored_body(&store, &note.id), ("built fine, 3 warnings".to_string(), 0));
+
+        // A retirement after a drop still withdraws the body for good.
+        store.drop_index_bodies(&ids).unwrap();
+        let mut retire = Event::new(
+            Uuid::nil(),
+            note.project,
+            Uuid::nil(),
+            Source { cli: "brain".into(), hook: "retire".into() },
+            EventKind::Retire,
+            "Retired 1".into(),
+            String::new(),
+        );
+        retire.links = ids;
+        store.index(&retire).unwrap();
+        assert_eq!(stored_body(&store, &note.id), (String::new(), 0));
     }
 
     #[test]
@@ -8198,6 +8536,171 @@ mod tests {
         assert_eq!(ids, vec![unseen.id.clone()], "only the never-surfaced body retires");
         assert!(bytes > 0, "the measurement must count the body it would drop");
         let _ = raw;
+    }
+
+    const LONG_AGO: &str = "2020-01-01T00:00:00.000000Z";
+    const CUTOFF: &str = "2026-01-01T00:00:00.000000Z";
+
+    /// An old, settled observation in `project`: the shape the rule drops.
+    fn old_observation(store: &Store, title: &str, project: Uuid) -> Event {
+        let mut old = event(title, "an old body", project);
+        old.ts = LONG_AGO.to_string();
+        old.consolidated = true;
+        store.index(&old).unwrap();
+        old
+    }
+
+    #[test]
+    fn the_retention_rule_spares_whatever_anyone_saw_and_whatever_is_still_in_flight() {
+        let store = Store::open_memory().unwrap();
+        let (mine, yours) = (Uuid::new_v4(), Uuid::new_v4());
+        let unseen = old_observation(&store, "nobody needed this", mine);
+        let elsewhere = old_observation(&store, "nor this, in another project", yours);
+        let injected = old_observation(&store, "offered by a primer", mine);
+        let offered = old_observation(&store, "offered by a search", mine);
+        let opened = old_observation(&store, "opened in full", mine);
+        let counted = old_observation(&store, "read before the ledgers", mine);
+        let forgotten = old_observation(&store, "withdrawn", mine);
+        let mut unsettled = event("not consolidated yet", "an old body", mine);
+        unsettled.ts = LONG_AGO.to_string();
+        store.index(&unsettled).unwrap();
+        let mut knowledge = event("a rule", "an old body", mine);
+        knowledge.ts = LONG_AGO.to_string();
+        knowledge.kind = EventKind::Knowledge;
+        knowledge.consolidated = true;
+        store.index(&knowledge).unwrap();
+        let mut recent = event("this morning", "a fresh body", mine);
+        recent.consolidated = true;
+        store.index(&recent).unwrap();
+
+        store.record_injected("s1", std::slice::from_ref(&injected.id), 0, 10, usize::MAX).unwrap();
+        store.record_recalled("s1", std::iter::once(offered.id.as_str())).unwrap();
+        store.record_opened("s1", std::iter::once(opened.id.as_str())).unwrap();
+        store.conn.execute("UPDATE events SET read_count = 1 WHERE id = ?1", [&counted.id]).unwrap();
+        store.conn.execute("UPDATE events SET forgotten = 1 WHERE id = ?1", [&forgotten.id]).unwrap();
+
+        let step = store.retention_step(CUTOFF, 0, 1_000, 100).unwrap();
+        let mut ids = step.ids.clone();
+        ids.sort();
+        let mut expected = vec![unseen.id.clone(), elsewhere.id.clone()];
+        expected.sort();
+        assert_eq!(ids, expected, "only an old, settled, never-surfaced observation goes, in any project");
+        assert!(step.end, "the whole table fit in the window");
+        assert_eq!(store.retention_pending(CUTOFF, 0, 1_000).unwrap(), 2);
+        let first = store.conn.query_row("SELECT rowid FROM events WHERE id = ?1", [&unseen.id], |r| r.get(0)).unwrap();
+        assert_eq!(store.retention_pending(CUTOFF, first, 1_000).unwrap(), 1, "a count from the cursor skips what is behind it");
+        assert_eq!(store.retention_pending(CUTOFF, 0, first).unwrap(), 1, "a count stops at the end of its window");
+    }
+
+    #[test]
+    fn the_retention_rule_keeps_a_prose_body_until_its_vector_exists() {
+        // The embed backlog encodes title plus body, so a body dropped first
+        // would leave a vector made from the title alone, for good.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let old_prose = |title: &str| {
+            let mut old = prose_event(title, "an old body", project);
+            old.ts = LONG_AGO.to_string();
+            old.consolidated = true;
+            store.index(&old).unwrap();
+            old
+        };
+        let without = old_prose("no vector yet");
+        let narrow = old_prose("a vector of another model");
+        let embedded = old_prose("embedded");
+        // A tool call is JSON the embedder skips, so there is nothing to wait for.
+        let tool_call = old_observation(&store, "a tool call", project);
+        let vector = |id: &str, width: usize| (id.to_string(), vec![1u8; width]);
+        store
+            .set_vectors(&[vector(&narrow.id, crate::embed::DIMS - 1), vector(&embedded.id, crate::embed::DIMS)])
+            .unwrap();
+
+        let step = store.retention_step(CUTOFF, 0, 1_000, 100).unwrap();
+        let mut ids = step.ids.clone();
+        ids.sort();
+        let mut expected = vec![embedded.id.clone(), tool_call.id.clone()];
+        expected.sort();
+        assert_eq!(ids, expected, "a prose body went before its vector (without {}, narrow {})", without.id, narrow.id);
+    }
+
+    #[test]
+    fn a_retention_step_reads_one_window_and_says_where_to_resume() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let ids: Vec<String> =
+            (0..5).map(|n| old_observation(&store, &format!("old {n}"), project).id).collect();
+
+        // A full slice stops at its last match.
+        let first = store.retention_step(CUTOFF, 0, 100, 2).unwrap();
+        assert_eq!((first.ids.as_slice(), first.next, first.end), (&ids[0..2], 2, false));
+        let second = store.retention_step(CUTOFF, first.next, 100, 2).unwrap();
+        assert_eq!((second.ids.as_slice(), second.next, second.end), (&ids[2..4], 4, false));
+        // A short one saw its whole window, and the table ended inside it.
+        let last = store.retention_step(CUTOFF, second.next, 100, 2).unwrap();
+        assert_eq!((last.ids.as_slice(), last.next, last.end), (&ids[4..5], 104, true));
+
+        // A window smaller than the table is the bound on one read.
+        let narrow = store.retention_step(CUTOFF, 0, 3, 100).unwrap();
+        assert_eq!((narrow.ids.as_slice(), narrow.next, narrow.end), (&ids[0..3], 3, false));
+    }
+
+    #[test]
+    fn a_retention_step_walks_rowids_and_probes_the_usage_indexes() {
+        // A scan of the table in rowid order is what bounds the read; through
+        // an index on kind the same statement fetched every observation by id.
+        let store = Store::open_memory().unwrap();
+        assert!(store.build_primer_indexes().unwrap());
+        let plan = plan_of(&store, &Store::retention_step_sql(), 4);
+        assert!(
+            plan.iter().any(|row| row.starts_with("SEARCH events USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)")),
+            "the step does not read a rowid window: {plan:#?}"
+        );
+        for table in ["injected", "recalled"] {
+            assert!(
+                plan.iter().any(|row| row.contains(&format!("COVERING INDEX {table}_by_event (event_id=?)"))),
+                "{table} is not probed by event: {plan:#?}"
+            );
+        }
+        assert!(!plan.iter().any(|row| row.contains("events_kind_proj")), "{plan:#?}");
+    }
+
+    #[test]
+    fn a_committed_retention_step_empties_bodies_moves_the_cursor_and_a_clear_forgets_both() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let old = old_observation(&store, "old", project);
+        let ids = vec![old.id.clone()];
+
+        assert_eq!(store.retention_cursor().unwrap(), 0);
+        assert_eq!(store.commit_retention_step(&ids, 7).unwrap(), 1);
+        assert_eq!(stored_body(&store, &old.id), (String::new(), 1));
+        assert_eq!((store.retention_cursor().unwrap(), store.retention_dropped().unwrap()), (7, 1));
+        assert_eq!(store.commit_retention_step(&ids, 9).unwrap(), 0, "an empty body is not dropped twice");
+        assert_eq!((store.retention_cursor().unwrap(), store.retention_dropped().unwrap()), (9, 1));
+
+        store.finish_retention_pass("2026-10-08T00:00:00Z").unwrap();
+        assert_eq!(store.retention_cursor().unwrap(), 0, "a finished pass starts over");
+        assert_eq!(store.retention_done_at().unwrap().as_deref(), Some("2026-10-08T00:00:00Z"));
+
+        // The replay restores every body, so what said they were dropped goes.
+        store.clear().unwrap();
+        assert_eq!(store.retention_done_at().unwrap(), None);
+        assert_eq!(store.retention_dropped().unwrap(), 0);
+    }
+
+    #[test]
+    fn settling_after_retention_merges_and_checkpoints_without_error() {
+        // On a file, where there is a WAL for the checkpoint to empty.
+        let dir = std::env::temp_dir().join(format!("brain-settle-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("brain.db");
+        let store = Store::open(&db).unwrap();
+        let old = old_observation(&store, "old", Uuid::new_v4());
+        store.commit_retention_step(std::slice::from_ref(&old.id), 1).unwrap();
+        store.settle_after_retention(10).unwrap();
+        let wal = db.with_file_name("brain.db-wal");
+        assert_eq!(std::fs::metadata(&wal).map_or(0, |wal| wal.len()), 0, "the checkpoint left the WAL full");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
