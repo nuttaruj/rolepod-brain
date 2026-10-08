@@ -101,6 +101,7 @@ impl Fixture {
             // A run fetches a missing embedding model by itself; a test must
             // not reach the network.
             .env("ROLEPOD_BRAIN_NO_FETCH", "1")
+            .env("ROLEPOD_BRAIN_HUB", "off")
             // ROLEPOD_BRAIN_HOME isolates our own data; it does NOT isolate
             // the CLI configs we wire into, which are found through $HOME. A
             // test running `uninstall --apply` without this unwired the real
@@ -239,6 +240,7 @@ impl Fixture {
             .current_dir(&self.project)
             .env("ROLEPOD_BRAIN_HOME", &self.home)
             .env("ROLEPOD_BRAIN_NO_FETCH", "1")
+            .env("ROLEPOD_BRAIN_HUB", "off")
             // Same reason brain_with_path owns HOME: the capture path reads
             // $HOME too, and a fixture that leaves it pointing at the real
             // machine is testing the machine, not the fixture.
@@ -277,6 +279,7 @@ impl Fixture {
             .current_dir(&self.project)
             .env("ROLEPOD_BRAIN_HOME", &self.home)
             .env("ROLEPOD_BRAIN_NO_FETCH", "1")
+            .env("ROLEPOD_BRAIN_HUB", "off")
             .env("HOME", self.home.parent().unwrap());
         self.own_git_config(&mut command);
         let mut child = command
@@ -324,6 +327,12 @@ impl Fixture {
             .current_dir(&self.project)
             .env("ROLEPOD_BRAIN_HOME", &self.home)
             .env("ROLEPOD_BRAIN_NO_FETCH", "1")
+            .env("ROLEPOD_BRAIN_HUB", "off")
+            // The summarizer ladder looks for a CLI in `~/.local/bin` as well as
+            // on PATH. Left on the real HOME, a search that is meant to find no
+            // CLI is reranked by this machine's real claude, and its answer is
+            // what the comparison against the stubbed run sees.
+            .env("HOME", self.home.parent().unwrap())
             .env("PATH", path);
         self.own_git_config(&mut command);
         let mut child = command
@@ -646,6 +655,7 @@ fn two_projects_with_one_basename_never_share_a_directory() {
         .current_dir(&rival)
         .env("ROLEPOD_BRAIN_HOME", &fixture.home)
         .env("ROLEPOD_BRAIN_NO_FETCH", "1")
+        .env("ROLEPOD_BRAIN_HUB", "off")
         .env("HOME", fixture.home.parent().unwrap())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -3008,6 +3018,7 @@ fn a_stale_tmpdir_does_not_look_like_every_cli_vanishing() {
         .current_dir(&fixture.project)
         .env("ROLEPOD_BRAIN_HOME", &fixture.home)
         .env("ROLEPOD_BRAIN_NO_FETCH", "1")
+        .env("ROLEPOD_BRAIN_HUB", "off")
         .env("HOME", fixture.home.parent().unwrap())
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
         .env("TMPDIR", &gone);
@@ -3053,6 +3064,7 @@ fn a_cli_that_trusts_pwd_still_runs_in_the_inert_directory() {
         .env("PWD", &fixture.project)
         .env("ROLEPOD_BRAIN_HOME", &fixture.home)
         .env("ROLEPOD_BRAIN_NO_FETCH", "1")
+        .env("ROLEPOD_BRAIN_HUB", "off")
         .env("HOME", fixture.home.parent().unwrap())
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
         .env("TMPDIR", &inert)
@@ -3887,6 +3899,7 @@ fn plugin_hook_shell(fixture: &Fixture, command: &str, bin: &Path) -> Command {
     shell
         .args(["-c", &command.replace("${PLUGIN_ROOT}", &root)])
         .current_dir(&fixture.project)
+        .env("ROLEPOD_BRAIN_HUB", "off")
         .env("HOME", fixture.home.parent().unwrap())
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
         .env_remove("GIT_CONFIG_PARAMETERS")
@@ -5025,6 +5038,7 @@ fn an_event_with_no_knowable_workspace_is_skipped_not_guessed() {
         .current_dir(&config_dir)
         .env("ROLEPOD_BRAIN_HOME", &fixture.home)
         .env("ROLEPOD_BRAIN_NO_FETCH", "1")
+        .env("ROLEPOD_BRAIN_HUB", "off")
         .env("HOME", fixture.home.parent().unwrap())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -5183,6 +5197,8 @@ fn a_silenced_run_leaves_no_trace_at_all() {
         .current_dir(&fixture.project)
         .env("ROLEPOD_BRAIN_HOME", &fixture.home)
         .env("ROLEPOD_BRAIN_NO_FETCH", "1")
+        .env("ROLEPOD_BRAIN_HUB", "off")
+        .env("HOME", fixture.home.parent().unwrap())
         .env("ROLEPOD_BRAIN_SILENT", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -5414,6 +5430,8 @@ fn a_headless_session_gets_nothing_even_after_a_wipe() {
         .current_dir(&fixture.project)
         .env("ROLEPOD_BRAIN_HOME", &fixture.home)
         .env("ROLEPOD_BRAIN_NO_FETCH", "1")
+        .env("ROLEPOD_BRAIN_HUB", "off")
+        .env("HOME", fixture.home.parent().unwrap())
         .env("ROLEPOD_BRAIN_SILENT", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -6350,6 +6368,7 @@ fn two_consolidations_racing_in_one_project_do_not_corrupt_or_double_up() {
                 .current_dir(&fixture.project)
                 .env("ROLEPOD_BRAIN_HOME", &fixture.home)
                 .env("ROLEPOD_BRAIN_NO_FETCH", "1")
+                .env("ROLEPOD_BRAIN_HUB", "off")
                 .env("HOME", fixture.home.parent().unwrap())
                 .env("PATH", "/usr/bin:/bin")
                 .stdout(Stdio::piped())
@@ -7170,7 +7189,9 @@ fn a_one_shot_run_starts_no_consolidation() {
     fixture.hook("claude-code", "SessionStart", &start_payload(&fixture.project, person, "startup"));
     let end = serde_json::json!({"session_id": person, "cwd": fixture.project, "reason": "other"});
     fixture.hook("claude-code", "SessionEnd", &end.to_string());
-    let wait_until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // The spawned run lands late under a loaded full suite; the wait costs
+    // time only when it fails.
+    let wait_until = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut modes = fixture.consolidation_modes();
     while modes.is_empty() && std::time::Instant::now() < wait_until {
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -7743,6 +7764,13 @@ fn maint_window_hook_answers_at_once_and_its_event_is_indexed_afterwards() {
     let fixture = Fixture::new("maint-hook");
     fixture.seed_session_as("0199a1f2-3c4d-7e8f-9012-3456789abcde", &["src/earlier.rs"]);
 
+    // What one hook spawn costs on this machine right now, with nothing held.
+    // A fixed bound measured load, not the wait on the store.
+    let before = edit_payload(&fixture, "0199c000-0000-7000-8000-00000000b000", "src/beforewindow.rs");
+    let began = std::time::Instant::now();
+    fixture.hook("claude-code", "PostToolUse", &before);
+    let baseline = began.elapsed();
+
     let lock = hold_write_lock(&fixture);
     open_window(&fixture);
     let payload = edit_payload(&fixture, "0199c000-0000-7000-8000-00000000b001", "src/inwindow.rs");
@@ -7750,7 +7778,11 @@ fn maint_window_hook_answers_at_once_and_its_event_is_indexed_afterwards() {
     let out = fixture.hook("claude-code", "PostToolUse", &payload);
     let took = started.elapsed();
     assert!(out.status.success(), "the host saw a failing hook: {out:?}");
-    assert!(took < std::time::Duration::from_millis(500), "the hook waited on the held store: {took:?}");
+    // Waiting out the store's 5 s busy timeout would add all of it on top of the baseline.
+    assert!(
+        took < baseline + std::time::Duration::from_secs(2),
+        "the hook waited on the held store: {took:?} against a {baseline:?} baseline"
+    );
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "{}");
     assert!(fixture.log_text().contains("inwindow.rs"), "the capture never reached the log");
     assert_eq!(brain_log_text(&fixture), "", "a hook in the window wrote to brain.log, which doctor counts");
@@ -7897,6 +7929,77 @@ fn maint_window_clear_leaves_a_pending_wipe_that_the_next_writable_hook_applies(
 }
 
 #[test]
+fn a_session_start_whose_index_write_fails_outside_the_window_still_gets_its_primer_and_logs_it() {
+    let fixture = Fixture::new("followup-primer-locked");
+    let earlier = "0199aaaa-0000-7000-8000-000000000000";
+    let prompt = serde_json::json!({"session_id": earlier, "cwd": fixture.project, "prompt": "why does the scheduler double-book?"});
+    fixture.hook("claude-code", "UserPromptSubmit", &prompt.to_string());
+    assert_eq!(brain_log_text(&fixture), "", "precondition: a clean log");
+
+    let session = "0199a1f2-3c4d-7e8f-9012-3456789abcde";
+    let lock = hold_write_lock(&fixture);
+    let out = fixture.hook("claude-code", "SessionStart", &start_payload(&fixture.project, session, "startup"));
+    lock.execute_batch("COMMIT").unwrap();
+    assert!(out.status.success());
+    let primer = injected_context(&out).expect("a failed index write cost the session its primer");
+    assert!(primer.contains(earlier), "the primer lost its content: {primer}");
+    let log = brain_log_text(&fixture);
+    assert!(log.contains("claude-code SessionStart"), "the failure left no line in brain.log: {log}");
+}
+
+#[test]
+fn a_clear_in_the_window_gets_the_primer_of_a_session_that_was_wiped() {
+    let fixture = Fixture::new("followup-clear-window");
+    let earlier = "0199aaaa-0000-7000-8000-000000000000";
+    let prompt = serde_json::json!({"session_id": earlier, "cwd": fixture.project, "prompt": "why does the scheduler double-book?"});
+    fixture.hook("claude-code", "UserPromptSubmit", &prompt.to_string());
+    let session = "0199a1f2-3c4d-7e8f-9012-3456789abcde";
+    let first = injected_context(&fixture.hook(
+        "claude-code",
+        "SessionStart",
+        &start_payload(&fixture.project, session, "startup"),
+    ))
+    .expect("a primer on a normal start");
+    assert!(first.contains(earlier), "precondition: the first primer names it: {first}");
+
+    let lock = hold_write_lock(&fixture);
+    open_window(&fixture);
+    let out = fixture.hook("claude-code", "SessionStart", &start_payload(&fixture.project, session, "clear"));
+    let again = injected_context(&out).expect("a /clear in the window got no primer");
+    assert!(again.contains(earlier), "the pointer shown before the wipe was suppressed: {again}");
+    assert_eq!(brain_log_text(&fixture), "", "a hook in the window wrote to brain.log");
+    lock.execute_batch("COMMIT").unwrap();
+    close_window(&fixture);
+}
+
+#[test]
+fn forget_in_the_window_answers_at_once_with_the_window_and_leaves_the_log_alone() {
+    let fixture = Fixture::new("followup-forget-window");
+    let id = fixture.prompt_event(1, "the zeta rendezvous cipher value");
+    let forget = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"brain_forget","arguments":{{"id":"{id}"}}}}}}"#
+    );
+    // The guard wants the id surfaced in the same server, so search first.
+    let search = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"brain_search","arguments":{"query":"zeta rendezvous"}}}"#;
+    let began = std::time::Instant::now();
+    fixture.mcp(&[search]);
+    let baseline = began.elapsed();
+
+    let lock = hold_write_lock(&fixture);
+    open_window(&fixture);
+    let started = std::time::Instant::now();
+    let responses = fixture.mcp(&[search, &forget]);
+    let took = started.elapsed();
+    assert!(took < baseline + std::time::Duration::from_secs(2), "forget waited on the held store: {took:?} against {baseline:?}");
+    let text = serde_json::to_string(&responses[1]).unwrap();
+    assert!(text.contains("compact window") && text.contains("under a minute"), "no window message: {text}");
+    assert_eq!(brain_log_text(&fixture), "", "forget in the window wrote to brain.log");
+    assert_eq!(scalar(&fixture, "SELECT COUNT(*) FROM events WHERE kind = 'tombstone'"), 0);
+    lock.execute_batch("COMMIT").unwrap();
+    close_window(&fixture);
+}
+
+#[test]
 fn maint_a_store_that_is_free_gains_no_file_in_the_data_directory() {
     let fixture = Fixture::new("maint-quiet");
     let session = "0199a1f2-3c4d-7e8f-9012-3456789abcde";
@@ -8039,6 +8142,7 @@ fn a_compactor_killed_mid_window_lets_its_marker_lapse_and_leaves_the_index_whol
         .env("ROLEPOD_BRAIN_HOME", &fixture.home)
         .env("ROLEPOD_BRAIN_NO_FETCH", "1")
         .env("ROLEPOD_BRAIN_MAINT_LIFETIME_MS", "1500")
+        .env("ROLEPOD_BRAIN_HUB", "off")
         .env("HOME", fixture.home.parent().unwrap())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

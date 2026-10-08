@@ -31,6 +31,7 @@ pub struct Config {
     pub injection: InjectionConfig,
     pub sanitize: SanitizeConfig,
     pub search: SearchConfig,
+    pub hub: HubConfig,
     pub sync: SyncConfig,
     pub team: TeamConfig,
     pub retention: RetentionConfig,
@@ -78,6 +79,39 @@ pub struct SearchConfig {
     /// session, and text relevance is already right most of the time. Turn it
     /// on if your searches return the right entry in the wrong place.
     pub rerank: bool,
+}
+
+/// The shared reranker. One hub per data dir holds the model, so N sessions
+/// do not each load a 1.7 GB copy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HubConfig {
+    /// `on` or `off`. On by default where there are Unix sockets; Windows has
+    /// no hub, so its default (and only) answer is off.
+    pub mode: String,
+}
+
+impl Default for HubConfig {
+    fn default() -> Self {
+        Self { mode: if cfg!(unix) { "on" } else { "off" }.to_string() }
+    }
+}
+
+impl HubConfig {
+    /// Is the hub to be used? `ROLEPOD_BRAIN_HUB=off` beats the file, so a
+    /// shell can turn it off for one run; nothing turns it on where it cannot
+    /// run.
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        if !cfg!(unix) {
+            return false;
+        }
+        let from_env = std::env::var("ROLEPOD_BRAIN_HUB").unwrap_or_default();
+        if matches!(from_env.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false") {
+            return false;
+        }
+        !self.mode.trim().eq_ignore_ascii_case("off")
+    }
 }
 
 /// Where sync bundles go, when the owner opts in. `None` - the default,

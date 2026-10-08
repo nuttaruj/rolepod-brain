@@ -698,6 +698,9 @@ pub struct SurfacedLine {
     pub session: String,
     pub kind: Ledger,
     pub ids: Vec<String>,
+    /// Bytes an injection spent; 0 for a line that spent none, and for a
+    /// spill written before this field existed.
+    pub bytes: usize,
 }
 
 /// How an entry reached a session: offered by a search, or opened on purpose.
@@ -5457,6 +5460,18 @@ impl Store {
         let transaction = self.conn.unchecked_transaction().context("begin fold surfaced")?;
         let mut seen = 0;
         for line in lines {
+            // The bytes are owed once: only when this fold is the one that
+            // first shows the session an id of the line, so a fold run again
+            // over the same file adds nothing.
+            if line.kind == Ledger::Injected && line.bytes > 0 && self.any_unseen_injection(&line)? {
+                self.conn
+                    .execute(
+                        "INSERT INTO injected_bytes (session, bytes) VALUES (?1, ?2)
+                         ON CONFLICT(session) DO UPDATE SET bytes = injected_bytes.bytes + ?2",
+                        params![line.session, i64::try_from(line.bytes).unwrap_or(i64::MAX)],
+                    )
+                    .context("fold injected bytes")?;
+            }
             for id in &line.ids {
                 match line.kind {
                     Ledger::Recalled => {
@@ -5473,6 +5488,24 @@ impl Store {
         }
         transaction.commit().context("commit fold surfaced")?;
         Ok(seen)
+    }
+
+    fn any_unseen_injection(&self, line: &SurfacedLine) -> Result<bool> {
+        for id in &line.ids {
+            let seen: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM injected WHERE session = ?1 AND event_id = ?2",
+                    params![line.session, id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("read injected row")?;
+            if seen.is_none() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Mark a file as covered for this session.

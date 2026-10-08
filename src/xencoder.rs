@@ -17,8 +17,8 @@
 //! caller falls through to the CLI it would have used anyway.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use ort::session::Session;
@@ -75,9 +75,9 @@ const IDLE_WINDOW: Duration = Duration::from_secs(90);
 /// waited for the next request. One short-lived thread per load, which exits
 /// the moment it has let go of the model.
 ///
-/// A failed load is kept as text and kept for good, as it always was: the
-/// model files do not appear mid-session, and trying again would cost every
-/// search the attempt. Most error types are not `Clone`, hence the text.
+/// A failed load is kept as text, since most error types are not `Clone`, and
+/// stands for [`RETRY_AFTER`] or until the model dir changes, so a model that
+/// arrives mid-session is picked up without paying the attempt on every search.
 static CELL: Idle<Reranker> = Idle::new(IDLE_WINDOW);
 
 /// Has this process paid the model load yet, and not let go of it since? The
@@ -89,10 +89,46 @@ pub fn is_loaded() -> bool {
     CELL.is_loaded()
 }
 
+/// How long a failed load stands before the next caller tries again. A model
+/// that is still downloading, or was just repaired, should not stay "absent"
+/// for the life of the process; a broken one should not cost every search the
+/// attempt either.
+const RETRY_AFTER: Duration = Duration::from_secs(60);
+
 enum Slot<T> {
     Empty,
+    /// One caller is building the value, with the lock released.
+    Loading,
     Held { value: Arc<T>, last_used: Instant },
+    /// The text of the failure, when it happened, and the model dir's mtime then.
+    Failed { why: String, at: Instant, stamp: Option<SystemTime> },
+}
+
+/// What [`Idle::get`] came back with.
+enum Got<T> {
+    /// The value, and whether this call built it.
+    Ready(Arc<T>, bool),
+    /// Someone else is still loading and `wait` ran out.
+    Busy,
+    /// The text of the failure; the hub reports it, in-process callers drop it.
+    #[allow(dead_code)]
     Failed(String),
+}
+
+/// Puts a slot that was `Loading` back to `Empty` if the loader unwinds, so a
+/// panic never leaves every later caller waiting.
+struct LoadGuard<'a, T> {
+    idle: &'a Idle<T>,
+    done: bool,
+}
+
+impl<T> Drop for LoadGuard<'_, T> {
+    fn drop(&mut self) {
+        if !self.done {
+            *self.idle.lock() = Slot::Empty;
+            self.idle.ready.notify_all();
+        }
+    }
 }
 
 /// A value built on demand and dropped after a spell of disuse.
@@ -103,11 +139,12 @@ enum Slot<T> {
 struct Idle<T> {
     window: Duration,
     slot: Mutex<Slot<T>>,
+    ready: Condvar,
 }
 
 impl<T> Idle<T> {
     const fn new(window: Duration) -> Self {
-        Self { window, slot: Mutex::new(Slot::Empty) }
+        Self { window, slot: Mutex::new(Slot::Empty), ready: Condvar::new() }
     }
 
     /// A panic mid-load leaves the slot in a state every arm handles, so a
@@ -116,35 +153,74 @@ impl<T> Idle<T> {
         self.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// The value, built by `load` if there is none, with whether this call built it.
+    /// The value, built by `load` if there is none.
     ///
-    /// The lock is held through the load, so two callers that arrive together
-    /// load once.
+    /// The lock is not held through the load: the slot says `Loading`, and a
+    /// caller that arrives meanwhile waits for it, at most `wait` (`None` waits
+    /// as long as it takes), so two callers that arrive together load once and a
+    /// short `wait` can answer `Busy` instead of queueing. `stamp` is the model
+    /// dir's mtime: a failure is retried once [`RETRY_AFTER`] has passed on the
+    /// `now` clock or the stamp differs from the one the failure saw.
     fn get(
         &self,
         now: Instant,
+        stamp: Option<SystemTime>,
+        wait: Option<Duration>,
         load: impl FnOnce() -> Result<T, String>,
-    ) -> Result<(Arc<T>, bool), String> {
+    ) -> Got<T> {
+        let deadline = wait.map(|wait| std::time::Instant::now() + wait);
         let mut slot = self.lock();
-        match &mut *slot {
-            Slot::Held { value, last_used } => {
-                *last_used = now;
-                return Ok((Arc::clone(value), false));
+        loop {
+            match &mut *slot {
+                Slot::Held { value, last_used } => {
+                    *last_used = now;
+                    return Got::Ready(Arc::clone(value), false);
+                }
+                Slot::Failed { why, at, stamp: seen } => {
+                    let stale = now.saturating_duration_since(*at) >= RETRY_AFTER || *seen != stamp;
+                    if !stale {
+                        return Got::Failed(why.clone());
+                    }
+                    *slot = Slot::Empty;
+                }
+                Slot::Empty => break,
+                Slot::Loading => {
+                    slot = match deadline {
+                        None => self.ready.wait(slot).unwrap_or_else(std::sync::PoisonError::into_inner),
+                        Some(deadline) => {
+                            let left = deadline.saturating_duration_since(std::time::Instant::now());
+                            if left.is_zero() {
+                                return Got::Busy;
+                            }
+                            self.ready
+                                .wait_timeout(slot, left)
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .0
+                        }
+                    };
+                }
             }
-            Slot::Failed(why) => return Err(why.clone()),
-            Slot::Empty => {}
         }
-        match load() {
+        *slot = Slot::Loading;
+        drop(slot);
+        let mut guard = LoadGuard { idle: self, done: false };
+        let loaded = load();
+        let mut slot = self.lock();
+        guard.done = true;
+        let got = match loaded {
             Ok(value) => {
                 let value = Arc::new(value);
                 *slot = Slot::Held { value: Arc::clone(&value), last_used: now };
-                Ok((value, true))
+                Got::Ready(value, true)
             }
             Err(why) => {
-                *slot = Slot::Failed(why.clone());
-                Err(why)
+                *slot = Slot::Failed { why: why.clone(), at: now, stamp };
+                Got::Failed(why)
             }
-        }
+        };
+        drop(slot);
+        self.ready.notify_all();
+        got
     }
 
     fn is_loaded(&self) -> bool {
@@ -196,6 +272,17 @@ struct Reranker {
     tokenizer: Tokenizer,
 }
 
+/// What [`rerank_within`] made of a request.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LocalOrder {
+    /// Indexes into the entries, best first.
+    Ranked(Vec<usize>),
+    /// The model is being loaded by someone else and `wait` ran out.
+    Busy,
+    /// No reranker to hand: no model, a load that failed, a score that failed.
+    Unavailable,
+}
+
 /// Score `entries` against `query`, best first, or `None` if this build has no
 /// reranker to hand.
 ///
@@ -205,10 +292,49 @@ struct Reranker {
 /// would have used anyway.
 #[must_use]
 pub fn rerank(model_dir: &Path, query: &str, entries: &[String]) -> Option<Vec<usize>> {
-    if entries.len() < 2 {
-        return None;
+    match rerank_inner(model_dir, query, entries, None) {
+        LocalOrder::Ranked(order) => Some(order),
+        LocalOrder::Busy | LocalOrder::Unavailable => None,
     }
-    let reranker = load(model_dir).ok()?;
+}
+
+/// [`rerank`] that waits at most `wait` for a model another caller is loading,
+/// and says `Busy` when that is not enough.
+/// Called by the hub.
+#[must_use]
+pub fn rerank_within(
+    model_dir: &Path,
+    query: &str,
+    entries: &[String],
+    wait: Duration,
+) -> LocalOrder {
+    rerank_inner(model_dir, query, entries, Some(wait))
+}
+
+/// Let go of a held model now, whatever its idle clock says. A load in
+/// progress or a recorded failure is left alone. The hub calls it when its
+/// memory is over the limit; a score already running keeps its own `Arc`.
+pub fn release() {
+    let mut slot = CELL.lock();
+    if matches!(&*slot, Slot::Held { .. }) {
+        *slot = Slot::Empty;
+    }
+}
+
+fn rerank_inner(
+    model_dir: &Path,
+    query: &str,
+    entries: &[String],
+    wait: Option<Duration>,
+) -> LocalOrder {
+    if entries.len() < 2 {
+        return LocalOrder::Unavailable;
+    }
+    let reranker = match load(model_dir, wait) {
+        Got::Ready(reranker, _) => reranker,
+        Got::Busy => return LocalOrder::Busy,
+        Got::Failed(_) => return LocalOrder::Unavailable,
+    };
     match reranker.score(query, entries) {
         Ok(scores) => {
             let mut order: Vec<usize> = (0..scores.len()).collect();
@@ -218,23 +344,25 @@ pub fn rerank(model_dir: &Path, query: &str, entries: &[String]) -> Option<Vec<u
             order.sort_by(|a, b| {
                 scores[*b].total_cmp(&scores[*a]).then_with(|| a.cmp(b))
             });
-            Some(order)
+            LocalOrder::Ranked(order)
         }
-        Err(_) => None,
+        Err(_) => LocalOrder::Unavailable,
     }
 }
 
-fn load(model_dir: &Path) -> Result<Arc<Reranker>, String> {
-    let (reranker, fresh) =
-        CELL.get(Instant::now(), || open(model_dir).map_err(|error| format!("{error:#}")))?;
-    if fresh {
+fn load(model_dir: &Path, wait: Option<Duration>) -> Got<Reranker> {
+    let stamp = std::fs::metadata(model_dir).and_then(|meta| meta.modified()).ok();
+    let got = CELL.get(Instant::now(), stamp, wait, || {
+        open(model_dir).map_err(|error| format!("{error:#}"))
+    });
+    if let Got::Ready(_, true) = &got {
         // The clock handed to `get` was read before the load, and a first load
         // that converts the model takes tens of seconds: the idle window starts
         // when the model is ready, not when it was asked for.
         CELL.touch(Instant::now());
         CELL.watch();
     }
-    Ok(reranker)
+    got
 }
 
 fn open(model_dir: &Path) -> Result<Reranker> {
@@ -480,6 +608,122 @@ mod tests {
 
     const WINDOW: Duration = Duration::from_secs(90);
 
+    /// `Idle::get` with no mtime and no wait limit, as the in-process path calls it.
+    fn get<T>(
+        idle: &Idle<T>,
+        now: Instant,
+        load: impl FnOnce() -> Result<T, String>,
+    ) -> Result<(Arc<T>, bool), String> {
+        match idle.get(now, None, None, load) {
+            Got::Ready(value, fresh) => Ok((value, fresh)),
+            Got::Failed(why) => Err(why),
+            Got::Busy => unreachable!("an unbounded wait is never busy"),
+        }
+    }
+
+    #[test]
+    fn a_failed_load_is_retried_after_a_minute_or_when_the_model_dir_changes() {
+        let idle: Idle<String> = Idle::new(WINDOW);
+        let t0 = Instant::now();
+        let m1 = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10));
+        let m2 = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(20));
+        let fail = |why: &str| match idle.get(t0, m1, None, || Err(why.to_string())) {
+            Got::Failed(why) => why,
+            _ => panic!("expected a failure"),
+        };
+        assert_eq!(fail("no model"), "no model");
+        // Same dir, inside the minute: remembered, the loader is not called.
+        let soon = t0 + Duration::from_secs(59);
+        assert!(matches!(
+            idle.get(soon, m1, None, || panic!("must not retry")),
+            Got::Failed(why) if why == "no model"
+        ));
+        // The dir changed: tried again, and this time it loads.
+        assert!(matches!(
+            idle.get(soon, m2, None, || Ok("model".to_string())),
+            Got::Ready(_, true)
+        ));
+        // A fresh failure at t0 is retried once the minute is up.
+        let idle: Idle<String> = Idle::new(WINDOW);
+        assert!(matches!(idle.get(t0, m1, None, || Err("x".into())), Got::Failed(_)));
+        assert!(matches!(
+            idle.get(t0 + RETRY_AFTER, m1, None, || Ok("model".to_string())),
+            Got::Ready(_, true)
+        ));
+    }
+
+    #[test]
+    fn two_callers_that_arrive_together_load_once() {
+        let idle: Arc<Idle<String>> = Arc::new(Idle::new(WINDOW));
+        let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let t0 = Instant::now();
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let (idle, loads) = (Arc::clone(&idle), Arc::clone(&loads));
+                std::thread::spawn(move || {
+                    idle.get(t0, None, None, || {
+                        loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(150));
+                        Ok("model".to_string())
+                    })
+                })
+            })
+            .collect();
+        let fresh = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread"))
+            .filter(|got| matches!(got, Got::Ready(_, true)))
+            .count();
+        assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(fresh, 1);
+    }
+
+    #[test]
+    fn a_waiter_gives_up_with_busy_and_a_longer_one_gets_the_model() {
+        let idle: Arc<Idle<String>> = Arc::new(Idle::new(WINDOW));
+        let t0 = Instant::now();
+        let (started, started_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let loader = {
+            let idle = Arc::clone(&idle);
+            std::thread::spawn(move || {
+                idle.get(t0, None, None, || {
+                    started.send(()).expect("signal");
+                    release_rx.recv().expect("release");
+                    Ok("model".to_string())
+                })
+            })
+        };
+        started_rx.recv().expect("loading");
+        // The lock is free while the load runs, and a short wait answers Busy.
+        let short = Duration::from_millis(30);
+        assert!(matches!(idle.get(t0, None, Some(short), || panic!("one load")), Got::Busy));
+        let patient = {
+            let idle = Arc::clone(&idle);
+            std::thread::spawn(move || {
+                idle.get(t0, None, Some(Duration::from_secs(10)), || panic!("one load"))
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        release.send(()).expect("release");
+        assert!(matches!(loader.join().expect("loader"), Got::Ready(_, true)));
+        assert!(matches!(patient.join().expect("patient"), Got::Ready(_, false)));
+    }
+
+    #[test]
+    fn a_loader_that_panics_does_not_strand_the_slot() {
+        let idle: Idle<String> = Idle::new(WINDOW);
+        let t0 = Instant::now();
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            idle.get(t0, None, None, || panic!("load blew up"))
+        }));
+        assert!(crashed.is_err());
+        assert!(matches!(
+            idle.get(t0, None, Some(Duration::from_millis(10)), || Ok("model".to_string())),
+            Got::Ready(_, true)
+        ));
+    }
+
     #[test]
     fn an_idle_model_is_dropped_and_the_next_call_reloads_it() {
         let idle: Idle<String> = Idle::new(WINDOW);
@@ -490,13 +734,13 @@ mod tests {
             Ok("model".to_string())
         };
 
-        let (model, fresh) = idle.get(t0, load).expect("load");
+        let (model, fresh) = get(&idle, t0, load).expect("load");
         assert!(fresh && idle.is_loaded());
         let weak = Arc::downgrade(&model);
         drop(model);
 
         // Inside the window: kept, not reloaded, and the clock restarts.
-        let (_, fresh) = idle.get(t0 + Duration::from_secs(60), load).expect("warm");
+        let (_, fresh) = get(&idle, t0 + Duration::from_secs(60), load).expect("warm");
         assert!(!fresh && loads.get() == 1);
         assert_eq!(idle.release_if_idle(t0 + Duration::from_secs(100)), Some(Duration::from_secs(50)));
         assert!(idle.is_loaded() && weak.strong_count() == 1);
@@ -506,7 +750,7 @@ mod tests {
         assert!(!idle.is_loaded());
         assert_eq!(weak.strong_count(), 0);
 
-        let (_, fresh) = idle.get(t0 + Duration::from_secs(151), load).expect("reload");
+        let (_, fresh) = get(&idle, t0 + Duration::from_secs(151), load).expect("reload");
         assert!(fresh && loads.get() == 2 && idle.is_loaded());
     }
 
@@ -514,7 +758,7 @@ mod tests {
     fn a_release_leaves_a_search_in_progress_its_model() {
         let idle: Idle<String> = Idle::new(WINDOW);
         let t0 = Instant::now();
-        let (held, _) = idle.get(t0, || Ok("model".to_string())).expect("load");
+        let (held, _) = get(&idle, t0, || Ok("model".to_string())).expect("load");
         assert_eq!(idle.release_if_idle(t0 + WINDOW), None);
         assert!(!idle.is_loaded());
         assert_eq!(*held, "model");
@@ -522,11 +766,11 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_load_is_remembered_rather_than_retried() {
+    fn a_failed_load_is_remembered_inside_the_retry_window() {
         let idle: Idle<String> = Idle::new(WINDOW);
         let t0 = Instant::now();
-        assert_eq!(idle.get(t0, || Err("no model".to_string())).err().as_deref(), Some("no model"));
-        let again = idle.get(t0, || panic!("must not retry"));
+        assert_eq!(get(&idle, t0, || Err("no model".to_string())).err().as_deref(), Some("no model"));
+        let again = get(&idle, t0, || panic!("must not retry"));
         assert_eq!(again.err().as_deref(), Some("no model"));
         assert!(!idle.is_loaded());
     }
@@ -535,7 +779,7 @@ mod tests {
     fn touching_a_held_value_restarts_its_idle_clock() {
         let idle: Idle<String> = Idle::new(WINDOW);
         let t0 = Instant::now();
-        idle.get(t0, || Ok("model".to_string())).expect("load");
+        get(&idle, t0, || Ok("model".to_string())).expect("load");
         // A load that took 80 s is not 80 s of the window already spent.
         idle.touch(t0 + Duration::from_secs(80));
         assert_eq!(

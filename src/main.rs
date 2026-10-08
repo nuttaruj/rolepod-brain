@@ -15,6 +15,8 @@ mod embed;
 mod event;
 mod history;
 mod hook;
+#[cfg(unix)]
+mod hub;
 mod ids;
 mod ingest;
 mod inject;
@@ -37,7 +39,6 @@ mod sync;
 mod team;
 mod summarizer;
 
-use std::io::Write;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -209,6 +210,13 @@ enum Commands {
         /// What it should say instead.
         text: String,
     },
+    /// The shared reranker one brain process starts for the others.
+    #[cfg(unix)]
+    #[command(hide = true)]
+    Hub {
+        #[command(subcommand)]
+        action: hub::HubAction,
+    },
     /// Show where this directory's memory lives.
     Where {
         /// Print only where the embedding model belongs, and nothing else.
@@ -277,25 +285,16 @@ fn run_hook(agent: &str, event: &str) {
     }
 }
 
-/// Record a capture failure where `brain doctor` will find it. Best-effort by
-/// design: if even this fails there is nothing useful left to do.
 fn log_capture_failure(agent: &str, event: &str, error: &anyhow::Error) {
-    let Ok(paths) = Paths::resolve() else { return };
-    if std::fs::create_dir_all(&paths.data_dir).is_err() {
-        return;
-    }
-    let line = format!("{} {agent} {event}: {error:#}\n", jiff::Timestamp::now());
-    if let Ok(mut file) =
-        std::fs::OpenOptions::new().create(true).append(true).open(paths.log_file())
-    {
-        let _ = file.write_all(line.as_bytes());
-    }
+    hook::log_failure(agent, event, error);
 }
 
 fn run(command: Commands) -> Result<()> {
     match command {
         Commands::Hook { .. } => unreachable!("handled in main"),
         Commands::Mcp => mcp::serve(),
+        #[cfg(unix)]
+        Commands::Hub { action } => hub::run(action),
         Commands::Consolidate { session, all, force, idle } => {
             let began = jiff::Timestamp::now();
             let started = std::time::Instant::now();
@@ -735,7 +734,7 @@ fn search(query: &str, limit: usize, topic: Option<&str>, rerank: Option<bool>, 
         let cli = store.project_cli(&project)?.unwrap_or_default();
         let model_dir = paths.model_dir_for(rerank::LOCAL_MODEL);
         let reranked_over = hits.len();
-        let (reranked, outcome) = rerank::rerank(&ladder, &cli, query, &model_dir, hits);
+        let (reranked, outcome) = rerank::rerank(&ladder, &cli, query, &model_dir, hits, config.hub.enabled().then_some(&paths));
         hits = reranked;
         let _ = store.record_rerank(outcome.engine, outcome.reason, outcome.ms, outcome.cold);
         let why = if outcome.reason.is_empty() { String::new() } else { format!(" ({})", outcome.reason) };

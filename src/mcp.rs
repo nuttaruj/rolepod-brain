@@ -82,7 +82,10 @@ pub fn serve() -> Result<()> {
                 let ready = crate::rerank::local_is_ready(
                     &paths.model_dir_for(crate::rerank::LOCAL_MODEL),
                 );
-                success(id, json!({ "tools": tool_definitions(ready) }))
+                let hub = crate::config::Config::load(&paths.config_file())
+                    .map(|config| config.hub.enabled())
+                    .unwrap_or(false);
+                success(id, json!({ "tools": tool_definitions(ready, hub) }))
             }
             "tools/call" => match call_tool(&paths, &project, &session, client, &params) {
                 Ok(result) => success(id, result),
@@ -161,11 +164,20 @@ fn initialize_result() -> Value {
 /// leaves an agent either skipping a rerank it could have had for free, or
 /// asking for one that costs a session's worth of patience. So the price on
 /// the label is the price this machine charges.
-fn tool_definitions(local_rerank: bool) -> Value {
+///
+/// `hub` says the shared reranker is switched on: with the model ready, a
+/// rerank is answered there and a busy or starting hub leaves the order as it
+/// was, so the label promises no more than that.
+fn tool_definitions(local_rerank: bool, hub: bool) -> Value {
     // Read once here rather than inside the macro: `json!` would otherwise
     // have to carry the branch, and the two strings are easier to compare
     // sitting next to each other.
-    let rerank_cost = if local_rerank {
+    let rerank_cost = if local_rerank && hub {
+        "Runs on this machine through one shared model - no subscription \
+         spent, nothing sent anywhere - usually in under two seconds. If \
+         that model is busy or starting the order comes back unchanged, and \
+         `rerank.reason` says why."
+    } else if local_rerank {
         "Runs on this machine in under two seconds - no subscription spent, \
          nothing sent anywhere - so ask for it whenever the first ordering \
          looks off."
@@ -511,6 +523,7 @@ fn call_tool(
             // The relevance floor applies only when this page is final: a
             // pool headed for the reranker stays wide for it to judge. If the
             // reranker then falls back to "none", that page goes out unfloored.
+            let mut rerank_note: Option<Value> = None;
             let (mut hits, _) =
                 store.search_traced(project, query, topic, pool, crate::store::Recall::Fused, !rerank)?;
 
@@ -534,16 +547,24 @@ fn call_tool(
                 // project's most recent CLI as before.
                 let cli = rerank_cli(client, || store.project_cli(project))?;
                 let model_dir = paths.model_dir_for(crate::rerank::LOCAL_MODEL);
+                let hub = config.hub.enabled().then_some(paths);
                 let (reranked, outcome) =
-                    crate::rerank::rerank(&ladder, &cli, query, &model_dir, hits);
+                    crate::rerank::rerank(&ladder, &cli, query, &model_dir, hits, hub);
                 hits = reranked;
                 // Telemetry, never a reason to fail the search.
                 let _ = store.record_rerank(outcome.engine, outcome.reason, outcome.ms, outcome.cold);
+                if hub.is_some() {
+                    rerank_note = Some(json!({ "engine": outcome.engine, "reason": outcome.reason }));
+                }
             }
             hits.truncate(limit);
 
             ledger(paths, &store, session, Ledger::Recalled, hits.iter().map(|hit| hit.id.as_str()));
-            json!({ "hits": hits, "count": hits.len() })
+            let mut payload = json!({ "hits": hits, "count": hits.len() });
+            if let Some(note) = rerank_note {
+                payload["rerank"] = note;
+            }
+            payload
         }
         "brain_get" => {
             let ids: Vec<String> = arguments
@@ -893,7 +914,7 @@ mod tests {
         // Both machines, because the list is worded per machine and a broken
         // schema on the rarer one is still a broken schema.
         for local_rerank in [false, true] {
-            let tools = tool_definitions(local_rerank);
+            let tools = tool_definitions(local_rerank, false);
             let tools = tools.as_array().unwrap();
             assert_eq!(tools.len(), 11, "a tool was added or lost");
             for tool in tools {
@@ -910,7 +931,7 @@ mod tests {
     #[test]
     fn the_tool_list_stays_under_its_size_ceiling() {
         for local_rerank in [false, true] {
-            let size = serde_json::to_string(&tool_definitions(local_rerank)).unwrap().len();
+            let size = serde_json::to_string(&tool_definitions(local_rerank, false)).unwrap().len();
             assert!(size <= 7_500, "tools/list is {size} B (local_rerank={local_rerank})");
         }
     }
@@ -919,7 +940,7 @@ mod tests {
     /// memory unprompted, nor leave the download looking like a per-call cost.
     #[test]
     fn trimmed_descriptions_keep_their_load_bearing_clauses() {
-        let tools = tool_definitions(false);
+        let tools = tool_definitions(false, false);
         let correct = tools
             .as_array()
             .unwrap()
@@ -936,6 +957,21 @@ mod tests {
         assert!(slow.contains("first one also starts"), "download reads as per-call");
     }
 
+    /// With the hub on, the rerank flag says the order may come back
+    /// unchanged and where to read why; with it off it does not.
+    #[test]
+    fn the_rerank_flag_names_the_hub_only_when_it_is_on() {
+        let flag = |hub| {
+            tool_definitions(true, hub)[0]["inputSchema"]["properties"]["rerank"]["description"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_ne!(flag(true), flag(false));
+        assert!(flag(true).contains("rerank.reason"));
+        assert!(!flag(false).contains("rerank.reason"));
+    }
+
     /// The point of wording the list per machine is the number in it.
     ///
     /// Asserted on the substance rather than the sentence: a machine with the
@@ -944,7 +980,7 @@ mod tests {
     #[test]
     fn the_rerank_flag_quotes_this_machine_s_price() {
         let cost = |local_rerank| {
-            tool_definitions(local_rerank)[0]["inputSchema"]["properties"]["rerank"]
+            tool_definitions(local_rerank, false)[0]["inputSchema"]["properties"]["rerank"]
                 ["description"]
                 .as_str()
                 .expect("rerank description")

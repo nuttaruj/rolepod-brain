@@ -1,8 +1,8 @@
 [package]
 name = "rolepod-brain"
-version = "0.67.0"
+version = "0.68.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "MIT"
 description = "Install-and-forget memory for AI coding agents. No resident process."
 repository = "https://github.com/nuttaruj/rolepod-brain"

@@ -91,13 +91,18 @@ pub fn run() -> Result<Vec<Check>> {
     checks.extend(summarizer_checks(&paths));
     checks.push(semantic_check(&paths));
     checks.push(retention_check(&paths));
-    let space = Store::open(&paths.db()).ok().and_then(|store| crate::maint::status(&paths, &store).ok());
+    let store = Store::open(&paths.db()).ok();
+    let space = store.as_ref().and_then(|store| crate::maint::status(&paths, store).ok());
     checks.extend(space.map(|status| space_check(&status)));
     checks.push(reranker_check(&paths));
+    checks.push(hub_check(&paths));
+    if let Some(store) = &store {
+        checks.extend(hub_answers_check(&store.rerank_runs().unwrap_or_default()));
+    }
     checks.extend(hook_checks());
     checks.extend(trigger_checks());
     checks.push(timer_check());
-    checks.push(resident_check());
+    checks.push(resident_check(&paths));
     checks.push(sync_check(&paths));
     checks.push(team_check(&paths));
     checks.push(wiki_check(&paths));
@@ -305,6 +310,84 @@ fn reranker_check(paths: &Paths) -> Check {
         "reranker",
         "not fetched yet - the first rerank asks the CLI and starts the download",
     )
+}
+
+/// The shared rerank hub: whether it is wanted, whether it is up, and what
+/// it holds. Information only - the hub starts itself with the next reranked
+/// search and leaves when idle, so nothing here asks for a command.
+#[cfg(not(unix))]
+fn hub_check(_paths: &Paths) -> Check {
+    Check::pass("hub", "off - not available on this platform")
+}
+
+#[cfg(unix)]
+fn hub_check(paths: &Paths) -> Check {
+    use crate::hub::client;
+    if client::mode(paths) == client::HubMode::Off {
+        return Check::pass("hub", "off - each session reranks in its own process");
+    }
+    if let Some(hub) = client::status(paths) {
+        let mb = |kb: u64| kb / 1024;
+        let footprint = hub.footprint_kb.map_or_else(|| "unknown".to_string(), |kb| format!("{} MB", mb(kb)));
+        let mut detail = format!(
+            "pid {} · build {} · up {} · footprint {footprint} · {} session(s) in 10 min · model {} · {} restart(s)/24h",
+            hub.pid,
+            crate::hub::printable(&hub.build),
+            uptime_label(hub.uptime_ms / 1000),
+            hub.sessions,
+            if hub.model_loaded { "loaded" } else { "not loaded" },
+            client::deaths_within(paths, 24 * 3600 * 1000),
+        );
+        if hub.retiring {
+            detail.push_str(" · retiring for a newer build");
+        }
+        return Check::pass("hub", detail);
+    }
+    if let Some(left) = client::lockout_remaining(paths) {
+        return Check::pass(
+            "hub",
+            format!(
+                "not running - it died repeatedly, so it is not restarted for {}s; searches keep index order meanwhile",
+                left.as_secs()
+            ),
+        );
+    }
+    Check::pass("hub", "not running - starts with the next reranked search, leaves when idle")
+}
+
+#[cfg(unix)]
+fn uptime_label(secs: u64) -> String {
+    match secs {
+        0..=119 => format!("{secs}s"),
+        120..=7199 => format!("{}m", secs / 60),
+        _ => format!("{}h", secs / 3600),
+    }
+}
+
+/// Warn when most of the latest reranks got no answer from the hub. Silent
+/// otherwise, and silent on too few runs to say.
+fn hub_answers_check(runs: &[crate::store::RerankRun]) -> Option<Check> {
+    let last = &runs[runs.len().saturating_sub(20)..];
+    let missed: Vec<&str> = last.iter().map(|run| run.reason.as_str()).filter(|r| r.starts_with(crate::hub::reason::PREFIX)).collect();
+    if last.len() < 4 || missed.len() * 2 <= last.len() {
+        return None;
+    }
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for reason in missed.iter().copied() {
+        match counts.iter_mut().find(|(seen, _)| *seen == reason) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((reason, 1)),
+        }
+    }
+    let by_reason = counts.iter().map(|(r, n)| format!("{r} x{n}")).collect::<Vec<_>>().join(", ");
+    Some(Check::pass(
+        "hub answers",
+        format!(
+            "warn: {} of the last {} reranks got no answer from the hub ({by_reason}) - those searches kept index order",
+            missed.len(),
+            last.len()
+        ),
+    ))
 }
 
 /// Automatic retention: the window, when a pass last finished, how many bodies
@@ -883,25 +966,33 @@ fn timer_check() -> Check {
 /// the honest line is the count and what those processes are.
 ///
 /// This check runs inside a `brain` process, so it must not count itself.
-fn resident_check() -> Check {
+fn resident_check(paths: &Paths) -> Check {
     let Some(running) = running_brains() else {
         return Check::fail("processes", "could not list processes");
     };
     let me = std::process::id();
-    let stray: Vec<String> =
-        running.into_iter().filter(|pid| *pid != me).map(|pid| format!("pid {pid}")).collect();
+    // The hub is one of these processes too; the lock names it.
+    let hub = std::fs::read_to_string(paths.data_dir.join(crate::hub::endpoint::LOCK_FILE))
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok())
+        .filter(|pid| running.contains(pid));
+    let stray: Vec<String> = running
+        .into_iter()
+        .filter(|pid| *pid != me && Some(*pid) != hub)
+        .map(|pid| format!("pid {pid}"))
+        .collect();
 
-    if stray.is_empty() {
+    let mut parts = Vec::new();
+    if let Some(pid) = hub {
+        parts.push(format!("1 hub (pid {pid})"));
+    }
+    if !stray.is_empty() {
+        parts.push(format!("{} MCP server(s), one per open session — {}", stray.len(), stray.join(", ")));
+    }
+    if parts.is_empty() {
         Check::pass("processes", "none running")
     } else {
-        Check::pass(
-            "processes",
-            format!(
-                "{} MCP server(s), one per open session — {}",
-                stray.len(),
-                stray.join(", ")
-            ),
-        )
+        Check::pass("processes", parts.join("; "))
     }
 }
 
@@ -1028,8 +1119,8 @@ fn wiki_check(paths: &Paths) -> Check {
         return Check::fail("wiki", format!("{} could not be read", wiki.display()));
     };
     let detail = format!(
-        "{} page(s), {} unresolved link(s), {} orphan(s) - old-style links are relinked automatically; {} left are not old-style links",
-        lint.pages, lint.unresolved, lint.orphans, lint.unresolved
+        "{} page(s), {} unresolved link(s), {} orphan(s) - old-style links are relinked automatically",
+        lint.pages, lint.unresolved, lint.orphans
     );
     if lint.unresolved == 0 && lint.orphans == 0 {
         Check::pass("wiki", format!("{} page(s), every link resolves, every page reachable", lint.pages))
@@ -1107,6 +1198,20 @@ mod tests {
             overdue,
             skip: skip.map(str::to_string),
         })
+    }
+
+    #[test]
+    fn the_wiki_row_says_the_unresolved_count_once() {
+        let dir = std::env::temp_dir().join(format!("brain-doctor-wiki-{}", ulid::Ulid::new()));
+        let paths = Paths { data_dir: dir.clone() };
+        let wiki = paths.wiki();
+        std::fs::create_dir_all(wiki.join("proj")).unwrap();
+        std::fs::write(wiki.join("proj/a.md"), "see [[nowhere]]\n").unwrap();
+        let check = wiki_check(&paths);
+        assert!(check.detail.contains("unresolved link(s)"), "{}", check.detail);
+        assert!(!check.detail.contains("old-style links;"), "{}", check.detail);
+        assert!(!check.detail.contains("left are not"), "{}", check.detail);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

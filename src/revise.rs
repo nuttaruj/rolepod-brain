@@ -287,7 +287,20 @@ pub fn retire(months: u32, apply: bool) -> Result<Retirement> {
 fn context() -> Result<(Paths, Store, ids::ProjectScope)> {
     let paths = Paths::resolve()?;
     paths.ensure()?;
-    let store = Store::open(&paths.db())?;
+    // While a compact window holds the database a revision does not wait it
+    // out: it says so at once, and writes nothing to `brain.log`. The probe
+    // takes the write lock (a delete of a key that is never there) so that a
+    // held lock is met here, before a tombstone reaches the event log.
+    let store = if crate::maint::active(&paths) {
+        let held = || {
+            anyhow::anyhow!("the compact window is open and holds the store; try again in under a minute")
+        };
+        let store = Store::open_waiting(&paths.db(), crate::maint::FAIL_FAST).map_err(|_| held())?;
+        store.clear_state("revise.window_probe").map_err(|_| held())?;
+        store
+    } else {
+        Store::open(&paths.db())?
+    };
     let scope = ids::resolve_scope(&std::env::current_dir().unwrap_or_default());
     Ok((paths, store, scope))
 }

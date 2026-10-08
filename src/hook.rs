@@ -97,6 +97,41 @@ fn drain_stdin(should: bool) {
 /// Returns an error only for conditions the caller should log; the caller is
 /// responsible for still exiting 0.
 pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Result<String> {
+    // An index failure outside a compact window must not cost the host its
+    // answer (the primer in particular), but it is still a failure to see in
+    // `brain.log`, on the line it always had.
+    let mut deferred = None;
+    let answer = capture_answering(cli, event_name, stdin_payload, &mut deferred);
+    if let Some(error) = deferred {
+        log_failure(cli, event_name, &error);
+    }
+    answer
+}
+
+/// Record a capture failure where `brain doctor` will find it. Best-effort by
+/// design: if even this fails there is nothing useful left to do.
+pub fn log_failure(agent: &str, event: &str, error: &anyhow::Error) {
+    use std::io::Write;
+    let Ok(paths) = Paths::resolve() else { return };
+    if std::fs::create_dir_all(&paths.data_dir).is_err() {
+        return;
+    }
+    let line = format!("{} {agent} {event}: {error:#}\n", jiff::Timestamp::now());
+    if let Ok(mut file) =
+        std::fs::OpenOptions::new().create(true).append(true).open(paths.log_file())
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+/// [`capture`]'s body. A store failure that does not stop the answer goes in
+/// `deferred` for the caller to log.
+fn capture_answering(
+    cli: &str,
+    event_name: &str,
+    stdin_payload: Option<String>,
+    deferred: &mut Option<anyhow::Error>,
+) -> Result<String> {
     // Our own subprocess: acknowledge the host and capture nothing.
     if is_worker_child() {
         drain_stdin(stdin_payload.is_none());
@@ -309,7 +344,13 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
     let store = if fast {
         match Store::open_waiting(&paths.db(), maint::FAIL_FAST) {
             Ok(store) => store,
-            Err(_) => return Ok("{}".to_string()),
+            Err(_) => {
+                // No store to reset: the wipe waits as a file, as any other.
+                if wipes_context(&hook, &payload) {
+                    maint::pending_wipe(&paths, &session_key);
+                }
+                return Ok("{}".to_string());
+            }
         }
     } else {
         Store::open(&paths.db())?
@@ -333,9 +374,7 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
         failed = failed.or(indexed.err());
     }
     if !fast {
-        if let Some(err) = failed {
-            return Err(err);
-        }
+        *deferred = failed;
     }
 
     if delegate.is_some() {
@@ -358,6 +397,9 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
     // A wipe the store could not take is not lost: it waits as a file for the
     // next hook of this session that can write, which applies it here too.
     let wipe_waiting = maint::wipe_pending(&paths, &session_key);
+    // A wipe that is still owed leaves the store's dedupe state as it was
+    // before the wipe; the primer must not treat it as the agent's memory.
+    let mut fresh = false;
     if wipes_context(&hook, &payload) || wipe_waiting {
         let reset = if skip {
             Err(anyhow::anyhow!("the store is held"))
@@ -370,6 +412,7 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
             }
         } else {
             skip = true;
+            fresh = true;
             maint::pending_wipe(&paths, &session_key);
         }
     }
@@ -381,7 +424,7 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
         || store.has_stale_backlog(STALE_BACKLOG_SECS).unwrap_or(false),
         || !skip && claim_idle_sweep_window(&store, jiff::Timestamp::now()),
     );
-    let spill = Spill { paths: &paths, session: &session_key, skip };
+    let spill = Spill { paths: &paths, session: &session_key, skip, fresh };
     match summoned.run {
         Some(Run::Session) => spawn_consolidation(Some(&session_key)),
         Some(Run::All) => spawn_consolidation(None),
@@ -415,6 +458,8 @@ struct Spill<'a> {
     paths: &'a Paths,
     session: &'a str,
     skip: bool,
+    /// The session's dedupe state is stale (a wipe is owed): read it as empty.
+    fresh: bool,
 }
 
 /// Is this Cursor's own session, echoed to us through Claude Code's hooks?
@@ -493,7 +538,7 @@ fn inject_for(
         // too, as a `session_start` whose source says `compact` - see
         // `wipes_context`, which explains why `post_compact` is not a second
         // route into this arm.
-        "session_start" => inject::primer(store, &project, session, &config.injection).ok(),
+        "session_start" => inject::primer(store, &project, session, &config.injection, spill.fresh).ok(),
         // Both sides of a tool call reach the same file injection, and the
         // first one to arrive wins: `pre_tool_use` for a `Read`, where memory
         // still has time to change what the turn does, and `post_tool_use` for
@@ -560,7 +605,7 @@ fn deliver(
         )
     };
     if recorded.is_err() {
-        maint::spill_surfaced(spill.paths, session, Ledger::Injected, &injection.ids);
+        maint::spill_injected(spill.paths, session, &injection.ids, injection.text.len());
     }
     // Another hook of the same session spent the budget between our read of
     // it and this write. A failed write still injects, as it always has.
@@ -2105,7 +2150,7 @@ mod tests {
 
     fn prompt_hook(store: &Store, config: &Config, prompt: &str) -> String {
         let paths = Paths { data_dir: std::env::temp_dir().join("rolepod-brain-hook-unit") };
-        inject_for_prompt(store, config, &scope(), "s1", "UserPromptSubmit", prompt, &Spill { paths: &paths, session: "s1", skip: false })
+        inject_for_prompt(store, config, &scope(), "s1", "UserPromptSubmit", prompt, &Spill { paths: &paths, session: "s1", skip: false, fresh: false })
     }
 
     fn on() -> Config {

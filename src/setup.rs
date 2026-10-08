@@ -956,6 +956,12 @@ const CONFIG_TEMPLATE: &str = r#"# rolepod-brain configuration.
 # call leaves the order exactly as the index ranked it.
 # rerank = false
 
+[hub]
+# One shared reranker process serves every session instead of each loading
+# the model. "off" gives each session its own. ROLEPOD_BRAIN_HUB=off beats
+# this file.
+# mode = "on"
+
 [sanitize]
 # Your own redaction on top of the built-in credential patterns. Anything an
 # extra pattern matches becomes [REDACTED] before it is written anywhere:
@@ -2338,12 +2344,14 @@ mod tests {
         assert_eq!(parsed.injection.primer_budget, defaults.injection.primer_budget);
         assert_eq!(parsed.injection.session_budget, defaults.injection.session_budget);
         assert_eq!(parsed.search.rerank, defaults.search.rerank);
+        assert_eq!(parsed.hub.enabled(), defaults.hub.enabled());
         assert!(parsed.summarizer.models.is_empty());
 
         // Every knob uncommented with a NON-default value must actually move
         // the field it claims to control.
         let live = CONFIG_TEMPLATE
             .replace("# mode = \"auto\"", "mode = \"off\"")
+            .replace("# mode = \"on\"", "mode = \"off\"")
             .replace("# \"claude-code\" = \"sonnet\"", "\"claude-code\" = \"sonnet\"")
             .replace("# primer_budget = 4096", "primer_budget = 1")
             .replace("# session_budget = 8192", "session_budget = 2")
@@ -2357,6 +2365,8 @@ mod tests {
         assert_eq!(parsed.injection.primer_budget, 1);
         assert_eq!(parsed.injection.session_budget, 2);
         assert!(parsed.search.rerank);
+        assert_eq!(parsed.hub.mode, "off");
+        assert!(!parsed.hub.enabled());
         assert_eq!(parsed.sanitize.extra_patterns, vec!["secret-\\d+".to_string()]);
         assert_eq!(parsed.sanitize.allowlist, vec!["not-a-secret".to_string()]);
     }

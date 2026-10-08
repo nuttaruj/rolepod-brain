@@ -57,9 +57,18 @@ impl Injection {
 
 /// Build the session-start primer.
 ///
+/// `fresh` reads the session's injected-state as empty: a context wipe whose
+/// reset has not reached the store yet.
+///
 /// # Errors
 /// Returns an error when the index cannot be queried.
-pub fn primer(store: &Store, project: &str, session: &str, config: &InjectionConfig) -> Result<Injection> {
+pub fn primer(
+    store: &Store,
+    project: &str,
+    session: &str,
+    config: &InjectionConfig,
+    fresh: bool,
+) -> Result<Injection> {
     // `for_file` reads this too, so both writers honour the ceiling. A context wipe
     // resets the count to zero, but a plain re-entry to session_start -
     // Claude Code's own "resume" source is one - keeps the session id and the
@@ -67,7 +76,7 @@ pub fn primer(store: &Store, project: &str, session: &str, config: &InjectionCon
     // primer_budget on top of whatever earlier calls had already spent. It is
     // read first because a spent session gets nothing, and the queries below
     // cost seconds cold; `record_injected` still enforces the cap atomically.
-    let spent = store.session_injected_bytes(session)?;
+    let spent = if fresh { 0 } else { store.session_injected_bytes(session)? };
     if spent >= config.session_budget {
         return Ok(Injection::default());
     }
@@ -176,7 +185,7 @@ pub fn primer(store: &Store, project: &str, session: &str, config: &InjectionCon
             // spending budget on again - the same guard `for_file` applies to
             // every id it injects. Without it, a resume's primer is a verbatim
             // repeat of the first one rather than what changed since.
-            if store.already_injected(session, &pointer.id)? {
+            if !fresh && store.already_injected(session, &pointer.id)? {
                 continue;
             }
             let line = render_line(pointer);
@@ -577,7 +586,7 @@ mod tests {
         let store = store_with(project, 3);
         let config = InjectionConfig::default();
 
-        let opening = primer(&store, &project.to_string(), "s1", &config).unwrap();
+        let opening = primer(&store, &project.to_string(), "s1", &config, false).unwrap();
         assert!(opening.text.contains("not instructions"), "primer has no fence: {}", opening.text);
 
         let file = for_file(
@@ -652,7 +661,7 @@ mod tests {
         assert!(store.record_injected("s1", &[], 0, config.session_budget, config.session_budget).unwrap());
         store.execute_batch_for_test("DROP TABLE events").unwrap();
 
-        let opening = primer(&store, &project.to_string(), "s1", &config).unwrap();
+        let opening = primer(&store, &project.to_string(), "s1", &config, false).unwrap();
         assert!(opening.is_empty(), "a spent session was handed a primer: {}", opening.text);
     }
 
@@ -693,7 +702,7 @@ mod tests {
         store.index(&lesson).unwrap();
 
         let config = InjectionConfig { primer_budget: SMALL_BUDGET, session_budget: 8192, ..InjectionConfig::default() };
-        let injection = primer(&store, &project.to_string(), "squeeze", &config).unwrap();
+        let injection = primer(&store, &project.to_string(), "squeeze", &config, false).unwrap();
         let knw = injection.text.find("KNW  Test only against an isolated HOME");
         let sum = injection.text.find("SUM  ");
         let knw = knw.expect("the lesson must survive a squeezed budget");
@@ -724,7 +733,7 @@ mod tests {
         store.index(&inflight).unwrap();
 
         let config = InjectionConfig { primer_budget: SMALL_BUDGET, session_budget: 8192, ..InjectionConfig::default() };
-        let injection = primer(&store, &project.to_string(), "s", &config).unwrap();
+        let injection = primer(&store, &project.to_string(), "s", &config, false).unwrap();
         assert!(
             injection.text.contains(&inflight.id),
             "a share smaller than a line emptied the layer:\n{}",
@@ -773,7 +782,7 @@ mod tests {
         }
 
         let config = InjectionConfig { primer_budget: 4096, session_budget: 8192, ..InjectionConfig::default() };
-        let injection = primer(&store, &project.to_string(), "s", &config).unwrap();
+        let injection = primer(&store, &project.to_string(), "s", &config, false).unwrap();
         let summaries = injection.text.matches("01SUM").count();
         assert!(
             summaries >= 4,
@@ -827,7 +836,7 @@ mod tests {
         store.index(&inflight).unwrap();
 
         let config = InjectionConfig { primer_budget: SMALL_BUDGET, session_budget: 8192, ..InjectionConfig::default() };
-        let injection = primer(&store, &project.to_string(), "next", &config).unwrap();
+        let injection = primer(&store, &project.to_string(), "next", &config, false).unwrap();
         assert!(
             injection.text.contains(&inflight.id),
             "the work still in flight did not survive the budget:\n{}",
@@ -867,7 +876,7 @@ mod tests {
         }
 
         let injection =
-            primer(&store, &project.to_string(), "next", &InjectionConfig::default()).unwrap();
+            primer(&store, &project.to_string(), "next", &InjectionConfig::default(), false).unwrap();
         let raw: Vec<&str> = injection.text.lines().filter(|line| line.contains("  raw  ")).collect();
         assert_eq!(raw.len(), 1, "one line per session:\n{}", injection.text);
         assert!(raw[0].starts_with(&newest), "keyed by the newest capture: {}", raw[0]);
@@ -895,7 +904,7 @@ mod tests {
         store.index(&event).unwrap();
 
         let injection =
-            primer(&store, &project.to_string(), &me.to_string(), &InjectionConfig::default())
+            primer(&store, &project.to_string(), &me.to_string(), &InjectionConfig::default(), false)
                 .unwrap();
         assert!(
             injection.text.contains("this session's own 1 capture(s)"),
@@ -938,7 +947,7 @@ mod tests {
         store.index(&note).unwrap();
 
         let injection =
-            primer(&store, &project.to_string(), "next", &InjectionConfig::default()).unwrap();
+            primer(&store, &project.to_string(), "next", &InjectionConfig::default(), false).unwrap();
         assert!(injection.text.contains("NTE  Trailing commas"), "{}", injection.text);
         assert!(!injection.text.contains("Edited src/parser.rs"), "{}", injection.text);
         assert!(!injection.text.contains("  raw  "), "a summarized session is not in flight");
@@ -949,7 +958,7 @@ mod tests {
         let project = Uuid::new_v4();
         let store = store_with(project, 200);
         let config = InjectionConfig { primer_budget: SMALL_BUDGET, session_budget: 8192, ..InjectionConfig::default() };
-        let injection = primer(&store, &project.to_string(), "s1", &config).unwrap();
+        let injection = primer(&store, &project.to_string(), "s1", &config, false).unwrap();
         assert!(!injection.is_empty());
         assert!(
             injection.text.len() <= config.primer_budget,
@@ -964,7 +973,7 @@ mod tests {
         let project = Uuid::new_v4();
         let store = store_with(project, 200);
         let config = InjectionConfig { primer_budget: 700, session_budget: 8192, ..InjectionConfig::default() };
-        let injection = primer(&store, &project.to_string(), "s1", &config).unwrap();
+        let injection = primer(&store, &project.to_string(), "s1", &config, false).unwrap();
         for line in injection.text.lines().filter(|line| line.starts_with("01TEST")) {
             assert!(line.len() > 30, "a pointer line was clipped: {line:?}");
             assert_eq!(
@@ -980,7 +989,7 @@ mod tests {
         let project = Uuid::new_v4();
         let store = store_with(project, 20);
         let config = InjectionConfig::default();
-        let injection = primer(&store, &project.to_string(), "s1", &config).unwrap();
+        let injection = primer(&store, &project.to_string(), "s1", &config, false).unwrap();
         assert!(
             !injection.text.contains("body that must never be injected"),
             "full-content auto-injection must be 0"
@@ -990,7 +999,7 @@ mod tests {
     #[test]
     fn an_empty_project_injects_nothing_at_all() {
         let store = Store::open_memory().unwrap();
-        let injection = primer(&store, &Uuid::new_v4().to_string(), "s1", &InjectionConfig::default())
+        let injection = primer(&store, &Uuid::new_v4().to_string(), "s1", &InjectionConfig::default(), false)
             .unwrap();
         assert!(injection.is_empty());
         assert_eq!(as_hook_output("SessionStart", &injection), "{}");
@@ -1059,16 +1068,16 @@ mod tests {
         let config = InjectionConfig { primer_budget: 4096, session_budget: 8192, ..InjectionConfig::default() };
         let session = "resumed-session";
 
-        let first = primer(&store, &project.to_string(), session, &config).unwrap();
+        let first = primer(&store, &project.to_string(), session, &config, false).unwrap();
         assert!(!first.is_empty());
         store.record_injected(session, &first.ids, first.in_flight, first.text.len(), config.session_budget).unwrap();
 
         // SessionStart fires again with source="resume": same session id, no
         // context wipe, so nothing resets injected_bytes.
-        let second = primer(&store, &project.to_string(), session, &config).unwrap();
+        let second = primer(&store, &project.to_string(), session, &config, false).unwrap();
         store.record_injected(session, &second.ids, second.in_flight, second.text.len(), config.session_budget).unwrap();
 
-        let third = primer(&store, &project.to_string(), session, &config).unwrap();
+        let third = primer(&store, &project.to_string(), session, &config, false).unwrap();
 
         let total = first.text.len() + second.text.len() + third.text.len();
         assert!(
@@ -1091,7 +1100,7 @@ mod tests {
         let store = store_with(project, 200);
         // A misconfiguration: primer budget larger than the session cap.
         let config = InjectionConfig { primer_budget: 100_000, session_budget: 2048, ..InjectionConfig::default() };
-        let injection = primer(&store, &project.to_string(), "s1", &config).unwrap();
+        let injection = primer(&store, &project.to_string(), "s1", &config, false).unwrap();
         assert!(injection.text.len() <= config.session_budget);
     }
 
@@ -1290,7 +1299,7 @@ mod tests {
         store.index(&signal).unwrap();
 
         let injection =
-            primer(&store, &project.to_string(), "s1", &InjectionConfig::default()).unwrap();
+            primer(&store, &project.to_string(), "s1", &InjectionConfig::default(), false).unwrap();
         assert!(injection.text.contains("Chose spawn-on-demand"), "the signal was cut");
         assert!(!injection.text.contains("echo noise"), "noise was injected");
         assert_eq!(injection.ids.len(), 1, "only the earned line should appear");
@@ -1384,7 +1393,7 @@ mod tests {
         handoff_summary(&store, project, Uuid::new_v4(), "claude-code", "01HANDOFFNEWEST0000000000", 1, false);
         let reader = reader_in(&store, project, "claude-code");
 
-        let on = primer(&store, &project.to_string(), &reader.to_string(), &handoff_on()).unwrap();
+        let on = primer(&store, &project.to_string(), &reader.to_string(), &handoff_on(), false).unwrap();
         let at = on.text.find("01HANDOFFNEWEST0000000000").expect("handoff line missing");
         let knowledge = on.text[PRIMER_HEADER.len()..].find("KNW").map(|i| i + PRIMER_HEADER.len());
         let knowledge = knowledge.expect("fixture has knowledge");
@@ -1431,7 +1440,7 @@ mod tests {
         handoff_summary(&store, project, Uuid::new_v4(), "claude-code", "01HANDOFFNEWEST0000000000", 1, false);
         let reader = reader_in(&store, project, "claude-code");
 
-        let first = primer(&store, &project.to_string(), &reader.to_string(), &handoff_on()).unwrap();
+        let first = primer(&store, &project.to_string(), &reader.to_string(), &handoff_on(), false).unwrap();
         let flight = first.text.find("01HANDOFFINFLIGHT0000000").expect("in-flight line missing");
         let line = first.text.find("01HANDOFFNEWEST0000000000").expect("handoff line missing");
         let knowledge = first.text[PRIMER_HEADER.len()..].find("KNW").expect("fixture has knowledge") + PRIMER_HEADER.len();
@@ -1440,7 +1449,7 @@ mod tests {
         // Recorded as shown to this session (what the hook does), a resume or
         // compaction primer must not spend budget on it again.
         store.record_injected(&reader.to_string(), &first.ids, first.in_flight, first.text.len(), usize::MAX).unwrap();
-        let second = primer(&store, &project.to_string(), &reader.to_string(), &handoff_on()).unwrap();
+        let second = primer(&store, &project.to_string(), &reader.to_string(), &handoff_on(), false).unwrap();
         assert!(!second.text.contains("01HANDOFFNEWEST0000000000"), "repeated on resume:\n{}", second.text);
     }
 
@@ -1450,31 +1459,31 @@ mod tests {
         let store = Store::open_memory().unwrap();
         handoff_summary(&store, project, Uuid::new_v4(), "codex", "01HANDOFFCODEX00000000000", 1, false);
         let claude = reader_in(&store, project, "claude-code");
-        let other = primer(&store, &project.to_string(), &claude.to_string(), &handoff_on()).unwrap();
+        let other = primer(&store, &project.to_string(), &claude.to_string(), &handoff_on(), false).unwrap();
         assert!(other.text.contains("(codex)"), "{}", other.text);
 
         let codex = reader_in(&store, project, "codex");
-        let same = primer(&store, &project.to_string(), &codex.to_string(), &handoff_on()).unwrap();
+        let same = primer(&store, &project.to_string(), &codex.to_string(), &handoff_on(), false).unwrap();
         assert!(same.text.contains("01HANDOFFCODEX00000000000"), "{}", same.text);
         assert!(!same.text.contains("(codex)"), "same-CLI line was labelled:\n{}", same.text);
 
         let store = Store::open_memory().unwrap();
         handoff_summary(&store, project, Uuid::new_v4(), "brain", "01HANDOFFBRAIN00000000000", 1, false);
         let reader = reader_in(&store, project, "claude-code");
-        let brain = primer(&store, &project.to_string(), &reader.to_string(), &handoff_on()).unwrap();
+        let brain = primer(&store, &project.to_string(), &reader.to_string(), &handoff_on(), false).unwrap();
         assert!(!brain.text.contains("(brain)"), "{}", brain.text);
 
         let store = Store::open_memory().unwrap();
         handoff_summary(&store, project, Uuid::new_v4(), "mcp", "01HANDOFFMCP0000000000000", 1, false);
         let reader = reader_in(&store, project, "claude-code");
-        let mcp = primer(&store, &project.to_string(), &reader.to_string(), &handoff_on()).unwrap();
+        let mcp = primer(&store, &project.to_string(), &reader.to_string(), &handoff_on(), false).unwrap();
         assert!(mcp.text.contains("01HANDOFFMCP0000000000000"), "{}", mcp.text);
         assert!(!mcp.text.contains("(mcp)"), "{}", mcp.text);
 
         // A reader with no capture of its own has no known CLI: no label.
         let store = Store::open_memory().unwrap();
         handoff_summary(&store, project, Uuid::new_v4(), "codex", "01HANDOFFCODEX00000000000", 1, false);
-        let unknown = primer(&store, &project.to_string(), &Uuid::new_v4().to_string(), &handoff_on()).unwrap();
+        let unknown = primer(&store, &project.to_string(), &Uuid::new_v4().to_string(), &handoff_on(), false).unwrap();
         assert!(unknown.text.contains("01HANDOFFCODEX00000000000"), "{}", unknown.text);
         assert!(!unknown.text.contains("(codex)"), "{}", unknown.text);
     }
@@ -1508,7 +1517,7 @@ mod tests {
         let reader = reader_in(&store, project, "claude-code");
         handoff_summary(&store, project, Uuid::new_v4(), "codex", "01HANDOFFNEWEST0000000000", 1, false);
         assert!(!InjectionConfig::default().handoff_line, "the line is opt-in");
-        let off = primer(&store, &project.to_string(), &reader.to_string(), &InjectionConfig::default()).unwrap();
+        let off = primer(&store, &project.to_string(), &reader.to_string(), &InjectionConfig::default(), false).unwrap();
         // Off, the summary is only a candidate for the ordinary summary layer:
         // the primer is exactly header + knowledge + that summary, unlabelled.
         let project_key = project.to_string();
@@ -1521,7 +1530,7 @@ mod tests {
         assert!(expected.len() > PRIMER_HEADER.len() + 100, "{expected}");
         assert!(expected.contains("01HANDOFFNEWEST0000000000"), "{expected}");
         assert_eq!(off.text, expected);
-        let again = primer(&store, &project.to_string(), &reader.to_string(), &InjectionConfig::default()).unwrap();
+        let again = primer(&store, &project.to_string(), &reader.to_string(), &InjectionConfig::default(), false).unwrap();
         assert_eq!(off.text, again.text);
     }
 }

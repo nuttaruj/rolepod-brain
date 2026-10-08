@@ -56,6 +56,8 @@ struct Timing {
     heartbeat: Duration,
     /// How far ahead each heartbeat puts the marker's expiry.
     lifetime: Duration,
+    /// How long between two tries to cut the log while a hook holds it.
+    cut_wait: Duration,
 }
 
 impl Timing {
@@ -79,6 +81,7 @@ impl Timing {
             budget: Duration::from_secs(budget),
             heartbeat: (lifetime / 6).min(Duration::from_secs(5)),
             lifetime,
+            cut_wait: Duration::from_secs(1),
         }
     }
 }
@@ -176,10 +179,24 @@ const WIPES: &str = "pending-wipe";
 /// the database is exactly what was out of reach. Best effort; there is
 /// nowhere left to report a failure to.
 pub fn spill_surfaced(paths: &Paths, session: &str, kind: Ledger, ids: &[String]) {
+    spill_line(paths, session, kind, ids, 0);
+}
+
+/// [`spill_surfaced`] for an injection, with the bytes it spent, so the fold
+/// can give them back to the session's budget.
+pub fn spill_injected(paths: &Paths, session: &str, ids: &[String], bytes: usize) {
+    spill_line(paths, session, Ledger::Injected, ids, bytes);
+}
+
+fn spill_line(paths: &Paths, session: &str, kind: Ledger, ids: &[String], bytes: usize) {
     if ids.is_empty() {
         return;
     }
-    let line = serde_json::json!({ "session": session, "kind": kind_tag(kind), "ids": ids });
+    let line = if bytes == 0 {
+        serde_json::json!({ "session": session, "kind": kind_tag(kind), "ids": ids })
+    } else {
+        serde_json::json!({ "session": session, "kind": kind_tag(kind), "ids": ids, "bytes": bytes })
+    };
     let _ = std::fs::create_dir_all(&paths.data_dir);
     if let Ok(mut file) =
         std::fs::OpenOptions::new().create(true).append(true).open(paths.data_dir.join(SURFACED))
@@ -217,6 +234,7 @@ fn parse_surfaced(text: &str) -> Vec<SurfacedLine> {
                     .iter()
                     .filter_map(|id| id.as_str().map(str::to_string))
                     .collect(),
+                bytes: value.get("bytes").and_then(serde_json::Value::as_u64).map_or(0, |n| usize::try_from(n).unwrap_or(0)),
             })
         })
         .collect()
@@ -238,36 +256,54 @@ pub fn spilled(paths: &Paths, session: &str, id: &str) -> bool {
     })
 }
 
-/// Fold the spill back into the ledger, then remove it. The file is renamed
-/// first so a hook appending meanwhile starts a fresh one; a `.folding` left
-/// by a run that died is folded again, which is harmless. Best effort: a fold
-/// that fails leaves the file for the next run, and says so: `false` means
-/// something is still unfolded.
+/// Fold one spill file and empty it. The file stays (emptied, not removed): a
+/// hook that had it open before the rename can still append to it, and that
+/// line is folded by the next fold. Emptying rather than replaying keeps a
+/// fold from re-arming what a context wipe cleared in between. `false` means
+/// the store refused a line and the file is left whole.
+fn fold_and_empty(path: &Path, store: &Store) -> bool {
+    let mut done = 0;
+    // A line landing between the read and the emptying makes the length
+    // differ; it is folded before the file is emptied.
+    for _ in 0..4 {
+        let Ok(bytes) = std::fs::read(path) else { return true };
+        let text = String::from_utf8_lossy(bytes.get(done..).unwrap_or_default());
+        if store.fold_surfaced(parse_surfaced(&text).into_iter()).is_err() {
+            return false;
+        }
+        done = bytes.len();
+        if done == 0 {
+            return true;
+        }
+        if std::fs::metadata(path).is_ok_and(|meta| meta.len() == done as u64) {
+            let _ = std::fs::OpenOptions::new().write(true).truncate(true).open(path);
+            return true;
+        }
+    }
+    true
+}
+
+/// Fold the spill back into the ledger. The file is renamed first so a hook
+/// appending meanwhile starts a fresh one; the renamed `.folding` is folded
+/// and emptied here, and again by the next fold for any late line. Folding is
+/// idempotent for a line seen twice. Best effort: a fold that fails leaves the
+/// files for the next run, and says so: `false` means something is still
+/// unfolded.
 pub fn fold_surfaced(paths: &Paths, store: &Store) -> bool {
     let spill = paths.data_dir.join(SURFACED);
     let folding = paths.data_dir.join(FOLDING);
-    if spill.exists() {
-        // Appending to a leftover `.folding` keeps both: rename would replace it.
-        if folding.exists() {
-            if let (Ok(old), Ok(new)) = (std::fs::read(&folding), std::fs::read(&spill)) {
-                let mut joined = old;
-                joined.extend(new);
-                if std::fs::write(&folding, joined).is_ok() {
-                    let _ = std::fs::remove_file(&spill);
-                }
-            }
-        } else {
-            let _ = std::fs::rename(&spill, &folding);
-        }
+    if !fold_and_empty(&folding, store) {
+        return false;
     }
-    if let Ok(text) = std::fs::read_to_string(&folding) {
-        if store.fold_surfaced(parse_surfaced(&text).into_iter()).is_ok() {
-            let _ = std::fs::remove_file(&folding);
-        }
+    if spill.exists() && std::fs::rename(&spill, &folding).is_err() {
+        return false;
+    }
+    if !fold_and_empty(&folding, store) {
+        return false;
     }
     // Whether anything is left unfolded: retention must not run while a body
     // that only the spill remembers having been shown could be dropped.
-    !spill.exists() && !folding.exists()
+    !spill.exists()
 }
 
 /// The file name of a session's pending wipe: the session id with anything
@@ -483,7 +519,7 @@ fn compact_with(paths: &Paths, store: &Store, lock: &RunLock, timing: &Timing) -
 /// The window itself: fold, check the disk again, rewrite, cut the log. The
 /// marker is gone when this returns, however it returns.
 fn rewrite(paths: &Paths, store: &Store, lock: &RunLock, timing: &Timing) -> Result<bool> {
-    let _window = Window::open(&paths.data_dir, timing)?;
+    let window = Window::open(&paths.data_dir, timing)?;
     store.optimize_text_indexes()?;
     lock.touch();
     guard(paths).map_err(|reason| anyhow::anyhow!(reason))?;
@@ -498,13 +534,25 @@ fn rewrite(paths: &Paths, store: &Store, lock: &RunLock, timing: &Timing) -> Res
                 return Ok(true);
             }
             if attempt < 9 {
-                std::thread::sleep(Duration::from_secs(1));
+                std::thread::sleep(timing.cut_wait);
             }
         }
         Ok(false)
     })();
+    // A hook the window held off may have let go by now: one more try, which
+    // is not allowed to fail the run.
+    drop(window);
+    let cut = match cut {
+        Ok(false) => Ok(cut_once(store)),
+        other => other,
+    };
     store.set_busy_timeout(Duration::from_secs(5))?;
     cut
+}
+
+/// One try to cut the log, at once; a failure is a `false`.
+fn cut_once(store: &Store) -> bool {
+    store.truncate_wal().unwrap_or(false)
 }
 
 /// Write down why a window did not open, and end the attempt quietly.
@@ -1049,7 +1097,7 @@ mod tests {
         assert_eq!(count("SELECT COUNT(*) FROM injected"), 1);
         assert_eq!(count("SELECT COUNT(*) FROM injected_files"), 1);
         assert_eq!(count("SELECT read_count FROM events WHERE read_count > 0 LIMIT 1"), 1);
-        assert!(!dir.join(SURFACED).exists() && !dir.join(FOLDING).exists(), "folded files were left");
+        assert!(!dir.join(SURFACED).exists(), "the spill was left");
 
         // The same lines again: nothing changes.
         spill_surfaced(&paths, "s1", Ledger::Recalled, &[one.clone(), two]);
@@ -1058,6 +1106,91 @@ mod tests {
         assert_eq!(count("SELECT COUNT(*) FROM recalled"), 2);
         assert_eq!(count("SELECT COUNT(*) FROM injected"), 1);
         assert_eq!(count("SELECT MAX(read_count) FROM events"), 1, "a second fold counted a second read");
+    }
+
+    #[test]
+    fn an_injection_spill_gives_its_bytes_back_once_and_an_old_spill_still_folds() {
+        let dir = scratch();
+        let paths = paths_in(&dir);
+        let store = Store::open_memory().unwrap();
+        let one = indexed_event(&store);
+        spill_injected(&paths, "s1", std::slice::from_ref(&one), 700);
+        // A line from before the field existed.
+        let old = indexed_event(&store);
+        let line = serde_json::json!({ "session": "s1", "kind": "injected", "ids": [old] });
+        let mut file = std::fs::OpenOptions::new().append(true).open(dir.join(SURFACED)).unwrap();
+        std::io::Write::write_all(&mut file, format!("{line}\n").as_bytes()).unwrap();
+        assert!(fold_surfaced(&paths, &store));
+        assert_eq!(store.session_injected_bytes("s1").unwrap(), 700);
+        assert_eq!(store.raw_count("SELECT COUNT(*) FROM injected"), 2);
+
+        spill_injected(&paths, "s1", std::slice::from_ref(&one), 700);
+        assert!(fold_surfaced(&paths, &store));
+        assert_eq!(store.session_injected_bytes("s1").unwrap(), 700, "a second fold spent again");
+    }
+
+    #[test]
+    fn a_line_appended_after_the_folds_last_read_is_taken_by_the_next_fold() {
+        let dir = scratch();
+        let paths = paths_in(&dir);
+        let store = Store::open_memory().unwrap();
+        let (one, two) = (indexed_event(&store), indexed_event(&store));
+        spill_surfaced(&paths, "s1", Ledger::Recalled, std::slice::from_ref(&one));
+        assert!(fold_surfaced(&paths, &store));
+        // A hook that opened the file before the rename appends to it now.
+        let line = serde_json::json!({ "session": "s1", "kind": "recalled", "ids": [two] });
+        let mut file = std::fs::OpenOptions::new().append(true).open(dir.join(FOLDING)).unwrap();
+        std::io::Write::write_all(&mut file, format!("{line}\n").as_bytes()).unwrap();
+        assert_eq!(store.raw_count("SELECT COUNT(*) FROM recalled"), 1);
+        assert!(fold_surfaced(&paths, &store));
+        assert_eq!(store.raw_count("SELECT COUNT(*) FROM recalled"), 2, "the late line was dropped");
+        assert_eq!(std::fs::metadata(dir.join(FOLDING)).unwrap().len(), 0, "a folded file is emptied");
+    }
+
+    #[test]
+    fn a_fold_after_a_wipe_does_not_re_arm_what_the_wipe_cleared() {
+        let dir = scratch();
+        let paths = paths_in(&dir);
+        let store = Store::open_memory().unwrap();
+        let one = indexed_event(&store);
+        spill_injected(&paths, "s1", std::slice::from_ref(&one), 300);
+        spill_surfaced(&paths, "s1", Ledger::File, &["src/x.rs".into()]);
+        assert!(fold_surfaced(&paths, &store));
+        store.reset_injection_state("s1").unwrap();
+        assert!(fold_surfaced(&paths, &store));
+        assert_eq!(store.raw_count("SELECT COUNT(*) FROM injected WHERE active = 1"), 0);
+        assert_eq!(store.raw_count("SELECT COUNT(*) FROM injected_files"), 0);
+    }
+
+    #[test]
+    fn folding_the_same_file_again_changes_nothing_bytes_included() {
+        let dir = scratch();
+        let paths = paths_in(&dir);
+        let store = Store::open_memory().unwrap();
+        let one = indexed_event(&store);
+        spill_injected(&paths, "s1", std::slice::from_ref(&one), 300);
+        let kept = std::fs::read(dir.join(SURFACED)).unwrap();
+        assert!(fold_surfaced(&paths, &store));
+        std::fs::write(dir.join(FOLDING), kept).unwrap();
+        assert!(fold_surfaced(&paths, &store));
+        assert_eq!(store.session_injected_bytes("s1").unwrap(), 300);
+        assert_eq!(store.raw_count("SELECT MAX(injected_count) FROM events"), 1);
+    }
+
+    #[test]
+    fn the_log_is_cut_once_more_when_the_reader_lets_go() {
+        let dir = scratch();
+        let paths = paths_in(&dir);
+        let store = Store::open(&paths.db()).unwrap();
+        let raw = rusqlite::Connection::open(paths.db()).unwrap();
+        raw.execute_batch("CREATE TABLE junk(b BLOB); INSERT INTO junk VALUES (zeroblob(65536));").unwrap();
+        let reader = rusqlite::Connection::open(paths.db()).unwrap();
+        reader.execute_batch("BEGIN; SELECT count(*) FROM junk;").unwrap();
+        raw.execute_batch("INSERT INTO junk VALUES (zeroblob(65536));").unwrap();
+        store.set_busy_timeout(Duration::ZERO).unwrap();
+        assert!(!cut_once(&store), "a reader still holds the log");
+        reader.execute_batch("COMMIT;").unwrap();
+        assert!(cut_once(&store), "the reader let go");
     }
 
     #[test]
@@ -1186,7 +1319,10 @@ mod tests {
         let reader = rusqlite::Connection::open(paths.db()).unwrap();
         reader.execute_batch("BEGIN; SELECT count(*) FROM sqlite_master;").unwrap();
 
-        let report = compact_with(&paths, &store, &lock, &Timing::live()).unwrap();
+        let began = Instant::now();
+        let timing = Timing { cut_wait: Duration::from_millis(10), ..Timing::live() };
+        let report = compact_with(&paths, &store, &lock, &timing).unwrap();
+        assert!(began.elapsed() < Duration::from_secs(2), "the cut waited {:?}", began.elapsed());
         assert!(!report.truncated, "the reader kept the log");
         let (pages, _) = store.page_use().unwrap();
         let page_size: i64 = raw.pragma_query_value(None, "page_size", |row| row.get(0)).unwrap();

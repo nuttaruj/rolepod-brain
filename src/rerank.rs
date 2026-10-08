@@ -100,6 +100,12 @@ pub struct Outcome {
 /// times out, or answers with anything unusable. There is no error case by
 /// design: a failed rerank is a no-op, never a failed search. The
 /// [`Outcome`] beside the hits says which of those happened.
+///
+/// `hub` is `Some` when the shared hub is switched on. Then, with the model
+/// on disk, the whole rerank is the hub's: this process loads no model and
+/// asks no CLI, and a hub that cannot answer leaves the index's order with the
+/// reason in the [`Outcome`]. With the model not yet on disk, or `hub` `None`,
+/// the path is the one every version before the hub took.
 #[must_use]
 pub fn rerank(
     ladder: &Ladder<'_>,
@@ -107,12 +113,21 @@ pub fn rerank(
     query: &str,
     model_dir: &std::path::Path,
     hits: Vec<Hit>,
+    hub: Option<&crate::config::Paths>,
 ) -> (Vec<Hit>, Outcome) {
     let started = Instant::now();
     let elapsed = |started: Instant| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     if hits.len() < 2 {
         return (hits, Outcome { engine: "none", reason: "too-few-hits", ms: 0, cold: false });
     }
+    #[cfg(unix)]
+    if let Some(paths) = hub {
+        if hub_model_ready(model_dir) {
+            return via_hub(paths, query, hits, started);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = hub;
     // The local model first, when this build has one and the weights are on
     // disk: same judgement, 1.6s instead of 12.2s, no subscription spent.
     let cold = !local_loaded();
@@ -140,6 +155,88 @@ pub fn rerank(
     (apply(order_in(&answer), hits), Outcome { engine: "cli", reason: why_not_local, ms, cold: false })
 }
 
+/// How long a request may wait for the hub to start on it; past it the
+/// index's order stands. 11 s because eight concurrent searches measured
+/// within the spec's 14 s (11 s to start, plus the reply slack for one scoring).
+/// Evidence: `docs/rolepod/plans/brain-hub-2026-10-08.md` §Changes during build.
+#[cfg(unix)]
+const HUB_DEADLINE: Duration = Duration::from_secs(11);
+
+/// Will the hub have a model to rank with? The same files `local_is_ready`
+/// looks for; a debug build running the hub's stub has none and does not need
+/// them.
+#[cfg(unix)]
+fn hub_model_ready(model_dir: &std::path::Path) -> bool {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("ROLEPOD_BRAIN_HUB_STUB").is_some() {
+        return true;
+    }
+    local_is_ready(model_dir)
+}
+
+/// What the hub's answer means for a search: the order it gave, or the order
+/// search already had, with the reason.
+#[cfg(unix)]
+fn outcome_of(order: &crate::hub::client::HubOrder, ms: u64) -> (Option<&[usize]>, Outcome) {
+    use crate::hub::client::HubOrder;
+    match order {
+        HubOrder::Ranked(indices) => {
+            (Some(indices), Outcome { engine: "hub", reason: "", ms, cold: false })
+        }
+        HubOrder::Busy => (None, Outcome { engine: "none", reason: crate::hub::reason::BUSY, ms, cold: false }),
+        HubOrder::Down(reason) => (None, Outcome { engine: "none", reason, ms, cold: false }),
+    }
+}
+
+#[cfg(unix)]
+fn via_hub(
+    paths: &crate::config::Paths,
+    query: &str,
+    hits: Vec<Hit>,
+    started: Instant,
+) -> (Vec<Hit>, Outcome) {
+    let entries: Vec<String> = offered_entries(&hits)
+        .into_iter()
+        .map(|entry| cap_bytes(entry, crate::hub::proto::MAX_ENTRY_BYTES))
+        .collect();
+    let deadline = std::env::var("ROLEPOD_BRAIN_HUB_DEADLINE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map_or(HUB_DEADLINE, Duration::from_millis);
+    let order = crate::hub::client::rerank(paths, query, &entries, deadline);
+    let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let (ranked, outcome) = outcome_of(&order, ms);
+    match ranked {
+        Some(indices) => (apply_order(indices, hits), outcome),
+        None => (hits, outcome),
+    }
+}
+
+/// `entry` cut to at most `max` bytes at a character boundary.
+#[cfg(unix)]
+fn cap_bytes(mut entry: String, max: usize) -> String {
+    if entry.len() > max {
+        let mut end = max;
+        while !entry.is_char_boundary(end) {
+            end -= 1;
+        }
+        entry.truncate(end);
+    }
+    entry
+}
+
+/// The text a cross-encoder reads for each of the first [`LOCAL_POOL`] hits.
+#[cfg(any(unix, feature = "local-rerank"))]
+fn offered_entries(hits: &[Hit]) -> Vec<String> {
+    hits.iter()
+        .take(LOCAL_POOL)
+        .map(|hit| {
+            let snippet = hit.snippet.replace(['[', ']'], "");
+            format!("{} {}", hit.title, snippet.trim()).trim().to_string()
+        })
+        .collect()
+}
+
 /// Has this process loaded the local model already?
 #[cfg(feature = "local-rerank")]
 fn local_loaded() -> bool {
@@ -161,6 +258,12 @@ fn local_loaded() -> bool {
 /// before the download begins.
 #[cfg(feature = "local-rerank")]
 fn fetch_in_background(model_dir: &std::path::Path) {
+    // The switch the embedding fetch already honours. Without it a test that
+    // searches with `rerank` on starts a real 568 MB download into its own
+    // fixture, and the model that lands mid-run answers a later search.
+    if std::env::var_os("ROLEPOD_BRAIN_NO_FETCH").is_some() {
+        return;
+    }
     let marker = model_dir.with_extension("fetching");
     // Asking for the weights alone was enough when the runtime was linked into
     // the binary. It is not any more: a machine upgraded from a build that
@@ -230,15 +333,7 @@ fn apply_order(order: &[usize], hits: Vec<Hit>) -> Vec<Hit> {
 /// falls through to the CLI it would have used anyway.
 #[cfg(feature = "local-rerank")]
 fn local_order(model_dir: &std::path::Path, query: &str, hits: &[Hit]) -> Option<Vec<usize>> {
-    let offered: Vec<String> = hits
-        .iter()
-        .take(LOCAL_POOL)
-        .map(|hit| {
-            let snippet = hit.snippet.replace(['[', ']'], "");
-            format!("{} {}", hit.title, snippet.trim()).trim().to_string()
-        })
-        .collect();
-    crate::xencoder::rerank(model_dir, query, &offered)
+    crate::xencoder::rerank(model_dir, query, &offered_entries(hits))
 }
 
 /// The same, for a build without the feature: there is no local model, and
@@ -366,6 +461,33 @@ fn prompt_for(query: &str, hits: &[Hit]) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn hub_orders_map_to_outcomes_and_never_to_a_cli() {
+        use crate::hub::client::HubOrder;
+        let ranked = HubOrder::Ranked(vec![1, 0]);
+        let (order, outcome) = outcome_of(&ranked, 5);
+        assert_eq!(order, Some(&[1usize, 0][..]));
+        assert_eq!((outcome.engine, outcome.reason, outcome.ms), ("hub", "", 5));
+        let (order, outcome) = outcome_of(&HubOrder::Busy, 7);
+        assert!(order.is_none());
+        assert_eq!((outcome.engine, outcome.reason), ("none", crate::hub::reason::BUSY));
+        for reason in [crate::hub::reason::DOWN, crate::hub::reason::STARTING, crate::hub::reason::UNSAFE] {
+            let down = HubOrder::Down(reason);
+            let (order, outcome) = outcome_of(&down, 1);
+            assert!(order.is_none());
+            assert_eq!((outcome.engine, outcome.reason), ("none", reason));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_is_cut_on_a_character_boundary() {
+        assert_eq!(cap_bytes("abcdef".into(), 4), "abcd");
+        assert_eq!(cap_bytes("กขค".into(), 4), "ก", "three bytes per Thai letter");
+        assert_eq!(cap_bytes("ab".into(), 4), "ab");
+    }
+
     /// Weights alone used to mean ready. They do not any more.
     ///
     /// This is the check that decides whether an agent is told reranking costs
@@ -414,7 +536,7 @@ mod tests {
         let store = crate::store::Store::open_memory().unwrap();
         let ladder = Ladder::new(&store, &crate::config::SummarizerConfig::default());
         let (hits, outcome) =
-            rerank(&ladder, "claude-code", "q", std::path::Path::new("/nonexistent"), vec![hit("a", "A")]);
+            rerank(&ladder, "claude-code", "q", std::path::Path::new("/nonexistent"), vec![hit("a", "A")], None);
         assert_eq!(hits.len(), 1);
         assert_eq!(outcome, Outcome { engine: "none", reason: "too-few-hits", ms: 0, cold: false });
     }
@@ -564,6 +686,26 @@ mod tests {
         assert!(!usable("   "));
         assert!(!usable("Claude usage limit reached. Resets at 3pm."));
         assert!(!usable("None of these look relevant, but here is some prose"));
+    }
+
+    /// With the switch set, asking for a fetch starts nothing: no marker, so
+    /// no download child behind it either.
+    #[cfg(feature = "local-rerank")]
+    #[test]
+    fn no_fetch_switch_stops_the_reranker_download_before_it_starts() {
+        let root = std::env::temp_dir().join(format!("brain-rerank-nofetch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let model_dir = root.join("models").join(LOCAL_MODEL);
+        let before = std::env::var_os("ROLEPOD_BRAIN_NO_FETCH");
+        std::env::set_var("ROLEPOD_BRAIN_NO_FETCH", "1");
+        fetch_in_background(&model_dir);
+        match before {
+            Some(value) => std::env::set_var("ROLEPOD_BRAIN_NO_FETCH", value),
+            None => std::env::remove_var("ROLEPOD_BRAIN_NO_FETCH"),
+        }
+        let started = model_dir.with_extension("fetching").exists();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(!started, "a fetch was started with ROLEPOD_BRAIN_NO_FETCH set");
     }
 
     #[test]
