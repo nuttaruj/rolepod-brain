@@ -1,7 +1,8 @@
 //! The hub server, end to end: the real `brain hub serve` binary, an isolated
 //! HOME and data dir, a socket dir under a test-owned TMPDIR, and the stub
 //! reranker (compiled into debug builds only). Unix only.
-#![cfg(unix)]
+// The hub's test seams (ROLEPOD_BRAIN_HUB_STUB and friends) exist only under debug_assertions; ci.yml's debug `cargo test` runs this file.
+#![cfg(all(unix, debug_assertions))]
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -227,7 +228,8 @@ fn exe_swap_hub_retires_after_inflight() {
     let mut raw = env.raw();
     raw.rerank(1, "q", 10_000);
     std::thread::sleep(Duration::from_millis(300));
-    let file = std::fs::OpenOptions::new().write(true).open(&env.exe).unwrap();
+    // Read-only: Linux refuses a write open of a running executable (ETXTBSY); futimens needs ownership only.
+    let file = std::fs::File::open(&env.exe).unwrap();
     file.set_modified(std::time::SystemTime::now() + Duration::from_secs(60)).unwrap();
     drop(file);
     assert_eq!(raw.recv().unwrap()["type"], "order", "the work already accepted is finished");
@@ -244,9 +246,7 @@ fn exe_swap_gives_the_endpoint_back_before_exiting() {
     let mut busy = env.raw();
     busy.rerank(1, "q", 10_000);
     std::thread::sleep(Duration::from_millis(200));
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&env.exe)
+    std::fs::File::open(&env.exe)
         .unwrap()
         .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
         .unwrap();

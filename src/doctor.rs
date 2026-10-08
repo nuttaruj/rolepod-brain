@@ -366,6 +366,12 @@ fn uptime_label(secs: u64) -> String {
 
 /// Warn when most of the latest reranks got no answer from the hub. Silent
 /// otherwise, and silent on too few runs to say.
+#[cfg(not(unix))]
+fn hub_answers_check(_runs: &[crate::store::RerankRun]) -> Option<Check> {
+    None
+}
+
+#[cfg(unix)]
 fn hub_answers_check(runs: &[crate::store::RerankRun]) -> Option<Check> {
     let last = &runs[runs.len().saturating_sub(20)..];
     let missed: Vec<&str> = last.iter().map(|run| run.reason.as_str()).filter(|r| r.starts_with(crate::hub::reason::PREFIX)).collect();
@@ -972,10 +978,16 @@ fn resident_check(paths: &Paths) -> Check {
     };
     let me = std::process::id();
     // The hub is one of these processes too; the lock names it.
+    #[cfg(unix)]
     let hub = std::fs::read_to_string(paths.data_dir.join(crate::hub::endpoint::LOCK_FILE))
         .ok()
         .and_then(|text| text.trim().parse::<u32>().ok())
         .filter(|pid| running.contains(pid));
+    #[cfg(not(unix))]
+    let hub: Option<u32> = {
+        let _ = paths;
+        None
+    };
     let stray: Vec<String> = running
         .into_iter()
         .filter(|pid| *pid != me && Some(*pid) != hub)
