@@ -16,7 +16,8 @@ use serde_json::{json, Value};
 
 use crate::config::Paths;
 use crate::ids;
-use crate::store::Store;
+use crate::maint;
+use crate::store::{Ledger, Store};
 
 /// MCP protocol revision this server implements.
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -420,6 +421,45 @@ fn tool_definitions(local_rerank: bool) -> Value {
     ])
 }
 
+/// Note what a tool call surfaced. Never a reason to fail the call: a write
+/// the database refuses (the compact window holds it) is kept in
+/// `surfaced.jsonl` and folded back by consolidation. In the window it does
+/// not wait for the lock.
+fn ledger<'a>(
+    paths: &Paths,
+    store: &Store,
+    session: &str,
+    how: Ledger,
+    ids: impl Iterator<Item = &'a str>,
+) {
+    let ids: Vec<&str> = ids.collect();
+    if ids.is_empty() {
+        return;
+    }
+    if maint::active(paths) {
+        let _ = store.set_busy_timeout(maint::FAIL_FAST);
+    }
+    let written = match how {
+        Ledger::Opened => store.record_opened(session, ids.iter().copied()),
+        _ => store.record_recalled(session, ids.iter().copied()),
+    };
+    if written.is_err() {
+        let owned: Vec<String> = ids.iter().map(|id| (*id).to_string()).collect();
+        maint::spill_surfaced(paths, session, how, &owned);
+    }
+}
+
+/// Was this id shown to this session - by the ledger, or by a spill the
+/// ledger has not taken back yet?
+fn surfaced_to(paths: &Paths, store: &Store, session: &str, id: &str) -> Result<bool> {
+    if maint::active(paths) {
+        let _ = store.set_busy_timeout(maint::FAIL_FAST);
+    }
+    Ok(store.already_injected(session, id)?
+        || store.was_recalled(session, id)?
+        || maint::spilled(paths, session, id))
+}
+
 fn call_tool(
     paths: &Paths,
     project: &str,
@@ -429,7 +469,11 @@ fn call_tool(
 ) -> Result<Value> {
     let name = params.get("name").and_then(Value::as_str).unwrap_or_default();
     let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-    let store = Store::open(&paths.db())?;
+    let store = if maint::active(paths) {
+        Store::open_waiting(&paths.db(), maint::FAIL_FAST)?
+    } else {
+        Store::open(&paths.db())?
+    };
 
     let payload = match name {
         "brain_search" => {
@@ -498,7 +542,7 @@ fn call_tool(
             }
             hits.truncate(limit);
 
-            store.record_recalled(session, hits.iter().map(|hit| hit.id.as_str()))?;
+            ledger(paths, &store, session, Ledger::Recalled, hits.iter().map(|hit| hit.id.as_str()));
             json!({ "hits": hits, "count": hits.len() })
         }
         "brain_get" => {
@@ -530,7 +574,7 @@ fn call_tool(
             // Not `record_recalled`: asking for a body, having seen only the
             // title, is the one moment an agent says an entry was worth the
             // tokens. Everything else in this file merely offered it.
-            store.record_opened(session, events.iter().map(|event| event.id.as_str()))?;
+            ledger(paths, &store, session, Ledger::Opened, events.iter().map(|event| event.id.as_str()));
             json!({ "events": events, "count": events.len() })
         }
         "brain_related" => {
@@ -539,7 +583,7 @@ fn call_tool(
                 .and_then(Value::as_str)
                 .context("brain_related requires an `id`")?;
             let hits = store.related(project, id, limit_from(&arguments))?;
-            store.record_recalled(session, hits.iter().map(|hit| hit.id.as_str()))?;
+            ledger(paths, &store, session, Ledger::Recalled, hits.iter().map(|hit| hit.id.as_str()));
             json!({ "hits": hits, "count": hits.len() })
         }
         "brain_doctor" => {
@@ -582,7 +626,7 @@ fn call_tool(
             // whose work is being asked about.
             let of_session = arguments.get("session").and_then(Value::as_str);
             let hits = store.recent(project, cli, kind, of_session, limit_from(&arguments))?;
-            store.record_recalled(session, hits.iter().map(|hit| hit.id.as_str()))?;
+            ledger(paths, &store, session, Ledger::Recalled, hits.iter().map(|hit| hit.id.as_str()));
             json!({ "events": hits, "count": hits.len() })
         }
         "brain_forget" => {
@@ -594,7 +638,7 @@ fn call_tool(
             // merely guessed at. Without this it could prune memory it never
             // saw, on nothing more than a plausible-looking id.
             anyhow::ensure!(
-                store.already_injected(session, id)? || store.was_recalled(session, id)?,
+                surfaced_to(paths, &store, session, id)?,
                 "id {id} has not been surfaced in this session; search for it first"
             );
             let outcome = crate::revise::forget(id)?;
@@ -615,7 +659,7 @@ fn call_tool(
             // could overwrite this project's memory from a guess - or from a
             // poisoned instruction it read somewhere.
             anyhow::ensure!(
-                store.already_injected(session, id)? || store.was_recalled(session, id)?,
+                surfaced_to(paths, &store, session, id)?,
                 "id {id} has not been surfaced in this session; search for it first"
             );
             let outcome = crate::revise::correct(id, text)?;
@@ -627,7 +671,7 @@ fn call_tool(
                 .and_then(Value::as_str)
                 .context("brain_feedback requires an `id`")?;
             anyhow::ensure!(
-                store.already_injected(session, id)? || store.was_recalled(session, id)?,
+                surfaced_to(paths, &store, session, id)?,
                 "id {id} has not been surfaced in this session; search for it first"
             );
             let reason = arguments.get("reason").and_then(Value::as_str);

@@ -26,7 +26,8 @@ use crate::sanitize::{
     clamp_leaf, leaves_private_open, truncate, truncate_head_tail, Sanitizer, FOOTSTEP_BODY_MAX_BYTES,
     FOOTSTEP_LEAF_MAX_BYTES, LEAF_MAX_BYTES,
 };
-use crate::store::Store;
+use crate::maint;
+use crate::store::{Ledger, Store};
 
 /// Ceiling for a generated title, before it reaches the primer.
 const TITLE_MAX_BYTES: usize = 120;
@@ -299,20 +300,42 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
     // logs it and the host still gets its acknowledgement - and none can undo
     // the append above. The writes are independent, so one failing does not
     // stop the others; the first error is the one returned.
-    let store = Store::open(&paths.db())?;
+    //
+    // While a compact window is open the database is expected to be held: a
+    // hook does not wait it out. It gives up on its writes at the first one
+    // that fails - the event is in the log, and the window's catch-up indexes
+    // it - and goes on to answer from what it can read.
+    let fast = maint::active(&paths);
+    let store = if fast {
+        match Store::open_waiting(&paths.db(), maint::FAIL_FAST) {
+            Ok(store) => store,
+            Err(_) => return Ok("{}".to_string()),
+        }
+    } else {
+        Store::open(&paths.db())?
+    };
+    // Set once a store write has failed in the window (or a wipe could not be
+    // applied): every later write of this hook is left to the spill files.
+    let mut skip = false;
     let mut failed = None;
     if !known {
         failed = store.record_session_invocation(&session_key, invocation.as_str()).err();
+        skip = fast && failed.is_some();
     }
     if let Some(path) = transcript {
-        let _ = store.record_transcript_path(&session_key, path);
+        if !skip {
+            skip = store.record_transcript_path(&session_key, path).is_err() && fast;
+        }
     }
-    if captured {
+    if captured && !skip {
         let indexed = store.index_captured(&event);
+        skip = fast && indexed.is_err();
         failed = failed.or(indexed.err());
     }
-    if let Some(err) = failed {
-        return Err(err);
+    if !fast {
+        if let Some(err) = failed {
+            return Err(err);
+        }
     }
 
     if delegate.is_some() {
@@ -331,8 +354,24 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
     // this reset the guard that stops us repeating ourselves would instead
     // guarantee amnesia: memory injected before the wipe would be suppressed
     // exactly when it is needed most.
-    if wipes_context(&hook, &payload) {
-        store.reset_injection_state(&session_key)?;
+    //
+    // A wipe the store could not take is not lost: it waits as a file for the
+    // next hook of this session that can write, which applies it here too.
+    let wipe_waiting = maint::wipe_pending(&paths, &session_key);
+    if wipes_context(&hook, &payload) || wipe_waiting {
+        let reset = if skip {
+            Err(anyhow::anyhow!("the store is held"))
+        } else {
+            store.reset_injection_state(&session_key)
+        };
+        if reset.is_ok() {
+            if wipe_waiting {
+                maint::clear_pending_wipe(&paths, &session_key);
+            }
+        } else {
+            skip = true;
+            maint::pending_wipe(&paths, &session_key);
+        }
     }
 
     let summoned = summons(
@@ -340,8 +379,9 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
         &hook,
         invocation.is_headless(),
         || store.has_stale_backlog(STALE_BACKLOG_SECS).unwrap_or(false),
-        || claim_idle_sweep_window(&store, jiff::Timestamp::now()),
+        || !skip && claim_idle_sweep_window(&store, jiff::Timestamp::now()),
     );
+    let spill = Spill { paths: &paths, session: &session_key, skip };
     match summoned.run {
         Some(Run::Session) => spawn_consolidation(Some(&session_key)),
         Some(Run::All) => spawn_consolidation(None),
@@ -363,9 +403,18 @@ pub fn capture(cli: &str, event_name: &str, stdin_payload: Option<String>) -> Re
     }
     if hook == "user_prompt_submit" {
         let prompt = first_string(&payload, &["prompt"]).unwrap_or("");
-        return Ok(inject_for_prompt(&store, &config, &scope, &session_key, event_name, prompt));
+        return Ok(inject_for_prompt(&store, &config, &scope, &session_key, event_name, prompt, &spill));
     }
-    Ok(inject_for(&store, &config, &scope, &session_key, &hook, event_name, &event))
+    Ok(inject_for(&store, &config, &scope, &hook, event_name, &event, &spill))
+}
+
+/// Where a hook's ledger writes stand. When `skip` is set the store is held
+/// and nothing is tried; a write that fails regardless is kept in
+/// `surfaced.jsonl`, to be folded back by consolidation.
+struct Spill<'a> {
+    paths: &'a Paths,
+    session: &'a str,
+    skip: bool,
 }
 
 /// Is this Cursor's own session, echoed to us through Claude Code's hooks?
@@ -431,12 +480,13 @@ fn inject_for(
     store: &Store,
     config: &Config,
     scope: &crate::ids::ProjectScope,
-    session: &str,
     hook: &str,
     event_name: &str,
     event: &Event,
+    spill: &Spill<'_>,
 ) -> String {
     let project = scope.project_id.to_string();
+    let session = spill.session;
 
     let injection = match hook {
         // The one entry point into a fresh context. Compaction arrives here
@@ -455,12 +505,14 @@ fn inject_for(
                     .ok()?;
             // Mark the file covered even when it had nothing, so a file with
             // no memory is not re-queried on every touch.
-            let _ = store.record_injected_file(session, path);
+            if spill.skip || store.record_injected_file(session, path).is_err() {
+                maint::spill_surfaced(spill.paths, session, Ledger::File, std::slice::from_ref(path));
+            }
             Some(injection)
         }),
         _ => None,
     };
-    deliver(store, config, session, event_name, injection)
+    deliver(store, config, session, event_name, injection, spill)
 }
 
 /// The prompt-time push: opt-in (`[injection] prompt_pointers`); off, a
@@ -473,13 +525,14 @@ fn inject_for_prompt(
     session: &str,
     event_name: &str,
     prompt: &str,
+    spill: &Spill<'_>,
 ) -> String {
     if !config.injection.prompt_pointers {
         return "{}".to_string();
     }
     let project = scope.project_id.to_string();
     let injection = inject::for_prompt(store, &project, session, prompt, &config.injection).ok();
-    deliver(store, config, session, event_name, injection)
+    deliver(store, config, session, event_name, injection, spill)
 }
 
 /// Record what an injection spent and render it as the hook's output.
@@ -489,18 +542,26 @@ fn deliver(
     session: &str,
     event_name: &str,
     injection: Option<inject::Injection>,
+    spill: &Spill<'_>,
 ) -> String {
     let Some(injection) = injection else { return "{}".to_string() };
     if injection.is_empty() {
         return "{}".to_string();
     }
-    let recorded = store.record_injected(
-        session,
-        &injection.ids,
-        injection.in_flight,
-        injection.text.len(),
-        config.injection.session_budget,
-    );
+    let recorded = if spill.skip {
+        Err(anyhow::anyhow!("the store is held"))
+    } else {
+        store.record_injected(
+            session,
+            &injection.ids,
+            injection.in_flight,
+            injection.text.len(),
+            config.injection.session_budget,
+        )
+    };
+    if recorded.is_err() {
+        maint::spill_surfaced(spill.paths, session, Ledger::Injected, &injection.ids);
+    }
     // Another hook of the same session spent the budget between our read of
     // it and this write. A failed write still injects, as it always has.
     if matches!(recorded, Ok(false)) {
@@ -2043,7 +2104,8 @@ mod tests {
     }
 
     fn prompt_hook(store: &Store, config: &Config, prompt: &str) -> String {
-        inject_for_prompt(store, config, &scope(), "s1", "UserPromptSubmit", prompt)
+        let paths = Paths { data_dir: std::env::temp_dir().join("rolepod-brain-hook-unit") };
+        inject_for_prompt(store, config, &scope(), "s1", "UserPromptSubmit", prompt, &Spill { paths: &paths, session: "s1", skip: false })
     }
 
     fn on() -> Config {

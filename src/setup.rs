@@ -1001,8 +1001,15 @@ fn write_config_template(apply: bool) -> Vec<Change> {
 /// machines the feature already touched, or an orphaned job keeps waking a
 /// binary that no longer knows why.
 fn sweep_legacy_timer(apply: bool) -> Result<Vec<Change>> {
-    const LEGACY_TIMER_LABEL: &str = "dev.rolepod.brain.consolidate";
     let Some(home) = dirs::home_dir() else { return Ok(Vec::new()) };
+    sweep_legacy_timer_in(&home, apply, true)
+}
+
+/// The same, rooted at a named home. `unload` asks launchd to drop the job
+/// before its file goes; a caller describing a home that is not the running
+/// user's has nothing loaded to drop.
+fn sweep_legacy_timer_in(home: &Path, apply: bool, unload: bool) -> Result<Vec<Change>> {
+    const LEGACY_TIMER_LABEL: &str = "dev.rolepod.brain.consolidate";
     let plist = home.join("Library/LaunchAgents").join(format!("{LEGACY_TIMER_LABEL}.plist"));
     if !plist.is_file() {
         return Ok(vec![Change {
@@ -1017,15 +1024,17 @@ fn sweep_legacy_timer(apply: bool) -> Result<Vec<Change>> {
         }]);
     }
 
-    let uid = Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map_or_else(|| "501".to_string(), |uid| uid.trim().to_string());
-    let _ = Command::new("launchctl")
-        .args(["bootout", &format!("gui/{uid}/{LEGACY_TIMER_LABEL}")])
-        .output();
+    if unload {
+        let uid = Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map_or_else(|| "501".to_string(), |uid| uid.trim().to_string());
+        let _ = Command::new("launchctl")
+            .args(["bootout", &format!("gui/{uid}/{LEGACY_TIMER_LABEL}")])
+            .output();
+    }
     std::fs::remove_file(&plist)
         .with_context(|| format!("remove {}", plist.display()))?;
     Ok(vec![Change {
@@ -1080,6 +1089,33 @@ pub fn binary_present(target: &Target, path_var: &std::ffi::OsStr) -> bool {
     }) || target.hooks_file.parent().is_some_and(|dir| {
         target.binaries.iter().any(|name| found(&dir.join("local"), name))
     })
+}
+
+/// What a consolidation run repairs by itself in `home`: an OpenCode plugin
+/// file that is already there but stale, and the launchd job an older version
+/// installed. Never creates a file or touches a CLI that was not set up -
+/// first-time setup is the user's to ask for. Returns how many it repaired.
+///
+/// `unload` is for [`sweep_legacy_timer_in`].
+pub(crate) fn heal_owned_files(home: &Path, exe: &Path, unload: bool) -> usize {
+    let mut healed = 0;
+    for target in targets_in(home, exe).unwrap_or_default() {
+        let path = &target.hooks_file;
+        if target.layout != Layout::Plugin
+            || !path.is_file()
+            || (plugin_source_is_current(path) && plugin_source_delivers(path))
+        {
+            continue;
+        }
+        if install_plugin(&target, exe, true).is_ok() {
+            healed += 1;
+        }
+    }
+    let plist = home.join("Library/LaunchAgents/dev.rolepod.brain.consolidate.plist");
+    if plist.is_file() && sweep_legacy_timer_in(home, true, unload).is_ok() {
+        healed += 1;
+    }
+    healed
 }
 
 /// Write (or preview) a plugin file.
@@ -3162,5 +3198,36 @@ mod tests {
         assert_eq!(kept[0], "hooks.json.brain-bak.20200103-000000");
         assert_eq!(dir.join(&kept[1]), fresh, "the copy just taken is the newest");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_run_heals_a_stale_plugin_and_the_old_plist_but_creates_nothing() {
+    let home = std::env::temp_dir().join(format!("brain-heal-{}", ulid::Ulid::new()));
+    let exe = Path::new("/x/brain");
+    let plugin = targets_in(&home, exe)
+    .unwrap()
+    .into_iter()
+    .find(|target| target.layout == Layout::Plugin)
+    .unwrap()
+    .hooks_file;
+
+    // Nothing set up: nothing written.
+    std::fs::create_dir_all(&home).unwrap();
+    assert_eq!(heal_owned_files(&home, exe, false), 0);
+    assert!(!plugin.exists() && !plugin.parent().unwrap().exists());
+
+    // A stale file is rewritten; a current one is left alone.
+    std::fs::create_dir_all(plugin.parent().unwrap()).unwrap();
+    std::fs::write(&plugin, "export const old = 1").unwrap();
+    assert_eq!(heal_owned_files(&home, exe, false), 1);
+    assert!(plugin_source_is_current(&plugin) && plugin_source_delivers(&plugin));
+    assert_eq!(heal_owned_files(&home, exe, false), 0);
+
+    let plist = home.join("Library/LaunchAgents/dev.rolepod.brain.consolidate.plist");
+    std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    std::fs::write(&plist, "<plist/>").unwrap();
+    assert_eq!(heal_owned_files(&home, exe, false), 1);
+    assert!(!plist.exists());
+    let _ = std::fs::remove_dir_all(&home);
     }
 }

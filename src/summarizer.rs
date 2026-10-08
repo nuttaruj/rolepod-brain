@@ -47,12 +47,37 @@ pub struct CliSpec {
     pub cli: &'static str,
     /// Executable name, resolved on `PATH`.
     pub program: &'static str,
-    /// Model identifier passed to that CLI.
+    /// The model id we tested, passed to that CLI. It is the floor and the
+    /// way back: a newer id found by [`refresh_models`] replaces it only when
+    /// it belongs to `family` and is numbered higher, and a call that fails on
+    /// the newer id is tried again on this one.
     pub model: &'static str,
     /// Whether the answer arrives on stdout or in a file we name.
     pub output: OutputMode,
     /// Arguments before the prompt. `{model}` and `{out}` are substituted.
     pub args: &'static [&'static str],
+    /// How to tell a newer model of the same cheap tier from every other
+    /// model, for a CLI whose ids move on. `None` where the id is an alias the
+    /// CLI keeps current itself, or where no id is passed at all.
+    pub family: Option<Family>,
+}
+
+/// The ids that count as "the same cheap tier, newer", and where to list them.
+pub struct Family {
+    /// Matches a model id of the tier; capture group 1 is its version, dotted
+    /// numbers (`6`, `5.6`, `3.10`).
+    pub pattern: &'static str,
+    /// Where the CLI's list of models comes from.
+    pub listing: Listing,
+}
+
+/// Where a CLI says which models it can run.
+pub enum Listing {
+    /// Codex keeps the list it last fetched in `models_cache.json`, so reading
+    /// it costs no call and no login.
+    CodexCache,
+    /// A command whose stdout has one `<id><TAB><name>` line per model.
+    Command(&'static [&'static str]),
 }
 
 impl CliSpec {
@@ -80,7 +105,10 @@ pub enum OutputMode {
 /// The model map. One table, checked by `brain doctor`, because model ids rot
 /// when a CLI upgrades and a silently-wrong id looks exactly like an outage.
 ///
-/// Every entry here was invoked for real before it was written down.
+/// Every entry here was invoked for real before it was written down. Where a
+/// rung has a `family`, its `model` is a pin: the tested floor and the way
+/// back, not necessarily what runs - a newer id of the same tier found by
+/// [`refresh_models`] runs instead, until a call on it fails.
 pub const SPECS: &[CliSpec] = &[
     CliSpec {
         cli: "claude-code",
@@ -108,6 +136,8 @@ pub const SPECS: &[CliSpec] = &[
             // draining a backlog sent its owner one push notification per
             // summary - to the phone, carrying the text of the summary.
         ],
+        // `haiku` is an alias the CLI keeps pointing at its newest Haiku.
+        family: None,
     },
     CliSpec {
         cli: "codex",
@@ -135,6 +165,10 @@ pub const SPECS: &[CliSpec] = &[
             "-o",
             "{out}",
         ],
+        family: Some(Family {
+            pattern: r"^gpt-(\d+(?:\.\d+)*)-luna$",
+            listing: Listing::CodexCache,
+        }),
     },
     CliSpec {
         // Google's replacement for Gemini CLI, and the reason that entry is
@@ -150,6 +184,10 @@ pub const SPECS: &[CliSpec] = &[
         // last is also exactly what `invoke` does - it appends the prompt as
         // the final argument - so the two agree by construction.
         args: &["--model", "{model}", "-p"],
+        family: Some(Family {
+            pattern: r"^gemini-(\d+(?:\.\d+)*)-flash-low$",
+            listing: Listing::Command(&["models"]),
+        }),
     },
     CliSpec {
         cli: "cursor",
@@ -179,6 +217,7 @@ pub const SPECS: &[CliSpec] = &[
         // never the user's repo. `-f` and `--yolo` do what their names say
         // and are not here.
         args: &["-p", "--output-format", "text", "--mode", "ask", "--trust"],
+        family: None,
     },
     CliSpec {
         // Second to last. OpenCode is a front end for whatever providers
@@ -197,6 +236,7 @@ pub const SPECS: &[CliSpec] = &[
         // Prints a one-line banner naming the model before the answer. It
         // carries no brace, so `extract_json_object` steps over it.
         args: &["run"],
+        family: None,
     },
     CliSpec {
         // Must match what hooks write as `source.cli`, not what the binary is
@@ -214,6 +254,8 @@ pub const SPECS: &[CliSpec] = &[
         model: "flash",
         output: OutputMode::Stdout,
         args: &["-m", "{model}", "--skip-trust", "-p"],
+        // `flash` is an alias the CLI keeps pointing at its newest Flash.
+        family: None,
     },
 ];
 
@@ -256,6 +298,13 @@ pub struct Ladder<'a> {
     /// Per-CLI model overrides from config; a CLI not named keeps its
     /// spec's cheap default.
     models: std::collections::HashMap<String, String>,
+    /// Newer models found by [`refresh_models`], read once when the ladder is
+    /// made so a call never queries the store for them.
+    discovered: Discovered,
+    /// CLIs whose found model failed during this ladder's life while their pin
+    /// answered. The store remembers it for a week; this makes the rest of
+    /// the run believe it without another failed call per session.
+    fell_back: std::cell::RefCell<std::collections::HashSet<&'static str>>,
     timeout: Duration,
     /// Someone is waiting on this call and its result is a bonus, not the
     /// answer. See [`Ladder::while_waiting`] for what that changes.
@@ -269,6 +318,8 @@ impl<'a> Ladder<'a> {
             store,
             mode: config.mode.clone(),
             models: config.models.clone(),
+            discovered: Discovered::read(store, jiff::Timestamp::now()),
+            fell_back: std::cell::RefCell::default(),
             timeout: CALL_TIMEOUT,
             advisory: false,
         }
@@ -303,6 +354,8 @@ impl<'a> Ladder<'a> {
             store: self.store,
             mode: self.mode.clone(),
             models: self.models.clone(),
+            discovered: self.discovered.clone(),
+            fell_back: self.fell_back.clone(),
             timeout: limit,
             advisory: true,
         }
@@ -409,30 +462,31 @@ impl<'a> Ladder<'a> {
             }
             attempts += 1;
 
-            let model = self.model_for(spec);
-            let started = std::time::Instant::now();
-            let result = invoke(spec, model, prompt, self.timeout);
-            // The bail in `wait_with_timeout` is unwrapped, so it leads the
-            // message; a CLI's own stderr is embedded later and must not match.
-            let good = matches!(&result, Ok(text) if usable(text));
-            let content_failure = matches!(&result, Ok(text) if !good && is_wrong_shape_json(text));
-            let (outcome, answer_bytes) = match &result {
-                Ok(text) if good => ("ok", text.len()),
-                Ok(text) if content_failure => ("unparseable", text.len()),
-                Ok(text) => ("unusable", text.len()),
-                Err(error) if error.to_string().starts_with(TIMED_OUT) => ("timeout", 0),
-                Err(_) => ("spawn_error", 0),
-            };
-            self.ledger(&crate::store::SummarizerCall {
-                session: ctx.session.to_string(),
-                purpose: ctx.purpose.to_string(),
-                cli: spec.cli.to_string(),
-                model: model.to_string(),
-                prompt_bytes: prompt.len() as u64,
-                answer_bytes: answer_bytes as u64,
-                ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                outcome: outcome.to_string(),
-            });
+            let (model, origin) = self.model_choice(spec);
+            let mut attempt = self.attempt(ctx, spec, model, prompt, &usable, &invoke);
+            // A model we found by listing, not one we tested, may be listed
+            // and still not runnable on this account. When it fails for any
+            // reason but the content, the tested pin gets the same call inside
+            // this rung, and only the pin's outcome is the rung's. If the pin
+            // answers, the found model is the culprit and is set aside; if it
+            // fails too, the CLI is down and nothing about the model is
+            // learned. A call someone is waiting on gets neither retry nor
+            // verdict, as with the breaker. A timeout is a non-content failure
+            // like any other, so a found model that hangs holds this rung for
+            // two timeouts at most, and is set aside if the pin answers.
+            if origin == Origin::Newest && !self.advisory && !attempt.good && !attempt.content_failure
+            {
+                let retry = self.attempt(ctx, spec, spec.model, prompt, &usable, &invoke);
+                if retry.good {
+                    self.fell_back.borrow_mut().insert(spec.cli);
+                    let mark = format!("{model} {}", jiff::Timestamp::now());
+                    // A mark that cannot be written costs one more retry next
+                    // run; it must not cost this answer.
+                    let _ = self.store.set_state(&bad_key(spec.cli), &mark);
+                }
+                attempt = retry;
+            }
+            let Attempt { result, good, content_failure } = attempt;
 
             match result {
                 Ok(text) if good => {
@@ -463,6 +517,46 @@ impl<'a> Ladder<'a> {
             }
         }
         Ok((Tier::RuleBased, String::new()))
+    }
+
+    /// One call to one CLI on one model, with its ledger row written.
+    fn attempt<F, I>(
+        &self,
+        ctx: &CallContext<'_>,
+        spec: &CliSpec,
+        model: &str,
+        prompt: &str,
+        usable: &F,
+        invoke: &I,
+    ) -> Attempt
+    where
+        F: Fn(&str) -> bool,
+        I: Fn(&CliSpec, &str, &str, Duration) -> Result<String>,
+    {
+        let started = std::time::Instant::now();
+        let result = invoke(spec, model, prompt, self.timeout);
+        // The bail in `wait_with_timeout` is unwrapped, so it leads the
+        // message; a CLI's own stderr is embedded later and must not match.
+        let good = matches!(&result, Ok(text) if usable(text));
+        let content_failure = matches!(&result, Ok(text) if !good && is_wrong_shape_json(text));
+        let (outcome, answer_bytes) = match &result {
+            Ok(text) if good => ("ok", text.len()),
+            Ok(text) if content_failure => ("unparseable", text.len()),
+            Ok(text) => ("unusable", text.len()),
+            Err(error) if error.to_string().starts_with(TIMED_OUT) => ("timeout", 0),
+            Err(_) => ("spawn_error", 0),
+        };
+        self.ledger(&crate::store::SummarizerCall {
+            session: ctx.session.to_string(),
+            purpose: ctx.purpose.to_string(),
+            cli: spec.cli.to_string(),
+            model: model.to_string(),
+            prompt_bytes: prompt.len() as u64,
+            answer_bytes: answer_bytes as u64,
+            ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            outcome: outcome.to_string(),
+        });
+        Attempt { result, good, content_failure }
     }
 
     /// One row in `summarizer_calls`, unless the call was advisory (a rerank
@@ -519,11 +613,20 @@ impl<'a> Ladder<'a> {
         }
     }
 
-    /// The model this rung should run: the user's override, or the spec's
-    /// cheap default.
-    #[must_use]
-    pub fn model_for(&self, spec: &CliSpec) -> &str {
-        self.models.get(spec.cli).map_or(spec.model, String::as_str)
+    /// The model this rung should run: the user's override, else the newest
+    /// model of the cheap tier [`refresh_models`] found, else the spec's pin.
+    #[cfg(test)]
+    fn model_for(&self, spec: &CliSpec) -> &str {
+        self.model_choice(spec).0
+    }
+
+    /// [`Ladder::model_for`], and which of the three it was.
+    fn model_choice(&self, spec: &CliSpec) -> (&str, Origin) {
+        let (model, origin) = choose_model(spec, &self.models, &self.discovered);
+        if origin == Origin::Newest && self.fell_back.borrow().contains(spec.cli) {
+            return (spec.model, Origin::BuiltIn);
+        }
+        (model, origin)
     }
 
     /// Is this CLI installed, and not in a cooldown?
@@ -777,52 +880,7 @@ fn invoke(spec: &CliSpec, model: &str, prompt: &str, timeout: Duration) -> Resul
         })
         .collect();
 
-    // The resolved path, not the bare name. On Windows these are npm `.cmd`
-    // shims and a bare name reaches nothing; everywhere else this is the same
-    // file `PATH` would have found, just named in full.
-    let program = resolve(spec.program)
-        .with_context(|| format!("{} is not on PATH", spec.program))?;
-    let workdir = inert_dir(std::env::temp_dir())?;
-    let mut command = Command::new(&program);
-    for key in host_session_vars() {
-        command.env_remove(key);
-    }
-    command
-        .args(&args)
-        .arg(prompt)
-        // Break the hook recursion before the child can start.
-        .env(WORKER_ENV, "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // Run somewhere inert: a headless CLI started inside the user's repo
-        // may read project instructions we neither need nor want to pay for.
-        .current_dir(&workdir)
-        // `current_dir` leaves `PWD` naming the repo the hook fired in, and
-        // `opencode run` trusts `PWD` over its real directory: it chdirs back
-        // and files the session under the user's project.
-        .env("PWD", &workdir);
-    if let Some(path) = interpreter_path(&program) {
-        command.env("PATH", path);
-    }
-
-    let mut child = command.spawn().with_context(|| {
-        // "No such file or directory" here is never about the program: it was
-        // resolved to an existing file a line ago. Two other things wear the
-        // same errno, and the message names both - and now names the
-        // directory too, because the first time this happened the report did
-        // not carry enough to tell them apart and the cause was never pinned
-        // down. A script's interpreter missing from the child's PATH is one.
-        // The working directory not existing is the other, and that one fails
-        // every rung identically, native binaries included.
-        format!(
-            "spawn {} ({}) in {} - if this says no such file, it is the \
-             script's interpreter or that directory, not the program",
-            spec.program,
-            program.display(),
-            workdir.display()
-        )
-    })?;
+    let mut child = spawn_headless(spec.program, &args, Some(prompt))?;
 
     let result = wait_with_timeout(&mut child, timeout)?;
 
@@ -844,6 +902,62 @@ fn invoke(spec: &CliSpec, model: &str, prompt: &str, timeout: Duration) -> Resul
     );
 
     Ok(answer)
+}
+
+/// Start one of the table's programs the way every call to it starts: found
+/// the way [`resolve`] finds it, told it is a worker, run somewhere inert.
+/// `tail` is the prompt, which goes last.
+fn spawn_headless(
+    name: &str,
+    args: &[String],
+    tail: Option<&str>,
+) -> Result<std::process::Child> {
+    // The resolved path, not the bare name. On Windows these are npm `.cmd`
+    // shims and a bare name reaches nothing; everywhere else this is the same
+    // file `PATH` would have found, just named in full.
+    let program = resolve(name).with_context(|| format!("{name} is not on PATH"))?;
+    let workdir = inert_dir(std::env::temp_dir())?;
+    let mut command = Command::new(&program);
+    for key in host_session_vars() {
+        command.env_remove(key);
+    }
+    command.args(args);
+    if let Some(tail) = tail {
+        command.arg(tail);
+    }
+    command
+        // Break the hook recursion before the child can start.
+        .env(WORKER_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Run somewhere inert: a headless CLI started inside the user's repo
+        // may read project instructions we neither need nor want to pay for.
+        .current_dir(&workdir)
+        // `current_dir` leaves `PWD` naming the repo the hook fired in, and
+        // `opencode run` trusts `PWD` over its real directory: it chdirs back
+        // and files the session under the user's project.
+        .env("PWD", &workdir);
+    if let Some(path) = interpreter_path(&program) {
+        command.env("PATH", path);
+    }
+
+    command.spawn().with_context(|| {
+        // "No such file or directory" here is never about the program: it was
+        // resolved to an existing file a line ago. Two other things wear the
+        // same errno, and the message names both - and now names the
+        // directory too, because the first time this happened the report did
+        // not carry enough to tell them apart and the cause was never pinned
+        // down. A script's interpreter missing from the child's PATH is one.
+        // The working directory not existing is the other, and that one fails
+        // every rung identically, native binaries included.
+        format!(
+            "spawn {name} ({}) in {} - if this says no such file, it is the \
+             script's interpreter or that directory, not the program",
+            program.display(),
+            workdir.display()
+        )
+    })
 }
 
 struct CallResult {
@@ -926,6 +1040,242 @@ pub const fn cooldown() -> Duration {
 #[must_use]
 pub const fn failure_threshold() -> i64 {
     FAILURES_BEFORE_COOLDOWN
+}
+
+/// What one call returned, classified once for the ladder to act on.
+struct Attempt {
+    result: Result<String>,
+    /// The caller accepted the answer.
+    good: bool,
+    /// The CLI answered in JSON that does not fit the prompt.
+    content_failure: bool,
+}
+
+/// Where a call's model came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// The user named it in `summarizer.models`.
+    Config,
+    /// The newest model of the tier, found by [`refresh_models`].
+    Newest,
+    /// The spec's tested pin.
+    BuiltIn,
+}
+
+/// How long a lookup answers for.
+const LOOKUP_EVERY_SECS: i64 = crate::store::DAY_SECS;
+/// How long a model that failed is left alone before it gets another chance.
+const FAILED_FOR_SECS: i64 = 7 * crate::store::DAY_SECS;
+/// Longest a `models` listing may take.
+const LISTING_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn model_key(cli: &str) -> String {
+    format!("summarizer_model:{cli}")
+}
+
+fn bad_key(cli: &str) -> String {
+    format!("summarizer_model_bad:{cli}")
+}
+
+fn checked_key(cli: &str) -> String {
+    format!("summarizer_model_checked:{cli}")
+}
+
+/// The models [`refresh_models`] left in the store, split by whether a call
+/// has since shown them not to run.
+#[derive(Debug, Default, Clone)]
+pub struct Discovered {
+    /// CLI to the newest id of its tier, minus the ones marked failed.
+    newest: std::collections::HashMap<String, String>,
+    /// CLI to the id found and marked failed, within the last week.
+    failed: std::collections::HashMap<String, String>,
+}
+
+impl Discovered {
+    /// Read what the store holds: a few keys, no process, no network.
+    ///
+    /// A mark names the id that failed, so a different id found since is not
+    /// held back by it; and a stored id that is no longer above the pin (the
+    /// pin was raised in a newer build) is ignored rather than trusted.
+    #[must_use]
+    pub fn read(store: &Store, now: jiff::Timestamp) -> Self {
+        let mut found = Self::default();
+        for spec in SPECS.iter().filter(|spec| spec.family.is_some()) {
+            let Ok(Some(id)) = store.state(&model_key(spec.cli)) else { continue };
+            if !is_newer_than_pin(spec, &id) {
+                continue;
+            }
+            let marked = store
+                .state(&bad_key(spec.cli))
+                .ok()
+                .flatten()
+                .is_some_and(|mark| mark_holds(&mark, &id, now));
+            let side = if marked { &mut found.failed } else { &mut found.newest };
+            side.insert(spec.cli.to_string(), id);
+        }
+        found
+    }
+
+    /// The found model a call has shown not to run, if that is why a rung is
+    /// on its pin.
+    #[must_use]
+    pub fn failed_model(&self, cli: &str) -> Option<&str> {
+        self.failed.get(cli).map(String::as_str)
+    }
+}
+
+/// Is this mark (`<id> <timestamp>`) about `id`, and recent enough to count?
+fn mark_holds(mark: &str, id: &str, now: jiff::Timestamp) -> bool {
+    let Some((marked, at)) = mark.split_once(' ') else { return false };
+    marked == id
+        && at
+            .parse::<jiff::Timestamp>()
+            .is_ok_and(|at| now.as_second() - at.as_second() < FAILED_FOR_SECS)
+}
+
+/// The model a rung runs and where it came from: the user's override, then the
+/// newest found model, then the pin.
+#[must_use]
+pub fn choose_model<'a>(
+    spec: &CliSpec,
+    overrides: &'a std::collections::HashMap<String, String>,
+    found: &'a Discovered,
+) -> (&'a str, Origin) {
+    if let Some(model) = overrides.get(spec.cli) {
+        return (model, Origin::Config);
+    }
+    if let Some(model) = found.newest.get(spec.cli) {
+        return (model, Origin::Newest);
+    }
+    (spec.model, Origin::BuiltIn)
+}
+
+/// The dotted number a family's pattern captures from `id`.
+fn version_of(pattern: &regex::Regex, id: &str) -> Option<Vec<u64>> {
+    pattern.captures(id)?.get(1)?.as_str().split('.').map(|part| part.parse().ok()).collect()
+}
+
+fn is_newer_than_pin(spec: &CliSpec, id: &str) -> bool {
+    let Some(family) = &spec.family else { return false };
+    pick_newest(family, spec.model, &[id.to_string()]).is_some()
+}
+
+/// The id of the family numbered highest, if any is numbered above the pin.
+///
+/// Numbers compare part by part, so `3.10` follows `3.9` and `6.1` follows
+/// `6`. Nothing at or below the pin is returned: the pin is the tested floor,
+/// and a lookup is only ever allowed to move up from it.
+fn pick_newest(family: &Family, pin: &str, ids: &[String]) -> Option<String> {
+    let pattern = regex::Regex::new(family.pattern).ok()?;
+    let floor = version_of(&pattern, pin)?;
+    ids.iter()
+        .filter_map(|id| Some((version_of(&pattern, id)?, id)))
+        .filter(|(version, _)| *version > floor)
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, id)| id.clone())
+}
+
+/// The ids codex lists for use: shown in its picker and not on their way out.
+///
+/// `None` when the text is not a model cache at all.
+fn parse_codex_cache(text: &str) -> Option<Vec<String>> {
+    let root: serde_json::Value = serde_json::from_str(text).ok()?;
+    let models = root.get("models")?.as_array()?;
+    Some(
+        models
+            .iter()
+            .filter(|model| model["visibility"] == "list" && model["upgrade"].is_null())
+            .filter_map(|model| model["slug"].as_str().map(str::to_string))
+            .collect(),
+    )
+}
+
+/// The ids in a `<id><TAB><name>` listing; the banner line has no tab.
+fn parse_listing(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| line.split_once('\t'))
+        .map(|(id, _)| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect()
+}
+
+fn codex_cache_path() -> Option<PathBuf> {
+    let home = std::env::var_os("CODEX_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))?;
+    Some(home.join("models_cache.json"))
+}
+
+/// Run a listing command and read its ids. `None` on any failure, a timeout
+/// included: a lookup that did not happen is not a lookup that found nothing.
+fn list_models(spec: &CliSpec, args: &[&str]) -> Option<Vec<String>> {
+    let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+    let mut child = spawn_headless(spec.program, &args, None).ok()?;
+    let result = wait_with_timeout(&mut child, LISTING_TIMEOUT).ok()?;
+    result.success.then(|| parse_listing(&result.stdout))
+}
+
+/// Every model this CLI lists, or `None` when it could not be asked.
+fn discover(spec: &CliSpec) -> Option<Vec<String>> {
+    let ids = match &spec.family.as_ref()?.listing {
+        Listing::CodexCache => {
+            parse_codex_cache(&std::fs::read_to_string(codex_cache_path()?).ok()?)?
+        }
+        Listing::Command(args) => list_models(spec, args)?,
+    };
+    // A listing that names nothing is a CLI that is not signed in or not
+    // itself, not a verdict that no model exists.
+    (!ids.is_empty()).then_some(ids)
+}
+
+/// Look for a newer model of each installed CLI's cheap tier, at most once a
+/// day per CLI, and keep the answer in the store for [`Ladder::new`].
+///
+/// Only consolidation calls this: a lookup can start a process, and the hooks
+/// and the MCP server must stay as quick as they are.
+///
+/// # Errors
+/// Returns an error when the store cannot be read or written.
+pub fn refresh_models(store: &Store) -> Result<()> {
+    // A unit test that reaches a consolidation run must not read the host's
+    // codex cache or start its `agy`; the lookup has its own tests through
+    // `refresh_models_with`.
+    if cfg!(test) {
+        return Ok(());
+    }
+    refresh_models_with(store, jiff::Timestamp::now(), |spec| installed(spec.program), discover)
+}
+
+/// [`refresh_models`] with the clock, the installed check and the lookup
+/// handed in, so a test can drive them without a CLI.
+fn refresh_models_with(
+    store: &Store,
+    now: jiff::Timestamp,
+    is_installed: impl Fn(&CliSpec) -> bool,
+    list: impl Fn(&CliSpec) -> Option<Vec<String>>,
+) -> Result<()> {
+    for spec in SPECS {
+        let Some(family) = &spec.family else { continue };
+        if !is_installed(spec) {
+            continue;
+        }
+        let looked_up = store
+            .state(&checked_key(spec.cli))?
+            .and_then(|at| at.parse::<jiff::Timestamp>().ok());
+        if looked_up.is_some_and(|at| now.as_second() - at.as_second() < LOOKUP_EVERY_SECS) {
+            continue;
+        }
+        // A failed lookup leaves both the pick and the date alone, so the
+        // next consolidation asks again instead of waiting out a day.
+        let Some(ids) = list(spec) else { continue };
+        match pick_newest(family, spec.model, &ids) {
+            Some(id) => store.set_state(&model_key(spec.cli), &id)?,
+            None => store.clear_state(&model_key(spec.cli))?,
+        }
+        store.set_state(&checked_key(spec.cli), &now.to_string())?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1530,6 +1880,289 @@ mod tests {
         assert!(said.contains("shim-answered"), "the shim did not run: {said:?}");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn spec_of(cli: &str) -> &'static CliSpec {
+        SPECS.iter().find(|spec| spec.cli == cli).unwrap()
+    }
+
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|id| (*id).to_string()).collect()
+    }
+
+    /// A `models_cache.json` as codex writes it: the cheap tier twice over, a
+    /// dearer tier numbered higher, a hidden luna, and a luna on its way out.
+    const CODEX_CACHE: &str = r#"{"fetched_at":"x","models":[
+        {"slug":"gpt-5.6-luna","visibility":"list","upgrade":null},
+        {"slug":"gpt-6-luna","visibility":"list","upgrade":null},
+        {"slug":"gpt-6.1-sol","visibility":"list","upgrade":null},
+        {"slug":"gpt-7-luna","visibility":"hide","upgrade":null},
+        {"slug":"gpt-6.2-luna","visibility":"list",
+         "upgrade":{"model":"gpt-6.3-sol","retirement_at":"2026-10-14T19:00:00Z"}}
+    ]}"#;
+
+    #[test]
+    fn the_newest_model_of_the_pinned_tier_wins_and_nothing_else_does() {
+        let codex = spec_of("codex");
+        let family = codex.family.as_ref().unwrap();
+
+        // Hidden and retiring models are not offered; a higher number in
+        // another tier (`sol`) is not the same tier.
+        let listed = parse_codex_cache(CODEX_CACHE).expect("a cache that parses");
+        assert!(!listed.contains(&"gpt-7-luna".to_string()), "a hidden model was offered");
+        assert!(!listed.contains(&"gpt-6.2-luna".to_string()), "a retiring model was offered");
+        assert_eq!(pick_newest(family, codex.model, &listed), Some("gpt-6-luna".to_string()));
+
+        // Never below the pin, and the pin itself is not news.
+        assert_eq!(pick_newest(family, codex.model, &ids(&["gpt-5.5-luna"])), None);
+        assert_eq!(pick_newest(family, codex.model, &ids(&["gpt-5.6-luna"])), None);
+
+        // Versions compare number by number: 3.10 is after 3.9, 6.1 after 6.
+        let antigravity = spec_of("antigravity").family.as_ref().unwrap();
+        assert_eq!(
+            pick_newest(
+                antigravity,
+                "gemini-3.7-flash-low",
+                &ids(&["gemini-3.9-flash-low", "gemini-3.10-flash-low", "gemini-3.10-flash-high"])
+            ),
+            Some("gemini-3.10-flash-low".to_string())
+        );
+        assert_eq!(
+            pick_newest(family, "gpt-6-luna", &ids(&["gpt-6-luna", "gpt-6.1-luna"])),
+            Some("gpt-6.1-luna".to_string())
+        );
+    }
+
+    #[test]
+    fn a_cache_that_is_missing_or_unreadable_names_no_models() {
+        assert!(parse_codex_cache("not json").is_none());
+        assert!(parse_codex_cache("{}").is_none());
+    }
+
+    #[test]
+    fn the_antigravity_listing_is_read_by_its_tab_columns() {
+        let out = "Fetching available models...\n\
+                   gemini-3.8-flash-high\tGemini 3.8 Flash (High)\n\
+                   gemini-3.8-flash-medium\tGemini 3.8 Flash (Medium)\n\
+                   gemini-3.8-flash-low\tGemini 3.8 Flash (Low)\n\
+                   claude-sonnet-5\tClaude Sonnet 5\n\
+                   a line with no tab\n";
+        let listed = parse_listing(out);
+        assert_eq!(listed.len(), 4, "{listed:?}");
+        let family = spec_of("antigravity").family.as_ref().unwrap();
+        assert_eq!(
+            pick_newest(family, "gemini-3.7-flash-low", &listed),
+            Some("gemini-3.8-flash-low".to_string())
+        );
+    }
+
+    #[test]
+    fn a_pin_is_a_member_of_its_own_family() {
+        for spec in SPECS {
+            if let Some(family) = &spec.family {
+                let pattern = regex::Regex::new(family.pattern).unwrap();
+                assert!(pattern.is_match(spec.model), "{}: pin {} is outside its family", spec.cli, spec.model);
+            }
+        }
+    }
+
+    fn found_in(store: &Store) -> Discovered {
+        Discovered::read(store, jiff::Timestamp::now())
+    }
+
+    #[test]
+    fn the_model_comes_from_config_then_the_newest_then_the_pin() {
+        let store = Store::open_memory().unwrap();
+        let codex = spec_of("codex");
+        let none = std::collections::HashMap::new();
+
+        // Nothing discovered, nothing configured: every CLI runs its pin.
+        for spec in SPECS {
+            assert_eq!(choose_model(spec, &none, &found_in(&store)), (spec.model, Origin::BuiltIn));
+        }
+
+        store.set_state("summarizer_model:codex", "gpt-6-luna").unwrap();
+        assert_eq!(choose_model(codex, &none, &found_in(&store)), ("gpt-6-luna", Origin::Newest));
+        let ladder = Ladder::new(&store, &config("auto"));
+        assert_eq!(ladder.model_for(codex), "gpt-6-luna");
+        assert_eq!(ladder.model_for(spec_of("claude-code")), "haiku", "another CLI is untouched");
+
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("codex".to_string(), "gpt-5.6-sol".to_string());
+        assert_eq!(choose_model(codex, &overrides, &found_in(&store)), ("gpt-5.6-sol", Origin::Config));
+    }
+
+    #[test]
+    fn a_newest_model_marked_failed_is_skipped_until_the_mark_lapses_or_the_id_changes() {
+        let store = Store::open_memory().unwrap();
+        let codex = spec_of("codex");
+        let none = std::collections::HashMap::new();
+        let now = jiff::Timestamp::now();
+        let days_ago = |days: i64| now - jiff::SignedDuration::from_secs(days * 24 * 3600);
+        store.set_state("summarizer_model:codex", "gpt-6-luna").unwrap();
+
+        store.set_state("summarizer_model_bad:codex", &format!("gpt-6-luna {}", days_ago(1))).unwrap();
+        let found = Discovered::read(&store, now);
+        assert_eq!(choose_model(codex, &none, &found), ("gpt-5.6-luna", Origin::BuiltIn));
+        assert_eq!(found.failed_model("codex"), Some("gpt-6-luna"));
+
+        // A different id was found since: the mark was about the old one.
+        store.set_state("summarizer_model:codex", "gpt-6.1-luna").unwrap();
+        assert_eq!(choose_model(codex, &none, &Discovered::read(&store, now)), ("gpt-6.1-luna", Origin::Newest));
+
+        // And after a week the same id gets another chance.
+        store.set_state("summarizer_model:codex", "gpt-6-luna").unwrap();
+        store.set_state("summarizer_model_bad:codex", &format!("gpt-6-luna {}", days_ago(8))).unwrap();
+        let found = Discovered::read(&store, now);
+        assert_eq!(choose_model(codex, &none, &found), ("gpt-6-luna", Origin::Newest));
+        assert_eq!(found.failed_model("codex"), None);
+    }
+
+    /// Run `run_with` on a codex-pinned ladder where `invoke` answers by the
+    /// model it is handed; returns the tier, answer, models tried and the store.
+    fn run_on_codex(
+        advisory: bool,
+        reply: impl Fn(&str) -> Result<String>,
+        usable: impl Fn(&str) -> bool,
+    ) -> (Tier, String, Vec<String>, Store) {
+        let store = Store::open_memory().unwrap();
+        store.set_state("summarizer_model:codex", "gpt-6-luna").unwrap();
+        let tried = std::cell::RefCell::new(Vec::new());
+        let (tier, text) = {
+            let ladder = Ladder::new(&store, &config("codex"));
+            let ladder = if advisory { ladder.while_waiting(Duration::from_secs(6)) } else { ladder };
+            ladder
+                .run_with(
+                    &CallContext { purpose: "consolidate", session: "s1" },
+                    "prompt",
+                    "codex",
+                    usable,
+                    |_| Ok(true),
+                    |_, model, _, _| {
+                        tried.borrow_mut().push(model.to_string());
+                        reply(model)
+                    },
+                )
+                .unwrap()
+        };
+        (tier, text, tried.into_inner(), store)
+    }
+
+    #[test]
+    fn a_newest_model_that_fails_while_the_pin_answers_is_marked_and_left_alone() {
+        let reply = |model: &str| match model {
+            "gpt-6-luna" => Err(anyhow::anyhow!("codex exited with 1: unknown model")),
+            _ => Ok("good answer".to_string()),
+        };
+        let (tier, text, tried, store) = run_on_codex(false, reply, |text| text.starts_with("good"));
+
+        assert_eq!(tier, Tier::Cli("codex".to_string()));
+        assert_eq!(text, "good answer");
+        assert_eq!(tried, ["gpt-6-luna", "gpt-5.6-luna"]);
+        assert!(
+            store.state("summarizer_model_bad:codex").unwrap().is_some_and(|mark| mark.starts_with("gpt-6-luna ")),
+            "the failed id was not marked"
+        );
+        let calls = store.summarizer_calls_since(60).unwrap();
+        let rows: Vec<(&str, &str)> = calls.iter().map(|c| (c.model.as_str(), c.outcome.as_str())).collect();
+        assert_eq!(rows, [("gpt-6-luna", "spawn_error"), ("gpt-5.6-luna", "ok")]);
+        let health = store.summarizer_health().unwrap();
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].failures, 0, "the pin answered: no strike for the CLI");
+
+        // The same ladder goes straight to the pin from now on.
+        let ladder = Ladder::new(&store, &config("codex"));
+        assert_eq!(ladder.model_for(spec_of("codex")), "gpt-5.6-luna");
+    }
+
+    #[test]
+    fn the_ladder_remembers_a_fallback_for_the_rest_of_its_run() {
+        let store = Store::open_memory().unwrap();
+        store.set_state("summarizer_model:codex", "gpt-6-luna").unwrap();
+        let ladder = Ladder::new(&store, &config("codex"));
+        let tried = std::cell::RefCell::new(Vec::new());
+        for _ in 0..2 {
+            ladder
+                .run_with(
+                    &CallContext { purpose: "consolidate", session: "s1" },
+                    "prompt",
+                    "codex",
+                    |_| true,
+                    |_| Ok(true),
+                    |_, model, _, _| {
+                        tried.borrow_mut().push(model.to_string());
+                        if model == "gpt-6-luna" { Err(anyhow::anyhow!("boom")) } else { Ok("x".to_string()) }
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(tried.into_inner(), ["gpt-6-luna", "gpt-5.6-luna", "gpt-5.6-luna"]);
+    }
+
+    #[test]
+    fn when_the_pin_fails_too_the_cli_failed_once_and_nothing_is_marked() {
+        let (tier, _, tried, store) =
+            run_on_codex(false, |_| Err(anyhow::anyhow!("codex exited with 1: down")), |_| true);
+
+        assert_eq!(tier, Tier::RuleBased);
+        assert_eq!(tried, ["gpt-6-luna", "gpt-5.6-luna"]);
+        assert_eq!(store.state("summarizer_model_bad:codex").unwrap(), None);
+        let health = store.summarizer_health().unwrap();
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].failures, 1, "one failed call is one strike, not two");
+        assert_eq!(store.summarizer_calls_since(60).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_content_failure_on_the_newest_model_is_not_retried() {
+        let (tier, _, tried, store) = run_on_codex(false, |_| Ok("{\"wrong\":1}".to_string()), |_| false);
+
+        assert_eq!(tier, Tier::RuleBased);
+        assert_eq!(tried, ["gpt-6-luna"]);
+        assert_eq!(store.state("summarizer_model_bad:codex").unwrap(), None);
+    }
+
+    #[test]
+    fn an_advisory_call_never_retries_on_the_pin_or_marks_a_model() {
+        let (tier, _, tried, store) =
+            run_on_codex(true, |_| Err(anyhow::anyhow!("codex exited with 1: down")), |_| true);
+
+        assert_eq!(tier, Tier::RuleBased);
+        assert_eq!(tried, ["gpt-6-luna"], "a favour asked mid-search was asked twice");
+        assert_eq!(store.state("summarizer_model_bad:codex").unwrap(), None);
+    }
+
+    #[test]
+    fn models_are_looked_up_at_most_once_a_day_and_a_failed_lookup_does_not_count() {
+        let store = Store::open_memory().unwrap();
+        let now = jiff::Timestamp::now();
+        let later = |hours: i64| now + jiff::SignedDuration::from_secs(hours * 3600);
+        let looked_up = std::cell::RefCell::new(Vec::new());
+        let codex_only = |spec: &CliSpec| spec.cli == "codex";
+        let lists = |spec: &CliSpec| {
+            looked_up.borrow_mut().push(spec.cli);
+            Some(ids(&["gpt-5.6-luna", "gpt-6-luna"]))
+        };
+
+        refresh_models_with(&store, now, codex_only, lists).unwrap();
+        assert_eq!(store.state("summarizer_model:codex").unwrap().as_deref(), Some("gpt-6-luna"));
+        // Only the installed CLI with a family is looked up.
+        assert_eq!(*looked_up.borrow(), ["codex"]);
+
+        refresh_models_with(&store, later(23), codex_only, lists).unwrap();
+        assert_eq!(looked_up.borrow().len(), 1, "looked up twice inside a day");
+        refresh_models_with(&store, later(25), codex_only, lists).unwrap();
+        assert_eq!(looked_up.borrow().len(), 2);
+
+        // A lookup that fails keeps what was known and is tried again next time.
+        refresh_models_with(&store, later(50), codex_only, |_| None).unwrap();
+        assert_eq!(store.state("summarizer_model:codex").unwrap().as_deref(), Some("gpt-6-luna"));
+        refresh_models_with(&store, later(51), codex_only, lists).unwrap();
+        assert_eq!(looked_up.borrow().len(), 3, "a failed lookup was counted as done");
+
+        // A list with nothing newer than the pin forgets the old pick.
+        refresh_models_with(&store, later(80), codex_only, |_| Some(ids(&["gpt-5.5-luna"]))).unwrap();
+        assert_eq!(store.state("summarizer_model:codex").unwrap(), None);
     }
 
     #[test]

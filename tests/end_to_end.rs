@@ -94,6 +94,13 @@ impl Fixture {
             .args(args)
             .current_dir(&self.project)
             .env("ROLEPOD_BRAIN_HOME", &self.home)
+            // A consolidation run that finds the index due for a compact waits
+            // minutes for a quiet log; a test that did not ask for that must
+            // not (a later `.env` in `env` overrides this).
+            .env("ROLEPOD_BRAIN_MAINT_WAIT_SECS", "0")
+            // A run fetches a missing embedding model by itself; a test must
+            // not reach the network.
+            .env("ROLEPOD_BRAIN_NO_FETCH", "1")
             // ROLEPOD_BRAIN_HOME isolates our own data; it does NOT isolate
             // the CLI configs we wire into, which are found through $HOME. A
             // test running `uninstall --apply` without this unwired the real
@@ -113,11 +120,16 @@ impl Fixture {
     /// Git reads config from HOME, from XDG_CONFIG_HOME and from the system
     /// file. These pin the last two to the fixture, so together with the
     /// fixture's HOME a wiki commit sees git's defaults, not this machine's.
+    ///
+    /// It also drops `CODEX_HOME`: consolidation reads codex's model cache
+    /// from there when a stub `codex` is on `PATH`, and a host's own cache
+    /// must not decide which model a test sees.
     fn own_git_config(&self, command: &mut Command) {
         let base = self.home.parent().unwrap();
         command
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("XDG_CONFIG_HOME", base.join(".config"));
+            .env("XDG_CONFIG_HOME", base.join(".config"))
+            .env_remove("CODEX_HOME");
     }
 
     /// Install a fake host CLI that responds however the test needs.
@@ -226,6 +238,7 @@ impl Fixture {
             .args(["hook", "--cli", cli, "--event", event])
             .current_dir(&self.project)
             .env("ROLEPOD_BRAIN_HOME", &self.home)
+            .env("ROLEPOD_BRAIN_NO_FETCH", "1")
             // Same reason brain_with_path owns HOME: the capture path reads
             // $HOME too, and a fixture that leaves it pointing at the real
             // machine is testing the machine, not the fixture.
@@ -263,6 +276,7 @@ impl Fixture {
             .args(["-p", "-c", &script])
             .current_dir(&self.project)
             .env("ROLEPOD_BRAIN_HOME", &self.home)
+            .env("ROLEPOD_BRAIN_NO_FETCH", "1")
             .env("HOME", self.home.parent().unwrap());
         self.own_git_config(&mut command);
         let mut child = command
@@ -309,6 +323,7 @@ impl Fixture {
             .arg("mcp")
             .current_dir(&self.project)
             .env("ROLEPOD_BRAIN_HOME", &self.home)
+            .env("ROLEPOD_BRAIN_NO_FETCH", "1")
             .env("PATH", path);
         self.own_git_config(&mut command);
         let mut child = command
@@ -630,6 +645,7 @@ fn two_projects_with_one_basename_never_share_a_directory() {
         .args(["hook", "--cli", "claude-code", "--event", "PostToolUse"])
         .current_dir(&rival)
         .env("ROLEPOD_BRAIN_HOME", &fixture.home)
+        .env("ROLEPOD_BRAIN_NO_FETCH", "1")
         .env("HOME", fixture.home.parent().unwrap())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2601,6 +2617,97 @@ fn compact_refuses_while_a_hook_has_run_in_the_last_ten_minutes() {
     assert!(allowed.status.success(), "compact refused a quiet machine: {allowed:?}");
 }
 
+impl Fixture {
+    fn state_value(&self, key: &str) -> String {
+        rusqlite::Connection::open(self.home.join("brain.db"))
+            .unwrap()
+            .query_row("SELECT value FROM schema_state WHERE key = ?1", [key], |row| row.get(0))
+            .unwrap_or_default()
+    }
+
+    /// A store whose retention has dropped sixty bodies and that nothing has
+    /// compacted. Returns the ids and the `id || rowid` listing.
+    fn emptied_store(&self) -> (Vec<String>, String) {
+        let filler = "lorem ipsum dolor sit amet ".repeat(120);
+        let ids: Vec<String> =
+            (1..=60).map(|n| self.prompt_event(n, &format!("marker{n:02}kestrel {filler}"))).collect();
+        std::fs::write(self.home.join("config.toml"), "[retention]\ndays = 0\n").unwrap();
+        assert!(self.brain(&["consolidate"]).status.success(), "embedding run failed");
+        std::fs::remove_file(self.home.join("config.toml")).unwrap();
+        let all: Vec<&String> = ids.iter().collect();
+        self.age_in_log(&all);
+        assert!(self.brain(&["consolidate"]).status.success(), "retention run failed");
+        assert_eq!(self.index_body(&ids[0]), "", "precondition: the body left the index");
+        let rowids = self.sql_one("SELECT group_concat(id || r) FROM (SELECT id, rowid AS r FROM events ORDER BY id)");
+        (ids, rowids)
+    }
+}
+
+#[test]
+fn a_consolidation_run_on_a_quiet_machine_compacts_the_index_by_itself() {
+    let fixture = Fixture::new("auto-compact");
+    let (ids, rowids) = fixture.emptied_store();
+    assert_eq!(fixture.state_value("compact_done_at"), "", "precondition: never compacted");
+
+    // The run that dropped the bodies saw a log written seconds before and
+    // left the window alone, and said why.
+    assert!(fixture.state_value("compact_skip").starts_with("not-quiet@"), "{}", fixture.state_value("compact_skip"));
+    assert!(fixture.home.join("brain.db").is_file());
+
+    fixture.quiet_logs();
+    let before = fixture.index_bytes();
+    let run = fixture.brain(&["consolidate", "--all"]);
+    assert!(run.status.success(), "consolidate failed: {run:?}");
+
+    let after = fixture.index_bytes();
+    assert!(after < before, "no one asked, and the index did not shrink: {before} -> {after}");
+    assert!(after * 10 <= before * 9, "the spec asks for at least 10% back: {before} -> {after}");
+    assert!(!fixture.state_value("compact_done_at").is_empty(), "the compact left no mark");
+    assert_eq!(fixture.state_value("compact_skip"), "", "a finished compact keeps no stale refusal");
+    assert!(!fixture.home.join(".brain-maintenance").exists(), "the window left its marker");
+    assert!(!fixture.home.join(".brain-maintain.lock").exists(), "the window left its gate");
+    assert_eq!(fixture.sql_one("SELECT CAST(freelist_count AS TEXT) FROM pragma_freelist_count"), "0");
+
+    let kept = fixture.sql_one("SELECT group_concat(id || r) FROM (SELECT id, rowid AS r FROM events ORDER BY id)");
+    assert_eq!(kept, rowids, "the rewrite renumbered the rows");
+    fixture.sql_run("INSERT INTO events_fts(events_fts) VALUES ('integrity-check')");
+    fixture.sql_run("INSERT INTO events_tri(events_tri) VALUES ('integrity-check')");
+    let found = String::from_utf8_lossy(&fixture.brain(&["search", "marker07kestrel"]).stdout).into_owned();
+    assert!(found.contains("marker07kestrel"), "search lost the row: {found}");
+    assert!(fixture.get_body(&ids[6]).contains("marker07kestrel"));
+
+    // Done is done: a second run finds nothing due.
+    fixture.quiet_logs();
+    let again = fixture.index_bytes();
+    assert!(fixture.brain(&["consolidate", "--all"]).status.success());
+    assert!(fixture.index_bytes() <= again, "a second run rewrote an index that was not due");
+}
+
+#[test]
+fn a_run_that_meets_the_window_stands_aside_and_leaves_no_trace_in_asks_or_log() {
+    let fixture = Fixture::new("maint-yield");
+    fixture.prompt_event(1, "the zeta rendezvous cipher value");
+    assert!(fixture.brain(&["consolidate"]).status.success());
+    let asks = "SELECT CAST(COUNT(*) AS TEXT) FROM consolidation_requests";
+    let asked = fixture.sql_one(asks);
+    let log_before = std::fs::read_to_string(fixture.home.join("brain.log")).unwrap_or_default();
+
+    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    std::fs::write(fixture.home.join(".brain-maintenance"), format!("99999 {}", now_ms + 2500)).unwrap();
+    let yielded = fixture.brain(&["consolidate"]);
+    assert!(yielded.status.success(), "{yielded:?}");
+    assert_eq!(fixture.sql_one(asks), asked, "a run in the window left an ask behind");
+    assert_eq!(std::fs::read_to_string(fixture.home.join("brain.log")).unwrap_or_default(), log_before);
+    assert!(fixture.home.join(".brain-maint-yielded").exists(), "nothing tells the compactor to rerun");
+    let last_run = "SELECT CAST(yielded AS TEXT) FROM consolidation_runs ORDER BY rowid DESC LIMIT 1";
+    assert_eq!(fixture.sql_one(last_run), "1");
+
+    // A compactor killed outright stops renewing: the marker lapses by itself.
+    std::thread::sleep(std::time::Duration::from_millis(2700));
+    assert!(fixture.brain(&["consolidate"]).status.success());
+    assert_eq!(fixture.sql_one(last_run), "0", "an expired marker still held a run back");
+}
+
 #[test]
 fn a_correction_made_twice_becomes_a_standing_rule() {
     // khwan's loop, kept local: corrections a person made more than once are
@@ -2900,6 +3007,7 @@ fn a_stale_tmpdir_does_not_look_like_every_cli_vanishing() {
         .args(["consolidate", "--force"])
         .current_dir(&fixture.project)
         .env("ROLEPOD_BRAIN_HOME", &fixture.home)
+        .env("ROLEPOD_BRAIN_NO_FETCH", "1")
         .env("HOME", fixture.home.parent().unwrap())
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
         .env("TMPDIR", &gone);
@@ -2944,6 +3052,7 @@ fn a_cli_that_trusts_pwd_still_runs_in_the_inert_directory() {
         .current_dir(&fixture.project)
         .env("PWD", &fixture.project)
         .env("ROLEPOD_BRAIN_HOME", &fixture.home)
+        .env("ROLEPOD_BRAIN_NO_FETCH", "1")
         .env("HOME", fixture.home.parent().unwrap())
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
         .env("TMPDIR", &inert)
@@ -4915,6 +5024,7 @@ fn an_event_with_no_knowable_workspace_is_skipped_not_guessed() {
         .args(["hook", "--cli", "antigravity", "--event", "PostToolUse"])
         .current_dir(&config_dir)
         .env("ROLEPOD_BRAIN_HOME", &fixture.home)
+        .env("ROLEPOD_BRAIN_NO_FETCH", "1")
         .env("HOME", fixture.home.parent().unwrap())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -5072,6 +5182,7 @@ fn a_silenced_run_leaves_no_trace_at_all() {
         .args(["hook", "--cli", "claude-code", "--event", "UserPromptSubmit"])
         .current_dir(&fixture.project)
         .env("ROLEPOD_BRAIN_HOME", &fixture.home)
+        .env("ROLEPOD_BRAIN_NO_FETCH", "1")
         .env("ROLEPOD_BRAIN_SILENT", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -5302,6 +5413,7 @@ fn a_headless_session_gets_nothing_even_after_a_wipe() {
         .args(["hook", "--cli", "claude-code", "--event", "PostCompact"])
         .current_dir(&fixture.project)
         .env("ROLEPOD_BRAIN_HOME", &fixture.home)
+        .env("ROLEPOD_BRAIN_NO_FETCH", "1")
         .env("ROLEPOD_BRAIN_SILENT", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -6237,6 +6349,7 @@ fn two_consolidations_racing_in_one_project_do_not_corrupt_or_double_up() {
                 .args(["consolidate", "--force"])
                 .current_dir(&fixture.project)
                 .env("ROLEPOD_BRAIN_HOME", &fixture.home)
+                .env("ROLEPOD_BRAIN_NO_FETCH", "1")
                 .env("HOME", fixture.home.parent().unwrap())
                 .env("PATH", "/usr/bin:/bin")
                 .stdout(Stdio::piped())
@@ -7590,4 +7703,365 @@ fn a_capture_reaches_the_log_when_the_store_cannot_even_be_opened() {
     // The next open migrates; the catch-up then brings the event in.
     assert!(fixture.brain(&["consolidate", "--session", "nonexistent-session"]).status.success());
     assert_eq!(indexed_with(&fixture, "lockedopen.rs"), 1, "the catch-up did not index the event");
+}
+
+/// Open the compact window the way the compactor does: a marker whose expiry
+/// is a minute away.
+fn open_window(fixture: &Fixture) {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    std::fs::write(fixture.home.join(".brain-maintenance"), format!("{} {}", std::process::id(), now + 60_000))
+        .unwrap();
+}
+
+fn close_window(fixture: &Fixture) {
+    let _ = std::fs::remove_file(fixture.home.join(".brain-maintenance"));
+}
+
+/// One number out of the store, read without taking any lock of its own.
+fn scalar(fixture: &Fixture, sql: &str) -> i64 {
+    let conn = rusqlite::Connection::open_with_flags(
+        fixture.home.join("brain.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("open brain.db read-only");
+    conn.query_row(sql, [], |row| row.get(0)).expect("scalar")
+}
+
+fn brain_log_text(fixture: &Fixture) -> String {
+    std::fs::read_to_string(fixture.home.join("brain.log")).unwrap_or_default()
+}
+
+/// The JSON a search or get returned, and whether the call was an error.
+fn tool_text(response: &serde_json::Value) -> (bool, serde_json::Value) {
+    let is_error = response["result"]["isError"].as_bool().unwrap_or(false) || response.get("error").is_some();
+    let text = response["result"]["content"][0]["text"].as_str().unwrap_or("null");
+    (is_error, serde_json::from_str(text).unwrap_or(serde_json::Value::Null))
+}
+
+#[test]
+fn maint_window_hook_answers_at_once_and_its_event_is_indexed_afterwards() {
+    let fixture = Fixture::new("maint-hook");
+    fixture.seed_session_as("0199a1f2-3c4d-7e8f-9012-3456789abcde", &["src/earlier.rs"]);
+
+    let lock = hold_write_lock(&fixture);
+    open_window(&fixture);
+    let payload = edit_payload(&fixture, "0199c000-0000-7000-8000-00000000b001", "src/inwindow.rs");
+    let started = std::time::Instant::now();
+    let out = fixture.hook("claude-code", "PostToolUse", &payload);
+    let took = started.elapsed();
+    assert!(out.status.success(), "the host saw a failing hook: {out:?}");
+    assert!(took < std::time::Duration::from_millis(500), "the hook waited on the held store: {took:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "{}");
+    assert!(fixture.log_text().contains("inwindow.rs"), "the capture never reached the log");
+    assert_eq!(brain_log_text(&fixture), "", "a hook in the window wrote to brain.log, which doctor counts");
+    lock.execute_batch("COMMIT").unwrap();
+    close_window(&fixture);
+
+    assert!(fixture.brain(&["consolidate", "--session", "nonexistent-session"]).status.success());
+    assert_eq!(indexed_with(&fixture, "inwindow.rs"), 1, "the catch-up did not index the event");
+}
+
+#[test]
+fn maint_window_session_start_still_injects_and_its_ledger_is_spilled_then_folded() {
+    let fixture = Fixture::new("maint-primer");
+    let earlier = "0199aaaa-0000-7000-8000-000000000000";
+    let prompt = serde_json::json!({"session_id": earlier, "cwd": fixture.project, "prompt": "why does the scheduler double-book?"});
+    fixture.hook("claude-code", "UserPromptSubmit", &prompt.to_string());
+
+    let session = "0199a1f2-3c4d-7e8f-9012-3456789abcde";
+    let lock = hold_write_lock(&fixture);
+    open_window(&fixture);
+    let out = fixture.hook("claude-code", "SessionStart", &start_payload(&fixture.project, session, "startup"));
+    assert!(out.status.success());
+    let primer = injected_context(&out).expect("a primer in the window, not `{}`");
+    assert!(primer.contains(earlier), "the primer lost its content: {primer}");
+    assert_eq!(brain_log_text(&fixture), "", "a hook in the window wrote to brain.log");
+    let spilled = std::fs::read_to_string(fixture.home.join("surfaced.jsonl")).expect("the ledger write was spilled");
+    assert!(spilled.contains(session) && spilled.contains("injected"), "unexpected spill: {spilled}");
+    lock.execute_batch("COMMIT").unwrap();
+    close_window(&fixture);
+    assert_eq!(scalar(&fixture, "SELECT COUNT(*) FROM injected"), 0, "precondition: nothing reached the ledger");
+
+    assert!(fixture.brain(&["consolidate", "--session", "nonexistent-session"]).status.success());
+    assert!(scalar(&fixture, "SELECT COUNT(*) FROM injected") > 0, "the spill was not folded back");
+    assert!(!fixture.home.join("surfaced.jsonl").exists(), "the folded spill was left behind");
+}
+
+#[test]
+fn mcp_search_in_the_window_returns_its_hits_and_its_ids_survive_as_surfaced() {
+    let fixture = Fixture::new("maint-mcp");
+    fixture.seed_session_as("0199a1f2-3c4d-7e8f-9012-3456789abcde", &["src/auth.rs", "src/auth/login.rs"]);
+    let search = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"brain_search","arguments":{"query":"auth"}}}"#;
+
+    // What starting the server and answering costs on this machine right now,
+    // with nothing held and nothing recorded (no hit, so no ledger write). A
+    // fixed bound measured start-up under load, not the wait on the lock.
+    let miss = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"brain_search","arguments":{"query":"zzqxjvk"}}}"#;
+    let began = std::time::Instant::now();
+    fixture.mcp(&[miss]);
+    let baseline = began.elapsed();
+
+    let lock = hold_write_lock(&fixture);
+    open_window(&fixture);
+    let started = std::time::Instant::now();
+    let responses = fixture.mcp(&[search]);
+    // Waiting out the 5 s busy timeout would add all of it on top of the baseline.
+    assert!(
+        started.elapsed() < baseline + std::time::Duration::from_secs(3),
+        "the search waited out the busy timeout: {:?} against a {baseline:?} baseline",
+        started.elapsed()
+    );
+    let (is_error, found) = tool_text(&responses[0]);
+    assert!(!is_error, "a held ledger failed the search: {responses:?}");
+    let ids: Vec<String> =
+        found["hits"].as_array().expect("hits").iter().filter_map(|hit| hit["id"].as_str().map(str::to_string)).collect();
+    assert!(!ids.is_empty(), "the search returned no hits: {found}");
+    let spilled = std::fs::read_to_string(fixture.home.join("surfaced.jsonl")).expect("the ids were spilled");
+    for id in &ids {
+        assert!(spilled.contains(id.as_str()), "{id} is not in surfaced.jsonl: {spilled}");
+    }
+    lock.execute_batch("COMMIT").unwrap();
+    close_window(&fixture);
+
+    assert!(fixture.brain(&["consolidate", "--session", "nonexistent-session"]).status.success());
+    for id in &ids {
+        assert_eq!(scalar(&fixture, &format!("SELECT COUNT(*) FROM recalled WHERE event_id = '{id}'")), 1, "{id} not folded");
+    }
+    assert!(!fixture.home.join("surfaced.jsonl").exists(), "the folded spill was left behind");
+}
+
+#[test]
+fn mcp_search_with_the_store_held_and_no_window_still_returns_its_hits() {
+    let fixture = Fixture::new("maint-mcp-nowindow");
+    fixture.seed_session_as("0199a1f2-3c4d-7e8f-9012-3456789abcde", &["src/auth.rs"]);
+    let search = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"brain_search","arguments":{"query":"auth"}}}"#;
+
+    let lock = hold_write_lock(&fixture);
+    let responses = fixture.mcp(&[search]);
+    let (is_error, found) = tool_text(&responses[0]);
+    assert!(!is_error && found["count"].as_i64().unwrap_or(0) > 0, "a held ledger failed the search: {responses:?}");
+    assert!(fixture.home.join("surfaced.jsonl").exists(), "the ids were not spilled");
+    lock.execute_batch("COMMIT").unwrap();
+}
+
+#[test]
+fn maint_spilled_ids_pass_the_forget_guard_of_their_own_session_only() {
+    let fixture = Fixture::new("maint-guard");
+    fixture.seed_session_as("0199a1f2-3c4d-7e8f-9012-3456789abcde", &["src/auth.rs"]);
+    let call = |name: &str, args: &str| {
+        format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{name}","arguments":{args}}}}}"#)
+    };
+
+    let lock = hold_write_lock(&fixture);
+    open_window(&fixture);
+    let responses = fixture.mcp(&[&call("brain_search", r#"{"query":"auth"}"#)]);
+    let (_, found) = tool_text(&responses[0]);
+    let id = found["hits"][0]["id"].as_str().expect("a hit").to_string();
+    // The same server process: the search's spill is what lets this through.
+    let forget = call("brain_forget", &format!(r#"{{"id":"{id}"}}"#));
+    let search = call("brain_search", r#"{"query":"auth"}"#);
+    let same = serde_json::to_string(&fixture.mcp(&[&search, &forget])).unwrap();
+    assert!(!same.contains("has not been surfaced"), "a spilled id failed the guard: {same}");
+    // Another server process was shown nothing.
+    let other = serde_json::to_string(&fixture.mcp(&[&forget])).unwrap();
+    assert!(other.contains("has not been surfaced"), "another session's spill opened the guard: {other}");
+    lock.execute_batch("COMMIT").unwrap();
+}
+
+#[test]
+fn maint_window_clear_leaves_a_pending_wipe_that_the_next_writable_hook_applies() {
+    let fixture = Fixture::new("maint-wipe");
+    let earlier = "0199aaaa-0000-7000-8000-000000000000";
+    let prompt = serde_json::json!({"session_id": earlier, "cwd": fixture.project, "prompt": "why does the scheduler double-book?"});
+    fixture.hook("claude-code", "UserPromptSubmit", &prompt.to_string());
+    let session = "0199a1f2-3c4d-7e8f-9012-3456789abcde";
+    injected_context(&fixture.hook("claude-code", "SessionStart", &start_payload(&fixture.project, session, "startup")))
+        .expect("a primer on a normal start");
+    let live = format!("SELECT COUNT(*) FROM injected WHERE session = '{session}' AND active = 1");
+    assert!(scalar(&fixture, &live) > 0, "precondition: the session was shown something");
+
+    let lock = hold_write_lock(&fixture);
+    open_window(&fixture);
+    let out = fixture.hook("claude-code", "SessionStart", &start_payload(&fixture.project, session, "clear"));
+    assert!(out.status.success());
+    let waiting = fixture.home.join("pending-wipe").join(session);
+    assert!(waiting.exists(), "a wipe that could not be written was lost");
+    assert_eq!(brain_log_text(&fixture), "", "a hook in the window wrote to brain.log");
+    lock.execute_batch("COMMIT").unwrap();
+    close_window(&fixture);
+    assert!(scalar(&fixture, &live) > 0, "precondition: the wipe was not applied yet");
+
+    fixture.hook("claude-code", "PostToolUse", &edit_payload(&fixture, session, "src/after.rs"));
+    assert!(!waiting.exists(), "the applied wipe was not removed");
+    assert_eq!(scalar(&fixture, &live), 0, "the session still counts what it was shown before /clear");
+}
+
+#[test]
+fn maint_a_store_that_is_free_gains_no_file_in_the_data_directory() {
+    let fixture = Fixture::new("maint-quiet");
+    let session = "0199a1f2-3c4d-7e8f-9012-3456789abcde";
+    fixture.seed_session_as(session, &["src/auth.rs"]);
+    fixture.hook("claude-code", "SessionStart", &start_payload(&fixture.project, session, "clear"));
+    let search = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"brain_search","arguments":{"query":"auth"}}}"#;
+    let (is_error, _) = tool_text(&fixture.mcp(&[search])[0]);
+    assert!(!is_error);
+    for name in ["surfaced.jsonl", "surfaced.jsonl.folding", "pending-wipe", ".brain-maintenance"] {
+        assert!(!fixture.home.join(name).exists(), "{name} appeared without a failure or a window");
+    }
+}
+
+#[test]
+fn a_daily_relink_fixes_old_links_skips_a_page_just_edited_and_is_committed() {
+    let fixture = Fixture::new("relink-daily");
+    fixture.seed_session(4);
+    let bin = fixture.fake_cli("claude", GOOD_CLI);
+    assert!(fixture.brain_with_path(&["consolidate", "--force"], Some(&bin)).status.success());
+    let dir = fixture.project_dirs().remove(0);
+    let wiki = fixture.wiki();
+
+    std::fs::create_dir_all(dir.join("entities")).unwrap();
+    std::fs::write(dir.join("entities/billing.md"), "---\ntitle: billing\n---\n").unwrap();
+    let page = |name: &str, session: &str| {
+        let path = dir.join("pages/sessions").join(name);
+        let text = format!(
+            "---\ntitle: t\ndate: 2026-08-23\nsession: {session}\n---\n\n# t\n\nAbout: [[billing|billing]] · [[once|once]]\n"
+        );
+        std::fs::write(&path, &text).unwrap();
+        (path, text)
+    };
+    let (quiet, _) = page("2026-08-23 quiet.md", "planted-quiet");
+    let (fresh, fresh_text) = page("2026-08-23 fresh.md", "planted-fresh");
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::options().write(true).open(&quiet).unwrap().set_modified(old).unwrap();
+
+    // Yesterday's relink is the one that is due.
+    fixture.sql_run("DELETE FROM schema_state WHERE key LIKE 'relinked_at:%'");
+    let output = fixture.brain_with_path(&["consolidate", "--force"], Some(&bin));
+    assert!(output.status.success(), "consolidate failed: {output:?}");
+
+    let fixed = std::fs::read_to_string(&quiet).unwrap();
+    assert!(fixed.contains("About: [[entities/billing|billing]] · once\n"), "{fixed}");
+    assert_eq!(std::fs::read_to_string(&fresh).unwrap(), fresh_text, "a page edited just now was touched");
+    let leftovers: Vec<_> = std::fs::read_dir(dir.join("pages/sessions"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".brain-tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+
+    // On default git config, in the wiki's history, with the run's own commits.
+    let last = git_stdout(&wiki, &["log", "--format=%s", "--name-only", "-3"]);
+    assert!(last.contains("consolidate relink"), "no relink commit:\n{last}");
+    assert!(last.contains("quiet.md"), "the relinked page is not in it:\n{last}");
+    assert_eq!(fixture.sql_one("SELECT CAST(count(*) AS TEXT) FROM schema_state WHERE key LIKE 'relinked_at:%'"), "1");
+}
+
+#[test]
+fn a_month_old_log_is_set_aside_and_a_later_line_starts_a_new_one() {
+    let fixture = Fixture::new("log-aged");
+    fixture.seed_session(2);
+    let bin = fixture.fake_cli("claude", GOOD_CLI);
+    assert!(fixture.brain_with_path(&["consolidate", "--force"], Some(&bin)).status.success());
+    let log = fixture.home.join("brain.log");
+    let long_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(31 * 24);
+    std::fs::write(&log, format!("{long_ago} claude-code Stop: ancient failure\n")).unwrap();
+    fixture.sql_run("DELETE FROM schema_state WHERE key = 'brain_log_aged_at'");
+
+    assert!(fixture.brain_with_path(&["consolidate", "--force"], Some(&bin)).status.success());
+    let aged = std::fs::read_to_string(fixture.home.join("brain.log.1")).unwrap();
+    assert!(aged.contains("ancient failure"), "{aged}");
+    assert!(!log.exists() || !std::fs::read_to_string(&log).unwrap().contains("ancient failure"));
+    let doctor = fixture.brain(&["doctor"]);
+    let report = String::from_utf8_lossy(&doctor.stdout);
+    assert!(!report.contains("FAIL capture errors"), "{report}");
+}
+
+/// Is the maintenance marker claiming a window right now? The file holds
+/// `pid until_unix_ms`.
+fn marker_active(fixture: &Fixture) -> bool {
+    let Ok(text) = std::fs::read_to_string(fixture.home.join(".brain-maintenance")) else { return false };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    text.split_whitespace().nth(1).and_then(|until| until.parse::<u128>().ok()).is_some_and(|until| until > now)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_run_yielding_to_a_window_that_holds_the_write_lock_leaves_brain_log_untouched() {
+    let fixture = Fixture::new("maint-yield-locked");
+    fixture.prompt_event(1, "the omega lantern cipher value");
+    assert!(fixture.brain(&["consolidate"]).status.success());
+    let log_path = fixture.home.join("brain.log");
+    let log_before = std::fs::read(&log_path).unwrap_or_default();
+
+    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    std::fs::write(fixture.home.join(".brain-maintenance"), format!("99999 {}", now_ms + 60_000)).unwrap();
+    let lock = hold_write_lock(&fixture);
+    let yielded = fixture.brain(&["consolidate"]);
+    assert!(yielded.status.success(), "{yielded:?}");
+    assert_eq!(std::fs::read(&log_path).unwrap_or_default(), log_before, "the yield wrote to brain.log");
+    assert!(fixture.home.join(".brain-maint-yielded").exists(), "nothing tells the compactor to rerun");
+
+    lock.execute_batch("ROLLBACK").unwrap();
+    drop(lock);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_run_that_cannot_record_itself_without_a_window_still_logs_it() {
+    let fixture = Fixture::new("maint-yield-locked-no-marker");
+    fixture.prompt_event(1, "the omega lantern cipher value");
+    assert!(fixture.brain(&["consolidate"]).status.success());
+    let log_path = fixture.home.join("brain.log");
+
+    let lock = hold_write_lock(&fixture);
+    let run = fixture.brain(&["consolidate"]);
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(log.contains("could not record the run"), "{run:?}\n{log}");
+
+    lock.execute_batch("ROLLBACK").unwrap();
+    drop(lock);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_compactor_killed_mid_window_lets_its_marker_lapse_and_leaves_the_index_whole() {
+    let fixture = Fixture::new("maint-sigkill");
+    fixture.seed_session(4);
+    let before = fixture.sql_one("SELECT CAST(count(*) AS TEXT) FROM events");
+    fixture.quiet_logs();
+
+    // Another writer holds the database, so the compactor's first write waits
+    // on its busy timeout with the window already open.
+    let lock = hold_write_lock(&fixture);
+    let mut child = Command::new(BRAIN)
+        .arg("compact")
+        .current_dir(&fixture.project)
+        .env("ROLEPOD_BRAIN_HOME", &fixture.home)
+        .env("ROLEPOD_BRAIN_NO_FETCH", "1")
+        .env("ROLEPOD_BRAIN_MAINT_LIFETIME_MS", "1500")
+        .env("HOME", fixture.home.parent().unwrap())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn compact");
+    let opened = std::time::Instant::now();
+    while !marker_active(&fixture) && opened.elapsed() < std::time::Duration::from_secs(4) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(marker_active(&fixture), "the compactor never opened its window");
+
+    child.kill().expect("SIGKILL the compactor");
+    let status = child.wait().expect("reap");
+    assert!(!status.success(), "the compactor was not killed: {status:?}");
+    let killed = std::time::Instant::now();
+    while marker_active(&fixture) && killed.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(!marker_active(&fixture), "a killed compactor's marker outlived its lifetime");
+    assert!(killed.elapsed() < std::time::Duration::from_millis(2500), "it took {:?} to lapse", killed.elapsed());
+
+    lock.execute_batch("ROLLBACK").unwrap();
+    drop(lock);
+    assert_eq!(fixture.sql_one("SELECT integrity_check FROM pragma_integrity_check"), "ok");
+    assert_eq!(fixture.sql_one("SELECT CAST(count(*) AS TEXT) FROM events"), before, "the index changed");
 }

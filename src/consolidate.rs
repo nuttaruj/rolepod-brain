@@ -157,7 +157,11 @@ fn run_idle_in(paths: &Paths, cwd: &Path) -> Result<Outcome> {
     };
     heal_wiki_repo(&paths.wiki());
     heal_store(&store);
+    crate::maint::daily(paths, &store, &run_lock);
     let config = Config::load(&paths.config_file())?;
+    // Under the lock and before the ladder reads its models. Best effort and
+    // silent for the same reason as the wiki git config above.
+    let _ = crate::summarizer::refresh_models(&store);
     let ladder = Ladder::new(&store, &config.summarizer);
     let mut outcome = Outcome::default();
     let began = jiff::Timestamp::now();
@@ -272,6 +276,15 @@ fn run_in(
     // a `--session X --force` that met a running `--all` was simply gone. The
     // holder reads what is still unconsumed once it lets go of the lock.
     let lock_path = run_lock_path(paths);
+    let started = std::time::Instant::now();
+    // A compact window is open: the run lock would turn this run away anyway,
+    // but only after an ask was written, and an ask left behind makes the
+    // compactor think someone is waiting. Stand aside without a trace except
+    // the note that tells the compactor to start this run again afterwards.
+    if crate::maint::active(paths) {
+        crate::maint::note_yield(paths);
+        return Ok(Outcome { yielded: true, ..Outcome::default() });
+    }
     let store = Store::open(&paths.db())?;
     let id =
         store.add_consolidation_request(session, all_projects, force, &cwd.to_string_lossy())?;
@@ -295,7 +308,11 @@ fn run_in(
     // Once per run, before the first commit it would otherwise block.
     heal_wiki_repo(&paths.wiki());
     heal_store(&store);
+    crate::maint::daily(paths, &store, &run_lock);
     let config = Config::load(&paths.config_file())?;
+    // Under the lock and before the ladder reads its models. Best effort and
+    // silent: doctor counts every brain.log line as a failure.
+    let _ = crate::summarizer::refresh_models(&store);
     let ladder = Ladder::new(&store, &config.summarizer);
     let mut outcome = Outcome::default();
     // The line for "a run we raced" is this invocation's start, for every ask it
@@ -314,7 +331,7 @@ fn run_in(
         &lock_path,
         run_lock,
         own,
-        std::time::Instant::now(),
+        started,
         &mut |request, lock, deadline| {
             execute(paths, &store, &ladder, request, lock, Round { deadline, began, idle: false }, &mut outcome)
         },
@@ -688,6 +705,9 @@ fn nothing_to_serve(store: &Store, request: &ConsolidationRequest) -> Result<boo
     }
 }
 
+/// A page edited this recently is not relinked by a run.
+const RELINK_SKIP_NEWER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 /// Carry out one ask under the lock. `Ok(false)` when the deadline stopped it.
 fn execute(
     paths: &Paths,
@@ -727,7 +747,11 @@ fn execute(
     // Before the early return below, so every kind of run spends its small
     // budget on it; once per invocation, not once per drained ask.
     if !std::mem::replace(&mut outcome.retention_ran, true) {
-        outcome.dropped += run_retention(paths, store, run_lock);
+        // What the hot paths could not write while the index was held, back
+        // into the ledger first: retention reads it to know what was used.
+        if crate::maint::fold_surfaced(paths, store) {
+            outcome.dropped += run_retention(paths, store, run_lock);
+        }
     }
     // One indexed read, before the per-project pass. It also skips the embed,
     // hand-edit and fold upkeep and the daily pack: the next ask with work
@@ -773,6 +797,28 @@ fn execute(
         if !done {
             finished = false;
             break;
+        }
+        // Daily, after the drain so the entity pages a link resolves to exist.
+        if crate::maint::relink_due(store, &project) {
+            let limits = RelinkLimits {
+                skip_newer_than: Some(RELINK_SKIP_NEWER),
+                deadline,
+                lock: Some(run_lock),
+            };
+            // An error is the next run's to retry; nothing is logged, because
+            // doctor counts every brain.log line as a failure.
+            if let Ok(pages) = relink_pages(&project_dir, store, &limits) {
+                // Committed here, with this project's own pages, so a later
+                // error in the run cannot leave them out of the history. Best
+                // effort: an optional daily item must not fail the run, and a
+                // page the commit missed is picked up by a rebuild's `add -u`.
+                if !pages.is_empty() {
+                    let _ = commit_pages(&paths.wiki(), &pages, "consolidate relink (about links)");
+                }
+                if deadline.is_none_or(|at| std::time::Instant::now() < at) {
+                    crate::maint::relink_done(store, &project);
+                }
+            }
         }
     }
     // The vault's front page is derived from every project, so it is
@@ -840,6 +886,19 @@ fn record_run_in(
         error,
     };
     if let Err(error) = Store::open(&paths.db()).and_then(|store| store.record_consolidation_run(&run)) {
+        // A run that met a compact window, or ended just as it opened, finds the
+        // write lock held and loses only its own row; a yielded run is rerun after
+        // the window and records then. Any other failure still logs.
+        let busy = error.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<rusqlite::Error>(),
+                Some(rusqlite::Error::SqliteFailure(failure, _))
+                    if matches!(failure.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+            )
+        });
+        if busy && crate::maint::active(paths) {
+            return;
+        }
         log_session_failure(paths, "run", &format!("could not record the run: {error:#}"));
     }
 }
@@ -862,7 +921,7 @@ struct Drain<'a> {
 /// Where a session's failed attempt goes: `brain.log`, which `doctor` reads.
 /// What `--session X --force` does before the drain: a settled session is
 /// reopened and a parked one gets its attempts back.
-fn revive_session(store: &Store, session: &str) -> Result<()> {
+pub(crate) fn revive_session(store: &Store, session: &str) -> Result<()> {
     store.reopen_settled_session(session)?;
     store.reset_session_attempts(session)
 }
@@ -2363,14 +2422,49 @@ pub(crate) fn about_entry(name: &str, linked: bool) -> String {
 /// # Errors
 /// Returns an error when a page cannot be rewritten.
 pub fn relink_session_pages(project_dir: &Path, store: &Store) -> Result<usize> {
+    Ok(relink_pages(project_dir, store, &RelinkLimits::default())?.len())
+}
+
+/// What bounds a relink that runs by itself.
+#[derive(Default)]
+pub(crate) struct RelinkLimits<'a> {
+    /// Pages edited more recently than this are somebody's: left alone.
+    pub skip_newer_than: Option<std::time::Duration>,
+    /// No page is started past this.
+    pub deadline: Option<std::time::Instant>,
+    pub lock: Option<&'a RunLock>,
+}
+
+/// [`relink_session_pages`], returning the pages it rewrote. A page is written
+/// aside and renamed over the original, so a reader or a kill never sees half
+/// of one; `Ok` with fewer pages than exist means the deadline stopped it.
+pub(crate) fn relink_pages(
+    project_dir: &Path,
+    store: &Store,
+    limits: &RelinkLimits<'_>,
+) -> Result<Vec<PathBuf>> {
     let entities = project_dir.join("entities");
     let has_page = |name: &str| entities.join(format!("{}.md", entity_stem(name))).is_file();
     let pages = project_dir.join("pages/sessions");
-    let mut relinked = 0;
+    let mut changed = Vec::new();
     for entry in std::fs::read_dir(&pages).into_iter().flatten().flatten() {
+        if limits.deadline.is_some_and(|at| std::time::Instant::now() >= at) {
+            break;
+        }
+        if let Some(lock) = limits.lock {
+            lock.touch();
+        }
         let path = entry.path();
         if path.extension().is_none_or(|ext| ext != "md") {
             continue;
+        }
+        if let Some(age) = limits.skip_newer_than {
+            let fresh = std::fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .is_ok_and(|at| at.elapsed().is_ok_and(|elapsed| elapsed < age));
+            if fresh {
+                continue;
+            }
         }
         let Ok(text) = std::fs::read_to_string(&path) else { continue };
         let Some(line) = text.lines().find(|line| line.starts_with("About: ")) else { continue };
@@ -2391,13 +2485,18 @@ pub fn relink_session_pages(project_dir: &Path, store: &Store) -> Result<usize> 
             continue;
         }
         let updated = text.replacen(line, &rewritten, 1);
-        std::fs::write(&path, &updated).with_context(|| format!("write {}", path.display()))?;
+        let aside = path.with_extension("md.brain-tmp");
+        let written = std::fs::write(&aside, &updated).and_then(|()| std::fs::rename(&aside, &path));
+        if let Err(error) = written {
+            let _ = std::fs::remove_file(&aside);
+            return Err(error).with_context(|| format!("write {}", path.display()));
+        }
         if let Some(session) = page_meta(&path).and_then(|meta| meta.session) {
             store.record_page(&path.to_string_lossy(), &page_hash(&updated), &session)?;
         }
-        relinked += 1;
+        changed.push(path);
     }
-    Ok(relinked)
+    Ok(changed)
 }
 
 pub fn write_hubs(project_dir: &Path, scope: &ProjectScope, store: &Store) -> Result<Vec<PathBuf>> {
@@ -6668,6 +6767,34 @@ mod tests {
             text.contains("About: [[entities/billing|billing]] · one-off\n"),
             "a thing touched once is named, not linked:\n{text}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_automatic_relink_leaves_a_page_edited_a_minute_ago_and_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!("brain-relink-auto-{}", ulid::Ulid::new()));
+        let sessions = dir.join("pages/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(dir.join("entities")).unwrap();
+        std::fs::write(dir.join("entities/billing.md"), "---\ntitle: billing\n---\n").unwrap();
+        let body = "---\ntitle: t\ndate: 2026-08-23\nsession: s1\n---\n\nAbout: [[billing|billing]]\n";
+        let (fresh, quiet) = (sessions.join("fresh.md"), sessions.join("quiet.md"));
+        std::fs::write(&fresh, body).unwrap();
+        std::fs::write(&quiet, body).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(&quiet).unwrap().set_modified(old).unwrap();
+
+        let store = Store::open_memory().unwrap();
+        let limits = RelinkLimits { skip_newer_than: Some(RELINK_SKIP_NEWER), ..RelinkLimits::default() };
+        let changed = relink_pages(&dir, &store, &limits).unwrap();
+        assert_eq!(changed, vec![quiet.clone()]);
+        assert_eq!(std::fs::read_to_string(&fresh).unwrap(), body, "the page edited just now is untouched");
+        assert!(std::fs::read_to_string(&quiet).unwrap().contains("[[entities/billing|billing]]"));
+        let names: Vec<String> = std::fs::read_dir(&sessions)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "no temp file left behind: {names:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

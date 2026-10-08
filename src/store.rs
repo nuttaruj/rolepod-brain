@@ -18,6 +18,8 @@ use crate::event::{Event, EventKind, Source};
 
 /// How long a writer waits for a competing writer before giving up.
 const BUSY_TIMEOUT_MS: u32 = 5_000;
+/// Bytes the write-ahead log is cut back to after a checkpoint.
+const WAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
 
 /// Hooks whose events carry a tool call or a lifecycle marker, not prose.
 /// Claude Code, Gemini and OpenCode spell the same hooks differently, and
@@ -676,6 +678,28 @@ pub struct Store {
     conn: Connection,
 }
 
+/// Which ledger a spilled id belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ledger {
+    /// `recalled`, offered by a search or listing.
+    Recalled,
+    /// `recalled`, opened in full.
+    Opened,
+    /// `injected`, a pointer a hook pushed.
+    Injected,
+    /// `injected_files`; the "id" is the file's path.
+    File,
+}
+
+/// One line of `surfaced.jsonl`: ids a session was shown while the ledger
+/// could not be written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurfacedLine {
+    pub session: String,
+    pub kind: Ledger,
+    pub ids: Vec<String>,
+}
+
 /// How an entry reached a session: offered by a search, or opened on purpose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reach {
@@ -698,21 +722,38 @@ impl Store {
     /// # Errors
     /// Returns an error when the database cannot be opened or migrated.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_waiting(path, std::time::Duration::from_millis(u64::from(BUSY_TIMEOUT_MS)))
+    }
+
+    /// [`Store::open`], waiting at most `wait` on a lock another holds - the
+    /// migration included, which is why it cannot be set after the open.
+    ///
+    /// # Errors
+    /// Returns an error when the database cannot be opened or migrated.
+    pub fn open_waiting(path: &Path, wait: std::time::Duration) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create {}", parent.display()))?;
         }
         let conn = Connection::open(path)
             .with_context(|| format!("open database {}", path.display()))?;
-        conn.busy_timeout(std::time::Duration::from_millis(u64::from(BUSY_TIMEOUT_MS)))
-            .context("set busy timeout")?;
+        conn.busy_timeout(wait).context("set busy timeout")?;
         // `journal_mode` is persistent, but setting it every open costs
         // nothing and keeps a hand-copied database correct.
         conn.pragma_update(None, "journal_mode", "WAL").context("enable WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL").context("set synchronous")?;
+        // A checkpoint that cannot truncate (a reader held it) must not leave a
+        // huge log behind: the file shrinks back to this after the next one.
+        conn.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT).context("set journal_size_limit")?;
         let store = Self { conn };
         store.migrate()?;
         Ok(store)
+    }
+
+    /// One number out of any query, for tests in other modules.
+    #[cfg(test)]
+    pub fn raw_count(&self, sql: &str) -> i64 {
+        self.conn.query_row(sql, [], |row| row.get(0)).expect("raw count")
     }
 
     /// Open a purely in-memory index.
@@ -2582,6 +2623,20 @@ impl Store {
         Ok(changed)
     }
 
+    /// Bytes the index holds in these rows' bodies.
+    fn body_bytes(&self, ids: &[String]) -> Result<i64> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT COALESCE(SUM(length(CAST(body AS BLOB))), 0) FROM events WHERE id = ?1")
+            .context("prepare body size")?;
+        let mut total = 0i64;
+        for id in ids {
+            let bytes: i64 = stmt.query_row(params![id], |row| row.get(0)).context("measure body")?;
+            total = total.saturating_add(bytes);
+        }
+        Ok(total)
+    }
+
     /// Is the log the only place this row's whole body lives?
     ///
     /// True when the body was cut down on the way into the index, or dropped
@@ -3416,11 +3471,103 @@ impl Store {
             .context("count retirable bodies")
     }
 
-    fn state(&self, key: &str) -> Result<Option<String>> {
+    /// One value out of `schema_state`, the table of small facts the index
+    /// keeps about itself.
+    ///
+    /// # Errors
+    /// Returns an error when the read fails.
+    pub fn state(&self, key: &str) -> Result<Option<String>> {
         self.conn
             .query_row("SELECT value FROM schema_state WHERE key = ?1", params![key], |row| row.get(0))
             .optional()
             .with_context(|| format!("read {key}"))
+    }
+
+    /// Write one `schema_state` value, replacing what was there.
+    ///
+    /// # Errors
+    /// Returns an error when the write fails.
+    pub fn set_state(&self, key: &str, value: &str) -> Result<()> {
+        self.conn
+            .execute("INSERT OR REPLACE INTO schema_state (key, value) VALUES (?1, ?2)", params![key, value])
+            .with_context(|| format!("write {key}"))?;
+        Ok(())
+    }
+
+    /// Remove one `schema_state` value; absent is fine.
+    ///
+    /// # Errors
+    /// Returns an error when the delete fails.
+    pub fn clear_state(&self, key: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM schema_state WHERE key = ?1", params![key])
+            .with_context(|| format!("clear {key}"))?;
+        Ok(())
+    }
+
+    /// Change how long this connection waits on a lock another holds.
+    ///
+    /// # Errors
+    /// Returns an error when the timeout cannot be set.
+    pub fn set_busy_timeout(&self, wait: std::time::Duration) -> Result<()> {
+        self.conn.busy_timeout(wait).context("set busy timeout")
+    }
+
+    /// What the compact window needs to decide, and what it last did, in one read.
+    ///
+    /// # Errors
+    /// Returns an error when a read fails.
+    pub fn compact_state(&self) -> Result<CompactState> {
+        let number = |key: &str| -> Result<u64> {
+            Ok(self.state(key)?.and_then(|value| value.parse().ok()).unwrap_or(0))
+        };
+        let (pages, free_pages): (i64, i64) = self.page_use()?;
+        let page_size: i64 =
+            self.conn.pragma_query_value(None, "page_size", |row| row.get(0)).context("read page_size")?;
+        Ok(CompactState {
+            done_at: self.state("compact_done_at")?,
+            tried_at: self.state("compact_tried_at")?.and_then(|value| value.parse().ok()),
+            skip: self.state("compact_skip")?,
+            retention_pending: self.state("retention_cursor")?.is_some(),
+            retention_dropped: number("retention_dropped")?,
+            retention_done_at: self.retention_done_at()?,
+            retention_dropped_bytes: number("retention_dropped_bytes")?,
+            compact_dropped_bytes: number("compact_dropped_bytes")?,
+            file_bytes: u64::try_from(pages).unwrap_or(0).saturating_mul(u64::try_from(page_size).unwrap_or(0)),
+            free_bytes: u64::try_from(free_pages).unwrap_or(0).saturating_mul(u64::try_from(page_size).unwrap_or(0)),
+            before_bytes: None,
+            after_bytes: None,
+        })
+    }
+
+    /// Write down what a compact attempt did: `done_at` (which also settles the
+    /// dropped-bytes counter and clears the last skip), `tried_at`, `skip`.
+    /// Only the fields that are set are written.
+    ///
+    /// # Errors
+    /// Returns an error when a write fails.
+    pub fn record_compact(&self, state: &CompactState) -> Result<()> {
+        let transaction = self.conn.unchecked_transaction().context("begin compact record")?;
+        if let Some(tried) = state.tried_at {
+            self.set_state("compact_tried_at", &tried.to_string())?;
+        }
+        if let Some(skip) = &state.skip {
+            self.set_state("compact_skip", skip)?;
+        }
+        if let Some(done) = &state.done_at {
+            self.set_state("compact_done_at", done)?;
+            self.set_state("compact_dropped_bytes", &state.compact_dropped_bytes.to_string())?;
+            if state.skip.is_none() {
+                self.clear_state("compact_skip")?;
+            }
+        }
+        if let Some(bytes) = state.before_bytes {
+            self.set_state("compact_bytes_before", &bytes.to_string())?;
+        }
+        if let Some(bytes) = state.after_bytes {
+            self.set_state("compact_bytes_after", &bytes.to_string())?;
+        }
+        transaction.commit().context("commit compact record")
     }
 
     /// The rowid the retention pass resumes after; 0 starts a pass.
@@ -3460,6 +3607,9 @@ impl Store {
     /// Returns an error when a write fails; the transaction rolls back.
     pub fn commit_retention_step(&self, ids: &[String], cursor: i64) -> Result<usize> {
         let transaction = self.conn.unchecked_transaction().context("begin retention step")?;
+        // Measured in this transaction, before the drop, in bytes: `length()`
+        // of a text value counts characters.
+        let bytes = self.body_bytes(ids)?;
         let dropped = self.drop_index_bodies(ids)?;
         self.conn
             .execute(
@@ -3476,6 +3626,14 @@ impl Store {
                 params![dropped.to_string()],
             )
             .context("count the dropped bodies")?;
+        self.conn
+            .execute(
+                "INSERT INTO schema_state (key, value) VALUES ('retention_dropped_bytes', ?1)
+                 ON CONFLICT(key) DO UPDATE
+                 SET value = CAST(value AS INTEGER) + CAST(excluded.value AS INTEGER)",
+                params![bytes.to_string()],
+            )
+            .context("count the dropped bytes")?;
         transaction.commit().context("commit retention step")?;
         Ok(dropped)
     }
@@ -4481,6 +4639,25 @@ impl Store {
         Ok(())
     }
 
+    /// Parked sessions whose last failed attempt is older than `cutoff`: the
+    /// ones a daily retry may give their attempts back.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn parked_before(&self, cutoff: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session FROM session_state
+                 WHERE attempts >= ?1 AND last_attempt_at < ?2 ORDER BY session",
+            )
+            .context("prepare parked sessions")?;
+        let rows = stmt
+            .query_map(params![Self::PARK_AFTER, cutoff], |row| row.get(0))
+            .context("run parked sessions")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("read parked sessions")
+    }
+
     /// Sessions that have failed at least `min_attempts` times in a row, worst
     /// first, as (session, attempts, last_error).
     ///
@@ -5221,48 +5398,81 @@ impl Store {
             return Ok(false);
         }
         for (at, id) in ids.iter().enumerate() {
-            // Counted once per session, matching read_count: re-pushing the
-            // same pointer inside one conversation says nothing new about
-            // how often it gets offered.
-            let seen: Option<i64> = self
-                .conn
-                .query_row(
-                    "SELECT 1 FROM injected WHERE session = ?1 AND event_id = ?2",
-                    params![session, id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .context("read injected row")?;
-            if seen.is_none() {
-                self.conn
-                    .execute(
-                        "UPDATE events SET injected_count = injected_count + 1 WHERE id = ?1",
-                        params![id],
-                    )
-                    .context("count injection")?;
-            }
-            self.conn
-                .execute(
-                    // Re-arms a row a compaction deactivated: after a reset the
-                    // guard reports the pointer as unseen, this pushes it
-                    // again, and OR IGNORE would leave `active` at 0 - so the
-                    // same pointer would then be re-pushed at every
-                    // opportunity for the rest of the session.
-                    // `in_flight` is sticky: a pointer first shown as
-                    // unsummarized work stays counted as that, even if a
-                    // later injection of the same id comes from the ranked
-                    // list once a summary exists. The question the column
-                    // answers is what the agent was handed, not what the
-                    // event became.
-                    "INSERT INTO injected (session, event_id, in_flight) VALUES (?1, ?2, ?3)
-                     ON CONFLICT(session, event_id) DO UPDATE SET
-                         active = 1,
-                         in_flight = MAX(injected.in_flight, ?3)",
-                    params![session, id, i64::from(at < in_flight)],
-                )
-                .context("record injected id")?;
+            self.note_injected_id(session, id, at < in_flight)?;
         }
         Ok(true)
+    }
+
+    /// One pointer a session was shown: counted once per session, matching
+    /// read_count - re-pushing the same pointer inside one conversation says
+    /// nothing new about how often it gets offered.
+    fn note_injected_id(&self, session: &str, id: &str, in_flight: bool) -> Result<()> {
+        let seen: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM injected WHERE session = ?1 AND event_id = ?2",
+                params![session, id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("read injected row")?;
+        if seen.is_none() {
+            self.conn
+                .execute(
+                    "UPDATE events SET injected_count = injected_count + 1 WHERE id = ?1",
+                    params![id],
+                )
+                .context("count injection")?;
+        }
+        self.conn
+            .execute(
+                // Re-arms a row a compaction deactivated: after a reset the
+                // guard reports the pointer as unseen, this pushes it
+                // again, and OR IGNORE would leave `active` at 0 - so the
+                // same pointer would then be re-pushed at every
+                // opportunity for the rest of the session.
+                // `in_flight` is sticky: a pointer first shown as
+                // unsummarized work stays counted as that, even if a
+                // later injection of the same id comes from the ranked
+                // list once a summary exists. The question the column
+                // answers is what the agent was handed, not what the
+                // event became.
+                "INSERT INTO injected (session, event_id, in_flight) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(session, event_id) DO UPDATE SET
+                     active = 1,
+                     in_flight = MAX(injected.in_flight, ?3)",
+                params![session, id, i64::from(in_flight)],
+            )
+            .context("record injected id")?;
+        Ok(())
+    }
+
+    /// Fold what the hot paths spilled to `surfaced.jsonl` into the ledger.
+    /// Idempotent - a row already there is left alone - so a fold that died
+    /// before its file was removed can simply run again. Returns the ids seen.
+    ///
+    /// # Errors
+    /// Returns an error when the writes fail; nothing is then applied.
+    pub fn fold_surfaced(&self, lines: impl Iterator<Item = SurfacedLine>) -> Result<usize> {
+        let transaction = self.conn.unchecked_transaction().context("begin fold surfaced")?;
+        let mut seen = 0;
+        for line in lines {
+            for id in &line.ids {
+                match line.kind {
+                    Ledger::Recalled => {
+                        self.record_recall(&line.session, std::iter::once(id.as_str()), Reach::Offered)?;
+                    }
+                    Ledger::Opened => {
+                        self.record_recall(&line.session, std::iter::once(id.as_str()), Reach::Opened)?;
+                    }
+                    Ledger::Injected => self.note_injected_id(&line.session, id, false)?,
+                    Ledger::File => self.record_injected_file(&line.session, id)?,
+                }
+                seen += 1;
+            }
+        }
+        transaction.commit().context("commit fold surfaced")?;
+        Ok(seen)
     }
 
     /// Mark a file as covered for this session.
@@ -5359,10 +5569,7 @@ impl Store {
     /// # Errors
     /// Returns an error when the query fails.
     pub fn log_watermark(&self, key: &str) -> Result<Option<String>> {
-        self.conn
-            .query_row("SELECT value FROM schema_state WHERE key = ?1", params![key], |row| row.get(0))
-            .optional()
-            .context("read log watermark")
+        self.state(key).context("read log watermark")
     }
 
     /// Record where the catch-up stopped in one log file.
@@ -5370,10 +5577,7 @@ impl Store {
     /// # Errors
     /// Returns an error when the write fails.
     pub fn set_log_watermark(&self, key: &str, value: &str) -> Result<()> {
-        self.conn
-            .execute("INSERT OR REPLACE INTO schema_state (key, value) VALUES (?1, ?2)", params![key, value])
-            .context("write log watermark")?;
-        Ok(())
+        self.set_state(key, value).context("write log watermark")
     }
 
     /// Delete everything. Safe because the log rebuilds it.
@@ -5395,10 +5599,13 @@ impl Store {
             // so after a clear that fails part-way they must not claim a log
             // is fully read. So do the retention marks: the replay restores
             // every body, and a cursor or a spent day left behind would hide
-            // them from the next pass.
+            // them from the next pass. The compact marks go with them: they
+            // measure against the retention counters, and a counter that
+            // restarts at zero beside a larger one would read as negative.
             .execute_batch(
                 "DELETE FROM event_files; DELETE FROM events;
-                 DELETE FROM schema_state WHERE key LIKE 'log_tail:%' OR key LIKE 'retention\\_%' ESCAPE '\\';",
+                 DELETE FROM schema_state WHERE key LIKE 'log_tail:%' OR key LIKE 'retention\\_%' ESCAPE '\\'
+                    OR key LIKE 'compact\\_%' ESCAPE '\\';",
             )
             .context("clear index")?;
         Ok(())
@@ -5530,6 +5737,33 @@ pub struct PendingSession {
     pub pending: i64,
     pub newest_event_id: String,
     pub cli: String,
+}
+
+/// What the index knows about its own compactions, with the page figures that
+/// say how much a rewrite would give back. Read by [`Store::compact_state`];
+/// [`Store::record_compact`] writes back the fields that are set.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompactState {
+    /// RFC 3339 time of the last finished compact.
+    pub done_at: Option<String>,
+    /// Unix seconds of the last attempt that got as far as the disk guard.
+    pub tried_at: Option<i64>,
+    /// `<reason>@<RFC 3339>` of the last attempt that stood aside or failed.
+    pub skip: Option<String>,
+    /// A retention pass is part-way: its dropped counters are still moving.
+    pub retention_pending: bool,
+    pub retention_dropped: u64,
+    pub retention_done_at: Option<String>,
+    /// Bytes of body text retention has dropped, and how much of that a compact
+    /// has already settled.
+    pub retention_dropped_bytes: u64,
+    pub compact_dropped_bytes: u64,
+    /// The database file's size by page count, and the part on the free list.
+    pub file_bytes: u64,
+    pub free_bytes: u64,
+    /// Sizes around a finished compact, for [`Store::record_compact`].
+    pub before_bytes: Option<u64>,
+    pub after_bytes: Option<u64>,
 }
 
 /// An ask to consolidate, as written before the run lock was tried.

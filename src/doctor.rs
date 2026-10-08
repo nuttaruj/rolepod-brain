@@ -91,8 +91,8 @@ pub fn run() -> Result<Vec<Check>> {
     checks.extend(summarizer_checks(&paths));
     checks.push(semantic_check(&paths));
     checks.push(retention_check(&paths));
-    let space = Store::open(&paths.db()).ok().and_then(|store| store.page_use().ok());
-    checks.extend(space.and_then(|(pages, free)| space_check(pages, free)));
+    let space = Store::open(&paths.db()).ok().and_then(|store| crate::maint::status(&paths, &store).ok());
+    checks.extend(space.map(|status| space_check(&status)));
     checks.push(reranker_check(&paths));
     checks.extend(hook_checks());
     checks.extend(trigger_checks());
@@ -353,21 +353,21 @@ fn retention_check(paths: &Paths) -> Check {
     )
 }
 
-/// The index file's free pages. A row only when at least a quarter of the
-/// pages hold nothing, since below that a rewrite buys little; it says what to
-/// run and never runs it.
-fn space_check(pages: i64, free: i64) -> Option<Check> {
-    if pages <= 0 || free * 4 < pages {
-        return None;
+/// The index file's space: when it was last rewritten and how much a rewrite
+/// would give back. Always shown, because the rewrite happens by itself; it is
+/// a warning only when the index has wanted one for a fortnight, with the last
+/// reason one was put off.
+fn space_check(status: &crate::maint::CompactStatus) -> Check {
+    let last = status.last.as_deref().map_or("never", |at| at.split('T').next().unwrap_or(at));
+    let mut detail = format!(
+        "last compact {last} · about {} MB reclaimable · runs automatically",
+        status.reclaimable / (1024 * 1024)
+    );
+    if status.overdue {
+        let why = status.skip.as_deref().unwrap_or("no attempt recorded");
+        detail = format!("warn: {detail} · wanted for over 14 days · last put off: {why}");
     }
-    Some(Check::pass(
-        "index space",
-        format!(
-            "{}% of the index file's pages are free · `brain compact` gives them back \
-             (it waits for ten quiet minutes)",
-            free * 100 / pages
-        ),
-    ))
+    Check::pass("index space", detail)
 }
 
 /// How much of the corpus can be searched by meaning rather than by words.
@@ -403,9 +403,8 @@ fn semantic_check(paths: &Paths) -> Check {
                 model.display()
             )
         } else {
-            "Fetch it once: curl -fsSL \
-             https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh \
-             | sh -s -- --model-only"
+            "It is being fetched automatically; a consolidation run retries daily \
+             until it arrives."
                 .to_string()
         };
         return Check::pass(
@@ -446,12 +445,27 @@ fn semantic_check(paths: &Paths) -> Check {
 /// reading it for the others would print a name the call never sends, which is
 /// the same report about a machine that does not exist, arrived at from the
 /// other direction.
-fn model_label(spec: &crate::summarizer::CliSpec, overrides: &HashMap<String, String>) -> String {
+///
+/// The model is the one a call would send, followed by why: the user's
+/// config, the newest of its tier that consolidation found, or the built-in
+/// pin - and when the pin is in use because a found model failed, which one.
+fn model_label(
+    spec: &crate::summarizer::CliSpec,
+    overrides: &HashMap<String, String>,
+    found: &crate::summarizer::Discovered,
+) -> String {
+    use crate::summarizer::Origin;
     if !spec.passes_a_model() {
         return format!("{}=(its own default)", spec.cli);
     }
-    let model = overrides.get(spec.cli).map_or(spec.model, String::as_str);
-    format!("{}={model}", spec.cli)
+    let (model, origin) = crate::summarizer::choose_model(spec, overrides, found);
+    let why = match (origin, found.failed_model(spec.cli)) {
+        (Origin::Config, _) => "config".to_string(),
+        (Origin::Newest, _) => "newest".to_string(),
+        (Origin::BuiltIn, Some(failed)) => format!("built-in; {failed} failed"),
+        (Origin::BuiltIn, None) => "built-in".to_string(),
+    };
+    format!("{}={model} ({why})", spec.cli)
 }
 
 /// The "summarizer calls" row: information, not a verdict - what the
@@ -469,7 +483,7 @@ fn spend_check(today: &[crate::store::SummarizerCall]) -> Option<Check> {
 
 /// The "failing sessions" row: sessions consolidation keeps failing on, with
 /// the last reason. A warning, not a failure - the rest of memory is fine, and
-/// a parked session is waiting on `brain consolidate --session X --force`.
+/// a parked session is retried once a day, up to three times.
 /// Absent when none has failed twice.
 fn failing_check(failing: &[(String, i64, String)]) -> Option<Check> {
     if failing.is_empty() {
@@ -484,7 +498,7 @@ fn failing_check(failing: &[(String, i64, String)]) -> Option<Check> {
     Some(Check::pass(
         "failing sessions",
         format!(
-            "warn: {} session(s) failing, {parked} parked after {} attempts\n    {}",
+            "warn: {} session(s) failing, {parked} parked after {} attempts (parked ones are retried daily, up to 3 times)\n    {}",
             failing.len(),
             Store::PARK_AFTER,
             lines.join("\n    ")
@@ -508,7 +522,7 @@ fn backlog_check(oldest_pending: Option<&str>) -> Option<Check> {
     Some(Check::pass(
         "consolidation backlog",
         format!(
-            "warn: the oldest unsummarized observation is {}h old (run `brain consolidate --all`)",
+            "warn: the oldest unsummarized observation is {}h old (the next session start catches it up)",
             age / 3600
         ),
     ))
@@ -551,8 +565,14 @@ fn summarizer_checks(paths: &Paths) -> Vec<Check> {
         .iter()
         .partition(|spec| crate::summarizer::installed(spec.program));
     let a_model_is_installed = !installed.is_empty();
+    // Read, never refreshed: a lookup can start a CLI, and doctor reports what
+    // consolidation last found rather than going to find out.
+    let store = Store::open(&paths.db()).ok();
+    let found = store.as_ref().map_or_else(crate::summarizer::Discovered::default, |store| {
+        crate::summarizer::Discovered::read(store, jiff::Timestamp::now())
+    });
     let installed: Vec<String> =
-        installed.iter().map(|spec| model_label(spec, &summarizer_cfg.models)).collect();
+        installed.iter().map(|spec| model_label(spec, &summarizer_cfg.models, &found)).collect();
 
     if installed.is_empty() {
         checks.push(Check::fail(
@@ -581,7 +601,7 @@ fn summarizer_checks(paths: &Paths) -> Vec<Check> {
     // is what orphaned this row in the first place.
     let live_rungs: Vec<&str> = crate::summarizer::SPECS.iter().map(|spec| spec.cli).collect();
 
-    if let Ok(store) = Store::open(&paths.db()) {
+    if let Some(store) = &store {
         if let Some(check) = consolidation_check(
             &store.consolidation_tiers().unwrap_or_default(),
             &summarizer_cfg.mode,
@@ -730,7 +750,7 @@ fn hook_checks() -> Vec<Check> {
                         &name,
                         format!(
                             "plugin {} has no default export, which OpenCode 2 requires to \
-                             load it — run `brain setup --apply`",
+                             load it — the next consolidation run rewrites it",
                             path.display()
                         ),
                     )
@@ -739,7 +759,7 @@ fn hook_checks() -> Vec<Check> {
                         &name,
                         format!(
                             "plugin {} only captures: OpenCode sessions get no memory pushed \
-                             — run `brain setup --apply`",
+                             — the next consolidation run rewrites it",
                             path.display()
                         ),
                     )
@@ -843,7 +863,7 @@ fn timer_check() -> Check {
         return Check::fail(
             "backstop",
             format!(
-                "a launchd job from an older version is still installed ({}) - run `brain setup --apply` to remove it",
+                "a launchd job from an older version is still installed ({}) - the next consolidation run removes it",
                 plist.display()
             ),
         );
@@ -1008,8 +1028,8 @@ fn wiki_check(paths: &Paths) -> Check {
         return Check::fail("wiki", format!("{} could not be read", wiki.display()));
     };
     let detail = format!(
-        "{} page(s), {} unresolved link(s), {} orphan(s) - `brain reindex` re-points old links",
-        lint.pages, lint.unresolved, lint.orphans
+        "{} page(s), {} unresolved link(s), {} orphan(s) - old-style links are relinked automatically; {} left are not old-style links",
+        lint.pages, lint.unresolved, lint.orphans, lint.unresolved
     );
     if lint.unresolved == 0 && lint.orphans == 0 {
         Check::pass("wiki", format!("{} page(s), every link resolves, every page reachable", lint.pages))
@@ -1024,14 +1044,39 @@ fn error_log_check(path: &Path) -> Check {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Check::pass("capture errors", "none recorded");
     };
-    let lines: Vec<&str> = text.lines().filter(|line| !line.trim().is_empty()).collect();
-    if lines.is_empty() {
-        return Check::pass("capture errors", "none recorded");
+    error_log_summary(&text, &path.display().to_string(), jiff::Timestamp::now().as_second())
+}
+
+/// Only the last week counts: older lines are history, and `brain.log` is set
+/// aside by the daily upkeep once its first line is a month old. A line with
+/// no timestamp of its own belongs to the one above it.
+const ERROR_LOG_WINDOW_SECS: i64 = 7 * 24 * 3600;
+
+fn error_log_summary(text: &str, name: &str, now: i64) -> Check {
+    let mut at: Option<i64> = None;
+    let mut recent: Vec<&str> = Vec::new();
+    let mut newest: Option<i64> = None;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        if let Some(stamp) = line.split_whitespace().next().and_then(|t| t.parse::<jiff::Timestamp>().ok()) {
+            at = Some(stamp.as_second());
+        }
+        // No timestamp anywhere yet: counted, since hiding a failure is worse.
+        if at.is_none_or(|at| now.saturating_sub(at) <= ERROR_LOG_WINDOW_SECS) {
+            recent.push(line);
+            newest = at.or(newest);
+        }
     }
-    let recent = lines.iter().rev().take(3).rev().copied().collect::<Vec<_>>().join("\n    ");
+    if recent.is_empty() {
+        return Check::pass("capture errors", "none in the last 7 days");
+    }
+    let age = newest.map_or_else(String::new, |at| {
+        let hours = now.saturating_sub(at) / 3600;
+        format!(", newest {hours}h ago")
+    });
+    let shown = recent.iter().rev().take(3).rev().copied().collect::<Vec<_>>().join("\n    ");
     Check::fail(
         "capture errors",
-        format!("{} in {}\n    {recent}", lines.len(), path.display()),
+        format!("{} in the last 7 days{age} in {name}\n    {shown}", recent.len()),
     )
 }
 
@@ -1054,13 +1099,40 @@ pub fn render(checks: &[Check]) -> (String, bool) {
 mod tests {
     use super::*;
 
+    fn space(last: Option<&str>, mb: u64, wanted: bool, overdue: bool, skip: Option<&str>) -> Check {
+        space_check(&crate::maint::CompactStatus {
+            last: last.map(str::to_string),
+            reclaimable: mb * 1024 * 1024,
+            wanted,
+            overdue,
+            skip: skip.map(str::to_string),
+        })
+    }
+
     #[test]
-    fn doctor_suggests_compact_only_when_a_quarter_of_the_pages_are_free() {
-        assert!(space_check(1000, 249).is_none(), "just under a quarter is not worth a rewrite");
-        let row = space_check(1000, 250).unwrap();
-        assert!(row.ok, "free pages are a suggestion, not a failure");
-        assert!(row.detail.contains("25%") && row.detail.contains("brain compact"), "{}", row.detail);
-        assert!(space_check(0, 0).is_none(), "an empty file has nothing to give back");
+    fn the_space_row_is_always_there_and_never_names_a_command() {
+        let never = space(None, 0, false, false, None);
+        assert!(never.ok);
+        assert_eq!(never.detail, "last compact never · about 0 MB reclaimable · runs automatically");
+
+        let due = space(None, 294, true, false, None);
+        assert!(due.ok && due.detail.contains("about 294 MB reclaimable"), "{}", due.detail);
+
+        let done = space(Some("2026-10-08T03:04:05Z"), 1, false, false, None);
+        assert!(done.detail.starts_with("last compact 2026-10-08 ·"), "{}", done.detail);
+
+        for row in [&never, &due, &done] {
+            assert!(!row.detail.contains("brain "), "a command in an automatic row: {}", row.detail);
+        }
+    }
+
+    #[test]
+    fn an_overdue_compact_warns_with_the_reason_it_was_put_off() {
+        let row = space(None, 300, true, true, Some("low-disk: 900 MB free, 5000 MB needed@2026-10-01T00:00:00Z"));
+        assert!(row.ok, "a warning is not a failure");
+        assert!(row.detail.starts_with("warn: "), "{}", row.detail);
+        assert!(row.detail.contains("low-disk"), "{}", row.detail);
+        assert!(!row.detail.contains("brain "), "{}", row.detail);
     }
 
     #[test]
@@ -1157,15 +1229,16 @@ mod tests {
             .find(|spec| !spec.passes_a_model())
             .expect("at least one rung runs on its CLI's own default");
 
+        let found = crate::summarizer::Discovered::default();
         let mut overrides = HashMap::new();
         assert_eq!(
-            model_label(unpinned, &overrides),
+            model_label(unpinned, &overrides, &found),
             format!("{}=(its own default)", unpinned.cli)
         );
 
         overrides.insert(unpinned.cli.to_string(), "composer-2.5".to_string());
         assert_eq!(
-            model_label(unpinned, &overrides),
+            model_label(unpinned, &overrides, &found),
             format!("{}=(its own default)", unpinned.cli),
             "an override on a rung with no `{{model}}` argument must not be reported as running"
         );
@@ -1176,7 +1249,31 @@ mod tests {
             .expect("at least one rung names a model");
         let mut overrides = HashMap::new();
         overrides.insert(pinned.cli.to_string(), "sonnet".to_string());
-        assert_eq!(model_label(pinned, &overrides), format!("{}=sonnet", pinned.cli));
+        assert_eq!(model_label(pinned, &overrides, &found), format!("{}=sonnet (config)", pinned.cli));
+    }
+
+    #[test]
+    fn a_rung_says_which_model_it_runs_and_why() {
+        let codex = crate::summarizer::SPECS.iter().find(|spec| spec.cli == "codex").unwrap();
+        let none = HashMap::new();
+        let store = Store::open_memory().unwrap();
+        let read = |store: &Store| crate::summarizer::Discovered::read(store, jiff::Timestamp::now());
+
+        assert_eq!(model_label(codex, &none, &read(&store)), "codex=gpt-5.6-luna (built-in)");
+
+        store.set_state("summarizer_model:codex", "gpt-6-luna").unwrap();
+        assert_eq!(model_label(codex, &none, &read(&store)), "codex=gpt-6-luna (newest)");
+
+        let mut overrides = HashMap::new();
+        overrides.insert("codex".to_string(), "gpt-5.6-sol".to_string());
+        assert_eq!(model_label(codex, &overrides, &read(&store)), "codex=gpt-5.6-sol (config)");
+
+        let mark = format!("gpt-6-luna {}", jiff::Timestamp::now());
+        store.set_state("summarizer_model_bad:codex", &mark).unwrap();
+        assert_eq!(
+            model_label(codex, &none, &read(&store)),
+            "codex=gpt-5.6-luna (built-in; gpt-6-luna failed)"
+        );
     }
 
     #[test]
@@ -1228,5 +1325,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(double_captured_sessions(&conn, "2026-09-28T00:00:00Z").unwrap(), 1);
+    }
+
+    #[test]
+    fn only_the_last_seven_days_of_the_log_fail_the_row() {
+        let now = jiff::Timestamp::now().as_second();
+        let at = |ago: i64| jiff::Timestamp::from_second(now - ago).unwrap();
+        let day = 24 * 3600;
+        let old = format!("{} hook x: old\n", at(9 * day));
+        let check = error_log_summary(&old, "brain.log", now);
+        assert!(check.ok, "{}", check.detail);
+
+        let both = format!("{old}{} hook x: new\n  continued\n", at(3 * 3600));
+        let check = error_log_summary(&both, "brain.log", now);
+        assert!(!check.ok);
+        assert!(check.detail.starts_with("2 in the last 7 days, newest 3h ago"), "{}", check.detail);
+    }
+
+    #[test]
+    fn no_row_tells_the_user_to_run_what_runs_by_itself() {
+        let source = include_str!("doctor.rs");
+        let tests = source.find("#[cfg(test)]").unwrap();
+        for command in ["brain compact", "brain consolidate --all", "re-points old links", "--session X --force", "Fetch it once"] {
+            assert!(!source[..tests].contains(command), "doctor still says: {command}");
+        }
     }
 }
