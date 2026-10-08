@@ -120,14 +120,17 @@ jobs:
         shell: bash
         run: |
           set -eu
-          # Captured first, so a missing `strings` stops the step; the control
-          # string proves the tool read the binary and printed something.
-          out=$(strings "target/${{ matrix.target }}/release/brain")
-          if ! printf '%s\n' "$out" | grep -q ROLEPOD_BRAIN_NO_UPDATE; then
+          # Written to a file first, so a missing `strings` stops the step; the
+          # control string proves the tool read the binary and printed
+          # something. No pipe into `grep -q`: under the runner's pipefail the
+          # writer's SIGPIPE would read as "not found".
+          out="$RUNNER_TEMP/brain.strings"
+          strings "target/${{ matrix.target }}/release/brain" > "$out"
+          if ! grep -q ROLEPOD_BRAIN_NO_UPDATE "$out"; then
               echo "strings did not read the binary: control string not found" >&2
               exit 1
           fi
-          if printf '%s\n' "$out" | grep -E 'ROLEPOD_BRAIN_(UPDATE_|HOOK_FAULT)'; then
+          if grep -E 'ROLEPOD_BRAIN_(UPDATE_|HOOK_FAULT)' "$out"; then
               echo "a debug-only seam is compiled into the release binary" >&2
               exit 1
           fi
