@@ -1043,6 +1043,11 @@ mod tests {
     /// A note carries the CLI that wrote it, and `mcp` when that is not known.
     #[test]
     fn a_note_is_attributed_to_the_cli_that_initialized_the_session() {
+        // `resolve_scope` reads the data dir env for its identity cache; the
+        // hook tests flip it, which would give the test and `write_note` two
+        // different project ids.
+        let _guard =
+            crate::invocation::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let note = |client: Option<&str>| {
             let data_dir = std::env::temp_dir().join(format!("brain-mcp-note-{}", ulid::Ulid::new()));
             let paths = Paths { data_dir };

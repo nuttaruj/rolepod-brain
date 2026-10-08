@@ -721,6 +721,7 @@ fn daily_in(paths: &Paths, store: &Store, lock: &RunLock, home: Option<&Path>, n
         }
     }
     fetch_model(paths);
+    spawn_update(paths, store, now);
 }
 
 /// Has a day gone by since `key` was last stamped? A store that cannot be
@@ -827,6 +828,50 @@ fn fetch_model(paths: &Paths) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
+}
+
+/// Once a day, start `brain update` detached and go on: nothing here waits
+/// for the network. `update_checked_at` is stamped at the spawn, so a machine
+/// where the updater has nothing to do still asks once a day, not once a run;
+/// `update.running` keeps a second one from starting while one is out (a
+/// marker a day old is a dead one). Silent, like the rest of `daily`.
+fn spawn_update(paths: &Paths, store: &Store, now: i64) {
+    if cfg!(windows) || cfg!(test) {
+        return;
+    }
+    #[allow(unused_mut)]
+    let mut no_fetch = std::env::var_os("ROLEPOD_BRAIN_NO_FETCH").is_some();
+    // A debug build can be told to spawn anyway, for the end-to-end test.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("ROLEPOD_BRAIN_UPDATE_SPAWN").is_some() {
+        no_fetch = false;
+    }
+    if no_fetch {
+        return;
+    }
+    let Ok(config) = crate::config::Config::load(&paths.config_file()) else { return };
+    if !crate::update::spawnable(&config) || !day_passed(store, crate::update::STATE_CHECKED_AT, now) {
+        return;
+    }
+    let marker = paths.data_dir.join(crate::update::FILE_RUNNING);
+    let young = std::fs::metadata(&marker)
+        .and_then(|meta| meta.modified())
+        .is_ok_and(|at| at.elapsed().is_ok_and(|age| age < FETCH_RETRY));
+    let Ok(exe) = std::env::current_exe() else { return };
+    if young || std::fs::write(&marker, "").is_err() {
+        return;
+    }
+    let spawned = std::process::Command::new(exe)
+        .arg("update")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    if spawned.is_ok() {
+        stamp(store, crate::update::STATE_CHECKED_AT, now);
+    } else {
+        let _ = std::fs::remove_file(&marker);
+    }
 }
 
 #[cfg(test)]

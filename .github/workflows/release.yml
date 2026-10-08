@@ -112,6 +112,26 @@ jobs:
           cargo build --release --locked --target ${{ matrix.target }} \
             ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
 
+      # The test seams (a release URL, a key, a forced hook fault) exist only
+      # in debug builds. If one is in the release binary the build is wrong,
+      # whatever the unit tests say.
+      - name: No test seam in the binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -eu
+          # Captured first, so a missing `strings` stops the step; the control
+          # string proves the tool read the binary and printed something.
+          out=$(strings "target/${{ matrix.target }}/release/brain")
+          if ! printf '%s\n' "$out" | grep -q ROLEPOD_BRAIN_NO_UPDATE; then
+              echo "strings did not read the binary: control string not found" >&2
+              exit 1
+          fi
+          if printf '%s\n' "$out" | grep -E 'ROLEPOD_BRAIN_(UPDATE_|HOOK_FAULT)'; then
+              echo "a debug-only seam is compiled into the release binary" >&2
+              exit 1
+          fi
+
       - name: Test
         # The same suite the repository runs. A binary nobody verified is
         # exactly the artifact this project argues against shipping — and the
@@ -298,8 +318,61 @@ jobs:
           # is time for nothing.
           compression-level: 0
 
+  # The only job that can see the signing key. It installs one distribution
+  # package and runs one script from this repository: no pip, no cargo, no
+  # downloaded script. It needs `build` for the binaries and nothing else, so
+  # code from the reranker's PyPI install never shares a runner with the key.
+  #
+  # ubuntu-24.04 and not 22.04: `minisign` is in noble's universe (0.11-1) and
+  # not in jammy at all. Universe is enabled on GitHub's image.
+  #
+  # Fails closed. A missing secret, a missing minisign.pub, or a signature that
+  # does not verify against minisign.pub stops the workflow, and `publish`
+  # needs this job, so nothing unsigned is ever released.
+  sign:
+    needs: build
+    runs-on: ubuntu-24.04
+    # The secret lives in this environment, which only a `v*` tag may deploy
+    # to, so a branch or a pull request cannot read it even from this file.
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # Only the build artifacts, by name pattern; the reranker's is not fetched.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: brain-*
+          path: artifacts
+
+      - name: Install minisign
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends minisign
+
+      # The key goes to a 0600 file in the runner's temp dir and is removed by
+      # the next step whatever happens here. Nothing prints it.
+      - name: Sign and verify
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          KEY_FILE: ${{ runner.temp }}/minisign.key
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: sh .github/scripts/sign-release.sh artifacts signatures minisign.pub
+
+      - name: Remove the key
+        if: always()
+        run: rm -f "${{ runner.temp }}/minisign.key"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signatures
+          path: signatures/*.minisig
+          if-no-files-found: error
+
   publish:
-    needs: [build, reranker]
+    needs: [build, reranker, sign]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -340,14 +413,29 @@ jobs:
           for d in artifacts/*/; do
               a=$(basename "$d")
               case "$a" in
-                  reranker) ;;
-                  brain-aarch64-apple-darwin|brain-x86_64-apple-darwin|\
+                  reranker|brain-aarch64-apple-darwin|brain-x86_64-apple-darwin|\
                   brain-x86_64-unknown-linux-gnu|brain-aarch64-unknown-linux-gnu|\
                   brain-x86_64-pc-windows-msvc)
-                      cp "$d$a"* dist/ ;;
+                      # A signature belongs to the `sign` job alone. One
+                      # arriving inside any other artifact is refused.
+                      if ls "$d" | grep -q '\.minisig$'; then
+                          echo "artifact $a carries a .minisig" >&2; exit 1
+                      fi
+                      [ "$a" = reranker ] || cp "$d$a"* dist/ ;;
+                  signatures) ;;
                   *) echo "unexpected artifact $a - add it to the matrix and here" >&2; exit 1 ;;
               esac
           done
+          # Exactly the five signatures, one per binary, and nothing else.
+          for t in aarch64-apple-darwin x86_64-apple-darwin \
+                   x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+                   x86_64-pc-windows-msvc; do
+              [ -s "artifacts/signatures/brain-$t.minisig" ] \
+                  || { echo "no signature for $t" >&2; exit 1; }
+              cp "artifacts/signatures/brain-$t.minisig" dist/
+          done
+          [ "$(ls artifacts/signatures | wc -l | tr -d ' ')" = 5 ] \
+              || { echo "artifacts/signatures must hold exactly 5 files" >&2; exit 1; }
           ( cd artifacts/reranker && sha256sum -c ../../assets/bge-reranker-v2-m3-int8/release.sha256 )
           awk '{ print $2 }' assets/bge-reranker-v2-m3-int8/release.sha256 \
               | while read -r f; do cp "artifacts/reranker/$f" dist/; done

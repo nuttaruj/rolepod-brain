@@ -876,6 +876,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
+name = "minisign-verify"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "871285dc19d8d0ebe0eef3d0e99a205f2a71363b122632cbbfa4a6c370a960ce"
+
+[[package]]
 name = "model2vec-rs"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1233,7 +1239,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rolepod-brain"
-version = "0.68.1"
+version = "0.69.0"
 dependencies = [
  "anyhow",
  "chacha20poly1305",
@@ -1241,6 +1247,7 @@ dependencies = [
  "dirs",
  "getrandom 0.3.4",
  "jiff",
+ "minisign-verify",
  "model2vec-rs",
  "ort",
  "regex",

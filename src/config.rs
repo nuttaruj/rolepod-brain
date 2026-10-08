@@ -32,6 +32,7 @@ pub struct Config {
     pub sanitize: SanitizeConfig,
     pub search: SearchConfig,
     pub hub: HubConfig,
+    pub update: UpdateConfig,
     pub sync: SyncConfig,
     pub team: TeamConfig,
     pub retention: RetentionConfig,
@@ -111,6 +112,37 @@ impl HubConfig {
             return false;
         }
         !self.mode.trim().eq_ignore_ascii_case("off")
+    }
+}
+
+/// Whether the installed binary keeps itself up to date.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateConfig {
+    /// On by default where an updater can run (macOS, Linux); Windows cannot
+    /// replace a running `.exe`, so there it is off and stays off.
+    pub auto: bool,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self { auto: cfg!(unix) }
+    }
+}
+
+impl UpdateConfig {
+    /// Is the updater to run? `ROLEPOD_BRAIN_NO_UPDATE` beats the file; nothing
+    /// turns it on where it cannot run.
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        if !cfg!(unix) {
+            return false;
+        }
+        let env = std::env::var("ROLEPOD_BRAIN_NO_UPDATE").unwrap_or_default();
+        if !matches!(env.trim().to_ascii_lowercase().as_str(), "" | "0" | "false") {
+            return false;
+        }
+        self.auto
     }
 }
 

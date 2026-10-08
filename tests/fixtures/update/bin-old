@@ -1,0 +1,4 @@
+#!/bin/sh
+if [ "${1:-}" = "--version" ]; then echo "brain 0.0.1"; exit 0; fi
+if [ "${1:-}" = "self-test" ]; then exit 0; fi
+exit 0

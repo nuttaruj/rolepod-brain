@@ -1,6 +1,6 @@
 [package]
 name = "rolepod-brain"
-version = "0.68.1"
+version = "0.69.0"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"
@@ -31,6 +31,7 @@ clap = { version = "4", features = ["derive"] }
 dirs = "6"
 getrandom = "0.3"
 jiff = "0.2"
+minisign-verify = "0.3.0"
 # `load-dynamic` is the whole reason every platform can have this. The crate's
 # own prebuilt onnxruntime is what demanded glibc 2.38 and what has no Intel
 # macOS build at all; Microsoft's official binaries need glibc 2.27 and are

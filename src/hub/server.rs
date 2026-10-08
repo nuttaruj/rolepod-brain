@@ -990,7 +990,10 @@ mod tests {
         assert!(lock_with_retry(&open(), 20, Duration::from_millis(10)).unwrap(), "won once the probe let go");
         releaser.join().unwrap();
         let holder = open();
-        holder.try_lock().unwrap();
+        // The winner above was dropped, but a child another test forked in this
+        // instant still holds its open file description until it execs, and
+        // the lock belongs to the description. Wait that out.
+        assert!(lock_with_retry(&holder, 50, Duration::from_millis(10)).unwrap(), "the lock frees once forks exec");
         assert!(!lock_with_retry(&open(), 3, Duration::from_millis(1)).unwrap(), "a real holder still wins");
     }
 
@@ -1067,6 +1070,10 @@ mod tests {
         let loser = open();
         assert!(matches!(loser.try_lock(), Err(fs::TryLockError::WouldBlock)));
         drop(holder);
-        assert!(loser.try_lock().is_ok(), "the OS drops the lock with its holder");
+        // A fork from another test can hold the description for an instant.
+        assert!(
+            lock_with_retry(&loser, 50, Duration::from_millis(10)).unwrap(),
+            "the OS drops the lock with its holder"
+        );
     }
 }

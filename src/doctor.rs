@@ -99,6 +99,7 @@ pub fn run() -> Result<Vec<Check>> {
     if let Some(store) = &store {
         checks.extend(hub_answers_check(&store.rerank_runs().unwrap_or_default()));
     }
+    checks.push(update_check(&paths, store.as_ref()));
     checks.extend(hook_checks());
     checks.extend(trigger_checks());
     checks.push(timer_check());
@@ -979,10 +980,7 @@ fn resident_check(paths: &Paths) -> Check {
     let me = std::process::id();
     // The hub is one of these processes too; the lock names it.
     #[cfg(unix)]
-    let hub = std::fs::read_to_string(paths.data_dir.join(crate::hub::endpoint::LOCK_FILE))
-        .ok()
-        .and_then(|text| text.trim().parse::<u32>().ok())
-        .filter(|pid| running.contains(pid));
+    let hub = hub_pid(paths, &running);
     #[cfg(not(unix))]
     let hub: Option<u32> = {
         let _ = paths;
@@ -1006,6 +1004,126 @@ fn resident_check(paths: &Paths) -> Check {
     } else {
         Check::pass("processes", parts.join("; "))
     }
+}
+
+/// The hub's pid, when the lock names a process that is running.
+#[cfg(unix)]
+fn hub_pid(paths: &Paths, running: &[u32]) -> Option<u32> {
+    std::fs::read_to_string(paths.data_dir.join(crate::hub::endpoint::LOCK_FILE))
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok())
+        .filter(|pid| running.contains(pid))
+}
+
+/// `[[dd-]hh:]mm:ss` as `ps -o etime=` prints it, in seconds.
+#[cfg(unix)]
+fn parse_etime(text: &str) -> Option<u64> {
+    let (days, clock) = match text.trim().split_once('-') {
+        Some((d, rest)) => (d.parse::<u64>().ok()?, rest),
+        None => (0, text.trim()),
+    };
+    let mut secs = 0;
+    for part in clock.split(':') {
+        secs = secs * 60 + part.parse::<u64>().ok()?;
+    }
+    Some(days * 86400 + secs)
+}
+
+/// How many `brain mcp` sessions started before `installed_secs` (unix
+/// seconds) and are still running: they keep the build they began with.
+/// The hub and this process are not sessions. `None` when `ps` cannot say.
+#[cfg(unix)]
+fn sessions_on_old_build(paths: &Paths, installed_secs: i64, now: i64) -> Option<usize> {
+    let running = running_brains()?;
+    let hub = hub_pid(paths, &running);
+    let me = std::process::id();
+    let started_before = u64::try_from(now.saturating_sub(installed_secs)).ok()?;
+    let mut count = 0;
+    for pid in running.into_iter().filter(|pid| *pid != me && Some(*pid) != hub) {
+        let Ok(out) = std::process::Command::new("ps").args(["-o", "etime=,command=", "-p", &pid.to_string()]).output() else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut tokens = text.split_whitespace();
+        let (Some(age), Some(_exe)) = (tokens.next().and_then(parse_etime), tokens.next()) else { continue };
+        if tokens.next() == Some("mcp") && age > started_before {
+            count += 1;
+        }
+    }
+    Some(count)
+}
+
+/// `5s`, `12m`, `3h`, `2d`.
+fn age_label(secs: i64) -> String {
+    match secs.max(0) {
+        s @ 0..=119 => format!("{s}s"),
+        s @ 120..=7199 => format!("{}m", s / 60),
+        s @ 7200..=172_799 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86400),
+    }
+}
+
+/// The auto-update row: mode, what was installed and when, the last check and
+/// skip, bad versions, and sessions still on the old build. Information only
+/// and local: it reads `schema_state` and files, never the network, and it
+/// names no command (the updater runs by itself). A rollback or a bad version
+/// is a `warn:`, never a failure.
+fn update_check(paths: &Paths, store: Option<&Store>) -> Check {
+    use crate::update::{Readiness, STATE_BAD, STATE_CHECKED_AT, STATE_INSTALLED, STATE_PREV, STATE_SKIP};
+    let config = Config::load(&paths.config_file()).unwrap_or_default();
+    let state = |key: &str| store.and_then(|s| s.state(key).ok().flatten());
+    let now = crate::update::now_secs();
+    let ago = |secs: i64| format!("{} ago", age_label(now - secs));
+    let mut warn = false;
+    let mut parts = vec![match crate::update::readiness(&config) {
+        Readiness::Off(why) => format!("off ({why})"),
+        Readiness::NoKey => "auto, waiting for a signed release".to_string(),
+        Readiness::Elsewhere => "auto, but installed another way, so not updated here".to_string(),
+        Readiness::Ready => "auto".to_string(),
+    }];
+
+    let installed = state(STATE_INSTALLED).unwrap_or_default();
+    let mut it = installed.split_whitespace();
+    let installed_at = match (it.next(), it.next().and_then(|n| n.parse::<i64>().ok())) {
+        (Some(version), Some(ms)) if ms > 0 => {
+            let prev = state(STATE_PREV).map(|p| format!(", was {p}")).unwrap_or_default();
+            parts.push(format!("installed {version} {}{prev}", ago(ms / 1000)));
+            Some(ms / 1000)
+        }
+        (Some(version), Some(_)) => {
+            parts.push(format!("running {version} after a rollback"));
+            None
+        }
+        _ => None,
+    };
+    match state(STATE_CHECKED_AT).and_then(|n| n.parse::<i64>().ok()) {
+        Some(at) => parts.push(format!("checked {}", ago(at))),
+        None => parts.push("never checked".to_string()),
+    }
+    if let Some(skip) = state(STATE_SKIP) {
+        let (reason, at) = skip.split_once('@').unwrap_or((&skip, ""));
+        let when = at.parse::<i64>().map(|s| format!(" {}", ago(s))).unwrap_or_default();
+        if matches!(reason, "rolled-back" | "rollback-unavailable") {
+            warn = true;
+        }
+        parts.push(format!("last skip: {reason}{when}"));
+    }
+    let bad = crate::update::bad_versions(&state(STATE_BAD).unwrap_or_default(), &paths.data_dir);
+    if !bad.is_empty() {
+        warn = true;
+        parts.push(format!("marked bad: {}", bad.join(" ")));
+    }
+    #[cfg(unix)]
+    if let Some(at) = installed_at {
+        if let Some(n) = sessions_on_old_build(paths, at, now).filter(|n| *n > 0) {
+            let was = state(STATE_PREV).unwrap_or_else(|| "the old version".to_string());
+            parts.push(format!("{n} session(s) still on {was} until they close"));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = installed_at;
+    let detail = parts.join(" · ");
+    Check::pass("update", if warn { format!("warn: {detail}") } else { detail })
 }
 
 /// Every `brain` process on this machine, or `None` if we could not ask.

@@ -33,6 +33,8 @@ mod revise;
 mod sanitize;
 mod setup;
 mod store;
+#[cfg_attr(not(unix), allow(dead_code, unused_imports, unused_variables))]
+mod update;
 mod tokenize;
 mod transcript;
 mod sync;
@@ -217,6 +219,12 @@ enum Commands {
         #[command(subcommand)]
         action: hub::HubAction,
     },
+    /// Install the newest signed release over this binary, or change nothing.
+    #[command(hide = true)]
+    Update,
+    /// Open the store read-only and exit; the updater runs it on a new binary.
+    #[command(hide = true)]
+    SelfTest,
     /// Show where this directory's memory lives.
     Where {
         /// Print only where the embedding model belongs, and nothing else.
@@ -274,7 +282,20 @@ fn main() {
 
 /// Capture path. Always exits 0 with a well-formed acknowledgement.
 fn run_hook(agent: &str, event: &str) {
-    match hook::capture(agent, event, None) {
+    // Only the first hour of a fresh install is watched (see update::hook_begin).
+    let watch = update::hook_begin();
+    #[cfg(debug_assertions)]
+    let fault = std::env::var("ROLEPOD_BRAIN_HOOK_FAULT").unwrap_or_default();
+    #[cfg(debug_assertions)]
+    if fault == "abort" {
+        std::process::abort();
+    }
+    #[cfg(debug_assertions)]
+    let result = if fault == "1" { Err(anyhow::anyhow!("injected capture fault")) } else { hook::capture(agent, event, None) };
+    #[cfg(not(debug_assertions))]
+    let result = hook::capture(agent, event, None);
+    let ok = result.is_ok();
+    match result {
         Ok(ack) => println!("{ack}"),
         Err(error) => {
             log_capture_failure(agent, event, &error);
@@ -282,6 +303,9 @@ fn run_hook(agent: &str, event: &str) {
             // silence as a malformed hook response on every single call.
             println!("{{}}");
         }
+    }
+    if let Some(watch) = watch {
+        watch.end(ok);
     }
 }
 
@@ -553,6 +577,15 @@ fn run(command: Commands) -> Result<()> {
             Ok(())
         }
         Commands::Where { models, reranker } => where_am_i(models, reranker),
+        Commands::Update => {
+            let paths = Paths::resolve()?;
+            // A config that does not parse may hold `auto = false`: refuse
+            // rather than assume the default.
+            let config = config::Config::load(&paths.config_file())?;
+            update::run(&paths, &config);
+            Ok(())
+        }
+        Commands::SelfTest => update::self_test(&Paths::resolve()?),
     }
 }
 
