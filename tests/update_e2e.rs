@@ -784,3 +784,115 @@ fn doctor_counts_sessions_still_on_the_old_build() {
     assert!(row.contains("session(s) still on 8.0.0 until they close"), "{row}");
     assert_no_command_text(&row);
 }
+
+// ---- the one line `brain update` prints ------------------------------------
+
+/// What `brain update` prints, and its exit status.
+fn said(env: &Env) -> (String, bool) {
+    let out = env.command(&env.bin(), &["update"]).stdout(Stdio::piped()).output().unwrap();
+    (String::from_utf8(out.stdout).unwrap(), out.status.success())
+}
+
+/// One line, ends in a newline, and shows no URL, token or data-dir path.
+fn assert_plain_line(env: &Env, name: &str, said: &str) {
+    assert_eq!(said.matches('\n').count(), 1, "{name}: {said:?}");
+    assert!(said.ends_with('\n'), "{name}: {said:?}");
+    for bad in ["://", "token", env.base.to_str().unwrap()] {
+        assert!(!said.contains(bad), "{name}: {said:?} shows {bad}");
+    }
+}
+
+#[test]
+fn update_says_what_it_installed() {
+    let env = Env::new();
+    env.release("v9.0.0", "good", Some("good"), 48);
+    let (line, ok) = said(&env);
+    assert!(ok);
+    assert_eq!(line, format!("installed 9.0.0 (was {RUNNING})\n"));
+    assert_plain_line(&env, "installed", &line);
+}
+
+#[test]
+fn update_says_why_it_did_not() {
+    type Setup = fn(&Env);
+    let rows: [(&str, &str, Setup); 6] = [
+        ("not-newer", "already on ", |e| e.release("v0.0.1", "old", Some("old"), 48)),
+        ("too-young", "not updated: the latest release was published 3 h ago; it installs once it is a day old\n", |e| {
+            e.release("v9.0.0", "good", Some("good"), 3)
+        }),
+        ("unsigned", "not updated: the latest release has no signature\n", |e| e.release("v9.0.0", "good", None, 48)),
+        ("bad-signature", "not updated: the signature does not match the download\n", |e| {
+            e.release("v9.0.0", "good", Some("stfail"), 48)
+        }),
+        ("selftest-version", "not updated: the new binary reports a different version", |e| {
+            e.release("v9.1.0", "badver", Some("badver"), 48)
+        }),
+        ("published-unknown", "not updated: the latest release has no readable publish time", |e| {
+            e.release("v9.0.0", "good", Some("good"), 48);
+            std::fs::write(e.base.join("rel/latest.json"), r#"{"tag_name":"v9.0.0"}"#).unwrap();
+        }),
+    ];
+    for (name, expect, setup) in rows {
+        let env = Env::new();
+        let log_before = env.log_len();
+        setup(&env);
+        let (line, ok) = said(&env);
+        assert!(ok, "{name}: exit code changed");
+        assert!(line.starts_with(expect), "{name}: {line:?}");
+        assert_plain_line(&env, name, &line);
+        assert_eq!(env.log_len(), log_before, "{name}: brain.log touched");
+    }
+    let env = Env::new();
+    env.release("v0.0.1", "old", Some("old"), 48);
+    assert_eq!(said(&env).0, format!("already on {RUNNING}, the latest release\n"));
+}
+
+#[test]
+fn update_with_no_key_says_so() {
+    let mut env = Env::new();
+    env.key = false;
+    env.release("v9.0.0", "good", Some("good"), 48);
+    let (line, ok) = said(&env);
+    assert!(ok);
+    assert_eq!(line, "not updated: this build has no signing key to check releases with\n");
+}
+
+#[test]
+fn update_says_when_it_is_off() {
+    let env = Env::new();
+    std::fs::write(env.base.join("data/config.toml"), "[update]\nauto = false\n").unwrap();
+    let (line, ok) = said(&env);
+    assert!(ok);
+    assert_eq!(line, "updates are off: auto = false in config\n");
+    assert_plain_line(&env, "config", &line);
+
+    let env = Env::new().with("ROLEPOD_BRAIN_NO_UPDATE", "1");
+    let (line, ok) = said(&env);
+    assert!(ok);
+    assert_eq!(line, "updates are off: ROLEPOD_BRAIN_NO_UPDATE is set\n");
+    assert!(env.curl_log().is_empty());
+}
+
+#[test]
+fn update_says_when_another_is_running() {
+    let env = Env::new();
+    env.release("v9.0.0", "good", Some("good"), 48);
+    // The lock is a flock on a file in the data dir; hold it from here.
+    let held = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(env.base.join("data/update.lock")).unwrap();
+    held.lock().unwrap();
+    let original = std::fs::read(env.bin()).unwrap();
+    let (line, ok) = said(&env);
+    assert!(ok);
+    assert_eq!(line, "another update is running\n");
+    assert_eq!(std::fs::read(env.bin()).unwrap(), original);
+    assert!(env.curl_log().is_empty());
+}
+
+#[test]
+fn help_lists_update_but_not_self_test() {
+    let env = Env::new();
+    let out = env.command(&env.bin(), &["--help"]).stdout(Stdio::piped()).output().unwrap();
+    let help = String::from_utf8(out.stdout).unwrap();
+    assert!(help.lines().any(|l| l.trim_start().starts_with("update ")), "{help}");
+    assert!(!help.contains("self-test"), "{help}");
+}

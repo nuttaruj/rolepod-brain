@@ -220,7 +220,9 @@ enum Commands {
         action: hub::HubAction,
     },
     /// Install the newest signed release over this binary, or change nothing.
-    #[command(hide = true)]
+    ///
+    /// A check already runs by itself once a day; use this to check now. A
+    /// release still installs only once it is a day old. Prints one line.
     Update,
     /// Open the store read-only and exit; the updater runs it on a new binary.
     #[command(hide = true)]
@@ -582,7 +584,7 @@ fn run(command: Commands) -> Result<()> {
             // A config that does not parse may hold `auto = false`: refuse
             // rather than assume the default.
             let config = config::Config::load(&paths.config_file())?;
-            update::run(&paths, &config);
+            println!("{}", update::run(&paths, &config));
             Ok(())
         }
         Commands::SelfTest => update::self_test(&Paths::resolve()?),

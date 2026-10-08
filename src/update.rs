@@ -668,7 +668,54 @@ impl Record {
 /// Why a run stopped without installing.
 enum Stop {
     Skip(&'static str),
+    /// A release not yet a day old, with its age in seconds.
+    Young(i64),
     Bad(&'static str, String),
+}
+
+/// The stop for a `decide` skip: a too-young release carries its age.
+fn stop_for(reason: &'static str, published: Option<&str>, now: i64) -> Stop {
+    let age = published.and_then(|p| p.parse::<jiff::Timestamp>().ok()).map(|at| now.saturating_sub(at.as_second()));
+    match (reason, age) {
+        ("too-young", Some(age)) => Stop::Young(age.max(0)),
+        _ => Stop::Skip(reason),
+    }
+}
+
+/// What a reader acts on, for a stop. Plain words: no URL, no path.
+fn stop_text(stop: &Stop) -> String {
+    let why = match stop {
+        Stop::Young(age) => {
+            let ago = if *age < 3600 { "under an hour ago".to_string() } else { format!("{} h ago", age / 3600) };
+            format!("the latest release was published {ago}; it installs once it is a day old")
+        }
+        Stop::Skip(reason) | Stop::Bad(reason, _) => match *reason {
+            "bad-tag" => "the latest release has a tag brain cannot read",
+            "prerelease" => "the latest release is a pre-release",
+            "running-unparsable" => "this brain's own version cannot be read",
+            "marked-bad" => "the latest release failed its self-test here before, so it is skipped",
+            "published-unknown" => "the latest release has no readable publish time; it waits until it has one",
+            "not-bootstrap-install" => "this brain was not installed by the bootstrap script, so it is not replaced",
+            "bin-unsafe" => "the install directory or the brain file is not yours or is writable by others",
+            "staging-failed" => "could not create a staging file next to brain",
+            "no-key" => "this build has no signing key to check releases with",
+            "bad-key" => "this build's signing key cannot be read",
+            "fetch-failed" => "could not fetch the release information",
+            "unsigned" => "the latest release has no signature",
+            "download-failed" => "the download failed or was too large",
+            "bad-signature" => "the signature does not match the download",
+            "signed-target-mismatch" => "the signature is for another platform",
+            "signed-version-mismatch" => "the signed version is not the release's version",
+            "codesign-failed" => "the new binary could not be code-signed",
+            "staging-changed" => "the downloaded file changed before it was placed",
+            "place-failed" => "the new binary could not be put in place",
+            "selftest-version" => "the new binary reports a different version than it was signed as",
+            "selftest-failed" => "the new binary failed its self-test",
+            _ => "the update stopped for an unexpected reason",
+        }
+        .to_string(),
+    };
+    format!("not updated: {why}")
 }
 
 impl From<&'static str> for Stop {
@@ -678,39 +725,55 @@ impl From<&'static str> for Stop {
 }
 
 /// `brain update`: install the newest signed release, or change nothing.
-/// Never fails loudly and never touches `brain.log`.
-pub fn run(paths: &Paths, config: &Config) {
+/// Never fails loudly and never touches `brain.log`. Returns the one line
+/// that says what happened, for the caller to print.
+pub fn run(paths: &Paths, config: &Config) -> String {
     // Opt-out returns before anything else, curl above all.
-    if !config.update.enabled() {
-        return;
+    if let Readiness::Off(why) = off_reason(config) {
+        return format!("updates are off: {why}");
     }
     #[cfg(unix)]
-    unix_run(paths);
+    return unix_run(paths);
     #[cfg(not(unix))]
-    let _ = paths;
+    {
+        let _ = paths;
+        String::new()
+    }
 }
 
 #[cfg(unix)]
-fn unix_run(paths: &Paths) {
-    let Some(triple) = target() else { return };
-    let Some(_lock) = take_lock(&paths.data_dir) else { return };
+fn unix_run(paths: &Paths) -> String {
+    let Some(triple) = target() else { return "updates are off: no release build for this platform".into() };
+    let Some(_lock) = take_lock(&paths.data_dir) else { return "another update is running".into() };
     let record = Record::open(paths);
     let outcome = attempt(paths, triple, &record);
-    match outcome {
-        Ok(()) => {
+    let line = match outcome {
+        Ok(version) => {
             let _ = record.store.as_ref().map(|s| s.clear_state(STATE_SKIP));
+            format!("installed {version} (was {})", env!("CARGO_PKG_VERSION"))
         }
-        Err(Stop::Skip(reason)) => record.skip(reason),
-        Err(Stop::Bad(reason, version)) => {
-            record.mark_bad(&version);
-            record.skip(reason);
+        Err(stop) => {
+            let line = match &stop {
+                Stop::Skip("not-newer") => format!("already on {}, the latest release", env!("CARGO_PKG_VERSION")),
+                other => stop_text(other),
+            };
+            match stop {
+                Stop::Skip(reason) => record.skip(reason),
+                Stop::Young(_) => record.skip("too-young"),
+                Stop::Bad(reason, version) => {
+                    record.mark_bad(&version);
+                    record.skip(reason);
+                }
+            }
+            line
         }
-    }
+    };
     let _ = std::fs::remove_file(paths.data_dir.join(FILE_RUNNING));
+    line
 }
 
 #[cfg(unix)]
-fn attempt(paths: &Paths, triple: &str, record: &Record) -> Result<(), Stop> {
+fn attempt(paths: &Paths, triple: &str, record: &Record) -> Result<String, Stop> {
     use std::os::unix::fs::PermissionsExt as _;
     let data = &paths.data_dir;
     let exe = std::env::current_exe().map_err(|_| Stop::Skip("not-bootstrap-install"))?;
@@ -740,7 +803,7 @@ fn attempt(paths: &Paths, triple: &str, record: &Record) -> Result<(), Stop> {
     // that is the signed one.
     let bad = record.bad_list();
     if let Verdict::Skip(reason) = decide(running, &tag, published.as_deref(), &bad, now_secs()) {
-        return Err(reason.into());
+        return Err(stop_for(reason, published.as_deref(), now_secs()));
     }
 
     let name = format!("brain-{triple}");
@@ -761,7 +824,7 @@ fn attempt(paths: &Paths, triple: &str, record: &Record) -> Result<(), Stop> {
     drop(bytes);
     // The version that counts is the signed one: decide again on it.
     if let Verdict::Skip(reason) = decide(running, &version, published.as_deref(), &bad, now_secs()) {
-        return Err(reason.into());
+        return Err(stop_for(reason, published.as_deref(), now_secs()));
     }
 
     std::fs::set_permissions(&staging.0, std::fs::Permissions::from_mode(0o755)).map_err(|_| Stop::Skip("staging-failed"))?;
@@ -777,7 +840,7 @@ fn attempt(paths: &Paths, triple: &str, record: &Record) -> Result<(), Stop> {
     }
     record.installing(&version);
     place_if_unchanged(&dir, &staging.0, &before, &mut |_| {})?;
-    Ok(())
+    Ok(version)
 }
 
 /// `brain self-test`: open the store read-only. Run by the updater on a
@@ -1049,6 +1112,18 @@ fn restore_prev(dir: &Path) -> Result<(), &'static str> {
     })
 }
 
+/// `Off` with the reason when config, env or the platform turn the updater
+/// off; `Ready` here only means none of those did.
+fn off_reason(config: &Config) -> Readiness {
+    if !cfg!(unix) {
+        return Readiness::Off("not available on this platform");
+    }
+    if !config.update.enabled() {
+        return Readiness::Off(if config.update.auto { "ROLEPOD_BRAIN_NO_UPDATE is set" } else { "auto = false in config" });
+    }
+    Readiness::Ready
+}
+
 /// Why the updater is or is not able to act on this machine, for `doctor`.
 /// Reads config, env, the key and the path of this executable; no network.
 #[derive(Debug, PartialEq, Eq)]
@@ -1061,11 +1136,9 @@ pub enum Readiness {
 
 #[must_use]
 pub fn readiness(config: &Config) -> Readiness {
-    if !cfg!(unix) {
-        return Readiness::Off("not available on this platform");
-    }
-    if !config.update.enabled() {
-        return Readiness::Off(if config.update.auto { "ROLEPOD_BRAIN_NO_UPDATE is set" } else { "auto = false in config" });
+    let off = off_reason(config);
+    if off != Readiness::Ready {
+        return off;
     }
     if target().is_none() {
         return Readiness::Off("no release build for this platform");

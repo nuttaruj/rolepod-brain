@@ -154,15 +154,34 @@ curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstr
 
 ### Update
 
-The same command that installs. It fetches whatever the latest release is,
-verifies the checksum, and replaces the binary in place — your memory and the
-wiring are untouched, so there is nothing else to re-run. `brain --version`
-says what you have; the [Releases](https://github.com/nuttaruj/rolepod-brain/releases)
-page says what is current.
+From 0.69.1 on, `brain` updates itself. Once a day it checks for a new
+release. It installs one only when the release's signature verifies against
+the key built into `brain`, the release is at least a day old, and the new
+binary passes a self-test. Your memory and the wiring are untouched. If a new
+build's first hooks keep failing, the previous build is put back on its own.
+`brain doctor` shows the last check and the last install.
+
+To check right now, run this. It prints one line saying what happened:
+
+```sh
+brain update
+```
+
+**Turning updates off.** Set `[update] auto = false` in `config.toml`, or
+`ROLEPOD_BRAIN_NO_UPDATE=1`. With either set, `brain` makes no update request
+at all.
+
+**Older builds, Windows, and other installs.** A build older than 0.69.1 has
+no updater, so it needs the install command one more time. The same applies on
+Windows, and to a `brain` installed some other way, such as `cargo install`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/nuttaruj/rolepod-brain/main/bootstrap.sh | sh -s -- --yes
 ```
+
+`brain --version` says what you have. The
+[Releases](https://github.com/nuttaruj/rolepod-brain/releases) page says what
+is current.
 
 ### Uninstall
 
