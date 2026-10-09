@@ -129,6 +129,9 @@ const MAX_DRAIN_ROUNDS: usize = 3;
 /// How long a taken ask is kept.
 const REQUEST_KEEP_DAYS: i64 = 7;
 
+/// How long a host-session tie is kept before the retention pass drops it.
+const HOST_SESSION_KEEP_DAYS: i64 = 30;
+
 /// The idle sweep: finish what sat quiet past [`crate::hook::IDLE_SWEEP_AGE_SECS`],
 /// in every project, under the run lock.
 ///
@@ -747,6 +750,12 @@ fn execute(
     // Before the early return below, so every kind of run spends its small
     // budget on it; once per invocation, not once per drained ask.
     if !std::mem::replace(&mut outcome.retention_ran, true) {
+        // Best effort: a pid that is gone is the only thing this forgets.
+        let cutoff = (jiff::Timestamp::now() - jiff::SignedDuration::from_hours(HOST_SESSION_KEEP_DAYS * 24))
+            .to_string();
+        if let Err(error) = store.prune_host_sessions(&cutoff) {
+            log_session_failure(paths, "host-sessions", &format!("{error:#}"));
+        }
         // What the hot paths could not write while the index was held, back
         // into the ledger first: retention reads it to know what was used.
         if crate::maint::fold_surfaced(paths, store) {

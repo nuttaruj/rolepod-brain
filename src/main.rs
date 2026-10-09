@@ -890,6 +890,9 @@ fn uninstall(apply: bool, wipe: bool) -> Result<()> {
     Ok(())
 }
 
+/// How far back `brain stats` looks for pull-through.
+const PULL_THROUGH_DAYS: i64 = 7;
+
 /// Report what this brain has done, from its own counters.
 ///
 /// Local only, and deliberately: these numbers exist so the user can judge
@@ -963,6 +966,22 @@ fn stats() -> Result<()> {
             );
         }
         println!("  {recalls} recall result(s) handed to agents");
+    }
+
+    println!("\nPull-through (last {PULL_THROUGH_DAYS} days)");
+    let since = (jiff::Timestamp::now() - jiff::SignedDuration::from_hours(PULL_THROUGH_DAYS * 24)).to_string();
+    if store.host_sessions_since(&since).unwrap_or(0) == 0 {
+        println!("  not measurable yet: no host session seen in the last {PULL_THROUGH_DAYS} days");
+        println!("  (the tie between a recall and its session started with this upgrade)");
+    } else {
+        let rows = store.pull_through(&since).unwrap_or_default();
+        for row in &rows {
+            println!(
+                "  {:<14} {} pushed to host-tied sessions, {} opened in the same session, {} recall(s) not joined",
+                row.kind, row.pushed, row.opened, row.unjoined
+            );
+        }
+        println!("  (not joined counts every recall since measuring began, not only the last 7 days)");
     }
 
     println!("\nRerank");

@@ -451,14 +451,27 @@ fn ledger<'a>(
     if maint::active(paths) {
         let _ = store.set_busy_timeout(maint::FAIL_FAST);
     }
+    // Looked up per call, not cached: the hook may record the session after
+    // this server started.
+    let host = host_session(store);
     let written = match how {
-        Ledger::Opened => store.record_opened(session, ids.iter().copied()),
-        _ => store.record_recalled(session, ids.iter().copied()),
+        Ledger::Opened => store.record_opened_in(session, &host, ids.iter().copied()),
+        _ => store.record_recalled_in(session, &host, ids.iter().copied()),
     };
     if written.is_err() {
         let owned: Vec<String> = ids.iter().map(|id| (*id).to_string()).collect();
         maint::spill_surfaced(paths, session, how, &owned);
     }
+}
+
+/// The host session the CLI running this server last reported through a hook,
+/// or `''` when there is none. The `ps` that finds the CLI runs once.
+fn host_session(store: &Store) -> String {
+    static HOST: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    // `host_pid()` runs `ps`; the cell keeps that to once per process.
+    HOST.get_or_init(crate::invocation::host_pid)
+        .and_then(|pid| store.latest_host_session(pid).ok().flatten())
+        .unwrap_or_default()
 }
 
 /// Was this id shown to this session - by the ledger, or by a spill the

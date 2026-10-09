@@ -86,9 +86,25 @@ pub fn silenced() -> bool {
 /// nothing about the CLI — verified by probing real runs, where interactive and
 /// headless alike showed no terminal on any descriptor. The CLI's argv is the
 /// signal that actually differs: `claude` alone versus `claude -p …`.
+///
+/// Returns the classification and the pid of the host CLI it was read from, from one
+/// `ps`. The host is the nearest ancestor `classify_argv` recognizes - the
+/// same process `classify_chain` decides on.
 #[must_use]
-pub fn classify() -> Invocation {
-    classify_chain(&ancestors())
+pub fn classify_with_host() -> (Invocation, Option<u32>) {
+    let chain = ancestors();
+    let argvs: Vec<String> = chain.iter().map(|(_, argv)| argv.clone()).collect();
+    (classify_chain(&argvs), host_of(&chain))
+}
+
+/// The host CLI's pid, for a caller that does not need the classification.
+#[must_use]
+pub fn host_pid() -> Option<u32> {
+    host_of(&ancestors())
+}
+
+fn host_of(chain: &[(u32, String)]) -> Option<u32> {
+    chain.iter().find(|(_, argv)| classify_argv(argv).is_some()).map(|(pid, _)| *pid)
 }
 
 /// The host CLI's own arguments decide first; who started the CLI decides
@@ -154,14 +170,14 @@ fn classify_argv(argv: &str) -> Option<Invocation> {
     Some(if headless { Invocation::Headless } else { Invocation::Interactive })
 }
 
-/// Command lines of our ancestors, nearest first.
+/// Pid and command line of our ancestors, nearest first.
 ///
 /// One `ps` for the whole table, then the walk happens in memory. The obvious
 /// implementation — one `ps` per ancestor — cost 70 ms on a real hook and blew
 /// the 50 ms budget outright. Process spawns are the expensive thing here, so
 /// there is exactly one.
 #[cfg(unix)]
-fn ancestors() -> Vec<String> {
+fn ancestors() -> Vec<(u32, String)> {
     let Ok(output) = std::process::Command::new("ps").args(["-Ao", "pid=,ppid=,args="]).output()
     else {
         return Vec::new();
@@ -184,7 +200,7 @@ fn ancestors() -> Vec<String> {
     let mut pid = std::os::unix::process::parent_id();
     for _ in 0..MAX_ANCESTORS {
         let Some((parent, argv)) = table.get(&pid) else { break };
-        out.push(argv.clone());
+        out.push((pid, argv.clone()));
         if *parent <= 1 {
             break;
         }
@@ -205,7 +221,7 @@ fn ancestors() -> Vec<String> {
 /// PowerShell startup inside a 50 ms hook budget, and the Win32 tool help API
 /// needs `unsafe`, which this crate forbids.
 #[cfg(windows)]
-fn ancestors() -> Vec<String> {
+fn ancestors() -> Vec<(u32, String)> {
     Vec::new()
 }
 
@@ -362,6 +378,21 @@ mod tests {
         // either: that would silence injection for everything unknown.
         assert_eq!(classify_chain(&["/bin/sh".to_string()]), Invocation::Interactive);
         assert_eq!(classify_chain(&[]), Invocation::Interactive);
+    }
+
+    #[test]
+    fn the_host_is_the_nearest_recognized_ancestor() {
+        let chain = |rows: &[(u32, &str)]| -> Vec<(u32, String)> {
+            rows.iter().map(|(pid, argv)| (*pid, (*argv).to_string())).collect()
+        };
+        assert_eq!(host_of(&chain(&[(5, "sh"), (6, "claude -c x"), (7, "login")])), Some(6));
+        // A codex under a claude: the nearer one is the host.
+        assert_eq!(
+            host_of(&chain(&[(5, "sh"), (6, "codex app-server"), (7, "claude --model opus")])),
+            Some(6)
+        );
+        assert_eq!(host_of(&chain(&[(5, "sh"), (7, "login -pf me")])), None);
+        assert_eq!(host_of(&[]), None);
     }
 
     #[test]

@@ -71,6 +71,29 @@ pub fn is_worker_child() -> bool {
     std::env::var_os(WORKER_ENV).is_some_and(|value| !value.is_empty())
 }
 
+/// The `host_session` pid that stands for "no host CLI found".
+const NO_HOST: u32 = 0;
+
+/// What a hook must do to learn the host pid of its session.
+#[derive(Debug, PartialEq, Eq)]
+enum HostPlan {
+    /// Nothing cached: classify, which finds invocation and host together.
+    Classify,
+    /// Invocation cached but no row (open before the tie existed): classify
+    /// once for the host; the row then exists.
+    FindHost,
+    /// A row exists (a marker included): reuse its pid, no process spawned.
+    Reuse(u32),
+}
+
+fn host_plan(invocation_cached: bool, peeked_host: Option<u32>) -> HostPlan {
+    match (invocation_cached, peeked_host) {
+        (false, _) => HostPlan::Classify,
+        (true, None) => HostPlan::FindHost,
+        (true, Some(pid)) => HostPlan::Reuse(pid),
+    }
+}
+
 /// Take what the host is sending, and throw it away.
 ///
 /// Capturing nothing is not the same as reading nothing. A hook that returns
@@ -269,7 +292,24 @@ fn capture_answering(
     let session_key = session.to_string();
     let remembered = Store::peek_session_invocation(&paths.db(), &session_key);
     let known = remembered.is_some();
-    let invocation = remembered.map_or_else(invocation::classify, |cached| invocation::parse(&cached));
+    //
+    // The host pid is looked up the same way, so every event can refresh the
+    // session's `host_session` row without another `ps`. A session with no row
+    // yet (open before the tie existed) is classified once to find it.
+    //
+    // A host that classification cannot find leaves a pid-0 marker row, so
+    // that session is never classified again.
+    let (invocation, host_pid) = match host_plan(known, known.then(|| Store::peek_session_host(&paths.db(), &session_key)).flatten()) {
+        HostPlan::Classify => {
+            let (found, pid) = invocation::classify_with_host();
+            (found, Some(pid.unwrap_or(NO_HOST)))
+        }
+        HostPlan::FindHost => (
+            invocation::parse(remembered.as_deref().unwrap_or_default()),
+            Some(invocation::classify_with_host().1.unwrap_or(NO_HOST)),
+        ),
+        HostPlan::Reuse(pid) => (invocation::parse(remembered.as_deref().unwrap_or_default()), Some(pid)),
+    };
 
     // A pointer to material consolidation will read and never copy. Claude
     // Code and Codex put it in every payload; Cursor's is accepted when its
@@ -362,6 +402,13 @@ fn capture_answering(
     if !known {
         failed = store.record_session_invocation(&session_key, invocation.as_str()).err();
         skip = fast && failed.is_some();
+    }
+    // Every event refreshes the tie, so `ts` is when the session was last seen.
+    if let (Some(pid), false) = (host_pid, skip) {
+        let at = jiff::Timestamp::now().to_string();
+        let tied = store.record_host_session(pid, &session_key, &at).err();
+        skip = fast && tied.is_some();
+        failed = failed.or(tied);
     }
     if let Some(path) = transcript {
         if !skip {
@@ -1396,6 +1443,16 @@ pub fn first_line(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_host_plan_spawns_a_process_only_when_nothing_is_known() {
+        use super::{host_plan, HostPlan, NO_HOST};
+        assert_eq!(host_plan(false, None), HostPlan::Classify);
+        assert_eq!(host_plan(true, None), HostPlan::FindHost);
+        assert_eq!(host_plan(true, Some(42)), HostPlan::Reuse(42));
+        // The marker for an unknown host is a row like any other.
+        assert_eq!(host_plan(true, Some(NO_HOST)), HostPlan::Reuse(NO_HOST));
+    }
+
     use super::*;
     use serde_json::json;
 

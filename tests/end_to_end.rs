@@ -926,6 +926,188 @@ fn what_an_agent_opens_is_recorded_apart_from_what_it_was_offered() {
     assert_eq!(count(1), 1, "reading a body in full was not recorded as opened");
 }
 
+/// Ids of the hits a search for `auth` returns, after a few edits to seed it.
+fn seed_and_search_auth(fixture: &Fixture) -> Vec<String> {
+    for name in ["auth.rs", "auth/login.rs"] {
+        let payload = serde_json::json!({
+            "session_id": "0199a1f2-3c4d-7e8f-9012-3456789abcde",
+            "cwd": fixture.project,
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": fixture.project.join(format!("src/{name}")),
+                "new_string": "fn check() {}"
+            },
+            "tool_response": {"success": true}
+        })
+        .to_string();
+        fixture.hook("claude-code", "PostToolUse", &payload);
+    }
+    let search = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"brain_search","arguments":{"query":"auth"}}}"#;
+    let responses = fixture.mcp(&[search]);
+    let text = responses.last().expect("a response")["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content")
+        .to_string();
+    let parsed: serde_json::Value = serde_json::from_str(&text).expect("hits JSON");
+    parsed["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["id"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+fn sqlite_value(fixture: &Fixture, sql: &str) -> String {
+    let out = Command::new("sqlite3")
+        .arg(fixture.home.join("brain.db"))
+        .arg(sql)
+        .output()
+        .expect("query the store");
+    assert!(out.status.success(), "sqlite3 failed: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn get_request(id: &str) -> String {
+    format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"brain_get","arguments":{{"ids":["{id}"]}}}}}}"#
+    )
+}
+
+/// A recall is tied to the host session whose hook ran under the same host
+/// process: the hooks and the MCP server are children of one fake `claude`.
+#[test]
+fn a_recall_is_tied_to_the_host_session_that_opened_it() {
+    let fixture = Fixture::new("hostjoin");
+    let ids = seed_and_search_auth(&fixture);
+    let id = ids.first().expect("a hit").clone();
+
+    let session = "0199b2c3-4d5e-7f80-9123-456789abcdef";
+    let base = fixture.home.parent().unwrap().to_path_buf();
+    std::fs::write(base.join("start.json"), start_payload(&fixture.project, session, "startup")).unwrap();
+    let post = serde_json::json!({
+        "session_id": session,
+        "cwd": fixture.project,
+        "tool_name": "Read",
+        "tool_input": {"file_path": fixture.project.join("src/auth.rs")}
+    });
+    std::fs::write(base.join("post.json"), post.to_string()).unwrap();
+    std::fs::write(base.join("req.jsonl"), format!("{}\n", get_request(&id))).unwrap();
+
+    let fake = base.join("host-bin");
+    std::fs::create_dir_all(&fake).unwrap();
+    let claude = fake.join("claude");
+    if claude.symlink_metadata().is_err() {
+        std::os::unix::fs::symlink("/bin/bash", &claude).unwrap();
+    }
+    // No `-p`: an interactive host. Several commands, so bash forks for each
+    // and the `claude` process is still the parent when brain looks it up.
+    let script = format!(
+        "'{BRAIN}' hook --cli claude-code --event SessionStart < start.json; \
+         '{BRAIN}' hook --cli claude-code --event PostToolUse < post.json; \
+         '{BRAIN}' mcp < req.jsonl > out.jsonl; exit $?"
+    );
+    let mut command = Command::new(&claude);
+    command
+        .args(["-c", &script])
+        .current_dir(&base)
+        .env("ROLEPOD_BRAIN_HOME", &fixture.home)
+        .env("ROLEPOD_BRAIN_NO_FETCH", "1")
+        .env("ROLEPOD_BRAIN_HUB", "off")
+        .env("HOME", &base)
+        .env("PATH", "/usr/bin:/bin");
+    fixture.own_git_config(&mut command);
+    let out = command.output().expect("run the fake host");
+    assert!(out.status.success(), "fake host failed: {out:?}");
+
+    assert_eq!(
+        sqlite_value(
+            &fixture,
+            &format!("SELECT host_session FROM recalled WHERE event_id = '{id}' AND opened = 1;")
+        ),
+        session,
+        "the recall was not tied to the host session"
+    );
+}
+
+/// Every hook refreshes its session's tie, not only the first: S1 is seen
+/// again after S2, so S1 is the host session the recall belongs to.
+#[test]
+fn a_later_hook_of_an_older_session_keeps_the_tie_fresh() {
+    let fixture = Fixture::new("hostrefresh");
+    let ids = seed_and_search_auth(&fixture);
+    let id = ids.first().expect("a hit").clone();
+
+    let (s1, s2) = ("0199b2c3-4d5e-7f80-9123-456789abcdef", "0199b2c3-4d5e-7f80-9123-456789abcd01");
+    let base = fixture.home.parent().unwrap().to_path_buf();
+    for (file, session) in [("post1.json", s1), ("post2.json", s2)] {
+        let post = serde_json::json!({
+            "session_id": session,
+            "cwd": fixture.project,
+            "tool_name": "Read",
+            "tool_input": {"file_path": fixture.project.join("src/auth.rs")}
+        });
+        std::fs::write(base.join(file), post.to_string()).unwrap();
+    }
+    std::fs::write(base.join("req.jsonl"), format!("{}\n", get_request(&id))).unwrap();
+
+    let fake = base.join("host-bin");
+    std::fs::create_dir_all(&fake).unwrap();
+    let claude = fake.join("claude");
+    if claude.symlink_metadata().is_err() {
+        std::os::unix::fs::symlink("/bin/bash", &claude).unwrap();
+    }
+    let script = format!(
+        "'{BRAIN}' hook --cli claude-code --event PostToolUse < post1.json; \
+         '{BRAIN}' hook --cli claude-code --event PostToolUse < post2.json; \
+         '{BRAIN}' hook --cli claude-code --event PostToolUse < post1.json; \
+         '{BRAIN}' mcp < req.jsonl > out.jsonl; exit $?"
+    );
+    let mut command = Command::new(&claude);
+    command
+        .args(["-c", &script])
+        .current_dir(&base)
+        .env("ROLEPOD_BRAIN_HOME", &fixture.home)
+        .env("ROLEPOD_BRAIN_NO_FETCH", "1")
+        .env("ROLEPOD_BRAIN_HUB", "off")
+        .env("HOME", &base)
+        .env("PATH", "/usr/bin:/bin");
+    fixture.own_git_config(&mut command);
+    let out = command.output().expect("run the fake host");
+    assert!(out.status.success(), "fake host failed: {out:?}");
+
+    assert_eq!(
+        sqlite_value(
+            &fixture,
+            &format!("SELECT host_session FROM recalled WHERE event_id = '{id}' AND opened = 1;")
+        ),
+        s1,
+        "the later hook of S1 did not refresh its tie"
+    );
+}
+
+/// With no hook from this host, the recall is still recorded, marked as
+/// unjoined by an empty host session rather than NULL.
+#[test]
+fn a_recall_without_a_known_host_is_recorded_unjoined() {
+    let fixture = Fixture::new("hostnone");
+    let ids = seed_and_search_auth(&fixture);
+    let id = ids.first().expect("a hit").clone();
+    // The seeding hooks ran under whatever host runs this suite, and that host
+    // is also the one the server finds: forget what they recorded.
+    sqlite_value(&fixture, "DELETE FROM host_session;");
+    fixture.mcp(&[&get_request(&id)]);
+    assert_eq!(
+        sqlite_value(
+            &fixture,
+            &format!(
+                "SELECT opened || ':' || COALESCE(host_session, 'NULL') FROM recalled WHERE event_id = '{id}' AND opened = 1;"
+            )
+        ),
+        "1:",
+        "the recall was lost or joined to a stranger"
+    );
+}
+
 /// Reranking is the caller's call, one question at a time.
 ///
 /// A config flag says what someone preferred once; an argument says this
@@ -4727,6 +4909,70 @@ fn a_note_is_saved_and_recalled_across_sessions() {
 
     // And it is in the log, not only the index.
     assert!(fixture.log_text().contains(r#""kind":"note""#));
+}
+
+#[test]
+fn stats_reports_pull_through_per_kind() {
+    let fixture = Fixture::new("pull-through");
+    for name in ["a.rs", "b.rs", "c.rs"] {
+        let payload = serde_json::json!({
+            "session_id": "0199a1f2-3c4d-7e8f-9012-3456789abcde",
+            "cwd": fixture.project,
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": fixture.project.join(format!("src/{name}")),
+                "new_string": "fn check() {}"
+            },
+            "tool_response": {"success": true}
+        })
+        .to_string();
+        fixture.hook("claude-code", "PostToolUse", &payload);
+    }
+    fixture.mcp(&[
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"brain_note","arguments":{"text":"Pull-through fixture note."}}}"#,
+    ]);
+
+    let ids = |kind: &str| -> Vec<String> {
+        let conn = rusqlite::Connection::open(fixture.home.join("brain.db")).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id FROM events WHERE kind = ?1 ORDER BY id")
+            .unwrap();
+        stmt.query_map([kind], |row| row.get(0)).unwrap().map(Result::unwrap).collect()
+    };
+    let obs = ids("observation");
+    let note = ids("note");
+    assert!(obs.len() >= 3, "need three observations: {obs:?}");
+    assert_eq!(note.len(), 1, "need one note: {note:?}");
+
+    // A real claude under the fixture may have left its own rows: start clean.
+    fixture.sql_run("DELETE FROM host_session; DELETE FROM injected; DELETE FROM recalled;");
+    let now = jiff::Timestamp::now().to_string();
+    fixture.sql_run(&format!(
+        "INSERT INTO host_session (host_pid, session, ts) VALUES (1, 'host-a', '{now}');
+         INSERT INTO injected (session, event_id) VALUES
+           ('host-a', '{o0}'), ('host-a', '{o1}'), ('host-a', '{o2}'), ('host-a', '{n0}');
+         INSERT INTO recalled (session, event_id, opened, host_session) VALUES
+           ('mcp-1', '{o0}', 1, 'host-a'),
+           ('mcp-2', '{o1}', 1, 'host-b'),
+           ('mcp-3', '{o2}', 1, ''),
+           ('mcp-4', '{n0}', 0, 'host-a');",
+        o0 = obs[0],
+        o1 = obs[1],
+        o2 = obs[2],
+        n0 = note[0],
+    ));
+
+    let out = fixture.brain(&["stats"]);
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(text.contains("Pull-through (last 7 days)"), "no section: {text}");
+    assert!(
+        text.contains("observation    3 pushed to host-tied sessions, 1 opened in the same session, 1 recall(s) not joined"),
+        "observation line: {text}"
+    );
+    assert!(
+        text.contains("note           1 pushed to host-tied sessions, 0 opened in the same session, 0 recall(s) not joined"),
+        "note line: {text}"
+    );
 }
 
 #[test]

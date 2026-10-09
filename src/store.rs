@@ -472,6 +472,15 @@ pub struct Outline {
     pub subjects: Vec<Subject>,
 }
 
+/// One kind's push-and-pull counts, as `brain stats` reads them back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullThrough {
+    pub kind: String,
+    pub pushed: i64,
+    pub opened: i64,
+    pub unjoined: i64,
+}
+
 /// One search hit.
 /// One recorded rerank, as `brain stats` reads it back.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -993,6 +1002,16 @@ impl Store {
                 -- Both are keyed session-first, so the replay's count by
                 -- event id scanned the table once per event. Side tables of
                 -- tens of thousands of rows: the build is a few hundred ms cold, once.
+                -- Which host session a host process last ran, written by the
+                -- hook and read by the MCP server to tie a recall to it. Local
+                -- bookkeeping like `recalled`: not in the log, and `clear()`
+                -- leaves it alone.
+                CREATE TABLE IF NOT EXISTS host_session (
+                    host_pid INTEGER NOT NULL,
+                    session  TEXT NOT NULL,
+                    ts       TEXT NOT NULL,
+                    PRIMARY KEY (host_pid, session)
+                );
                 CREATE INDEX IF NOT EXISTS injected_by_event ON injected(event_id);
                 CREATE INDEX IF NOT EXISTS recalled_by_event ON recalled(event_id);
 
@@ -1325,6 +1344,7 @@ impl Store {
                 ("injected", "active", "INTEGER NOT NULL DEFAULT 1"),
                 ("injected", "in_flight", "INTEGER NOT NULL DEFAULT 0"),
                 ("recalled", "opened", "INTEGER NOT NULL DEFAULT 0"),
+                ("recalled", "host_session", "TEXT"),
             ]
         {
             if self.has_column(table, column)? {
@@ -3052,6 +3072,24 @@ impl Store {
         .flatten()
     }
 
+    /// The host pid of the latest `host_session` row of this session, read the
+    /// way [`Self::peek_session_invocation`] reads: without opening for writes,
+    /// every failure meaning "not known".
+    #[must_use]
+    pub fn peek_session_host(path: &Path, session: &str) -> Option<u32> {
+        let conn =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+        conn.busy_timeout(std::time::Duration::from_millis(200)).ok()?;
+        conn.query_row(
+            "SELECT host_pid FROM host_session WHERE session = ?1 ORDER BY ts DESC LIMIT 1",
+            params![session],
+            |row| row.get::<_, u32>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
     /// Remember how a session was invoked.
     ///
     /// # Errors
@@ -3122,24 +3160,96 @@ impl Store {
     ///
     /// # Errors
     /// Returns an error when the write fails.
+    #[cfg(test)]
     pub fn record_recalled<'a>(
         &self,
         session: &str,
         ids: impl Iterator<Item = &'a str>,
     ) -> Result<()> {
-        self.record_recall(session, ids, Reach::Offered)
+        self.record_recall(session, None, ids, Reach::Offered)
+    }
+
+    /// [`Self::record_recalled`], tying the rows to the host session that
+    /// asked. `host` is `''` when no host session could be found; a row is
+    /// only ever filled in later, never emptied.
+    ///
+    /// # Errors
+    /// Returns an error when the write fails.
+    pub fn record_recalled_in<'a>(
+        &self,
+        session: &str,
+        host: &str,
+        ids: impl Iterator<Item = &'a str>,
+    ) -> Result<()> {
+        self.record_recall(session, Some(host), ids, Reach::Offered)
+    }
+
+    /// [`Self::record_opened`], tying the rows to the host session. An open
+    /// overwrites the host of a row a search offered earlier.
+    ///
+    /// # Errors
+    /// Returns an error when the write fails.
+    pub fn record_opened_in<'a>(
+        &self,
+        session: &str,
+        host: &str,
+        ids: impl Iterator<Item = &'a str>,
+    ) -> Result<()> {
+        self.record_recall(session, Some(host), ids, Reach::Opened)
+    }
+
+    /// Remember that a host process is running this host session.
+    ///
+    /// # Errors
+    /// Returns an error when the write fails.
+    pub fn record_host_session(&self, pid: u32, session: &str, ts: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO host_session (host_pid, session, ts) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(host_pid, session) DO UPDATE SET ts = excluded.ts",
+                params![i64::from(pid), session, ts],
+            )
+            .context("record host session")?;
+        Ok(())
+    }
+
+    /// The host session a host process ran most recently.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn latest_host_session(&self, pid: u32) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT session FROM host_session WHERE host_pid = ?1 AND host_pid <> 0
+                 ORDER BY ts DESC LIMIT 1",
+                params![i64::from(pid)],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("read host session")
+    }
+
+    /// Forget host sessions last seen before `cutoff`. Returns how many.
+    ///
+    /// # Errors
+    /// Returns an error when the delete fails.
+    pub fn prune_host_sessions(&self, cutoff: &str) -> Result<usize> {
+        self.conn
+            .execute("DELETE FROM host_session WHERE ts < ?1", params![cutoff])
+            .context("prune host sessions")
     }
 
     /// The same, for ids the agent asked to read in full.
     ///
     /// # Errors
     /// Returns an error when the write fails.
+    #[cfg(test)]
     pub fn record_opened<'a>(
         &self,
         session: &str,
         ids: impl Iterator<Item = &'a str>,
     ) -> Result<()> {
-        self.record_recall(session, ids, Reach::Opened)
+        self.record_recall(session, None, ids, Reach::Opened)
     }
 
     /// Write one recall, remembering whether it was merely offered by a
@@ -3158,6 +3268,7 @@ impl Store {
     fn record_recall<'a>(
         &self,
         session: &str,
+        host: Option<&str>,
         ids: impl Iterator<Item = &'a str>,
         how: Reach,
     ) -> Result<()> {
@@ -3175,8 +3286,9 @@ impl Store {
                 None => {
                     self.conn
                         .execute(
-                            "INSERT INTO recalled (session, event_id, opened) VALUES (?1, ?2, ?3)",
-                            params![session, id, i64::from(how == Reach::Opened)],
+                            "INSERT INTO recalled (session, event_id, opened, host_session)
+                             VALUES (?1, ?2, ?3, ?4)",
+                            params![session, id, i64::from(how == Reach::Opened), host],
                         )
                         .context("record recalled id")?;
                     // Count a session's first read only. Re-reading the same
@@ -3200,6 +3312,27 @@ impl Store {
                         .context("mark opened")?;
                 }
                 Some(_) => {}
+            }
+            if seen.is_some() {
+                if let Some(host) = host {
+                    // An open overwrites, but never with nothing; an offer
+                    // only fills a row that has no host yet.
+                    let sql = match how {
+                        Reach::Opened => {
+                            "UPDATE recalled SET host_session = ?3
+                             WHERE session = ?1 AND event_id = ?2
+                               AND (?3 <> '' OR host_session IS NULL)"
+                        }
+                        Reach::Offered => {
+                            "UPDATE recalled SET host_session = ?3
+                             WHERE session = ?1 AND event_id = ?2
+                               AND ?3 <> '' AND (host_session IS NULL OR host_session = '')"
+                        }
+                    };
+                    self.conn
+                        .execute(sql, params![session, id, host])
+                        .context("tie recall to host session")?;
+                }
             }
         }
         Ok(())
@@ -4101,6 +4234,92 @@ impl Store {
             .context("read in-flight uptake")
     }
 
+    /// Pull-through per kind: of what was pushed into host sessions seen since
+    /// `since`, how much that same session then opened in full.
+    ///
+    /// `unjoined` counts recalls the MCP server could not tie to a host
+    /// session (`host_session = ''`). `recalled` has no time column, so it
+    /// covers everything since measurement began, not only the window. Rows
+    /// written before the tie existed (NULL) are not counted: they say nothing
+    /// about a join.
+    ///
+    /// # Errors
+    /// Returns an error when a query fails.
+    pub fn pull_through(&self, since: &str) -> Result<Vec<PullThrough>> {
+        let mut by_kind: std::collections::BTreeMap<String, PullThrough> =
+            std::collections::BTreeMap::new();
+        let mut rows = Vec::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT e.kind, COUNT(*),
+                            SUM(EXISTS (SELECT 1 FROM recalled r
+                                         WHERE r.host_session = i.session
+                                           AND r.event_id = i.event_id
+                                           AND r.opened = 1))
+                     FROM injected i JOIN events e ON e.id = i.event_id
+                     WHERE i.session IN (SELECT session FROM host_session WHERE ts >= ?1 AND host_pid <> 0)
+                     GROUP BY e.kind",
+                )
+                .context("prepare pull-through")?;
+            let mapped = stmt
+                .query_map(params![since], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+                })
+                .context("run pull-through")?;
+            for row in mapped {
+                rows.push(row.context("read pull-through")?);
+            }
+        }
+        for (kind, pushed, opened) in rows {
+            let entry = by_kind.entry(kind.clone()).or_insert(PullThrough {
+                kind,
+                pushed: 0,
+                opened: 0,
+                unjoined: 0,
+            });
+            entry.pushed = pushed;
+            entry.opened = opened;
+        }
+        let mut unjoined = Vec::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT e.kind, COUNT(*) FROM recalled r JOIN events e ON e.id = r.event_id
+                     WHERE r.host_session = '' GROUP BY e.kind",
+                )
+                .context("prepare unjoined recalls")?;
+            let mapped = stmt
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+                .context("run unjoined recalls")?;
+            for row in mapped {
+                unjoined.push(row.context("read unjoined recalls")?);
+            }
+        }
+        for (kind, count) in unjoined {
+            by_kind
+                .entry(kind.clone())
+                .or_insert(PullThrough { kind, pushed: 0, opened: 0, unjoined: 0 })
+                .unjoined = count;
+        }
+        Ok(by_kind.into_values().collect())
+    }
+
+    /// Whether any host session was seen since `since`: without one, no
+    /// pull-through can be measured.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn host_sessions_since(&self, since: &str) -> Result<i64> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM host_session WHERE ts >= ?1 AND host_pid <> 0", params![since], |row| {
+                row.get(0)
+            })
+            .context("count host sessions")
+    }
+
     /// Total recall calls that returned something.
     ///
     /// # Errors
@@ -4876,6 +5095,9 @@ impl Store {
     /// material. Five sessions of being pushed and never once pulled is the
     /// budget talking: the line buys nothing where it is.
     const INJECTIONS_BEFORE_DECAY: i64 = 5;
+    /// The same budget for knowledge, which earns its place as the line
+    /// itself and so gets four times the patience.
+    const KNOWLEDGE_INJECTIONS_BEFORE_DECAY: i64 = 20;
 
     fn rank(prefix: &str) -> String {
         format!(
@@ -4890,11 +5112,27 @@ impl Store {
                  WHEN 'page_update' THEN 3
                  ELSE 4
              END,
-             -- A standing rule first among lessons: it was distilled from
+             -- Knowledge offered this many times and never once found or
+             -- opened sinks behind the rest of its layer; one pull brings it
+             -- back. Far slower than the pointer decay below: the line is
+             -- the value, so only a long unread run counts as evidence.
+             CASE WHEN {prefix}kind = 'knowledge'
+                       AND {prefix}injected_count >= {kdecay}
+                       AND {prefix}read_count = 0
+                  THEN 1 ELSE 0 END,
+             -- Among lessons, a standing rule first: it was distilled from
              -- corrections a person made more than once, which is the
-             -- strongest evidence this table holds. Only knowledge rows
-             -- carry hook = 'rule', so nothing else moves.
-             CASE WHEN {prefix}hook = 'rule' THEN 0 ELSE 1 END,
+             -- strongest evidence this table holds. Then gotcha, decision,
+             -- procedure. Wrapped in kind so no other kind's order moves.
+             CASE WHEN {prefix}kind = 'knowledge' THEN
+                 CASE {prefix}hook
+                     WHEN 'rule' THEN 0
+                     WHEN 'gotcha' THEN 1
+                     WHEN 'decision' THEN 2
+                     WHEN 'procedure' THEN 3
+                     ELSE 4
+                 END
+             ELSE 0 END,
              CASE WHEN {prefix}invocation = 'headless' THEN 1 ELSE 0 END,
              -- Evidence beats heuristics: something an agent went back and
              -- read is worth more than something we merely guessed at, and a
@@ -4903,8 +5141,8 @@ impl Store {
              CASE WHEN {prefix}read_count > 0 THEN 0 ELSE 1 END,
              -- Decay on the push side: offered this many sessions and never
              -- once pulled, a pointer stops crowding out fresh lines.
-             -- Knowledge is exempt - its worth is the line itself (83% of it
-             -- ever surfaced), not a body nobody needs to pull.
+             -- Knowledge is exempt here - its worth is the line itself (83%
+             -- of it ever surfaced); it has its own, slower decay above.
              CASE WHEN {prefix}kind != 'knowledge'
                        AND {prefix}injected_count >= {decay}
                        AND {prefix}read_count = 0
@@ -4918,7 +5156,8 @@ impl Store {
                  WHEN 'test' THEN 5
                  ELSE 6
              END",
-            decay = Self::INJECTIONS_BEFORE_DECAY
+            decay = Self::INJECTIONS_BEFORE_DECAY,
+            kdecay = Self::KNOWLEDGE_INJECTIONS_BEFORE_DECAY
         )
     }
 
@@ -5475,10 +5714,20 @@ impl Store {
             for id in &line.ids {
                 match line.kind {
                     Ledger::Recalled => {
-                        self.record_recall(&line.session, std::iter::once(id.as_str()), Reach::Offered)?;
+                        self.record_recall(
+                            &line.session,
+                            None,
+                            std::iter::once(id.as_str()),
+                            Reach::Offered,
+                        )?;
                     }
                     Ledger::Opened => {
-                        self.record_recall(&line.session, std::iter::once(id.as_str()), Reach::Opened)?;
+                        self.record_recall(
+                            &line.session,
+                            None,
+                            std::iter::once(id.as_str()),
+                            Reach::Opened,
+                        )?;
                     }
                     Ledger::Injected => self.note_injected_id(&line.session, id, false)?,
                     Ledger::File => self.record_injected_file(&line.session, id)?,
@@ -8699,10 +8948,9 @@ mod tests {
     }
 
     #[test]
-    fn knowledge_is_exempt_from_push_decay() {
-        // Knowledge earns its place as the line itself - 83% of it ever
-        // surfaced against 2% of observations - and it is never pulled via
-        // brain_get, so zero reads there is not evidence of uselessness.
+    fn knowledge_decays_only_after_twenty_unread_pushes() {
+        // Knowledge is rarely pulled via brain_get, so zero reads is weak
+        // evidence: it takes twenty offers, and one open undoes it.
         let store = Store::open_memory().unwrap();
         let project = Uuid::new_v4();
         let mut fresh = event("young lesson", "body", project);
@@ -8717,8 +8965,50 @@ mod tests {
         for n in 0..6 {
             store.record_injected(&format!("s{n}"), std::slice::from_ref(&stale.id), 0, 10, usize::MAX).unwrap();
         }
+        let p = project.to_string();
+        let pointers = store.pointers_of_kind(&p, "knowledge", 10).unwrap();
+        assert_eq!(pointers[0].id, stale.id, "six offers are not decay for a lesson");
+
+        for n in 6..20 {
+            store.record_injected(&format!("s{n}"), std::slice::from_ref(&stale.id), 0, 10, usize::MAX).unwrap();
+        }
+        let pointers = store.pointers_of_kind(&p, "knowledge", 10).unwrap();
+        assert_eq!(pointers[0].id, fresh.id, "twenty unread offers must sink the lesson");
+
+        store.record_opened("reader", std::iter::once(stale.id.as_str())).unwrap();
+        let pointers = store.pointers_of_kind(&p, "knowledge", 10).unwrap();
+        assert_eq!(pointers[0].id, stale.id, "one open must restore the lesson");
+    }
+
+    #[test]
+    fn knowledge_reads_out_rule_gotcha_decision_procedure() {
+        // Ids run opposite to the wanted order, so the id DESC tie-break
+        // would reverse it: only the hook rank can produce this order.
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        for (hook, id) in [
+            ("rule", "01TESTKIND0000000000000004"),
+            ("gotcha", "01TESTKIND0000000000000003"),
+            ("decision", "01TESTKIND0000000000000002"),
+            ("procedure", "01TESTKIND0000000000000001"),
+        ] {
+            let mut e = event(&format!("a {hook}"), "body", project);
+            e.kind = EventKind::Knowledge;
+            e.source.hook = hook.to_string();
+            e.id = id.to_string();
+            store.index(&e).unwrap();
+        }
         let pointers = store.pointers_of_kind(&project.to_string(), "knowledge", 10).unwrap();
-        assert_eq!(pointers[0].id, stale.id, "a lesson must not decay for being shown");
+        let ids: Vec<&str> = pointers.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "01TESTKIND0000000000000004",
+                "01TESTKIND0000000000000003",
+                "01TESTKIND0000000000000002",
+                "01TESTKIND0000000000000001",
+            ]
+        );
     }
 
     #[test]
@@ -8744,6 +9034,121 @@ mod tests {
 
         let pointers = store.pointers_of_kind(&project.to_string(), "knowledge", 10).unwrap();
         assert_eq!(pointers[0].id, rule.id, "a rule must read out before other knowledge");
+    }
+
+    #[test]
+    fn pull_through_counts_same_session_opens_per_kind() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let obs: Vec<Event> = (0..3).map(|n| event(&format!("o{n}"), "b", project)).collect();
+        let mut note = event("n", "b", project);
+        note.kind = EventKind::Knowledge;
+        for e in obs.iter().chain([&note]) {
+            store.index(e).unwrap();
+        }
+        let ids = |es: &[&Event]| es.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
+        store.record_host_session(1, "fresh", "2026-10-08T00:00:00Z").unwrap();
+        store.record_host_session(2, "stale", "2026-09-01T00:00:00Z").unwrap();
+        store
+            .record_injected("fresh", &ids(&[&obs[0], &obs[1], &note]), 0, 10, usize::MAX)
+            .unwrap();
+        // Older than the window: not counted.
+        store.record_injected("stale", &ids(&[&obs[2]]), 0, 10, usize::MAX).unwrap();
+        // Opened from the same host session: counts.
+        store.record_opened_in("mcp-a", "fresh", [obs[0].id.as_str()].into_iter()).unwrap();
+        // Opened from another host session: does not.
+        store.record_opened_in("mcp-b", "other", [obs[1].id.as_str()].into_iter()).unwrap();
+        // No host found: unjoined.
+        store.record_opened_in("mcp-c", "", [obs[2].id.as_str()].into_iter()).unwrap();
+        // Written before the tie existed (NULL): neither.
+        store.record_recalled("mcp-d", [note.id.as_str()].into_iter()).unwrap();
+
+        let rows = store.pull_through("2026-10-02T00:00:00Z").unwrap();
+        let get = |k: &str| rows.iter().find(|r| r.kind == k).cloned().unwrap();
+        let o = get("observation");
+        assert_eq!((o.pushed, o.opened, o.unjoined), (2, 1, 1));
+        let k = get("knowledge");
+        assert_eq!((k.pushed, k.opened, k.unjoined), (1, 0, 0));
+        assert_eq!(store.host_sessions_since("2026-10-02T00:00:00Z").unwrap(), 1);
+    }
+
+    #[test]
+    fn a_pid_zero_marker_is_found_but_never_counted_as_a_host() {
+        let dir = std::env::temp_dir().join(format!("brain-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("brain.db");
+        let store = Store::open(&db).unwrap();
+        let project = Uuid::new_v4();
+        let e = event("x", "b", project);
+        store.index(&e).unwrap();
+        store.record_host_session(0, "unknown-host", "2026-10-08T00:00:00Z").unwrap();
+        store.record_injected("unknown-host", std::slice::from_ref(&e.id), 0, 10, usize::MAX).unwrap();
+
+        assert_eq!(Store::peek_session_host(&db, "unknown-host"), Some(0));
+        assert_eq!(store.latest_host_session(0).unwrap(), None);
+        assert_eq!(store.host_sessions_since("2026-10-02T00:00:00Z").unwrap(), 0);
+        assert!(store.pull_through("2026-10-02T00:00:00Z").unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_sessions_keep_the_latest_per_pid_and_prune_the_old() {
+        let store = Store::open_memory().unwrap();
+        store.record_host_session(10, "old", "2026-01-01T00:00:00Z").unwrap();
+        store.record_host_session(10, "new", "2026-02-01T00:00:00Z").unwrap();
+        store.record_host_session(11, "other", "2026-03-01T00:00:00Z").unwrap();
+        assert_eq!(store.latest_host_session(10).unwrap().as_deref(), Some("new"));
+        // Seen again: the older row becomes the latest.
+        store.record_host_session(10, "old", "2026-04-01T00:00:00Z").unwrap();
+        assert_eq!(store.latest_host_session(10).unwrap().as_deref(), Some("old"));
+        assert_eq!(store.latest_host_session(99).unwrap(), None);
+
+        assert_eq!(store.prune_host_sessions("2026-03-15T00:00:00Z").unwrap(), 2);
+        assert_eq!(store.latest_host_session(11).unwrap(), None);
+        assert_eq!(store.latest_host_session(10).unwrap().as_deref(), Some("old"));
+
+        // Bookkeeping the log does not hold: a rebuild keeps it.
+        store.clear().unwrap();
+        assert_eq!(store.latest_host_session(10).unwrap().as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn a_recall_takes_its_host_session_by_the_rules() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let a = event("a", "", project);
+        let b = event("b", "", project);
+        let c = event("c", "", project);
+        for e in [&a, &b, &c] {
+            store.index(e).unwrap();
+        }
+        let host = |id: &str| -> Option<String> {
+            store
+                .conn
+                .query_row("SELECT host_session FROM recalled WHERE event_id = ?1", [id], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+        };
+        // The plain forms keep writing NULL.
+        store.record_recalled("s", std::iter::once(a.id.as_str())).unwrap();
+        assert_eq!(host(&a.id), None);
+        // A new row carries the host; an unknown one is '', not NULL.
+        store.record_recalled_in("s", "H1", std::iter::once(b.id.as_str())).unwrap();
+        store.record_recalled_in("s", "", std::iter::once(c.id.as_str())).unwrap();
+        assert_eq!(host(&b.id).as_deref(), Some("H1"));
+        assert_eq!(host(&c.id).as_deref(), Some(""));
+        // An offer fills only an empty row.
+        store.record_recalled_in("s", "H2", [a.id.as_str(), b.id.as_str(), c.id.as_str()].into_iter()).unwrap();
+        assert_eq!(host(&a.id).as_deref(), Some("H2"));
+        assert_eq!(host(&b.id).as_deref(), Some("H1"));
+        assert_eq!(host(&c.id).as_deref(), Some("H2"));
+        // An open overwrites, but never with nothing.
+        store.record_opened_in("s", "H3", std::iter::once(b.id.as_str())).unwrap();
+        assert_eq!(host(&b.id).as_deref(), Some("H3"));
+        store.record_opened_in("s", "", std::iter::once(b.id.as_str())).unwrap();
+        assert_eq!(host(&b.id).as_deref(), Some("H3"));
     }
 
     #[test]
