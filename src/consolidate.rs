@@ -581,7 +581,7 @@ pub(crate) fn run_lock_path(paths: &Paths) -> PathBuf {
 /// Catch the index up on every project's log, as far as one run's byte budget
 /// goes. Returns how many events it indexed.
 pub(crate) fn catch_up_all(paths: &Paths, store: &Store, run_lock: &RunLock) -> Result<usize> {
-    let dirs: Vec<PathBuf> = known_projects(paths)?.into_iter().map(|(_, dir)| dir).collect();
+    let dirs: Vec<PathBuf> = projects_with_machine(paths)?.into_iter().map(|(_, dir)| dir).collect();
     Ok(catch_up_index(store, &dirs, Some(run_lock), None).indexed)
 }
 
@@ -732,7 +732,7 @@ fn execute(
     // `unnamed/<dir-name>--<id>` - a shadow copy of every project, gaining
     // another id fragment on each run.
     let projects: Vec<(ProjectScope, PathBuf)> = if request.all_projects {
-        known_projects(paths)?
+        projects_with_machine(paths)?
     } else {
         let scope = ids::resolve_scope(Path::new(&request.cwd));
         let dir = paths.project_dir(&scope);
@@ -815,7 +815,8 @@ fn execute(
             break;
         }
         // Daily, after the drain so the entity pages a link resolves to exist.
-        if crate::maint::relink_due(store, &project) {
+        // The machine has no vault pages to link, and gets none.
+        if scope.project_id != ids::machine_id() && crate::maint::relink_due(store, &project) {
             let limits = RelinkLimits {
                 skip_newer_than: Some(RELINK_SKIP_NEWER),
                 deadline,
@@ -837,6 +838,17 @@ fn execute(
             }
         }
     }
+    // A run for one project does not visit the machine; its duplicates are
+    // folded here, once, all the same.
+    if !request.all_projects {
+        let machine = ProjectScope::machine();
+        let dir = paths.project_dir(&machine);
+        if dir.join("events").is_dir() {
+            outcome.folded += fold_duplicate_knowledge(&dir, &machine, store)?;
+        }
+    }
+    // Best effort: a stale list only costs a hook one extra lookup.
+    let _ = write_lesson_programs(paths, store);
     // The vault's front page is derived from every project, so it is
     // refreshed whenever any of them moved.
     if outcome.sessions > sessions_before {
@@ -1475,7 +1487,7 @@ fn consolidate_session(
     // Semantic memory, promoted from episodic: what recurs across sessions
     // becomes a page that outlives any of them.
     let knowledge =
-        synthesize_knowledge(project_dir, scope, store, ladder, &sanitizer, &pending.cli)
+        synthesize_knowledge(paths, project_dir, scope, store, ladder, &sanitizer, &pending.cli)
             .unwrap_or_default();
 
     let hubs = write_hubs(project_dir, scope, store)?;
@@ -1552,7 +1564,7 @@ pub(crate) fn group_same_fact(vectors: &[&crate::embed::Vector], threshold: f32)
 /// first pass there is nothing left to fold, and the cost is one title
 /// encoding per page. Without the embedding model it does nothing, exactly
 /// like the write-time check it mirrors.
-fn fold_duplicate_knowledge(
+pub(crate) fn fold_duplicate_knowledge(
     project_dir: &Path,
     scope: &ProjectScope,
     store: &Store,
@@ -3941,6 +3953,20 @@ pub fn known_projects(paths: &Paths) -> Result<Vec<(ProjectScope, PathBuf)>> {
     Ok(out)
 }
 
+/// [`known_projects`] plus the machine, when `<data>/machine/events` exists.
+///
+/// For replay and consolidation only. The outbound paths (team, sync, export)
+/// keep using [`known_projects`] or the vault, which never include it.
+pub fn projects_with_machine(paths: &Paths) -> Result<Vec<(ProjectScope, PathBuf)>> {
+    let mut out = known_projects(paths)?;
+    let dir = paths.project_dir(&ProjectScope::machine());
+    if dir.join("events").is_dir() {
+        let scope = scope_from_log(&dir, "default").unwrap_or_else(ProjectScope::machine);
+        out.push((scope, dir));
+    }
+    Ok(out)
+}
+
 /// Move every project to its human-first home.
 ///
 /// `wiki/default/rolepod-brain--6023cf84/` becomes `wiki/rolepod-brain/`:
@@ -4188,6 +4214,7 @@ const KNOWLEDGE_KINDS: &[&str] = &["gotcha", "decision", "procedure", "rule"];
 /// twenty-summary window is four times the cadence, so anything that starts
 /// recurring across this boundary is still in view next round.
 pub(crate) fn synthesize_knowledge(
+    paths: &Paths,
     project_dir: &Path,
     scope: &ProjectScope,
     store: &Store,
@@ -4195,7 +4222,17 @@ pub(crate) fn synthesize_knowledge(
     sanitizer: &crate::sanitize::Sanitizer,
     cli: &str,
 ) -> Result<Vec<PathBuf>> {
-    synthesize_knowledge_with(project_dir, scope, store, sanitizer, |prompt| {
+    // Every project the machine knows, this one included: a lesson that names
+    // one of them is about that project, not about the machine.
+    let mut names: Vec<String> = known_projects(paths)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(known, _)| known.project)
+        .collect();
+    names.push(scope.project.clone());
+    let machine_dir = paths.project_dir(&ProjectScope::machine());
+    let machine = Machine { dir: &machine_dir, names: &names };
+    synthesize_knowledge_with(project_dir, scope, store, sanitizer, &machine, |prompt| {
         // Synthesis spans sessions, so the project stands in for the session.
         let project = scope.project_id.to_string();
         let ctx = CallContext { purpose: "synthesis", session: &project };
@@ -4220,6 +4257,7 @@ fn synthesize_knowledge_with(
     scope: &ProjectScope,
     store: &Store,
     sanitizer: &crate::sanitize::Sanitizer,
+    machine: &Machine<'_>,
     ask: impl FnOnce(&str) -> Result<Option<String>>,
 ) -> Result<Vec<PathBuf>> {
     let project = scope.project_id.to_string();
@@ -4238,8 +4276,10 @@ fn synthesize_knowledge_with(
         return Ok(Vec::new());
     }
 
+    // The machine's lessons too: the model must not rediscover one. Wording
+    // only - nothing here is rewritten, so the project-only list stays below.
     let known_titles: Vec<String> =
-        store.knowledge_entries(&project)?.into_iter().map(|(_, title)| title).collect();
+        store.knowledge_entries_in_scope(&project)?.into_iter().map(|(_, title)| title).collect();
     let corrections = store.recent_corrections(&project, CORRECTIONS_WINDOW)?;
     let clusters = cluster_corrections(&corrections);
     let stale = store.stale_knowledge(&project, RECHECK_MAX)?;
@@ -4271,10 +4311,16 @@ fn synthesize_knowledge_with(
         })
         .collect();
 
+    // The machine's own lessons, for the same comparison. Read only when an
+    // entry asks for the machine, so a round without one costs nothing.
+    let mut machine_known: Option<Vec<(String, String, crate::embed::Vector)>> = None;
+    let mut machine_revised: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut machine_written = 0usize;
+
     let mut written = Vec::new();
     let mut labelled: std::collections::HashSet<String> = std::collections::HashSet::new();
     for entry in entries {
-        if written.len() >= MAX_PER_ROUND {
+        if written.len() + machine_written >= MAX_PER_ROUND {
             break;
         }
         let Some(kind) = normalize_knowledge_kind(&entry.kind) else { continue };
@@ -4290,6 +4336,11 @@ fn synthesize_knowledge_with(
         if title.is_empty() || body.is_empty() {
             continue;
         }
+        // Only a durable claim the filter passes leaves the project; anything
+        // else the model labelled `machine` stays where it was learned.
+        let to_machine = !status
+            && entry.scope.trim().eq_ignore_ascii_case("machine")
+            && machine_safe(sanitizer, &entry.title, &entry.body, machine.names);
         // A claim already on the wall is not written a second time - but it is
         // not thrown away either, which is what used to happen. Skipping kept
         // whichever wording was written FIRST, so a fact that had since moved
@@ -4347,7 +4398,8 @@ fn synthesize_knowledge_with(
                     body.clone(),
                 );
                 label.links = vec![known_id];
-                apply_label(&mut label, status, &entry.cites, &sources);
+                apply_label(&mut label, status, &entry, &sources);
+                label.scope = Some("project".to_string());
                 label.consolidated = true;
                 log.append(&label)?;
                 store.index(&label)?;
@@ -4362,6 +4414,54 @@ fn synthesize_knowledge_with(
                 continue;
             }
         } else if sources.len() < MIN_SOURCES {
+            continue;
+        }
+
+        if to_machine {
+            // Event log and index only: the machine has no vault page, and
+            // nothing of the project (its files, its cites) travels with it.
+            let machine_scope = ProjectScope::machine();
+            if machine_known.is_none() {
+                machine_known = Some(
+                    store
+                        .knowledge_entries(&machine_scope.project_id.to_string())?
+                        .iter()
+                        .map(|(id, title)| {
+                            (
+                                id.clone(),
+                                normalize_entity(title),
+                                crate::embed::encode(title).unwrap_or_default(),
+                            )
+                        })
+                        .collect(),
+                );
+            }
+            let Some(known) = machine_known.as_ref() else { continue };
+            let log = EventLog::open(machine.dir)?;
+            if let Some(known_id) = already_learned(known, &title) {
+                // One revision per id per round: two could share a millisecond.
+                if machine_revised.insert(known_id.clone()) {
+                    supersede_knowledge(&log, store, &machine_scope, &known_id, &title, &body)?;
+                }
+                continue;
+            }
+            let mut event = Event::new(
+                machine_scope.workspace_id,
+                machine_scope.project_id,
+                uuid::Uuid::nil(),
+                Source { cli: "brain".to_string(), hook: kind.to_string() },
+                EventKind::Knowledge,
+                title.clone(),
+                body.clone(),
+            );
+            apply_label(&mut event, status, &entry, &sources);
+            event.scope = Some("machine".to_string());
+            event.cites = Vec::new();
+            event.files = Vec::new();
+            event.consolidated = true;
+            log.append(&event)?;
+            store.index(&event)?;
+            machine_written += 1;
             continue;
         }
 
@@ -4404,14 +4504,8 @@ fn synthesize_knowledge_with(
             body.clone(),
         );
         event.links = sources.iter().map(|source| source.id.clone()).collect();
-        apply_label(&mut event, status, &entry.cites, &sources);
-        event.scope = Some(if entry.scope.trim().eq_ignore_ascii_case("machine") {
-            "machine"
-        } else {
-            "project"
-        }
-        .to_string());
-        event.commands = normalize_commands(&entry.commands);
+        apply_label(&mut event, status, &entry, &sources);
+        event.scope = Some("project".to_string());
         // Drawn from the sessions this claim cites, so a file named by two of
         // them outranks one named by a single session - which is the same
         // recurrence test the tier itself is built on.
@@ -4427,6 +4521,110 @@ fn synthesize_knowledge_with(
 
     store.note_knowledge_synthesized(&project)?;
     Ok(written)
+}
+
+/// Where machine-wide lessons go, and the project names that keep a lesson
+/// out of there.
+struct Machine<'a> {
+    dir: &'a Path,
+    names: &'a [String],
+}
+
+/// May this lesson leave its project for the machine?
+///
+/// Only when nothing of a project travels with it: the sanitizer would not
+/// change the raw text, no token is a repo path or a home path, and no known
+/// project is named. Pure code, so it adds no model call; any doubt keeps the
+/// lesson where it was learned.
+pub(crate) fn machine_safe(
+    sanitizer: &crate::sanitize::Sanitizer,
+    title: &str,
+    body: &str,
+    project_names: &[String],
+) -> bool {
+    [title, body].into_iter().all(|text| {
+        let text = text.trim();
+        sanitizer.scrub_body(text) == text
+            && sanitizer.scrub(text) == text
+            && !text.contains("/Users/")
+            && !text.contains("/home/")
+            && !text.split_whitespace().any(|token| {
+                let token = token.trim_matches(|c: char| {
+                    matches!(c, '`' | '"' | '\'' | ',' | ';' | ':' | '(' | ')' | '[' | ']' | '<' | '>')
+                });
+                // A tool's dotfile in the home directory is the machine's own.
+                if token.starts_with("~/.") {
+                    return false;
+                }
+                let token = token.trim_end_matches('.');
+                if token.starts_with("~/")
+                    || token.starts_with("src/")
+                    || token.starts_with("./")
+                    || token.starts_with("../")
+                {
+                    return true;
+                }
+                // Anything that reads as a location outside the machine's own
+                // vocabulary: a Windows path, an absolute path, a URL, a host,
+                // an address, a path of two or more steps, or a file name.
+                // A pair like `and/or` or `TCP/IP` is two short plain words;
+                // any other single step is a directory until shown otherwise.
+                let word = |s: &str| s.chars().count() <= 5 && s.chars().all(|c| c.is_ascii_alphabetic());
+                let single = token.split_once('/').filter(|(_, rest)| !rest.contains('/'));
+                let labels: Vec<&str> = token.split('.').collect();
+                let bare_host = labels.len() >= 3 && labels.iter().all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+                let port = token.rsplit_once(':').is_some_and(|(h, p)| !h.is_empty() && !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+                let drive = token.len() > 1 && token.as_bytes()[1] == b':' && token.as_bytes()[0].is_ascii_alphabetic();
+                token.contains('\\')
+                    || token.contains("://")
+                    || (token.contains('@') && token.rsplit('@').next().is_some_and(|host| host.contains('.')))
+                    || (token.starts_with('/') && token.len() > 1)
+                    || token.matches('/').count() >= 2
+                    || bare_host
+                    || port
+                    || drive
+                    || single.is_some_and(|(a, b)| !(word(a) && word(b)))
+                    || (token.contains('/')
+                        && token.rsplit('/').next().is_some_and(|name| {
+                            name.rsplit_once('.').is_some_and(|(stem, ext)| {
+                                !stem.is_empty()
+                                    && !ext.is_empty()
+                                    && ext.chars().all(|c| c.is_ascii_alphanumeric())
+                            })
+                        }))
+            })
+            && !names_a_project(text, project_names)
+    })
+}
+
+/// Does `text` contain one of `names` as a whole word, ignoring case?
+fn names_a_project(text: &str, names: &[String]) -> bool {
+    let text = text.to_lowercase();
+    let word = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
+    names.iter().map(|name| name.trim().to_lowercase()).filter(|name| !name.is_empty()).any(|name| {
+        text.match_indices(&name).any(|(at, _)| {
+            let before = text[..at].chars().next_back();
+            let after = text[at + name.len()..].chars().next();
+            !before.is_some_and(word) && !after.is_some_and(word)
+        })
+    })
+}
+
+/// Rewrite `<data>/lesson-programs` from the live lessons when the list moved,
+/// so a hook can tell in one small read whether a command has a lesson at all.
+/// Written beside the file and renamed over it, so a reader sees a whole list.
+pub(crate) fn write_lesson_programs(paths: &Paths, store: &Store) -> Result<()> {
+    let mut list = store.lesson_programs()?.join("\n");
+    if !list.is_empty() {
+        list.push('\n');
+    }
+    let path = paths.data_dir.join("lesson-programs");
+    if std::fs::read_to_string(&path).is_ok_and(|current| current == list) {
+        return Ok(());
+    }
+    let tmp = paths.data_dir.join(format!(".lesson-programs.{}", ulid::Ulid::new()));
+    std::fs::write(&tmp, &list).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("replace {}", path.display()))
 }
 
 /// One durable claim, as a model returns it.
@@ -4452,7 +4650,12 @@ struct Knowledge {
 
 /// Put the whole label on an event: class, expiry (status only, from the
 /// event's own ts) and the cites that a source session really touched.
-fn apply_label(event: &mut Event, status: bool, cites: &[String], sources: &[&Event]) {
+fn apply_label(event: &mut Event, status: bool, entry: &Knowledge, sources: &[&Event]) {
+    let cites = &entry.cites;
+    event.scope = Some(
+        if entry.scope.trim().eq_ignore_ascii_case("machine") { "machine" } else { "project" }.to_string(),
+    );
+    event.commands = normalize_commands(&entry.commands);
     event.class = Some(if status { "status" } else { "durable" }.to_string());
     event.expires = if status {
         event
@@ -5830,7 +6033,9 @@ mod tests {
         seed(&store, &scope);
         let sanitizer = crate::sanitize::Sanitizer::default();
         let mut calls = 0;
-        synthesize_knowledge_with(&dir, &scope, &store, &sanitizer, |_| {
+        let machine_dir = dir.join("machine");
+        let machine = Machine { dir: &machine_dir, names: &[] };
+        synthesize_knowledge_with(&dir, &scope, &store, &sanitizer, &machine, |_| {
             calls += 1;
             Ok(Some(answer.to_string()))
         })
@@ -5846,6 +6051,181 @@ mod tests {
             r#"{{"kind":"gotcha","title":"{title}","body":"b","sources":["01SUMMARY{:0>17}","01SUMMARY{:0>17}"]{extra}}}"#,
             0, 1
         )
+    }
+
+    /// One synthesis round whose store and `<data>/machine` the test keeps.
+    /// Returns the project's events, the machine's events and the data dir.
+    fn machine_round(answer: &str, names: &[String]) -> (Vec<Event>, Vec<Event>, PathBuf, Store) {
+        let data = std::env::temp_dir().join(format!("brain-machine-{}", ulid::Ulid::new()));
+        let dir = data.join("project");
+        std::fs::create_dir_all(&dir).unwrap();
+        let scope = crate::ids::resolve_scope(&dir);
+        let store = Store::open_memory().unwrap();
+        for n in 0..2 {
+            let mut summary = Event::new(
+                scope.workspace_id,
+                scope.project_id,
+                Uuid::nil(),
+                Source { cli: "claude-code".into(), hook: "consolidate".into() },
+                EventKind::SessionSummary,
+                format!("session {n}"),
+                "did a thing".into(),
+            );
+            summary.id = format!("01SUMMARY{n:0>17}");
+            summary.files = vec!["src/auth.rs".to_string()];
+            store.index(&summary).unwrap();
+        }
+        let project = scope.project_id.to_string();
+        for _ in 1..SESSIONS_PER_SYNTHESIS {
+            store.note_session_consolidated(&project).unwrap();
+        }
+        let sanitizer = crate::sanitize::Sanitizer::default();
+        let machine_dir = data.join("machine");
+        let machine = Machine { dir: &machine_dir, names };
+        synthesize_knowledge_with(&dir, &scope, &store, &sanitizer, &machine, |_| {
+            Ok(Some(answer.to_string()))
+        })
+        .unwrap();
+        // The all-projects pass visits the machine; it must write no page.
+        let machine_scope = ProjectScope::machine();
+        if machine_dir.join("events").is_dir() {
+            fold_duplicate_knowledge(&machine_dir, &machine_scope, &store).unwrap();
+            adopt_hand_edits(&machine_dir, &machine_scope, &store).unwrap();
+        }
+        let project_events = EventLog::open(&dir).unwrap().read_all().unwrap().0;
+        let machine_events = if machine_dir.join("events").is_dir() {
+            EventLog::open(&machine_dir).unwrap().read_all().unwrap().0
+        } else {
+            Vec::new()
+        };
+        (project_events, machine_events, data, store)
+    }
+
+    fn md_files(dir: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let Ok(read) = std::fs::read_dir(dir) else { return found };
+        for entry in read.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(md_files(&path));
+            } else if path.extension().is_some_and(|ext| ext == "md") {
+                found.push(path);
+            }
+        }
+        found
+    }
+
+    fn machine_entry(title: &str, body: &str, extra: &str) -> String {
+        format!(
+            r#"{{"kind":"gotcha","title":"{title}","body":"{body}","sources":["01SUMMARY{:0>17}","01SUMMARY{:0>17}"],"scope":"machine","commands":["curl"]{extra}}}"#,
+            0, 1
+        )
+    }
+
+    #[test]
+    fn a_machine_lesson_with_a_repo_path_stays_in_the_project() {
+        let answer = format!(
+            r#"{{"knowledge":[{},{},{},{}]}}"#,
+            machine_entry("curl drops the header", "see src/auth.rs for the call", ""),
+            machine_entry("curl needs a flag", "the script is in ~/work/run.sh", ""),
+            machine_entry("curl in /Users/someone is slow", "it is", ""),
+            machine_entry("Acme builds break curl", "in the Acme repo", ""),
+        );
+        let (project, machine, data, _store) = machine_round(&answer, &["acme".to_string()]);
+        std::fs::remove_dir_all(&data).ok();
+        assert!(machine.is_empty(), "a project's lesson reached the machine: {machine:?}");
+        let kept: Vec<_> = project.iter().filter(|e| e.kind == EventKind::Knowledge).collect();
+        assert_eq!(kept.len(), 4, "each stays a project lesson");
+        assert!(kept.iter().all(|e| e.scope.as_deref() == Some("project")));
+    }
+
+    #[test]
+    fn a_clean_tool_lesson_goes_to_machine_without_a_vault_page() {
+        let answer = format!(
+            r#"{{"knowledge":[{}]}}"#,
+            machine_entry("curl follows no redirect by default", "pass -L, or it prints the 301 body", ""),
+        );
+        let (project, machine, data, store) = machine_round(&answer, &["acme".to_string()]);
+        assert!(project.iter().all(|e| e.kind != EventKind::Knowledge), "also written to the project");
+        assert_eq!(machine.len(), 1, "{machine:?}");
+        let lesson = &machine[0];
+        assert_eq!(lesson.project, crate::ids::machine_id());
+        assert_eq!(lesson.scope.as_deref(), Some("machine"));
+        assert!(lesson.files.is_empty() && lesson.cites.is_empty());
+        let indexed = store.knowledge_entries(&crate::ids::machine_id().to_string()).unwrap();
+        assert_eq!(indexed.len(), 1);
+        assert!(md_files(&data.join("machine")).is_empty(), "the machine got a page");
+        assert!(md_files(&data.join("project")).is_empty(), "a page was written for it");
+        std::fs::remove_dir_all(&data).ok();
+    }
+
+    #[test]
+    fn a_status_lesson_never_goes_to_machine() {
+        let answer = format!(
+            r#"{{"knowledge":[{}]}}"#,
+            machine_entry("curl is blocked by the proxy today", "wait for it", r#","class":"status""#),
+        );
+        let (project, machine, data, _store) = machine_round(&answer, &[]);
+        std::fs::remove_dir_all(&data).ok();
+        assert!(machine.is_empty());
+        assert!(project.iter().any(|e| e.kind == EventKind::Knowledge));
+    }
+
+    #[test]
+    fn machine_safe_judges_text_alone() {
+        let plain = crate::sanitize::Sanitizer::default();
+        let names = vec!["rolepod-brain".to_string()];
+        assert!(machine_safe(&plain, "git needs ~/.gitconfig set", "a TCP/IP and/or note", &names));
+        assert!(!machine_safe(&plain, "title", "open ./run.sh", &names));
+        assert!(!machine_safe(&plain, "title", "see ../x/y.toml", &names));
+        assert!(!machine_safe(&plain, "title", "in ~/notes", &names));
+        for leak in [
+            "see /opt/acme/service", "at /Volumes/work", r"in C:\work\app", "clone github.com/acme/repo",
+            "https://git.acme.io/team/repo", "ask dev@acme.io", "edit services/billing", "a/b/c", "host git.acme.io", "ip 10.0.0.5",
+            "on localhost:8080", "in C:/work", "see acme/billing-service", "under packages/web",
+        ] {
+            assert!(!machine_safe(&plain, "title", leak, &names), "{leak} was judged safe");
+        }
+        assert!(machine_safe(&plain, "read/write is atomic", "use TCP/IP and/or UDP", &names));
+        assert!(!machine_safe(&plain, "RoLePod-Brain breaks", "b", &names));
+        assert!(machine_safe(&plain, "rolepod-brainy is not it", "b", &names));
+    }
+
+    #[test]
+    fn the_program_cache_is_rewritten_when_triggers_change() {
+        let data = std::env::temp_dir().join(format!("brain-programs-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&data).unwrap();
+        let paths = Paths { data_dir: data.clone() };
+        let store = Store::open_memory().unwrap();
+        let scope = ProjectScope::machine();
+        let lesson = |title: &str, command: &str| {
+            let mut event = Event::new(
+                scope.workspace_id,
+                scope.project_id,
+                Uuid::nil(),
+                Source { cli: "brain".into(), hook: "gotcha".into() },
+                EventKind::Knowledge,
+                title.into(),
+                "b".into(),
+            );
+            event.class = Some("durable".into());
+            event.scope = Some("machine".into());
+            event.commands = vec![command.into()];
+            event.consolidated = true;
+            store.index(&event).unwrap();
+        };
+        let file = data.join("lesson-programs");
+        write_lesson_programs(&paths, &store).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "");
+        lesson("curl a", "curl");
+        write_lesson_programs(&paths, &store).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "curl\n");
+        lesson("git a", "git");
+        write_lesson_programs(&paths, &store).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "curl\ngit\n");
+        let left: Vec<_> = std::fs::read_dir(&data).unwrap().flatten().collect();
+        assert_eq!(left.len(), 1, "a temp file was left behind");
+        std::fs::remove_dir_all(&data).ok();
     }
 
     #[test]
@@ -5977,7 +6357,9 @@ mod tests {
         }
         let sanitizer = crate::sanitize::Sanitizer::default();
         let (mut calls, mut asked) = (0, String::new());
-        synthesize_knowledge_with(dir, scope, store, &sanitizer, |prompt| {
+        let machine_dir = dir.join("machine");
+        let machine = Machine { dir: &machine_dir, names: &[] };
+        synthesize_knowledge_with(dir, scope, store, &sanitizer, &machine, |prompt| {
             calls += 1;
             asked = prompt.to_string();
             Ok(Some(answer.to_string()))
@@ -6212,9 +6594,12 @@ mod tests {
         );
         let answer = format!(
             r#"{{"knowledge":[{}]}}"#,
-            entry("deploy", r#","scope":"machine","commands":["Codesign -s x","ls","a b","c d","e f"]"#)
+            entry("deploy", r#","class":"durable","scope":"machine","commands":["Codesign -s x","ls","a b","c d","e f"]"#)
         );
-        let written = synthesize_with_answer(&answer);
+        // A durable, machine-safe entry goes to the machine's log.
+        let (_, machine, data, _store) = machine_round(&answer, &[]);
+        std::fs::remove_dir_all(&data).ok();
+        let written: Vec<_> = machine.iter().filter(|e| e.kind == EventKind::Knowledge).collect();
         assert_eq!(written[0].scope.as_deref(), Some("machine"));
         assert_eq!(written[0].commands, vec!["codesign", "ls", "a b", "c d"]);
     }

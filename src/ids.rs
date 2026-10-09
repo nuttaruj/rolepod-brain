@@ -23,6 +23,17 @@ pub const MARKER_FILE: &str = ".rolepod-brain.toml";
 /// Fixed forever: changing it re-keys every existing brain.
 const NAMESPACE: Uuid = Uuid::from_u128(0x726f_6c65_706f_645f_6272_6169_6e5f_7631);
 
+/// The project id of the machine itself: knowledge about this computer that
+/// belongs to no repository. Its events live at `<data>/machine`, outside the
+/// vault, so nothing that walks the vault (team, sync, export) can see it.
+///
+/// A function because a v5 UUID cannot be computed in a `const`; it returns
+/// the same value on every call.
+#[must_use]
+pub fn machine_id() -> Uuid {
+    Uuid::new_v5(&NAMESPACE, b"machine")
+}
+
 /// Which CLI produced an event.
 ///
 /// Only variants this project has actually wired and tested get a name; every
@@ -83,6 +94,18 @@ pub struct ProjectScope {
 }
 
 impl ProjectScope {
+    /// The scope of the machine itself; see [`machine_id`].
+    #[must_use]
+    pub fn machine() -> Self {
+        Self {
+            workspace: "default".to_string(),
+            workspace_id: Uuid::new_v5(&NAMESPACE, b"default"),
+            project: "machine".to_string(),
+            project_id: machine_id(),
+            root: PathBuf::new(),
+        }
+    }
+
     /// Directory name used under `wiki/<workspace>/`.
     ///
     /// The UUID is the identity; this is the on-disk label. It carries the
@@ -320,6 +343,30 @@ pub fn resolve_scope(cwd: &Path) -> ProjectScope {
     ProjectScope { workspace, workspace_id, project, project_id, root }
 }
 
+/// The project id of `cwd` as an earlier hook already settled it, or `None`.
+///
+/// The same rules as [`resolve_scope`] but read-only: no `git`, no write. A
+/// git repository whose identity was never cached answers `None`, because
+/// choosing its id is what runs git.
+#[must_use]
+pub(crate) fn known_project_id(cwd: &Path) -> Option<Uuid> {
+    let start = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let (root, marker) = match find_marker(&start) {
+        Some((dir, marker)) => (dir, marker),
+        None => (git_root(&start).unwrap_or_else(|| start.clone()), Marker::default()),
+    };
+    if let Some(name) = marker.project.name.filter(|n| !n.trim().is_empty()) {
+        return Some(Uuid::new_v5(&NAMESPACE, format!("project:{name}").as_bytes()));
+    }
+    let path_id = Uuid::new_v5(&NAMESPACE, root.to_string_lossy().as_bytes());
+    if git_root(&root).is_none() {
+        return Some(path_id);
+    }
+    let paths = crate::config::Paths::resolve().ok()?;
+    let cache = paths.data_dir.join("identity").join(path_id.simple().to_string());
+    std::fs::read_to_string(cache).ok().and_then(|text| text.trim().parse().ok())
+}
+
 /// Walk from `start` upwards looking for a marker file.
 fn find_marker(start: &Path) -> Option<(PathBuf, Marker)> {
     for dir in start.ancestors() {
@@ -410,6 +457,14 @@ pub fn slugify(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn machine_id_is_stable() {
+        assert_eq!(machine_id(), machine_id());
+        assert_eq!(machine_id(), Uuid::new_v5(&NAMESPACE, b"machine"));
+        assert_eq!(ProjectScope::machine().project_id, machine_id());
+        assert_eq!(ProjectScope::machine().workspace_id, Uuid::new_v5(&NAMESPACE, b"default"));
+    }
 
     #[test]
     fn slugify_is_filesystem_safe() {

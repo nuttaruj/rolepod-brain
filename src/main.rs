@@ -697,7 +697,7 @@ fn reindex() -> Result<()> {
     let mut skipped = 0usize;
     let mut projects = 0usize;
 
-    for (_, project_dir) in consolidate::known_projects(&paths)? {
+    for (_, project_dir) in consolidate::projects_with_machine(&paths)? {
         let log = EventLog::open(&project_dir)?;
         let (events, bad_lines) = log.read_all()?;
         skipped += bad_lines;
@@ -714,6 +714,8 @@ fn reindex() -> Result<()> {
     // A quiet or headless verdict is kept in the store, not the log, so the
     // replay above reopened those sessions; put them back as they were.
     store.resettle_replayed()?;
+    // The program list is derived from the index just rebuilt.
+    let _ = consolidate::write_lesson_programs(&paths, &store);
 
     // Hub notes are derived from the pages exactly as the index is derived
     // from the log, and they were only ever refreshed when a project happened

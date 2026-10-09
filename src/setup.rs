@@ -130,10 +130,11 @@ pub fn targets_in(home: &Path, exe: &Path) -> Result<Vec<Target>> {
             hooks_file: home.join(".claude/settings.json"),
             binaries: &["claude"],
             timeout_overrides: &[],
-            // `PreToolUse` is wired for one tool only. It is not a capture
+            // `PreToolUse` is wired for two tools only. It is not a capture
             // surface - see `hook::captures` - it is there so that what we know
-            // about a file reaches the agent before the file's contents do.
-            matchers: &[("PreToolUse", "Read")],
+            // about a file reaches the agent before the file's contents do, and
+            // the lesson a shell command triggers before it runs.
+            matchers: &[("PreToolUse", "Read|Bash")],
             // Verified against the installed Claude Code binary's own event
             // names, not documentation.
             //

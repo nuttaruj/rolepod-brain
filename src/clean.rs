@@ -54,6 +54,22 @@ const BODY_BYTES: usize = 500;
 /// Files of an entry the model is shown.
 const FILES_SHOWN: usize = 8;
 
+/// Model invocations (ledger rows of purpose `label`) in any 24 hours for the
+/// entries the cleanup left unlabelled.
+const LABEL_CALLS: usize = 5;
+const LABEL_PURPOSE: &str = "label";
+const LABEL_STATE: &str = "label_remainder";
+
+/// The one-time move of old `machine` lessons to the machine: its own flag and
+/// its own cursor, so an interrupted move continues from the last id it passed.
+const MACHINE_FLAG: &str = "machine_migrated";
+const MACHINE_CURSOR: &str = "machine_cursor";
+const MACHINE_MOVED: &str = "machine_moved";
+/// Lessons one invocation looks at; the move is pure code, so only the clock
+/// bounds it.
+const MACHINE_BATCH: usize = 100;
+const MACHINE_REASON: &str = "reclassified_machine";
+
 const FLAG: &str = "knowledge_cleaned";
 const CURSOR: &str = "clean_cursor";
 const LAST_RUN: &str = "clean_last_run";
@@ -217,7 +233,10 @@ fn retire(log: &EventLog, store: &Store, target: &Event, reason: &str, run: &str
     tombstone.links = vec![target.id.clone()];
     tombstone.consolidated = true;
     tombstone.extra.insert("reason".to_string(), reason.into());
-    tombstone.extra.insert("run".to_string(), run.into());
+    // No run: a restore of a run must never bring this one back.
+    if !run.is_empty() {
+        tombstone.extra.insert("run".to_string(), run.into());
+    }
     log.append(&tombstone)?;
     store.index(&tombstone)?;
     Ok(())
@@ -381,11 +400,273 @@ pub(crate) fn pass(
     deadline: Option<std::time::Instant>,
 ) {
     if matches!(store.state(FLAG), Ok(Some(_))) {
+        if let Err(error) = label_remainder(paths, store, ladder, run_lock, deadline) {
+            consolidate::log_session_failure(paths, "knowledge-labels", &format!("{error:#}"));
+        }
+        if let Err(error) = move_to_machine(paths, store, run_lock, deadline) {
+            consolidate::log_session_failure(paths, "knowledge-machine-move", &format!("{error:#}"));
+        }
         return;
     }
     if let Err(error) = run_pass(paths, store, ladder, run_lock, deadline) {
         consolidate::log_session_failure(paths, "knowledge-cleanup", &format!("{error:#}"));
     }
+}
+
+/// Where the daily labelling stands: today's run id, the position of the
+/// sweep over the unlabelled, and the count at which a sweep gave up.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct LabelState {
+    /// The run of the latest day's budget, so `brain restore --run` undoes one day.
+    run: String,
+    project: String,
+    after: String,
+    fails: usize,
+    /// Unlabelled entries when the current sweep began.
+    sweep_left: usize,
+    /// A whole sweep labelled nothing at this count; wait for it to grow.
+    stuck: usize,
+}
+
+/// The entries the cleanup left unlabelled, labelled a little each day by the
+/// stage-b rules until none remain. The budget is the `label` rows of the
+/// ledger in the last 24 hours, never a stored counter.
+fn label_remainder(
+    paths: &Paths,
+    store: &Store,
+    ladder: &Ladder<'_>,
+    run_lock: &RunLock,
+    deadline: Option<std::time::Instant>,
+) -> Result<()> {
+    let since = (jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24)).to_string();
+    let spent = || store.summarizer_rows_for(LABEL_PURPOSE, &since);
+    if spent()? >= LABEL_CALLS {
+        return Ok(());
+    }
+    let total = store.unlabelled_knowledge_total()?;
+    if total == 0 {
+        return Ok(());
+    }
+    let mut state: LabelState = store.state(LABEL_STATE)?.and_then(|raw| serde_json::from_str(&raw).ok()).unwrap_or_default();
+    if state.stuck > 0 {
+        if total <= state.stuck {
+            return Ok(());
+        }
+        state.stuck = 0;
+    }
+    // No `label` row in the last 24 hours: a new day's budget, a new run.
+    if spent()? == 0 || state.run.is_empty() {
+        state.run = ulid::Ulid::new().to_string();
+    }
+    let began = std::time::Instant::now();
+    let mut projects = consolidate::known_projects(paths)?;
+    projects.sort_by_key(|(scope, _)| scope.project_id.to_string());
+    let mut cursor = Cursor { run: state.run.clone(), ..Cursor::default() };
+    if state.project.is_empty() && state.after.is_empty() {
+        state.sweep_left = total;
+    }
+    let mut swept = true;
+    'projects: for (scope, dir) in &projects {
+        let project = scope.project_id.to_string();
+        if !state.project.is_empty() && project < state.project {
+            continue;
+        }
+        if project != state.project {
+            state.project = project.clone();
+            state.after = String::new();
+            state.fails = 0;
+        }
+        let log = EventLog::open(dir)?;
+        loop {
+            if spent()? >= LABEL_CALLS
+                || began.elapsed() >= PASS_BUDGET
+                || deadline.is_some_and(|at| std::time::Instant::now() >= at)
+            {
+                swept = false;
+                break 'projects;
+            }
+            let ids = store.unlabelled_knowledge(&project, &state.after, BATCH)?;
+            if ids.is_empty() {
+                break;
+            }
+            run_lock.touch();
+            let batch = fit(store.get(&ids)?);
+            let Some(last) = batch.last().map(|entry| entry.id.clone()) else {
+                state.after = ids.last().cloned().unwrap_or_default();
+                continue;
+            };
+            let cli = store.project_cli(&project)?.unwrap_or_else(|| "claude-code".to_string());
+            if !ladder.could_answer(&cli)? {
+                swept = false;
+                break 'projects;
+            }
+            let ctx = CallContext { purpose: LABEL_PURPOSE, session: &project };
+            let (tier, answer) =
+                ladder.run(&ctx, &prompt_for(&batch), &cli, |text| parse_labels(text).is_some())?;
+            let labels = match tier {
+                Tier::Cli(_) => parse_labels(&answer),
+                _ => None,
+            };
+            if let Some(labels) = labels {
+                apply(store, &log, &batch, labels, &mut cursor)?;
+                state.after = last;
+                state.fails = 0;
+            } else {
+                // Retried on a later day; one no model can answer three
+                // times running is passed over.
+                state.fails += 1;
+                if state.fails >= 3 {
+                    state.after = last;
+                    state.fails = 0;
+                }
+                swept = false;
+                break 'projects;
+            }
+            store.set_state(LABEL_STATE, &serde_json::to_string(&state)?)?;
+        }
+    }
+    if swept {
+        // A sweep that labelled nothing is over: the rest cannot be labelled.
+        let left = store.unlabelled_knowledge_total()?;
+        if left >= state.sweep_left {
+            state.stuck = left;
+        }
+        state.project = String::new();
+        state.after = String::new();
+    }
+    store.set_state(LABEL_STATE, &serde_json::to_string(&state)?)
+}
+
+/// Where the move of old machine lessons stands, and how many it has moved.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct MachineMove {
+    /// The run id on every tombstone of the move, so `brain restore --run`
+    /// undoes it as one.
+    run: String,
+    after: String,
+    moved: usize,
+    /// Lessons a person corrected, left in their project.
+    #[serde(default)]
+    kept: usize,
+}
+
+/// Is the labelling of the remainder still going? It is while lessons have no
+/// label and the daily sweep has not given up on them: a lesson labelled
+/// `machine` after the move would never move.
+fn remainder_unfinished(store: &Store) -> Result<bool> {
+    let total = store.unlabelled_knowledge_total()?;
+    if total == 0 {
+        return Ok(false);
+    }
+    let stuck = store
+        .state(LABEL_STATE)?
+        .and_then(|raw| serde_json::from_str::<LabelState>(&raw).ok())
+        .map_or(0, |state| state.stuck);
+    Ok(!(stuck > 0 && total <= stuck))
+}
+
+/// The old lessons the cleanup labelled `machine`, moved to the machine once,
+/// by the rule a new lesson follows (`machine_safe`). Pure code; no model.
+///
+/// Per lesson, in order: a new Knowledge on the machine with `links=[old]`,
+/// then a `clean` tombstone on the old one (reason `reclassified_machine`, the
+/// move's run id). Each id gets one revision, and a crash between the two
+/// leaves a pair the machine fold merges. A lesson `brain restore` brought
+/// back is never moved again. The flag is set only when the cursor has passed
+/// the last candidate and the remainder is labelled (or given up on).
+fn move_to_machine(
+    paths: &Paths,
+    store: &Store,
+    run_lock: &RunLock,
+    deadline: Option<std::time::Instant>,
+) -> Result<()> {
+    if store.state(MACHINE_FLAG)?.is_some() || remainder_unfinished(store)? {
+        return Ok(());
+    }
+    let mut state: MachineMove =
+        store.state(MACHINE_CURSOR)?.and_then(|raw| serde_json::from_str(&raw).ok()).unwrap_or_default();
+    if state.run.is_empty() {
+        state.run = ulid::Ulid::new().to_string();
+    }
+    let config = crate::config::Config::load(&paths.config_file())?;
+    let sanitizer = crate::sanitize::Sanitizer::new(&config.sanitize).context("compile sanitizer patterns")?;
+    // The same names `synthesize_knowledge` keeps a lesson out of the machine
+    // for: every project the machine knows.
+    let projects = consolidate::known_projects(paths)?;
+    let names: Vec<String> = projects.iter().map(|(scope, _)| scope.project.clone()).collect();
+    let moved_before = state.moved;
+    let machine = crate::ids::ProjectScope::machine();
+    let machine_dir = paths.project_dir(&machine);
+    // Opened at the first copy: a store with nothing to move grows no directory.
+    let mut machine_log: Option<EventLog> = None;
+    let began = std::time::Instant::now();
+    loop {
+        if began.elapsed() >= PASS_BUDGET || deadline.is_some_and(|at| std::time::Instant::now() >= at) {
+            break;
+        }
+        let ids = store.machine_candidates(&state.after, MACHINE_BATCH)?;
+        let Some(last) = ids.last().cloned() else {
+            store.set_state(MACHINE_FLAG, &jiff::Timestamp::now().to_string())?;
+            store.clear_state(MACHINE_CURSOR)?;
+            // Kept for `brain doctor`.
+            store.set_state(MACHINE_MOVED, &serde_json::to_string(&state)?)?;
+            break;
+        };
+        // Only a batch with work is a sign of life.
+        run_lock.touch();
+        let restored = store.restored_among(&ids)?;
+        // A fresh copy has no correction history, so a person's page stays put.
+        let corrected = store.human_corrected(&ids)?;
+        for old in store.get(&ids)? {
+            if restored.contains(&old.id) {
+                continue;
+            }
+            if corrected.contains(&old.id) {
+                state.kept += 1;
+                continue;
+            }
+            let Some((_, dir)) = projects.iter().find(|(scope, _)| scope.project_id == old.project) else {
+                continue;
+            };
+            if !consolidate::machine_safe(&sanitizer, &old.title, &old.body, &names) {
+                continue;
+            }
+            let mut copy = Event::new(
+                machine.workspace_id,
+                machine.project_id,
+                uuid::Uuid::nil(),
+                Source { cli: "brain".to_string(), hook: old.source.hook.clone() },
+                EventKind::Knowledge,
+                old.title.clone(),
+                old.body.clone(),
+            );
+            copy.links = vec![old.id.clone()];
+            copy.class = Some("durable".to_string());
+            copy.scope = Some("machine".to_string());
+            copy.commands = store.lesson_commands(&old.id)?;
+            copy.consolidated = true;
+            if machine_log.is_none() {
+                machine_log = Some(EventLog::open(&machine_dir)?);
+            }
+            if let Some(log) = &machine_log {
+                log.append(&copy)?;
+            }
+            store.index(&copy)?;
+            retire(&EventLog::open(dir)?, store, &old, MACHINE_REASON, &state.run)?;
+            state.moved += 1;
+        }
+        state.after = last;
+        store.set_state(MACHINE_CURSOR, &serde_json::to_string(&state)?)?;
+        store.set_state(MACHINE_MOVED, &serde_json::to_string(&state)?)?;
+    }
+    if state.moved > moved_before {
+        // Two projects may have taught the machine the same thing: the
+        // ordinary fold, here, because a quiet round returns before its own.
+        consolidate::fold_duplicate_knowledge(&machine_dir, &machine, store)?;
+        // Moved triggers stay cached for the hook.
+        consolidate::write_lesson_programs(paths, store)?;
+    }
+    Ok(())
 }
 
 /// The saved cursor, or a fresh one. A cursor written before calls were counted
@@ -543,8 +824,32 @@ pub(crate) fn summary(store: &Store) -> String {
     );
     if matches!(store.state(FLAG), Ok(None)) {
         line.push_str(&format!(" · in progress ({}/{MAX_CALLS} calls)", last.calls));
-    } else if c.unlabelled > 0 {
-        line.push_str(&format!(" · {} left unlabelled", c.unlabelled));
+    } else {
+        let left = store.unlabelled_knowledge_total().unwrap_or(c.unlabelled);
+        if left > 0 {
+            line.push_str(&format!(" · {left} left unlabelled"));
+        }
+    }
+    if let Some(label) =
+        store.state(LABEL_STATE).ok().flatten().and_then(|raw| serde_json::from_str::<LabelState>(&raw).ok())
+    {
+        line.push_str(&format!(" · daily labels run {}", label.run));
+    }
+    if let Some(moved) = store
+        .state(MACHINE_MOVED)
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<MachineMove>(&raw).ok())
+        .filter(|moved| moved.moved > 0 || moved.kept > 0)
+    {
+        let pending = if matches!(store.state(MACHINE_FLAG), Ok(None)) { ", in progress" } else { "" };
+        line.push_str(&format!(
+            " · reclassified_machine {} (run {}{pending})",
+            moved.moved, moved.run
+        ));
+        if moved.kept > 0 {
+            line.push_str(&format!(" · {} kept in their project as a person corrected them", moved.kept));
+        }
     }
     if c.protected > 0 {
         line.push_str(&format!(" · {} kept as a person corrected them", c.protected));
@@ -577,6 +882,8 @@ pub(crate) fn restore(
     let mut restored = 0usize;
     let mut found = false;
     let mut done: HashSet<String> = HashSet::new();
+    // Old lessons this restore brought back from the machine move.
+    let mut moved_back: HashSet<String> = HashSet::new();
     for (_, dir) in consolidate::known_projects(paths)? {
         let log = EventLog::open(&dir)?;
         let mut targets: Vec<(Event, String)> = Vec::new();
@@ -613,6 +920,9 @@ pub(crate) fn restore(
                 "Restored a knowledge page".to_string(),
                 String::new(),
             );
+            if tombstone.extra.get("reason").and_then(Value::as_str) == Some(MACHINE_REASON) {
+                moved_back.insert(target.clone());
+            }
             note.links = vec![target];
             note.consolidated = true;
             note.extra.insert("run".to_string(), run.clone().into());
@@ -621,8 +931,39 @@ pub(crate) fn restore(
             restored += 1;
         }
     }
+    retire_machine_copies(paths, store, &moved_back)?;
     anyhow::ensure!(found, "no cleanup run {run}");
     Ok((run, restored))
+}
+
+/// A lesson the move brought back to its project would read twice, once there
+/// and once as the machine's copy: the copy (a Knowledge linking the old id)
+/// is withdrawn with a `clean` tombstone of its own, which names no run so a
+/// restore never reverses it. Reads the machine's log, as a replay would.
+fn retire_machine_copies(paths: &Paths, store: &Store, back: &HashSet<String>) -> Result<()> {
+    if back.is_empty() {
+        return Ok(());
+    }
+    let dir = paths.project_dir(&crate::ids::ProjectScope::machine());
+    if !dir.join("events").is_dir() {
+        return Ok(());
+    }
+    let log = EventLog::open(&dir)?;
+    for path in log.files()? {
+        let text = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        for line in text.lines().filter(|line| line.contains("\"knowledge\"")) {
+            let Ok(copy) = serde_json::from_str::<Event>(line) else { continue };
+            if copy.kind == EventKind::Knowledge
+                && copy.links.iter().any(|link| back.contains(link))
+                && !store.event_cleaned(&copy.id)?
+                // A person's edit outlives the restore: a duplicate shows, a lost edit does not.
+                && store.human_corrected(std::slice::from_ref(&copy.id))?.is_empty()
+            {
+                retire(&log, store, &copy, "restored_to_project", "")?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

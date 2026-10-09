@@ -251,9 +251,20 @@ pub fn run(file: &Path, force: bool) -> Result<Ingested> {
     // A document counts toward the synthesis cadence like a session does:
     // five readings with nothing else happening still deserve one look at
     // what recurs across them.
-    let knowledge =
-        consolidate::synthesize_knowledge(&project_dir, &scope, &store, &ladder, &sanitizer, &preferred)
-            .unwrap_or_default();
+    //
+    // Under the run lock, because synthesis can append to the machine's log;
+    // a reading that finds the lock held skips synthesis and keeps its page.
+    let run_lock = consolidate::RunLock::take(&consolidate::run_lock_path(&paths)).ok().flatten();
+    let knowledge = if run_lock.is_some() {
+        let found =
+            consolidate::synthesize_knowledge(&paths, &project_dir, &scope, &store, &ladder, &sanitizer, &preferred)
+                .unwrap_or_default();
+        let _ = consolidate::write_lesson_programs(&paths, &store);
+        found
+    } else {
+        Vec::new()
+    };
+    drop(run_lock);
     let hubs = consolidate::write_hubs(&project_dir, &scope, &store)?;
     let root = consolidate::write_root(&paths)?;
 

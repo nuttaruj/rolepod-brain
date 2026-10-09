@@ -158,6 +158,15 @@ const PROMPT_POINTER_DEADLINE: std::time::Duration = std::time::Duration::from_m
 /// caps a bad plan rather than a normal run.
 const RELATED_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The project condition of every read a machine lesson may answer: the
+/// current project (parameter `?n`) and the machine itself, and nothing else.
+/// A project's own lessons never cross projects; only `MACHINE` is shared.
+/// The machine id is formatted from [`crate::ids::machine_id`], a UUID this
+/// code derived, never text typed into SQL.
+fn scope_clause(prefix: &str, n: usize) -> String {
+    format!("{prefix}project IN (?{n}, '{}')", crate::ids::machine_id())
+}
+
 /// Shared names are counted once per session, before events are touched:
 /// entities are recorded per session, so every event in it shares the same
 /// set, and a per-event join multiplies a session's events by its names
@@ -169,9 +178,11 @@ const RELATED_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 /// the limit: fetching every event of the 45 sharing sessions took 3.4 s cold
 /// on the 115k-event project, counting them in the index 0.12 s. The seed is
 /// looked up by primary key, with `project` only a check.
-const RELATED_SQL: &str = "WITH seed_sessions AS (
+fn related_sql() -> String {
+    format!(
+        "WITH seed_sessions AS (
              SELECT DISTINCT session FROM events
-             WHERE id = ?1 AND +project = ?2
+             WHERE id = ?1 AND +{seed_scope}
          ),
          subject AS (
              SELECT DISTINCT n.name FROM entities n
@@ -197,23 +208,32 @@ const RELATED_SQL: &str = "WITH seed_sessions AS (
                       END AS authority
                FROM events e
                JOIN shared s ON s.session = e.session
-               WHERE e.project = ?2 AND e.id != ?1
+               WHERE {scope} AND e.id != ?1
                      AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
                      AND e.hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')
                ORDER BY s.shared DESC, demoted, authority, e.id DESC
                LIMIT ?3) c
          JOIN events h ON h.id = c.id
-         ORDER BY c.shared DESC, c.demoted, c.authority, c.id DESC";
+         ORDER BY c.shared DESC, c.demoted, c.authority, c.id DESC",
+        seed_scope = scope_clause("", 2),
+        scope = scope_clause("e.", 2),
+    )
+}
 
 /// The statement behind [`Store::nearest`], with the same recall floor every
 /// other read enforces. A memory withdrawn from search has to be withdrawn
 /// from this one too, or the withdrawal was cosmetic.
-const NEAREST_SQL: &str = "SELECT v.event_id, v.vec, e.confidence
+fn nearest_sql() -> String {
+    format!(
+        "SELECT v.event_id, v.vec, e.confidence
          FROM event_vec v
          JOIN events e ON e.id = v.event_id
-         WHERE e.project = ?1 AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
+         WHERE {} AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
                AND e.hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')
-               AND (?2 IS NULL OR e.topic = ?2)";
+               AND (?2 IS NULL OR e.topic = ?2)",
+        scope_clause("e.", 1)
+    )
+}
 
 /// The keyword stream of [`Store::search_traced`].
 ///
@@ -232,13 +252,15 @@ const NEAREST_SQL: &str = "SELECT v.event_id, v.vec, e.confidence
 /// 1.5 s cold on the 115k-event project. `pos` carries the pool's own order to
 /// the final read, numbered by an explicit `ORDER BY` so it does not lean on
 /// the order a subquery happens to emit.
-const KEYWORD_SQL: &str = "WITH matched AS (
+fn keyword_sql() -> String {
+    format!(
+        "WITH matched AS (
          SELECT e.rowid AS rid, e.session,
                 CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END AS demoted,
                 rank AS relevance
          FROM events_fts
          JOIN events e ON e.rowid = events_fts.rowid
-         WHERE events_fts MATCH ?1 AND e.project = ?2 AND e.forgotten = 0
+         WHERE events_fts MATCH ?1 AND {scope} AND e.forgotten = 0
                AND e.kind NOT IN ('tombstone', 'retire')
                AND e.hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')
                AND (?5 IS NULL OR e.topic = ?5)
@@ -261,7 +283,10 @@ const KEYWORD_SQL: &str = "WITH matched AS (
      JOIN events e ON e.rowid = events_fts.rowid
      JOIN pool ON pool.rid = events_fts.rowid
      WHERE events_fts MATCH ?1
-     ORDER BY pool.pos";
+     ORDER BY pool.pos",
+        scope = scope_clause("e.", 2)
+    )
+}
 
 /// How much of a prompt becomes the query.
 const PROMPT_QUERY_CHARS: usize = 400;
@@ -914,6 +939,18 @@ impl Store {
                 CREATE INDEX IF NOT EXISTS event_files_lookup
                     ON event_files(project, path);
 
+                -- The commands a lesson names, so a shell command can find the
+                -- lesson that is about it. Derived from the log like every
+                -- table here: `clear()` empties it and a replay refills it.
+                CREATE TABLE IF NOT EXISTS lesson_triggers (
+                    event_id TEXT NOT NULL,
+                    program  TEXT NOT NULL,
+                    sub      TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (program, sub, event_id)
+                );
+                CREATE INDEX IF NOT EXISTS lesson_triggers_by_event
+                    ON lesson_triggers(event_id);
+
                 -- Circuit-breaker state per summarizer CLI. Derived in the
                 -- sense that losing it only costs one wasted retry.
                 CREATE TABLE IF NOT EXISTS summarizer_health (
@@ -1340,6 +1377,7 @@ impl Store {
                 ("events", "expires_at", "TEXT"),
                 ("events", "stale_since", "TEXT"),
                 ("events", "cites", "TEXT"),
+                ("events", "scope", "TEXT"),
                 ("summarizer_health", "last_failed_at", "TEXT"),
                 ("session_state", "claimed_at", "TEXT"),
                 ("session_state", "attempts", "INTEGER NOT NULL DEFAULT 0"),
@@ -1354,11 +1392,22 @@ impl Store {
             if self.has_column(table, column)? {
                 continue;
             }
-            self.conn
-                .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition};"))
-                .with_context(|| format!("add {table}.{column}"))?;
+            self.add_column(table, column, definition)?;
         }
         Ok(())
+    }
+
+    fn add_column(&self, table: &str, column: &str, definition: &str) -> Result<()> {
+        let added = self
+            .conn
+            .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition};"))
+            .with_context(|| format!("add {table}.{column}"));
+        // Two hooks can migrate at once; the loser's ALTER fails on a column
+        // the winner just added (another process added it).
+        if added.is_err() && self.has_column(table, column)? {
+            return Ok(());
+        }
+        added
     }
 
     fn has_column(&self, table: &str, column: &str) -> Result<bool> {
@@ -1432,9 +1481,9 @@ impl Store {
                 "INSERT INTO events
                     (id, ts, workspace, project, session, cli, hook, kind, title, body,
                      files, topic, invocation, confidence, consolidated, agent, clamped,
-                     class, expires_at, cites)
+                     class, expires_at, cites, scope)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                         ?18, ?19, ?20)
+                         ?18, ?19, ?20, ?21)
                  ON CONFLICT(id) DO UPDATE SET
                      title = excluded.title,
                      body = excluded.body,
@@ -1446,7 +1495,8 @@ impl Store {
                      agent = excluded.agent,
                      class = COALESCE(excluded.class, class),
                      expires_at = COALESCE(excluded.expires_at, expires_at),
-                     cites = COALESCE(excluded.cites, cites)",
+                     cites = COALESCE(excluded.cites, cites),
+                     scope = COALESCE(excluded.scope, scope)",
                 params![
                     event.id,
                     event.ts,
@@ -1468,9 +1518,13 @@ impl Store {
                     event.class.as_deref(),
                     event.expires.as_deref(),
                     cites_json(&event.cites),
+                    event.scope.as_deref(),
                 ],
             )
             .context("index event")?;
+        if event.kind == EventKind::Knowledge && !event.commands.is_empty() {
+            self.set_lesson_triggers(&event.id, &event.commands)?;
+        }
 
         // A tombstone or a correction is about ANOTHER event. Both are
         // ordinary appended lines - nothing is deleted or edited in the log -
@@ -1523,16 +1577,23 @@ impl Store {
                 for target in &event.links {
                     self.conn
                         .execute(
-                            "UPDATE events SET class = ?2, expires_at = ?3, cites = ?4
+                            "UPDATE events SET class = ?2, expires_at = ?3, cites = ?4,
+                                    scope = COALESCE(?5, scope)
                              WHERE id = ?1",
                             params![
                                 target,
                                 event.class.as_deref(),
                                 event.expires.as_deref(),
-                                cites_json(&event.cites)
+                                cites_json(&event.cites),
+                                event.scope.as_deref()
                             ],
                         )
                         .context("apply classification")?;
+                    // A label from before triggers existed carries neither
+                    // field and leaves the set alone; any other replaces it.
+                    if event.scope.is_some() || !event.commands.is_empty() {
+                        self.set_lesson_triggers(target, &event.commands)?;
+                    }
                 }
             }
             // A human saying "this is stale" is a judgement the log has to
@@ -1793,7 +1854,7 @@ impl Store {
         recall: Recall,
         floor: bool,
     ) -> Result<(Vec<Hit>, Trace)> {
-        let mut stmt = self.conn.prepare(KEYWORD_SQL).context("prepare search")?;
+        let mut stmt = self.conn.prepare(&keyword_sql()).context("prepare search")?;
 
         // Read a pool wider than asked for, capped per session: spreading
         // results is only possible if the quiet sessions' hits were fetched
@@ -2101,7 +2162,7 @@ impl Store {
     }
 
     fn related_rows(&self, project: &str, id: &str, limit: usize) -> Result<Vec<Hit>> {
-        let mut stmt = self.conn.prepare(RELATED_SQL).context("prepare related")?;
+        let mut stmt = self.conn.prepare(&related_sql()).context("prepare related")?;
         let rows = stmt
             .query_map(params![id, project, limit as i64], |row| {
                 Ok(Hit {
@@ -2143,17 +2204,18 @@ impl Store {
         }
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT e.id, e.ts, e.cli, e.kind, e.title,
                         substr(COALESCE(e.body, ''), 1, 160), e.session
                  FROM events_tri
                  JOIN events e ON e.rowid = events_tri.rowid
-                 WHERE events_tri MATCH ?1 AND e.project = ?2 AND e.forgotten = 0
+                 WHERE events_tri MATCH ?1 AND {scope} AND e.forgotten = 0
                        AND e.kind NOT IN ('tombstone', 'retire') AND e.hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')
                        AND (?4 IS NULL OR e.topic = ?4)
                  ORDER BY CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END, rank
                  LIMIT ?3",
-            )
+                scope = scope_clause("e.", 2)
+            ))
             .context("prepare substring matches")?;
         let phrase = format!("\"{}\"", query.replace('"', " "));
         let rows = stmt
@@ -2637,7 +2699,7 @@ impl Store {
             return Ok(Vec::new());
         }
         self.vectors_are_this_models()?;
-        let mut stmt = self.conn.prepare(NEAREST_SQL).context("prepare nearest")?;
+        let mut stmt = self.conn.prepare(&nearest_sql()).context("prepare nearest")?;
         let mut scored: Vec<(String, f32, bool)> = stmt
             .query_map(params![project, topic], |row| {
                 let id: String = row.get(0)?;
@@ -2811,7 +2873,7 @@ impl Store {
         session: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Hit>> {
-        let mut stmt = self.conn.prepare(Self::recent_sql()).context("prepare recent")?;
+        let mut stmt = self.conn.prepare(&Self::recent_sql()).context("prepare recent")?;
         let rows = stmt
             .query_map(params![project, limit as i64, cli, kind, session], |row| {
                 Ok(Hit {
@@ -2867,15 +2929,18 @@ impl Store {
     /// fetch per skipped id. Before the build the inner
     /// select reads the project through `events_unconsolidated`, as the
     /// single select did.
-    fn recent_sql() -> &'static str {
-        "SELECT id, ts, cli, kind, title, session FROM events
+    fn recent_sql() -> String {
+        format!(
+            "SELECT id, ts, cli, kind, title, session FROM events
          WHERE id IN (SELECT id FROM events
-                      WHERE project = ?1 AND forgotten = 0 AND kind NOT IN ('tombstone', 'retire')
+                      WHERE {} AND forgotten = 0 AND kind NOT IN ('tombstone', 'retire')
                             AND hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')
                             AND (?4 IS NULL OR kind = ?4)
                             AND (?5 IS NULL OR session = ?5))
                AND (?3 IS NULL OR cli = ?3)
-         ORDER BY id DESC LIMIT ?2"
+         ORDER BY id DESC LIMIT ?2",
+            scope_clause("", 1)
+        )
     }
 
     /// Number of indexed events.
@@ -3450,6 +3515,10 @@ impl Store {
     /// Synthesis runs again every few sessions and will happily rediscover
     /// what it found last time; without this, one durable fact would accrete
     /// one entry per run until the primer said little else.
+    ///
+    /// Project-only on purpose: clean, fold and supersede rewrite what this
+    /// returns, and none of them may touch a `MACHINE` lesson. A read that
+    /// only compares wording uses [`Self::knowledge_entries_in_scope`].
     pub fn knowledge_entries(&self, project: &str) -> Result<Vec<(String, String)>> {
         let mut stmt = self.conn.prepare(
             // `team = 0`: this list is what folding, superseding and
@@ -3460,6 +3529,23 @@ impl Store {
             "SELECT id, title FROM events
              WHERE project = ?1 AND kind = 'knowledge' AND forgotten = 0 AND team = 0",
         )?;
+        let rows = stmt
+            .query_map([project], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// The live own knowledge of a project and of the machine, for a read
+    /// that only compares wording (dedupe before a write). Never feed it to
+    /// a path that rewrites what it returns.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn knowledge_entries_in_scope(&self, project: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, title FROM events
+             WHERE {} AND kind = 'knowledge' AND forgotten = 0 AND team = 0",
+            scope_clause("", 1)
+        ))?;
         let rows = stmt
             .query_map([project], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
         Ok(rows.filter_map(std::result::Result::ok).collect())
@@ -3498,6 +3584,59 @@ impl Store {
             )
             .context("count unlabelled knowledge")?;
         Ok(usize::try_from(count).unwrap_or(0))
+    }
+
+    /// How many live, own knowledge entries of every project have no label.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn unlabelled_knowledge_total(&self) -> Result<usize> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE kind = 'knowledge' AND forgotten = 0 AND team = 0 AND class IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .context("count unlabelled knowledge")?;
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
+    /// The next live, own, durable lessons of any project other than the
+    /// machine that carry the `machine` label, after `after`, by id: what the
+    /// one-time move to the machine reads.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn machine_candidates(&self, after: &str, limit: usize) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM events
+             WHERE kind = 'knowledge' AND forgotten = 0 AND team = 0
+                   AND scope = 'machine' AND class = 'durable'
+                   AND project != ?1 AND id > ?2
+             ORDER BY id LIMIT ?3",
+        )?;
+        let machine = crate::ids::machine_id().to_string();
+        let rows = stmt.query_map(params![machine, after, limit as i64], |row| row.get(0))?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// The commands one lesson is triggered by, as `"program"` or
+    /// `"program sub"`.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn lesson_commands(&self, id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT program, sub FROM lesson_triggers WHERE event_id = ?1 ORDER BY program, sub",
+        )?;
+        let rows = stmt.query_map(params![id], |row| {
+            let program: String = row.get(0)?;
+            let sub: String = row.get(1)?;
+            Ok(if sub.is_empty() { program } else { format!("{program} {sub}") })
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
     }
 
     /// For each id, how many sessions opened it in full.
@@ -5552,13 +5691,14 @@ impl Store {
             // future session whether or not anyone asked. A withdrawn memory
             // that only disappears from search has not been withdrawn.
             "SELECT id, ts, kind, title, topic FROM events
-             WHERE project = ?1 AND forgotten = 0 AND kind NOT IN ('tombstone', 'retire')
+             WHERE {scope} AND forgotten = 0 AND kind NOT IN ('tombstone', 'retire')
                    AND hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')
                    AND (expires_at IS NULL OR expires_at > '{now}')
                    {kind}
              ORDER BY {}, id DESC
              LIMIT ?2",
             Self::rank(""),
+            scope = scope_clause("", 1),
             now = jiff::Timestamp::now()
         )
     }
@@ -5718,6 +5858,104 @@ impl Store {
         Ok(true)
     }
 
+    /// Replace the commands one lesson is triggered by. A command is stored
+    /// as `"program"` or `"program sub"`.
+    fn set_lesson_triggers(&self, event_id: &str, commands: &[String]) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM lesson_triggers WHERE event_id = ?1", params![event_id])
+            .context("clear lesson triggers")?;
+        for command in commands {
+            let (program, sub) = command.split_once(' ').unwrap_or((command, ""));
+            if program.is_empty() {
+                continue;
+            }
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO lesson_triggers (event_id, program, sub) VALUES (?1, ?2, ?3)",
+                    params![event_id, program, sub.trim()],
+                )
+                .context("index lesson trigger")?;
+        }
+        Ok(())
+    }
+
+    /// The live condition a lesson must meet to be offered: the same floor
+    /// every other read enforces, and the flagged and expired kept out.
+    const LIVE_LESSON: &'static str = "e.kind = 'knowledge' AND e.forgotten = 0
+             AND e.hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')
+             AND COALESCE(e.confidence, 0) >= 0";
+
+    /// The best live lesson one of `candidates` (`"program"` or
+    /// `"program sub"`) triggers, which `session` has not been shown yet.
+    /// Only lessons of `projects` are read: the caller passes the current
+    /// project and the machine, and no project's lesson reaches another.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn lesson_for_command(
+        &self,
+        projects: &[&str],
+        session: &str,
+        candidates: &[String],
+    ) -> Result<Option<Pointer>> {
+        if projects.is_empty() || candidates.is_empty() {
+            return Ok(None);
+        }
+        let mut values: Vec<String> = vec![session.to_string()];
+        let mut scope = Vec::new();
+        for project in projects {
+            values.push((*project).to_string());
+            scope.push(format!("?{}", values.len()));
+        }
+        let mut pairs = Vec::new();
+        for candidate in candidates {
+            let (program, sub) = candidate.split_once(' ').unwrap_or((candidate, ""));
+            values.push(program.to_string());
+            values.push(sub.trim().to_string());
+            pairs.push(format!("(t.program = ?{} AND t.sub = ?{})", values.len() - 1, values.len()));
+        }
+        let sql = format!(
+            "SELECT e.id, e.ts, e.kind, e.title, e.topic
+             FROM lesson_triggers t
+             JOIN events e ON e.id = t.event_id
+             WHERE ({pairs}) AND e.project IN ({scope}) AND {live}
+                   AND (e.expires_at IS NULL OR e.expires_at > '{now}')
+                   AND NOT EXISTS (SELECT 1 FROM injected i WHERE i.session = ?1 AND i.event_id = e.id)
+             ORDER BY {rank}, e.id DESC
+             LIMIT 1",
+            pairs = pairs.join(" OR "),
+            scope = scope.join(", "),
+            live = Self::LIVE_LESSON,
+            now = jiff::Timestamp::now(),
+            rank = Self::rank("e."),
+        );
+        self.conn
+            .query_row(&sql, rusqlite::params_from_iter(values.iter()), Self::pointer_row)
+            .optional()
+            .context("read the lesson for a command")
+    }
+
+    /// Every program a live lesson is triggered by: the list a hook checks a
+    /// command against before it opens anything else.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn lesson_programs(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT DISTINCT t.program FROM lesson_triggers t
+                 JOIN events e ON e.id = t.event_id
+                 WHERE {live} AND (e.expires_at IS NULL OR e.expires_at > '{now}')
+                 ORDER BY t.program",
+                live = Self::LIVE_LESSON,
+                now = jiff::Timestamp::now()
+            ))
+            .context("prepare lesson programs")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0)).context("run lesson programs")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("read lesson programs")
+    }
+
     /// Pointers for events that touched one file, best first.
     ///
     /// # Errors
@@ -5732,7 +5970,7 @@ impl Store {
             "SELECT e.id, e.ts, e.kind, e.title, e.topic
              FROM event_files f
              JOIN events e ON e.id = f.event_id
-             WHERE f.project = ?1 AND f.path = ?2 AND e.forgotten = 0
+             WHERE {scope} AND f.path = ?2 AND e.forgotten = 0
                    AND e.kind NOT IN ('tombstone', 'retire')
                          AND e.hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')
                    AND (e.expires_at IS NULL OR e.expires_at > '{now}')
@@ -5741,6 +5979,7 @@ impl Store {
              ORDER BY {}, e.id DESC
              LIMIT ?3",
             Self::rank("e."),
+            scope = scope_clause("f.", 1),
             now = jiff::Timestamp::now()
         );
         let mut stmt = self.conn.prepare(&sql).context("prepare file pointers")?;
@@ -5814,13 +6053,14 @@ impl Store {
                 "SELECT e.id, e.ts, e.kind, e.title, e.topic
                  FROM events_fts
                  JOIN events e ON e.rowid = events_fts.rowid
-                 WHERE events_fts MATCH ?1 AND e.project = ?2 AND e.forgotten = 0
+                 WHERE events_fts MATCH ?1 AND {scope} AND e.forgotten = 0
                        AND e.kind IN ('knowledge', 'session_summary', 'note')
                        AND e.hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')
                        AND COALESCE(e.confidence, 0) >= 0
                        AND (e.expires_at IS NULL OR e.expires_at > '{now}')
                  ORDER BY rank
                  LIMIT ?3",
+                scope = scope_clause("e.", 2),
                 now = jiff::Timestamp::now()
             ))
             .context("prepare prompt pointers")?;
@@ -6213,7 +6453,7 @@ impl Store {
             // measure against the retention counters, and a counter that
             // restarts at zero beside a larger one would read as negative.
             .execute_batch(
-                "DELETE FROM event_files; DELETE FROM events;
+                "DELETE FROM event_files; DELETE FROM lesson_triggers; DELETE FROM events;
                  DELETE FROM schema_state WHERE key LIKE 'log_tail:%' OR key LIKE 'retention\\_%' ESCAPE '\\'
                     OR key LIKE 'compact\\_%' ESCAPE '\\'
                     OR key LIKE 'stale\\_scan\\_at:%' ESCAPE '\\';",
@@ -7048,10 +7288,10 @@ mod tests {
         let store = Store::open_memory().unwrap();
         assert!(store.build_primer_indexes().unwrap());
         for (name, sql, args) in [
-            ("nearest", NEAREST_SQL.to_string(), 2),
+            ("nearest", nearest_sql(), 2),
             ("entity matches", Store::entity_matches_sql(3), 7),
             ("neighbours", Store::neighbours_sql(3), 6),
-            ("related", RELATED_SQL.to_string(), 3),
+            ("related", related_sql(), 3),
         ] {
             let plan = plan_of(&store, &sql, args);
             assert!(
@@ -7069,7 +7309,7 @@ mod tests {
         for (name, sql, args) in [
             ("entity matches", Store::entity_matches_sql(3), 7),
             ("neighbours", Store::neighbours_sql(3), 6),
-            ("related", RELATED_SQL.to_string(), 3),
+            ("related", related_sql(), 3),
         ] {
             let plan = plan_of(&store, &sql, args);
             assert!(
@@ -7080,7 +7320,7 @@ mod tests {
 
         // A covering index that can answer `id IN (...) AND project = ?` made
         // the planner walk the project to find three seeds.
-        for (name, sql, args) in [("neighbours", Store::neighbours_sql(3), 6), ("related", RELATED_SQL.to_string(), 3)] {
+        for (name, sql, args) in [("neighbours", Store::neighbours_sql(3), 6), ("related", related_sql(), 3)] {
             let plan = plan_of(&store, &sql, args);
             assert!(
                 plan.iter().any(|row| row == "SEARCH events USING INDEX sqlite_autoindex_events_1 (id=?)"),
@@ -7103,7 +7343,7 @@ mod tests {
     fn recent_stops_at_the_limit_instead_of_sorting_the_project() {
         let store = Store::open_memory().unwrap();
         assert!(store.build_primer_indexes().unwrap());
-        let plan = plan_of(&store, Store::recent_sql(), 5);
+        let plan = plan_of(&store, &Store::recent_sql(), 5);
         assert!(
             plan.iter().any(|row| row.starts_with("SEARCH events USING COVERING INDEX events_recall (project=?")),
             "recent does not filter through events_recall: {plan:#?}"
@@ -7450,7 +7690,7 @@ mod tests {
             let expected = run(OLD_KEYWORD, query, topic, per_session, pool);
             assert!(expected.len() > 2, "the fixture matched too little for {topic:?}: {expected:?}");
             assert_eq!(
-                run(KEYWORD_SQL, query, topic, per_session, pool),
+                run(&keyword_sql(), query, topic, per_session, pool),
                 expected,
                 "topic={topic:?} per_session={per_session} pool={pool}"
             );
@@ -8953,7 +9193,7 @@ mod tests {
             drop(rows);
             stmt.get_status(rusqlite::StatementStatus::VmStep)
         };
-        let (old, new) = (steps(OLD_RELATED), steps(RELATED_SQL));
+        let (old, new) = (steps(OLD_RELATED), steps(&related_sql()));
         assert!(new * 3 < old, "related still scales with events x names: {new} steps against {old}");
     }
 
@@ -10200,6 +10440,198 @@ mod tests {
         );
         entry.consolidated = true;
         entry
+    }
+
+    fn lesson(title: &str, body: &str, project: Uuid, session: Uuid) -> Event {
+        let mut lesson = Event::new(
+            Uuid::nil(),
+            project,
+            session,
+            Source { cli: "claude-code".into(), hook: "gotcha".into() },
+            EventKind::Knowledge,
+            title.into(),
+            body.into(),
+        );
+        lesson.consolidated = true;
+        lesson
+    }
+
+    fn label_of(target: &Event, scope: Option<&str>, commands: &[&str]) -> Event {
+        let mut label = Event::new(
+            Uuid::nil(),
+            target.project,
+            Uuid::nil(),
+            Source { cli: "brain".into(), hook: "classify".into() },
+            EventKind::Note,
+            target.title.clone(),
+            String::new(),
+        );
+        label.links = vec![target.id.clone()];
+        label.class = Some("durable".into());
+        label.scope = scope.map(str::to_string);
+        label.commands = commands.iter().map(|command| (*command).to_string()).collect();
+        label
+    }
+
+    /// The privacy invariant of the machine scope: project B reads the
+    /// machine's lessons through every read path, and never project A's.
+    #[test]
+    fn a_machine_lesson_reads_in_every_project() {
+        let store = Store::open_memory().unwrap();
+        let (a, b) = (Uuid::from_u128(101), Uuid::from_u128(102));
+        let machine = crate::ids::machine_id();
+        let shared = Uuid::from_u128(103);
+        let (a_id, b_id, machine_id) = (a.to_string(), b.to_string(), machine.to_string());
+
+        let mut shared_lesson = lesson("Curl hangs without a deadline", "zebrafruit needs timeout", machine, shared);
+        shared_lesson.files = vec!["src/shared.rs".to_string()];
+        let mut secret = lesson("Ledger rotates monthly", "ledgerapple belongs to project A", a, shared);
+        secret.files = vec!["src/shared.rs".to_string()];
+        let mut a_capture = event_in_session("ledgerapple capture", "zebrafruit too", a, shared);
+        a_capture.files = vec!["src/shared.rs".to_string()];
+        let seed = event_in_session("B seed", "where B starts", b, shared);
+        for event in [&shared_lesson, &secret, &a_capture, &seed] {
+            store.index(event).unwrap();
+        }
+        store.record_entities(&shared.to_string(), &b_id, &["src/shared.rs".to_string()]).unwrap();
+
+        let has = |ids: Vec<String>, wanted: &Event| ids.contains(&wanted.id);
+        let ids = |pointers: Vec<Pointer>| pointers.into_iter().map(|pointer| pointer.id).collect::<Vec<_>>();
+        let hit_ids = |hits: Vec<Hit>| hits.into_iter().map(|hit| hit.id).collect::<Vec<_>>();
+
+        let primer = ids(store.primer_pointers(&b_id, 20).unwrap());
+        assert!(has(primer.clone(), &shared_lesson), "primer of B misses the machine lesson: {primer:?}");
+        assert!(!has(primer, &secret), "primer of B shows project A's lesson");
+
+        let file = ids(store.pointers_for_file(&b_id, "src/shared.rs", 20).unwrap());
+        assert!(has(file.clone(), &shared_lesson), "file pointers of B miss the machine lesson");
+        assert!(!has(file.clone(), &secret) && !has(file, &a_capture), "file pointers of B show project A");
+
+        let prompt = ids(store.prompt_pointers(&b_id, "zebrafruit timeout", 20).unwrap());
+        assert!(has(prompt.clone(), &shared_lesson), "prompt pointers of B miss the machine lesson");
+        assert!(!has(prompt, &a_capture));
+        let prompt_a = ids(store.prompt_pointers(&b_id, "ledgerapple", 20).unwrap());
+        assert!(prompt_a.is_empty(), "prompt pointers of B reach project A: {prompt_a:?}");
+
+        for recall in [Recall::Lexical, Recall::Fused] {
+            let found = hit_ids(store.search(&b_id, "zebrafruit", None, 20, recall).unwrap());
+            assert!(has(found.clone(), &shared_lesson), "search ({recall:?}) of B misses the machine lesson");
+            assert!(!has(found.clone(), &secret) && !has(found, &a_capture), "search of B shows project A");
+            let a_only = hit_ids(store.search(&b_id, "ledgerapple", None, 20, recall).unwrap());
+            assert!(a_only.is_empty(), "search ({recall:?}) of B reaches project A: {a_only:?}");
+        }
+
+        let related = hit_ids(store.related(&b_id, &seed.id, 20).unwrap());
+        assert!(has(related.clone(), &shared_lesson), "related of B misses the machine lesson: {related:?}");
+        assert!(!has(related.clone(), &secret) && !has(related, &a_capture), "related of B shows project A");
+
+        let recent = hit_ids(store.recent(&b_id, None, Some("knowledge"), None, 20).unwrap());
+        assert!(has(recent.clone(), &shared_lesson), "recent of B misses the machine lesson");
+        assert!(!has(recent, &secret), "recent of B shows project A's lesson");
+
+        let entries = store.knowledge_entries_in_scope(&b_id).unwrap();
+        assert!(entries.iter().any(|(id, _)| *id == shared_lesson.id));
+        assert!(!entries.iter().any(|(id, _)| *id == secret.id));
+        // The reads that feed rewrites stay project-only, and so does the
+        // timeline.
+        assert!(store.knowledge_entries(&b_id).unwrap().is_empty());
+        assert!(store.knowledge_entries(&machine_id).unwrap().iter().any(|(id, _)| *id == shared_lesson.id));
+        assert!(!store.knowledge_entries(&a_id).unwrap().iter().any(|(id, _)| *id == shared_lesson.id));
+        let timeline = store.timeline(&b_id, "0", 50).unwrap();
+        assert!(!timeline.iter().any(|hit| hit.id == shared_lesson.id), "timeline widened");
+    }
+
+    /// The loser of a migration race meets a column that is already there.
+    #[test]
+    fn adding_a_column_another_process_added_is_not_an_error() {
+        let store = Store::open_memory().unwrap();
+        assert!(store.has_column("events", "scope").unwrap());
+        store.add_column("events", "scope", "TEXT").unwrap();
+        assert!(store.add_column("no_such_table", "x", "TEXT").is_err());
+    }
+
+    #[test]
+    fn triggers_follow_the_latest_label_and_survive_a_replay() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::from_u128(111);
+        let key = project.to_string();
+        let mut gotcha = lesson("Curl needs a deadline", "use timeout", project, Uuid::nil());
+        gotcha.commands = vec!["curl".into(), "git push".into()];
+        gotcha.scope = Some("project".into());
+        store.index(&gotcha).unwrap();
+        let offer = |program: &str| {
+            store
+                .lesson_for_command(&[key.as_str()], "s", &[program.to_string()])
+                .unwrap()
+                .map(|pointer| pointer.id)
+        };
+        assert_eq!(offer("curl"), Some(gotcha.id.clone()));
+        assert_eq!(offer("git push"), Some(gotcha.id.clone()));
+        assert_eq!(offer("git pull"), None, "a sub command that was not named matched");
+        assert_eq!(store.lesson_programs().unwrap(), vec!["curl".to_string(), "git".to_string()]);
+
+        // A label from before triggers existed leaves the set alone.
+        let old_label = label_of(&gotcha, None, &[]);
+        store.index(&old_label).unwrap();
+        assert_eq!(offer("curl"), Some(gotcha.id.clone()));
+
+        // The latest label replaces the set, and carries the scope.
+        let label = label_of(&gotcha, Some("machine"), &["timeout"]);
+        store.index(&label).unwrap();
+        assert_eq!(offer("curl"), None);
+        assert_eq!(offer("timeout"), Some(gotcha.id.clone()));
+        let scope = |store: &Store| -> Option<String> {
+            store
+                .conn
+                .query_row("SELECT scope FROM events WHERE id = ?1", params![gotcha.id], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(scope(&store).as_deref(), Some("machine"));
+
+        // Replay: clear, then index the log in order.
+        store.clear().unwrap();
+        assert!(store.lesson_programs().unwrap().is_empty());
+        for event in [&gotcha, &old_label, &label] {
+            store.index(event).unwrap();
+        }
+        assert_eq!(offer("curl"), None);
+        assert_eq!(offer("timeout"), Some(gotcha.id.clone()));
+        assert_eq!(scope(&store).as_deref(), Some("machine"));
+
+        // Indexing the same line twice changes nothing.
+        store.index(&gotcha).unwrap();
+        store.index(&label).unwrap();
+        assert_eq!(store.lesson_programs().unwrap(), vec!["timeout".to_string()]);
+
+        // A project's trigger does not answer in another project.
+        let other = Uuid::from_u128(112).to_string();
+        assert_eq!(
+            store.lesson_for_command(&[other.as_str()], "s", &["timeout".to_string()]).unwrap().map(|p| p.id),
+            None
+        );
+    }
+
+    #[test]
+    fn a_lesson_shown_once_is_not_offered_again_in_that_session() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::from_u128(121);
+        let key = project.to_string();
+        let mut first = lesson("Curl needs a deadline", "use timeout", project, Uuid::nil());
+        first.commands = vec!["curl".into()];
+        let mut second = lesson("Curl follows redirects", "use -L", project, Uuid::nil());
+        second.commands = vec!["curl".into()];
+        store.index(&first).unwrap();
+        store.index(&second).unwrap();
+        let ask = |session: &str| {
+            store.lesson_for_command(&[key.as_str()], session, &["curl".to_string()]).unwrap().map(|p| p.id)
+        };
+        let shown = ask("one").expect("a trigger matched");
+        assert!(store.record_injected("one", std::slice::from_ref(&shown), 0, 10, 1_000).unwrap());
+        let next = ask("one").expect("the other lesson is still unseen");
+        assert_ne!(next, shown);
+        assert!(store.record_injected("one", std::slice::from_ref(&next), 0, 10, 1_000).unwrap());
+        assert_eq!(ask("one"), None, "a shown lesson was offered again");
+        assert_eq!(ask("two"), Some(shown), "another session is not affected");
     }
 
     #[test]

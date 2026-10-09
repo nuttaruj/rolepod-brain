@@ -185,6 +185,15 @@ fn capture_answering(
 
     let mut payload: Value = serde_json::from_str(&raw).context("parse hook payload")?;
 
+    // A shell command is looked up and never captured: it takes this path
+    // before anything that classifies the invocation, runs `ps` or git, or
+    // opens the store, and every outcome is an answer.
+    if normalize_hook(event_name) == "pre_tool_use"
+        && payload.get("tool_name").and_then(Value::as_str) == Some("Bash")
+    {
+        return Ok(shell_lesson(cli, event_name, &payload).unwrap_or_else(|_| "{}".to_string()));
+    }
+
     let mut hook = normalize_hook(event_name);
     let failed_call = hook == "post_tool_use_failure";
     if let Some(object) = payload.as_object_mut() {
@@ -496,6 +505,110 @@ fn capture_answering(
         return Ok(inject_for_prompt(&store, &config, &scope, &session_key, event_name, prompt, &spill));
     }
     Ok(inject_for(&store, &config, &scope, &hook, event_name, &event, &spill))
+}
+
+/// The lesson a shell command triggers, as the hook's output.
+///
+/// The command is only parsed here: never run, never stored, never put in an
+/// error. A command no stored lesson names ends on the program-list cache
+/// without the store being opened; a missing cache counts as a match. The
+/// project comes from the identity cache alone (computing it can run git),
+/// and the machine's lessons are always in reach.
+fn shell_lesson(cli: &str, event_name: &str, payload: &Value) -> Result<String> {
+    const NONE: &str = "{}";
+    // Cursor's echo of its own session, and a subagent's call, get nothing -
+    // the same rule `inject_for` follows for files.
+    if cli != "claude-code"
+        || payload.get("cursor_version").is_some()
+        || delegate_label(payload).is_some()
+    {
+        return Ok(NONE.to_string());
+    }
+    let command = payload
+        .get("tool_input")
+        .and_then(|input| input.get("command"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let candidates = command_candidates(command);
+    if candidates.is_empty() {
+        return Ok(NONE.to_string());
+    }
+    let paths = Paths::resolve()?;
+    if let Ok(listed) = std::fs::read_to_string(paths.data_dir.join("lesson-programs")) {
+        let known: std::collections::HashSet<&str> = listed.lines().collect();
+        if !candidates.iter().any(|c| known.contains(c.split(' ').next().unwrap_or(""))) {
+            return Ok(NONE.to_string());
+        }
+    }
+    let Some(cwd) = working_directory(payload) else { return Ok(NONE.to_string()) };
+    let machine = ids::machine_id().to_string();
+    let project = ids::known_project_id(&cwd).map(|id| id.to_string());
+    let mut projects: Vec<&str> = project.as_deref().into_iter().collect();
+    projects.push(&machine);
+
+    let session = ids::session_uuid(
+        first_string(payload, &["session_id", "sessionId", "thread_id", "conversationId"])
+            .unwrap_or("unknown-session"),
+    )
+    .to_string();
+    let store = if maint::active(&paths) {
+        Store::open_waiting(&paths.db(), maint::FAIL_FAST)?
+    } else {
+        Store::open(&paths.db())?
+    };
+    let config = Config::load(&paths.config_file())?;
+    let injection = inject::for_command(&store, &projects, &session, &candidates, &config.injection)?;
+    // Not skipped and not fresh on purpose: the store opened just above, and
+    // `deliver` spills a failed write itself.
+    let spill = Spill { paths: &paths, session: &session, skip: false, fresh: false };
+    Ok(deliver(&store, &config, &session, event_name, Some(injection), &spill))
+}
+
+/// What a shell command could be triggered by: `program` and `program sub`,
+/// lowercase, for each of its first three parts (split on `&&`, `;` and `|`).
+/// `sudo`, `env X=Y`, leading assignments and `cd x` are looked through.
+fn command_candidates(command: &str) -> Vec<String> {
+    let mut end = command.len().min(4096);
+    while !command.is_char_boundary(end) {
+        end -= 1;
+    }
+    let text = command[..end].replace("&&", ";").replace('|', ";");
+    let mut found: Vec<String> = Vec::new();
+    for part in text.split(';').take(3) {
+        let mut words = part.split_whitespace().peekable();
+        let mut wrapped = false;
+        while let Some(word) = words.peek() {
+            let skip = if matches!(*word, "sudo" | "env") {
+                wrapped = true;
+                true
+            } else {
+                // An assignment, or a flag of the `sudo` / `env` before it.
+                word.contains('=') || (wrapped && word.starts_with('-'))
+            };
+            if !skip {
+                break;
+            }
+            words.next();
+        }
+        let Some(first) = words.next() else { continue };
+        let program = first.rsplit('/').next().unwrap_or(first).to_lowercase();
+        let plain = |s: &str| {
+            !s.is_empty()
+                && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
+        };
+        if program == "cd" || !plain(&program) {
+            continue;
+        }
+        if let Some(sub) = words.next().map(str::to_lowercase) {
+            if !sub.starts_with('-') && plain(&sub) {
+                found.push(format!("{program} {sub}"));
+            }
+        }
+        found.push(program);
+    }
+    found.sort();
+    found.dedup();
+    found
 }
 
 /// Where a hook's ledger writes stand. When `skip` is set the store is held
@@ -1455,6 +1568,17 @@ mod tests {
 
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_shell_command_yields_its_program_and_sub_command() {
+        assert_eq!(command_candidates("sudo -E env A=1 /usr/bin/Git push origin && ls"), vec!["git", "git push", "ls"]);
+        assert_eq!(command_candidates("timeout 5 curl -s x"), vec!["timeout", "timeout 5"]);
+        assert_eq!(command_candidates("cd /tmp; cargo test | wc -l"), vec!["cargo", "cargo test", "wc"]);
+        assert!(!captures("pre_tool_use"), "a shell pre-event became a capture surface");
+        assert!(command_candidates("cd /tmp").is_empty());
+        assert!(command_candidates("").is_empty());
+        assert_eq!(command_candidates("a; b; c; d"), vec!["a", "b", "c"]);
+    }
 
     #[cfg(unix)]
     #[test]

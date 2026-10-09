@@ -8433,6 +8433,11 @@ fn knowledge_titles(fixture: &Fixture, state: i64) -> Vec<String> {
 fn seed_old_knowledge(fixture: &Fixture, entries: &[(&str, &str)]) -> Vec<String> {
     fixture.seed_session(1);
     let dir = fixture.project_dirs().into_iter().next().expect("a project directory");
+    seed_old_knowledge_in(fixture, &dir, entries)
+}
+
+/// The same, into the project directory the test names.
+fn seed_old_knowledge_in(fixture: &Fixture, dir: &Path, entries: &[(&str, &str)]) -> Vec<String> {
     let first = std::fs::read_dir(dir.join("events"))
         .unwrap()
         .filter_map(Result::ok)
@@ -8634,6 +8639,9 @@ fn a_second_cleanup_retires_nothing() {
     let counter = fixture.home.parent().unwrap().join("clean-calls");
     let bin = fixture.fake_cli("claude", &cleanup_cli(&counter));
     seed_old_knowledge(&fixture, OLD_ENTRIES);
+    // This is about the cleanup's own retirements; the move to the machine has
+    // its own tests.
+    fixture.sql_run("INSERT OR REPLACE INTO schema_state (key, value) VALUES ('machine_migrated', 'test')");
     run_cleanup(&fixture, &bin);
     let calls = || std::fs::read_to_string(&counter).unwrap_or_default().lines().count();
     let retired = knowledge_titles(&fixture, 2);
@@ -8642,6 +8650,11 @@ fn a_second_cleanup_retires_nothing() {
 
     run_cleanup(&fixture, &bin);
     assert_eq!(knowledge_titles(&fixture, 2), retired, "a finished cleanup retired more");
+    // Only the entry whose label was refused is asked about once more, by the
+    // remainder stage, and a sweep that labels nothing ends there.
+    assert!(calls() <= spent + 1, "a finished cleanup called the model again");
+    let spent = calls();
+    run_cleanup(&fixture, &bin);
     assert_eq!(calls(), spent, "a finished cleanup called the model again");
 
     // Without the flag it looks again, and finds every entry already labelled.
@@ -8726,16 +8739,719 @@ fn cleanup_respects_its_call_ceiling() {
     let rows = || -> i64 {
         fixture.sql_one("SELECT CAST(COUNT(*) AS TEXT) FROM summarizer_calls WHERE purpose = 'clean'").parse().unwrap()
     };
+    let label_rows = || -> usize {
+        fixture
+            .sql_one("SELECT CAST(COUNT(*) AS TEXT) FROM summarizer_calls WHERE purpose = 'label'")
+            .parse()
+            .unwrap()
+    };
     for _ in 0..12 {
         run_cleanup(&fixture, &bin);
         // The check is made before each batch, so one ladder run may end a
-        // call or two past it.
-        assert!(calls() <= 32, "the cleanup made {} model calls", calls());
+        // call or two past it. Once it has ended, the remainder is labelled
+        // under its own budget of 5 a day.
+        assert!(calls() <= 32 + 5, "the cleanup made {} model calls", calls());
     }
-    assert!((30..=32).contains(&calls()), "the cleanup made {} model calls", calls());
-    assert_eq!(rows(), calls() as i64, "the ledger and the CLI disagree on the calls made");
+    assert!((30..=32).contains(&(calls() - label_rows())), "the cleanup made {} model calls", calls());
+    assert_eq!(rows() + label_rows() as i64, calls() as i64, "the ledger and the CLI disagree on the calls made");
     // It ended rather than starting over, with the rest left unlabelled.
     assert_eq!(fixture.sql_one("SELECT CAST(COUNT(*) AS TEXT) FROM schema_state WHERE key = 'knowledge_cleaned'"), "1");
     let doctor = String::from_utf8_lossy(&fixture.brain(&["doctor"]).stdout).into_owned();
     assert!(doctor.contains("left unlabelled"), "{doctor}");
+}
+
+#[test]
+fn the_unlabelled_remainder_is_labelled_a_little_each_day() {
+    let fixture = Fixture::new("label-remainder");
+    let counter = fixture.home.parent().unwrap().join("label-calls");
+    let bin = fixture.fake_cli("claude", &cleanup_cli(&counter));
+    // 8 batches of 40 and a few more, with the one-time cleanup already over.
+    // Gibberish, so that no fold takes any of them for a repeat.
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut word = || {
+        (0..7)
+            .map(|_| {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                char::from(b'a' + ((seed >> 33) % 26) as u8)
+            })
+            .collect::<String>()
+    };
+    let titles: Vec<String> = (0..330).map(|_| format!("{} {} {} {}", word(), word(), word(), word())).collect();
+    let entries: Vec<(&str, &str)> = titles.iter().map(|t| (t.as_str(), "2026-10-01T00:00:00Z")).collect();
+    seed_old_knowledge(&fixture, &entries);
+    fixture.sql_run(
+        "INSERT OR REPLACE INTO schema_state (key, value) VALUES ('knowledge_cleaned', '2026-10-01');
+         INSERT OR REPLACE INTO schema_state (key, value) VALUES ('clean_last_run',
+           '{\"run\":\"old\",\"at\":\"2026-10-01T00:00:00Z\",\"calls\":0}');",
+    );
+
+    let calls = || std::fs::read_to_string(&counter).unwrap_or_default().lines().count();
+    let rows =|| -> usize {
+        fixture
+            .sql_one("SELECT CAST(COUNT(*) AS TEXT) FROM summarizer_calls WHERE purpose = 'label'")
+            .parse()
+            .unwrap()
+    };
+    let left = || -> usize {
+        fixture
+            .sql_one("SELECT CAST(COUNT(*) AS TEXT) FROM events WHERE kind = 'knowledge' AND forgotten = 0 AND team = 0 AND class IS NULL")
+            .parse()
+            .unwrap()
+    };
+    let run_id = || fixture.sql_one("SELECT json_extract(value, '$.run') FROM schema_state WHERE key = 'label_remainder'");
+    assert_eq!(left(), 330);
+
+    run_cleanup(&fixture, &bin);
+    assert_eq!((calls(), rows()), (5, 5), "the first pass is held to the daily budget");
+    assert!(left() > 0 && left() < 330, "{} left, {} total", left(), fixture.sql_one("SELECT CAST(COUNT(*) AS TEXT) FROM events WHERE kind = 'knowledge'"));
+    let first_run = run_id();
+    let doctor = String::from_utf8_lossy(&fixture.brain(&["doctor"]).stdout).into_owned();
+    assert!(doctor.contains(&format!("{} left unlabelled", left())), "{doctor}");
+
+    // The same day: the ledger says the budget is spent.
+    run_cleanup(&fixture, &bin);
+    assert_eq!((calls(), rows()), (5, 5), "a second pass the same day made calls");
+
+    // A day later the rest is labelled, and then nothing is called.
+    fixture.sql_run("UPDATE summarizer_calls SET ts = '2020-01-01T00:00:00.000000Z' WHERE purpose = 'label'");
+    run_cleanup(&fixture, &bin);
+    assert_eq!(left(), 0);
+    let total = calls();
+    assert!((6..=9).contains(&total), "{total} calls");
+    assert_ne!(run_id(), first_run, "a new day has its own run id");
+    fixture.sql_run("UPDATE summarizer_calls SET ts = '2020-01-01T00:00:00.000000Z' WHERE purpose = 'label'");
+    run_cleanup(&fixture, &bin);
+    assert_eq!(calls(), total, "labelled entries were called again");
+}
+
+#[test]
+fn a_machine_lesson_never_leaves_the_machine() {
+    // `MACHINE` knowledge lives at <data>/machine, beside the vault. Team,
+    // sync and export all walk the vault, so none of them may carry it.
+    const MACHINE_PROJECT: &str = "65a15af1-5427-510f-88a9-576cf8b3a005";
+    const DEFAULT_WORKSPACE: &str = "1626d894-a5e5-5e55-bb85-855adfc8035c";
+    let title = "Zanzibar machine quirk the keyboard repeats";
+    let marker = "[project]\nname = \"machineprop\"\n";
+    let a = Fixture::new("machine-a");
+    let b = Fixture::new("machine-b");
+    std::fs::write(a.project.join(".rolepod-brain.toml"), marker).unwrap();
+    std::fs::write(b.project.join(".rolepod-brain.toml"), marker).unwrap();
+    seed_old_knowledge(&a, &[("Ordinary gateway lesson about retries", "2026-01-01T00:00:00Z")]);
+
+    let machine_events = a.home.join("machine").join("events");
+    std::fs::create_dir_all(&machine_events).unwrap();
+    let event = serde_json::json!({
+        "v": 1, "id": ulid::Ulid::new().to_string(), "ts": "2026-01-02T00:00:00Z",
+        "workspace": DEFAULT_WORKSPACE, "project": MACHINE_PROJECT,
+        "session": "00000000-0000-0000-0000-000000000000",
+        "source": {"cli": "brain", "hook": "gotcha"}, "kind": "knowledge",
+        "title": title, "body": "Body of the machine lesson.",
+        "files": [], "links": [], "consolidated": true
+    });
+    std::fs::write(machine_events.join("2026-10.jsonl"), format!("{event}\n")).unwrap();
+
+    // `brain search` is scoped to the cwd's project, so ask the store itself.
+    let count = |f: &Fixture, prefix: &str| {
+        let out = Command::new("sqlite3")
+            .arg(f.home.join("brain.db"))
+            .arg(format!("SELECT COUNT(*) FROM events WHERE title LIKE '{prefix}%';"))
+            .output()
+            .expect("query the store");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let found = |f: &Fixture| count(f, "Zanzibar") == "1";
+    assert!(a.brain(&["reindex"]).status.success());
+    assert!(found(&a), "the machine lesson was not replayed");
+
+    // Nothing the three outbound paths build holds it.
+    let shared_team = a.home.parent().unwrap().join("machine-team");
+    let shared_sync = a.home.parent().unwrap().join("machine-sync");
+    assert!(a.brain(&["team", "init", shared_team.to_str().unwrap(), "--name", "Alex"]).status.success());
+    assert!(b.brain(&["team", "init", shared_team.to_str().unwrap(), "--name", "Sam"]).status.success());
+    std::fs::copy(a.home.join("team.key"), b.home.join("team.key")).unwrap();
+    assert!(a.brain(&["team"]).status.success());
+    assert!(b.brain(&["team"]).status.success());
+    assert!(a.brain(&["sync", "init", shared_sync.to_str().unwrap()]).status.success());
+    assert!(b.brain(&["sync", "init", shared_sync.to_str().unwrap()]).status.success());
+    std::fs::copy(a.home.join("sync.key"), b.home.join("sync.key")).unwrap();
+    assert!(a.brain(&["sync"]).status.success());
+    assert!(b.brain(&["sync"]).status.success());
+    assert!(b.brain(&["reindex"]).status.success());
+    // Positive control: something did cross, so the absence below means something.
+    assert!(
+        count(&b, "Ordinary gateway").parse::<u32>().unwrap_or(0) > 0,
+        "neither team nor sync carried the ordinary lesson to B"
+    );
+    assert!(!found(&b), "the machine lesson reached a teammate or a second machine");
+    assert!(!b.home.join("machine").exists(), "B grew a machine directory");
+
+    // The export, extracted for real.
+    let archive = a.home.parent().unwrap().join("machine-export.tar.gz");
+    assert!(a.brain(&["export", archive.to_str().unwrap()]).status.success());
+    let out = a.home.parent().unwrap().join("machine-extracted");
+    std::fs::create_dir_all(&out).unwrap();
+    assert!(Command::new("tar").args(["-xzf", archive.to_str().unwrap(), "-C", out.to_str().unwrap()]).status().unwrap().success());
+    let mut all = String::new();
+    collect_ext(&out, "jsonl", &mut all);
+    collect_ext(&out, "md", &mut all);
+    assert!(all.contains("Ordinary gateway lesson"), "the export held nothing to compare against");
+    assert!(!all.contains("Zanzibar") && !all.contains(MACHINE_PROJECT), "the export carried the machine lesson");
+
+    // The database is derived: delete it and the lesson comes back from the log.
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(a.home.join(format!("brain.db{suffix}")));
+    }
+    assert!(a.brain(&["reindex"]).status.success());
+    assert!(found(&a), "a rebuild lost the machine lesson");
+}
+
+// --- the one-time move of old machine lessons ------------------------------
+
+const MACHINE_PROJECT_ID: &str = "65a15af1-5427-510f-88a9-576cf8b3a005";
+
+/// Lessons the cleanup stub labels `machine`: three that may leave their
+/// project, one that names a repo path and one that names the project.
+const MOVABLE: &[&str] = &[
+    "Cargo test needs the locked flag to match the lockfile",
+    "Pineapple pizza belongs in the freezer overnight",
+    "Violins need humidity above forty percent",
+];
+const STAYING: &[&str] = &["Edit src/main.rs before running the loader", "The checkout script prints a banner first"];
+
+fn lesson_entries() -> Vec<(&'static str, &'static str)> {
+    let stamps = ["2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", "2026-01-03T00:00:00Z", "2026-01-04T00:00:00Z", "2026-01-05T00:00:00Z"];
+    MOVABLE.iter().chain(STAYING).copied().zip(stamps).collect()
+}
+
+fn count_knowledge(fixture: &Fixture, clause: &str) -> i64 {
+    fixture
+        .sql_one(&format!("SELECT CAST(COUNT(*) AS TEXT) FROM events WHERE kind = 'knowledge' AND {clause}"))
+        .parse()
+        .unwrap()
+}
+
+/// How many times a title reads: live, in any project or on the machine.
+fn live_copies(fixture: &Fixture, title: &str) -> i64 {
+    count_knowledge(fixture, &format!("forgotten = 0 AND title = '{title}'"))
+}
+
+/// A fixture whose old lessons were labelled by the cleanup and then moved:
+/// the stub CLI, and the id of the move's run.
+fn moved_fixture(name: &str) -> (Fixture, PathBuf, String) {
+    let fixture = Fixture::new(name);
+    let counter = fixture.home.parent().unwrap().join("clean-calls");
+    let bin = fixture.fake_cli("claude", &cleanup_cli(&counter));
+    seed_old_knowledge(&fixture, &lesson_entries());
+    // The first pass labels, the second moves.
+    run_cleanup(&fixture, &bin);
+    assert_eq!(fixture.sql_one("SELECT CAST(COUNT(*) AS TEXT) FROM schema_state WHERE key = 'machine_migrated'"), "0");
+    run_cleanup(&fixture, &bin);
+    let run = fixture.sql_one(
+        "SELECT json_extract(value, '$.run') FROM schema_state WHERE key = 'machine_moved'",
+    );
+    (fixture, bin, run)
+}
+
+fn log_events(dir: &Path) -> Vec<serde_json::Value> {
+    let mut text = String::new();
+    collect_jsonl(dir, &mut text);
+    text.lines().filter_map(|line| serde_json::from_str(line).ok()).collect()
+}
+
+#[test]
+fn old_machine_lessons_move_once_and_restore_brings_them_back() {
+    let (fixture, bin, run) = moved_fixture("machine-move");
+
+    // Moved: three live on the machine, the three originals cleaned, and the
+    // lessons that name a repo path or the project stayed where they were.
+    assert_eq!(count_knowledge(&fixture, &format!("project = '{MACHINE_PROJECT_ID}' AND forgotten = 0")), 3);
+    assert_eq!(count_knowledge(&fixture, &format!("project != '{MACHINE_PROJECT_ID}' AND forgotten = 2")), 3);
+    for title in STAYING {
+        assert_eq!(
+            count_knowledge(&fixture, &format!("project != '{MACHINE_PROJECT_ID}' AND forgotten = 0 AND title = '{title}'")),
+            1,
+            "{title} left its project"
+        );
+        assert_eq!(live_copies(&fixture, title), 1, "{title}");
+    }
+    for title in MOVABLE {
+        assert_eq!(live_copies(&fixture, title), 1, "{title} reads {} times", live_copies(&fixture, title));
+        assert_eq!(
+            count_knowledge(&fixture, &format!("project = '{MACHINE_PROJECT_ID}' AND forgotten = 0 AND title = '{title}'")),
+            1
+        );
+    }
+    assert_eq!(fixture.sql_one("SELECT CAST(COUNT(*) AS TEXT) FROM schema_state WHERE key = 'machine_migrated'"), "1");
+
+    // An ordinary clean tombstone, no new kind: an old binary reads it as it
+    // reads any other cleanup.
+    let moved: Vec<serde_json::Value> = log_events(&fixture.wiki())
+        .into_iter()
+        .filter(|event| event["reason"] == "reclassified_machine")
+        .collect();
+    assert_eq!(moved.len(), 3, "{moved:?}");
+    assert!(moved.iter().all(|e| e["kind"] == "tombstone" && e["source"]["hook"] == "clean" && e["run"] == run.as_str()));
+    let machine_events = log_events(&fixture.home.join("machine"));
+    assert_eq!(machine_events.len(), 3, "{machine_events:?}");
+    for copy in &machine_events {
+        assert_eq!(copy["kind"], "knowledge");
+        let old = copy["links"][0].as_str().expect("a link to the original");
+        assert_eq!(copy["links"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            fixture.sql_one(&format!("SELECT title FROM events WHERE id = '{old}'")),
+            copy["title"].as_str().unwrap()
+        );
+    }
+    // The originals' triggers moved with them, and the hook's cache has them.
+    assert_eq!(
+        fixture.sql_one(&format!(
+            "SELECT CAST(COUNT(*) AS TEXT) FROM lesson_triggers t JOIN events e ON e.id = t.event_id
+             WHERE e.project = '{MACHINE_PROJECT_ID}' AND e.forgotten = 0"
+        )),
+        "3"
+    );
+    assert!(std::fs::read_to_string(fixture.home.join("lesson-programs")).unwrap().contains("cargo"));
+    let doctor = String::from_utf8_lossy(&fixture.brain(&["doctor"]).stdout).into_owned();
+    assert!(doctor.contains(&format!("reclassified_machine 3 (run {run})")), "{doctor}");
+
+    // Moved once: more passes, and with the flag cleared too, move nothing.
+    let settled = || {
+        (
+            count_knowledge(&fixture, "1 = 1"),
+            fixture.sql_one("SELECT CAST(COUNT(*) AS TEXT) FROM events WHERE kind = 'tombstone'"),
+        )
+    };
+    let before = settled();
+    run_cleanup(&fixture, &bin);
+    run_cleanup(&fixture, &bin);
+    assert_eq!(settled(), before, "a later pass moved more");
+
+    // Restore brings the originals back, and the machine's copies go with
+    // them: every title reads exactly once, in its own project.
+    let restored = fixture.brain(&["restore", "--run", &run]);
+    assert!(restored.status.success(), "restore failed: {restored:?}");
+    assert!(String::from_utf8_lossy(&restored.stdout).contains("Restored 3"), "{restored:?}");
+    for title in MOVABLE.iter().chain(STAYING) {
+        assert_eq!(live_copies(&fixture, title), 1, "{title} reads {} times after restore", live_copies(&fixture, title));
+        assert_eq!(
+            count_knowledge(&fixture, &format!("project != '{MACHINE_PROJECT_ID}' AND forgotten = 0 AND title = '{title}'")),
+            1,
+            "{title} is not back in its project"
+        );
+    }
+    assert_eq!(count_knowledge(&fixture, &format!("project = '{MACHINE_PROJECT_ID}' AND forgotten = 0")), 0);
+    let programs = fixture.sql_one(&format!(
+        "SELECT CAST(COUNT(*) AS TEXT) FROM lesson_triggers t JOIN events e ON e.id = t.event_id
+         WHERE e.project = '{MACHINE_PROJECT_ID}' AND e.forgotten = 0"
+    ));
+    assert_eq!(programs, "0");
+
+    // A restored lesson is not moved again, even from a fresh start.
+    fixture.sql_run("DELETE FROM schema_state WHERE key IN ('machine_migrated', 'machine_cursor')");
+    run_cleanup(&fixture, &bin);
+    run_cleanup(&fixture, &bin);
+    for title in MOVABLE {
+        assert_eq!(live_copies(&fixture, title), 1, "{title} after a second move");
+        assert_eq!(
+            count_knowledge(&fixture, &format!("project != '{MACHINE_PROJECT_ID}' AND forgotten = 0 AND title = '{title}'")),
+            1,
+            "a restored {title} was moved again"
+        );
+    }
+}
+
+#[test]
+fn a_corrected_lesson_stays_in_its_project_and_a_corrected_copy_survives_a_restore() {
+    // Corrected before the move: it is not moved.
+    let fixture = Fixture::new("machine-corrected");
+    let counter = fixture.home.parent().unwrap().join("clean-calls");
+    let bin = fixture.fake_cli("claude", &cleanup_cli(&counter));
+    seed_old_knowledge(&fixture, &lesson_entries());
+    run_cleanup(&fixture, &bin);
+    let kept = MOVABLE[1];
+    let id = fixture.sql_one(&format!("SELECT id FROM events WHERE kind = 'knowledge' AND title = '{kept}'"));
+    assert!(fixture.brain(&["correct", &id, "Pizza belongs in the freezer for one night."]).status.success());
+    run_cleanup(&fixture, &bin);
+    assert_eq!(count_knowledge(&fixture, &format!("project = '{MACHINE_PROJECT_ID}' AND forgotten = 0")), 2);
+    assert_eq!(
+        count_knowledge(&fixture, &format!("project != '{MACHINE_PROJECT_ID}' AND forgotten = 0 AND id = '{id}'")),
+        1,
+        "a corrected lesson was moved"
+    );
+    let doctor = String::from_utf8_lossy(&fixture.brain(&["doctor"]).stdout).into_owned();
+    assert!(doctor.contains("1 kept in their project as a person corrected them"), "{doctor}");
+
+    // Corrected after the move: a restore leaves the corrected copy live.
+    let (fixture, _bin, run) = moved_fixture("machine-corrected-copy");
+    let title = MOVABLE[0];
+    let copy = fixture.sql_one(&format!(
+        "SELECT id FROM events WHERE kind = 'knowledge' AND title = '{title}' AND project = '{MACHINE_PROJECT_ID}'"
+    ));
+    assert!(fixture.brain(&["correct", &copy, "Cargo test wants --locked, as CI does."]).status.success());
+    assert!(fixture.brain(&["restore", "--run", &run]).status.success());
+    assert_eq!(
+        count_knowledge(&fixture, &format!("id = '{copy}' AND forgotten = 0")),
+        1,
+        "the restore retired a person's correction"
+    );
+    assert_eq!(
+        count_knowledge(&fixture, &format!("project != '{MACHINE_PROJECT_ID}' AND forgotten = 0 AND title = '{title}'")),
+        1,
+        "the original is not back in its project"
+    );
+}
+
+#[test]
+fn old_machine_lessons_wait_for_the_remainder_to_be_labelled() {
+    let fixture = Fixture::new("machine-order");
+    let counter = fixture.home.parent().unwrap().join("clean-calls");
+    let bin = fixture.fake_cli("claude", &cleanup_cli(&counter));
+    let nobody = fixture.home.parent().unwrap().join("no-cli");
+    std::fs::create_dir_all(&nobody).unwrap();
+    // Two labelled already, one the stub labels, one it refuses (outside the enum).
+    let mut entries = lesson_entries();
+    entries.truncate(3);
+    entries.push(("WEIRD label outside the enum on a lighthouse note", "2026-01-08T00:00:00Z"));
+    seed_old_knowledge(&fixture, &entries);
+    fixture.sql_run(
+        "INSERT OR REPLACE INTO schema_state (key, value) VALUES ('knowledge_cleaned', '2026-10-01');
+         INSERT OR REPLACE INTO schema_state (key, value) VALUES ('clean_last_run',
+           '{\"run\":\"old\",\"at\":\"2026-10-01T00:00:00Z\",\"calls\":0}');
+         UPDATE events SET class = 'durable', scope = 'machine'
+           WHERE kind = 'knowledge' AND title IN ('Cargo test needs the locked flag to match the lockfile',
+                                                  'Pineapple pizza belongs in the freezer overnight');",
+    );
+    let flag = || fixture.sql_one("SELECT CAST(COUNT(*) AS TEXT) FROM schema_state WHERE key = 'machine_migrated'");
+    let cleaned = || count_knowledge(&fixture, "forgotten = 2");
+
+    // No model answers: two lessons are unlabelled, the sweep is not over.
+    let done = fixture.brain_with_path(&["consolidate", "--force"], Some(&nobody));
+    assert!(done.status.success(), "consolidate failed: {done:?}");
+    assert!(fixture.sql_one("SELECT CAST(COUNT(*) AS TEXT) FROM events WHERE kind = 'knowledge' AND class IS NULL") != "0");
+    assert_eq!((flag().as_str(), cleaned()), ("0", 0), "the move started with lessons unlabelled");
+    assert!(!fixture.home.join("machine").exists(), "the machine grew a directory before its turn");
+
+    // The stub labels one; the other is refused, but the sweep has not yet
+    // seen that it labelled nothing, so the remainder is still unfinished.
+    run_cleanup(&fixture, &bin);
+    assert_eq!((flag().as_str(), cleaned()), ("0", 0), "the move started before the remainder was done");
+
+    // The next sweep labels nothing and gives up (stuck): now the move runs.
+    run_cleanup(&fixture, &bin);
+    assert_eq!(fixture.sql_one("SELECT CAST(json_extract(value, '$.stuck') AS TEXT) FROM schema_state WHERE key = 'label_remainder'"), "1");
+    assert_eq!(flag(), "1");
+    assert_eq!(cleaned(), 3, "lessons labelled machine did not move once the remainder was done");
+    assert_eq!(count_knowledge(&fixture, &format!("project = '{MACHINE_PROJECT_ID}' AND forgotten = 0")), 3);
+}
+
+#[test]
+fn a_replay_rebuilds_the_machine_scope() {
+    let (fixture, _bin, run) = moved_fixture("machine-replay");
+    let snapshot = |fixture: &Fixture| -> String {
+        let conn = rusqlite::Connection::open(fixture.home.join("brain.db")).unwrap();
+        let mut rows: Vec<String> = Vec::new();
+        let mut statement = conn
+            .prepare(
+                "SELECT id, project, forgotten, IFNULL(class, ''), IFNULL(scope, '') FROM events
+                 WHERE kind = 'knowledge' ORDER BY id",
+            )
+            .unwrap();
+        rows.extend(
+            statement
+                .query_map([], |row| {
+                    Ok(format!(
+                        "{}|{}|{}|{}|{}",
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?
+                    ))
+                })
+                .unwrap()
+                .filter_map(Result::ok),
+        );
+        let mut triggers = conn
+            .prepare("SELECT event_id, program, sub FROM lesson_triggers ORDER BY event_id, program, sub")
+            .unwrap();
+        rows.extend(
+            triggers
+                .query_map([], |row| {
+                    Ok(format!("T {}|{}|{}", row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                })
+                .unwrap()
+                .filter_map(Result::ok),
+        );
+        rows.join("\n")
+    };
+    let rebuild = |fixture: &Fixture| {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(fixture.home.join(format!("brain.db{suffix}")));
+        }
+        assert!(fixture.brain(&["reindex"]).status.success(), "reindex failed");
+    };
+
+    let moved = snapshot(&fixture);
+    assert!(moved.contains(MACHINE_PROJECT_ID), "{moved}");
+    rebuild(&fixture);
+    assert_eq!(snapshot(&fixture), moved, "a replay lost the moved lessons");
+
+    // And after a restore, which also withdrew the machine's copies.
+    assert!(fixture.brain(&["restore", "--run", &run]).status.success());
+    let restored = snapshot(&fixture);
+    rebuild(&fixture);
+    assert_eq!(snapshot(&fixture), restored, "a replay arrived at a different state after a restore");
+    for title in MOVABLE {
+        assert_eq!(live_copies(&fixture, title), 1, "{title}");
+    }
+}
+
+#[test]
+fn the_same_tool_lesson_from_two_projects_folds_into_one() {
+    let a = Fixture::new("machine-fold");
+    let counter = a.home.parent().unwrap().join("clean-calls");
+    let bin = a.fake_cli("claude", &cleanup_cli(&counter));
+    seed_old_knowledge(&a, &[("Gateway auth tokens expire after one hour", "2026-01-01T00:00:00Z")]);
+    // A second project on the same brain. Not dropped: the base belongs to `a`.
+    let other = a.home.parent().unwrap().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    run_in(&other, "git", &["init", "-q"]);
+    let b = std::mem::ManuallyDrop::new(Fixture { home: a.home.clone(), project: other });
+    let known = a.project_dirs();
+    b.seed_session(1);
+    let dir_b = b.project_dirs().into_iter().find(|dir| !known.contains(dir)).expect("a second project");
+    seed_old_knowledge_in(&b, &dir_b, &[("Auth tokens expire after one hour in the gateway", "2026-01-02T00:00:00Z")]);
+
+    run_cleanup(&a, &bin);
+    run_cleanup(&a, &bin);
+
+    assert_eq!(count_knowledge(&a, &format!("project != '{MACHINE_PROJECT_ID}' AND forgotten = 2")), 2, "both originals move");
+    assert_eq!(count_knowledge(&a, &format!("project = '{MACHINE_PROJECT_ID}'")), 2, "both reach the machine");
+    assert_eq!(
+        count_knowledge(&a, &format!("project = '{MACHINE_PROJECT_ID}' AND forgotten = 0")),
+        1,
+        "the same lesson from two projects reads twice on the machine"
+    );
+    assert_eq!(count_knowledge(&a, &format!("project = '{MACHINE_PROJECT_ID}' AND forgotten = 2")), 1);
+}
+
+/// A fixture whose project holds one lesson triggered by `timeout`, with the
+/// program-list cache the way consolidation leaves it, and `extra` settled
+/// observations behind it.
+fn shell_fixture(name: &str, extra: usize) -> Fixture {
+    let fixture = Fixture::new(name);
+    fixture.seed_session(1);
+    let dir = fixture.project_dirs().into_iter().next().expect("a project directory");
+    let first = std::fs::read_dir(dir.join("events"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+        .expect("an event log")
+        .path();
+    let sample: serde_json::Value =
+        serde_json::from_str(std::fs::read_to_string(&first).unwrap().lines().next().unwrap()).unwrap();
+    let mut lines = String::new();
+    let lesson = serde_json::json!({
+        "v": 1, "id": ulid::Ulid::new().to_string(), "ts": "2026-10-01T00:00:00.000000Z",
+        "workspace": sample["workspace"], "project": sample["project"],
+        "session": "00000000-0000-0000-0000-000000000000",
+        "source": {"cli": "brain", "hook": "gotcha"}, "kind": "knowledge",
+        "title": "Wrap network calls in timeout", "body": "A hung curl blocks the whole run.",
+        "files": [], "links": [], "consolidated": true, "commands": ["timeout"]
+    });
+    lines.push_str(&lesson.to_string());
+    lines.push('\n');
+    for index in 0..extra {
+        let event = serde_json::json!({
+            "v": 1, "id": ulid::Ulid::new().to_string(), "ts": "2026-10-01T00:00:00.000000Z",
+            "workspace": sample["workspace"], "project": sample["project"],
+            "session": "00000000-0000-0000-0000-000000000001",
+            "source": {"cli": "claude-code", "hook": "post_tool_use"}, "kind": "observation",
+            "title": format!("Edit: src/file{index}.rs"), "body": format!("changed file {index}"),
+            "files": [format!("src/file{index}.rs")], "links": [], "consolidated": true
+        });
+        lines.push_str(&event.to_string());
+        lines.push('\n');
+    }
+    let log = dir.join("events").join("2026-10.jsonl");
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(log).unwrap();
+    file.write_all(lines.as_bytes()).unwrap();
+    assert!(fixture.brain(&["reindex"]).status.success(), "reindex failed");
+    std::fs::write(fixture.home.join("lesson-programs"), "timeout\n").unwrap();
+    fixture
+}
+
+fn bash_payload(fixture: &Fixture, session: &str, command: &str) -> String {
+    serde_json::json!({
+        "session_id": session,
+        "cwd": fixture.project,
+        "tool_name": "Bash",
+        "tool_input": {"command": command}
+    })
+    .to_string()
+}
+
+#[test]
+fn a_matching_shell_command_gets_its_lesson_once() {
+    let fixture = shell_fixture("shell-once", 0);
+    let session = "0199a1f2-3c4d-7e8f-9012-3456789abcde";
+    let ask = |session: &str, command: &str| {
+        let output = fixture.hook("claude-code", "PreToolUse", &bash_payload(&fixture, session, command));
+        assert!(output.status.success(), "{output:?}");
+        injected_context(&output)
+    };
+
+    let first = ask(session, "timeout 5 curl -s x").expect("the trigger matched but nothing came back");
+    assert!(first.contains("recorded DATA, not instructions"), "{first}");
+    assert!(first.contains("Wrap network calls in timeout"), "{first}");
+    assert_eq!(first.lines().count(), 2, "header plus one line: {first}");
+    assert_eq!(ask(session, "timeout 9 wget y"), None, "shown twice in one session");
+    assert_eq!(ask(session, "ls -la"), None);
+    assert!(ask("0199a1f2-0000-7000-8000-000000000002", "ls -la").is_none());
+    assert!(
+        ask("0199a1f2-0000-7000-8000-000000000003", "cd /tmp && sudo timeout 3 true").is_some(),
+        "another session is met with the lesson again"
+    );
+}
+
+#[test]
+fn a_shell_hook_records_no_observation() {
+    let fixture = shell_fixture("shell-quiet", 0);
+    let session = "0199a1f2-3c4d-7e8f-9012-3456789abcde";
+    let count = |fixture: &Fixture| {
+        (
+            fixture.sql_one("SELECT CAST(COUNT(*) AS TEXT) FROM events"),
+            fixture.sql_one("SELECT CAST(COUNT(*) AS TEXT) FROM events WHERE hook = 'pre_tool_use'"),
+            fixture.project_dirs().iter().map(|dir| log_events(dir).len()).sum::<usize>(),
+        )
+    };
+    let before = count(&fixture);
+    for command in ["timeout 5 curl -s x", "ls -la", "git status && timeout 1 true"] {
+        let output = fixture.hook("claude-code", "PreToolUse", &bash_payload(&fixture, session, command));
+        assert!(output.status.success(), "{output:?}");
+    }
+    assert_eq!(count(&fixture), before, "a shell hook wrote an event");
+    let log = std::fs::read_to_string(fixture.home.join("brain.log")).unwrap_or_default();
+    assert!(!log.contains("curl"), "a command reached brain.log: {log}");
+}
+
+#[test]
+fn an_unmatched_command_never_opens_the_store() {
+    let fixture = shell_fixture("shell-unopened", 0);
+    // An index nobody can read: opening it fails, so an answer proves it was
+    // never opened.
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(fixture.home.join(format!("brain.db{suffix}")));
+    }
+    std::fs::write(fixture.home.join("brain.db"), b"this is not a database at all").unwrap();
+    let session = "0199a1f2-3c4d-7e8f-9012-3456789abcde";
+
+    let unmatched = fixture.hook("claude-code", "PreToolUse", &bash_payload(&fixture, session, "ls -la | wc -l"));
+    assert!(unmatched.status.success(), "{unmatched:?}");
+    assert_eq!(String::from_utf8_lossy(&unmatched.stdout).trim(), "{}");
+    assert!(unmatched.stderr.is_empty(), "{unmatched:?}");
+
+    // A matched command with the store unreadable still answers quietly.
+    let matched = fixture.hook("claude-code", "PreToolUse", &bash_payload(&fixture, session, "timeout 5 curl x"));
+    assert!(matched.status.success(), "{matched:?}");
+    assert_eq!(String::from_utf8_lossy(&matched.stdout).trim(), "{}");
+    assert!(matched.stderr.is_empty(), "{matched:?}");
+    let log = std::fs::read_to_string(fixture.home.join("brain.log")).unwrap_or_default();
+    assert!(!log.contains("curl"), "a command reached brain.log: {log}");
+}
+
+#[test]
+fn a_shell_hook_returns_inside_its_budget() {
+    let fixture = shell_fixture("shell-budget", 10_000);
+    let rows: i64 = fixture.sql_one("SELECT CAST(COUNT(*) AS TEXT) FROM events").parse().unwrap();
+    assert!(rows >= 10_000, "precondition: {rows} events");
+    let p95 = |command: &str, fresh_session: bool| {
+        let mut times = Vec::new();
+        // Two warm-up spawns, then twenty measured.
+        for round in 0..22 {
+            let session = if fresh_session {
+                format!("0199b000-0000-7000-8000-{round:012}")
+            } else {
+                "0199a1f2-3c4d-7e8f-9012-3456789abcde".to_string()
+            };
+            let payload = bash_payload(&fixture, &session, command);
+            let start = std::time::Instant::now();
+            let output = fixture.hook("claude-code", "PreToolUse", &payload);
+            let took = start.elapsed();
+            assert!(output.status.success());
+            if round >= 2 {
+                times.push(took);
+            }
+        }
+        times.sort();
+        times[times.len() * 95 / 100]
+    };
+    let budget = if cfg!(debug_assertions) { 250 } else { 50 };
+    let budget = std::time::Duration::from_millis(budget);
+    // A fresh session each time, so every matched call reaches the lesson.
+    let matched = p95("timeout 5 curl -s x", true);
+    let unmatched = p95("ls -la", false);
+    assert!(matched < budget, "matched shell hook p95 was {matched:?}, over {budget:?}");
+    assert!(unmatched < budget, "unmatched shell hook p95 was {unmatched:?}, over {budget:?}");
+}
+
+#[test]
+fn a_machine_lesson_reaches_another_project_and_a_project_lesson_does_not() {
+    const MACHINE_PROJECT: &str = "65a15af1-5427-510f-88a9-576cf8b3a005";
+    const DEFAULT_WORKSPACE: &str = "1626d894-a5e5-5e55-bb85-855adfc8035c";
+    let fixture = Fixture::new("machine-cross");
+    let b_dir = fixture.project.parent().unwrap().join("checkout-b");
+    std::fs::create_dir_all(&b_dir).unwrap();
+    run_in(&b_dir, "git", &["init", "-q"]);
+
+    // Both projects exist; project A holds a lesson of its own.
+    fixture.seed_session(1);
+    let a_dir = fixture.project_dirs().into_iter().next().expect("project A's directory");
+    let b_read = serde_json::json!({
+        "session_id": "0199a1f2-0000-7000-8000-00000000000b", "cwd": b_dir,
+        "tool_name": "Edit", "tool_input": {"file_path": b_dir.join("main.rs")}
+    })
+    .to_string();
+    assert!(fixture.hook("claude-code", "PostToolUse", &b_read).status.success());
+    seed_old_knowledge_in(&fixture, &a_dir, &[("Quokka cache lesson only for project A", "2026-01-01T00:00:00Z")]);
+
+    let machine_events = fixture.home.join("machine").join("events");
+    std::fs::create_dir_all(&machine_events).unwrap();
+    let lesson = serde_json::json!({
+        "v": 1, "id": ulid::Ulid::new().to_string(), "ts": "2026-01-02T00:00:00Z",
+        "workspace": DEFAULT_WORKSPACE, "project": MACHINE_PROJECT,
+        "session": "00000000-0000-0000-0000-000000000000",
+        "source": {"cli": "brain", "hook": "gotcha"}, "kind": "knowledge",
+        "title": "Zanzibar keyboard repeats on this machine", "body": "A machine quirk.",
+        "files": [], "links": [], "consolidated": true, "class": "durable", "scope": "machine"
+    });
+    std::fs::write(machine_events.join("2026-10.jsonl"), format!("{lesson}\n")).unwrap();
+    assert!(fixture.brain(&["reindex"]).status.success());
+
+    // Which project's lessons the primer of this checkout shows.
+    let primer_of = |cwd: &Path| {
+        let start = start_payload(cwd, "0199a1f2-0000-7000-8000-0000000000c1", "startup");
+        injected_context(&fixture.hook("claude-code", "SessionStart", &start)).unwrap_or_default()
+    };
+    let search_from = |cwd: &Path, query: &str| {
+        let out = Command::new(BRAIN)
+            .args(["search", query])
+            .current_dir(cwd)
+            .env("ROLEPOD_BRAIN_HOME", &fixture.home)
+            .env("ROLEPOD_BRAIN_NO_FETCH", "1")
+            .env("ROLEPOD_BRAIN_HUB", "off")
+            .env("HOME", fixture.home.parent().unwrap())
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .expect("run brain search");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    let primer_b = primer_of(&b_dir);
+    assert!(primer_b.contains("Zanzibar"), "the machine lesson is missing from B's primer: {primer_b}");
+    assert!(!primer_b.contains("Quokka"), "A's lesson reached B's primer: {primer_b}");
+    assert!(search_from(&b_dir, "Zanzibar").contains("Zanzibar"), "B's search misses the machine lesson");
+    assert!(!search_from(&b_dir, "Quokka").contains("Quokka"), "B's search shows A's lesson");
+    // Control: A reaches its own lesson the same way.
+    assert!(search_from(&fixture.project, "Quokka").contains("Quokka"), "A's search misses its own lesson");
 }

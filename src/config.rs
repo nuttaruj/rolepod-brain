@@ -346,6 +346,11 @@ impl Paths {
     ///    someone else - another project, or a workspace directory.
     #[must_use]
     pub fn project_dir(&self, scope: &ProjectScope) -> PathBuf {
+        // The machine is not a project of the vault: it lives beside it, so
+        // team, sync and export - which all walk the vault - never see it.
+        if scope.project_id == crate::ids::machine_id() {
+            return self.data_dir.join("machine");
+        }
         let parent = if scope.workspace == "default" {
             self.wiki()
         } else {
@@ -434,6 +439,14 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn machine_lives_outside_the_vault() {
+        let paths = Paths { data_dir: PathBuf::from("/data") };
+        let dir = paths.project_dir(&ProjectScope::machine());
+        assert!(dir.starts_with(&paths.data_dir), "{dir:?}");
+        assert!(!dir.starts_with(paths.wiki()), "{dir:?}");
+    }
 
     #[test]
     fn no_background_agent_by_default() {
