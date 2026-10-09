@@ -36,7 +36,7 @@ pub fn forget(id: &str) -> Result<Outcome> {
     let (_, title) = store
         .event_summary(id)?
         .with_context(|| format!("no memory with id {id}"))?;
-    anyhow::ensure!(store.event_exists(id)?, "{id} is already forgotten");
+    anyhow::ensure!(store.event_forgettable(id)?, "{id} is already forgotten");
 
     let mut event = Event::new(
         scope.workspace_id,

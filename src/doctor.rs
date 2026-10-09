@@ -97,6 +97,7 @@ pub fn run() -> Result<Vec<Check>> {
     checks.push(reranker_check(&paths));
     checks.push(hub_check(&paths));
     if let Some(store) = &store {
+        checks.push(Check::pass("knowledge cleanup", crate::clean::summary(store)));
         checks.extend(hub_answers_check(&store.rerank_runs().unwrap_or_default()));
     }
     checks.push(update_check(&paths, store.as_ref()));

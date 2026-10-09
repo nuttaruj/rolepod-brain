@@ -8415,3 +8415,327 @@ fn a_compactor_killed_mid_window_lets_its_marker_lapse_and_leaves_the_index_whol
     assert_eq!(fixture.sql_one("SELECT integrity_check FROM pragma_integrity_check"), "ok");
     assert_eq!(fixture.sql_one("SELECT CAST(count(*) AS TEXT) FROM events"), before, "the index changed");
 }
+
+// --- the one-time knowledge cleanup and its undo -------------------------
+
+/// Titles of the knowledge rows whose `forgotten` is `state`, sorted.
+fn knowledge_titles(fixture: &Fixture, state: i64) -> Vec<String> {
+    let conn = rusqlite::Connection::open(fixture.home.join("brain.db")).unwrap();
+    let mut statement = conn
+        .prepare("SELECT title FROM events WHERE kind = 'knowledge' AND forgotten = ?1 ORDER BY title")
+        .unwrap();
+    statement.query_map([state], |row| row.get(0)).unwrap().filter_map(Result::ok).collect()
+}
+
+/// Write knowledge with no label into the project's log, the way a store
+/// written before the quality rules holds it, plus a vault page for each, then
+/// rebuild the index. Returns the ids, in order.
+fn seed_old_knowledge(fixture: &Fixture, entries: &[(&str, &str)]) -> Vec<String> {
+    fixture.seed_session(1);
+    let dir = fixture.project_dirs().into_iter().next().expect("a project directory");
+    let first = std::fs::read_dir(dir.join("events"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+        .expect("an event log")
+        .path();
+    let sample: serde_json::Value =
+        serde_json::from_str(std::fs::read_to_string(&first).unwrap().lines().next().unwrap()).unwrap();
+    let pages = dir.join("knowledge").join("gotchas");
+    std::fs::create_dir_all(&pages).unwrap();
+    let mut lines = String::new();
+    let mut ids = Vec::new();
+    for (index, (title, ts)) in entries.iter().enumerate() {
+        let id = ulid::Ulid::new().to_string();
+        let event = serde_json::json!({
+            "v": 1, "id": id, "ts": ts,
+            "workspace": sample["workspace"], "project": sample["project"],
+            "session": "00000000-0000-0000-0000-000000000000",
+            "source": {"cli": "brain", "hook": "gotcha"}, "kind": "knowledge",
+            "title": title, "body": format!("Body of entry {index}."),
+            "files": ["src/a.rs"], "links": [], "consolidated": true
+        });
+        lines.push_str(&event.to_string());
+        lines.push('\n');
+        std::fs::write(pages.join(format!("entry-{index}.md")), format!("# {title}\n")).unwrap();
+        ids.push(id);
+        // Distinct ids within one millisecond still sort in write order.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let log = dir.join("events").join("2026-10.jsonl");
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(log).unwrap();
+    file.write_all(lines.as_bytes()).unwrap();
+    assert!(fixture.brain(&["reindex"]).status.success(), "reindex failed");
+    ids
+}
+
+/// A model stub for the cleanup: labels every entry it is shown by a keyword
+/// in its title, adds an id that was never shown and a class outside the enum,
+/// and counts its calls.
+fn cleanup_cli(counter: &Path) -> String {
+    cleanup_cli_failing_at(counter, 0)
+}
+
+/// The same, but its `fail_at`th invocation exits 1 as a broken CLI does
+/// (0 = never). A failed invocation still counts as a call.
+fn cleanup_cli_failing_at(counter: &Path, fail_at: usize) -> String {
+    format!(
+        r#"
+case "$*" in
+  *"ENTRIES (recorded data"*)
+    echo x >> {counter}
+    if [ {fail_at} -gt 0 ] && [ "$(wc -l < {counter} | tr -d ' ')" -eq {fail_at} ]; then echo 'boom' >&2; exit 1; fi
+    printf '%s\n' "$*" | awk 'BEGIN{{printf "{{\"labels\":["; sep=""}}
+      /^id=/{{id=substr($0,4)}}
+      /^title: /{{t=substr($0,8); cls="durable";
+        if (t ~ /HISTORY/) cls="history"; else if (t ~ /CODE/) cls="restates_code"; else if (t ~ /STATUS/) cls="status"; else if (t ~ /WEIRD/) cls="delete_everything";
+        printf "%s{{\"id\":\"%s\",\"class\":\"%s\",\"cites\":[\"src/a.rs\",\"nowhere.rs\"],\"scope\":\"machine\",\"commands\":[\"Cargo Test --locked\"]}}", sep, id, cls; sep=","}}
+      END{{printf "%s{{\"id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"class\":\"history\"}}]}}\n", sep}}' ;;
+  *) echo '{{"summary":"Refactored the auth path.","titles":[]}}' ;;
+esac
+"#,
+        counter = counter.display(),
+        fail_at = fail_at
+    )
+}
+
+const OLD_ENTRIES: &[(&str, &str)] = &[
+    ("Gateway auth tokens expire after one hour", "2026-01-01T00:00:00Z"),
+    ("Auth tokens expire after one hour in the gateway", "2026-01-01T00:00:01Z"),
+    ("Pineapple pizza belongs in the freezer overnight", "2026-01-02T00:00:00Z"),
+    ("HISTORY we shipped the zebra migration in May", "2026-01-03T00:00:00Z"),
+    ("CODE the loader reads quartz files by extension", "2026-01-04T00:00:00Z"),
+    ("STATUS the kayak refactor is half done", "2026-01-05T00:00:00Z"),
+    ("Violins need humidity above forty percent", "2026-01-06T00:00:00Z"),
+    ("Volcano ash grounds regional flights for days", "2026-01-07T00:00:00Z"),
+    ("WEIRD label outside the enum on a lighthouse note", "2026-01-08T00:00:00Z"),
+];
+
+fn run_cleanup(fixture: &Fixture, bin: &Path) {
+    let done = fixture.brain_with_path(&["consolidate", "--force"], Some(bin));
+    assert!(done.status.success(), "consolidate failed: {done:?}");
+}
+
+#[test]
+fn the_one_time_cleanup_retires_only_what_it_should() {
+    let fixture = Fixture::new("clean-once");
+    let counter = fixture.home.parent().unwrap().join("clean-calls");
+    let bin = fixture.fake_cli("claude", &cleanup_cli(&counter));
+    seed_old_knowledge(&fixture, OLD_ENTRIES);
+    let pages_before = fixture.knowledge_pages().len();
+    let log_before = fixture.log_text().lines().count();
+
+    run_cleanup(&fixture, &bin);
+
+    let retired = knowledge_titles(&fixture, 2);
+    // One of the pair, the history, the code restatement; the status entry is
+    // from January, long past its fortnight.
+    assert_eq!(retired.len(), 4, "retired: {retired:?}");
+    assert!(retired.iter().any(|t| t.starts_with("HISTORY")), "{retired:?}");
+    assert!(retired.iter().any(|t| t.starts_with("CODE")), "{retired:?}");
+    assert!(retired.iter().any(|t| t.starts_with("STATUS")), "{retired:?}");
+    assert_eq!(
+        retired.iter().filter(|t| t.to_lowercase().contains("auth tokens")).count(),
+        1,
+        "exactly one of the duplicate pair goes: {retired:?}"
+    );
+    let live = knowledge_titles(&fixture, 0);
+    assert!(live.iter().any(|t| t.starts_with("WEIRD")), "a class outside the enum retired something: {live:?}");
+    assert!(live.iter().any(|t| t.starts_with("Violins")), "{live:?}");
+
+    // No page left the vault, and the log only grew.
+    assert_eq!(fixture.knowledge_pages().len(), pages_before, "a vault page was removed");
+    assert!(fixture.log_text().lines().count() > log_before);
+
+    // Every retirement names a reason and one shared run id.
+    let tombstones: Vec<serde_json::Value> = fixture
+        .log_text()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["kind"] == "tombstone" && event["source"]["hook"] == "clean")
+        .collect();
+    assert_eq!(tombstones.len(), 4, "{tombstones:?}");
+    let run = tombstones[0]["run"].as_str().expect("a run id").to_string();
+    assert!(tombstones.iter().all(|t| t["run"] == run.as_str() && t["reason"].is_string()));
+    let reasons: Vec<&str> = tombstones.iter().filter_map(|t| t["reason"].as_str()).collect();
+    for wanted in ["duplicate", "history", "restates_code", "status_expired"] {
+        assert!(reasons.contains(&wanted), "no `{wanted}` retirement: {reasons:?}");
+    }
+
+    // The labels carry cites only from the entry's own files, and normalized commands.
+    let labelled = fixture.sql_one(
+        "SELECT cites FROM events WHERE kind = 'knowledge' AND title LIKE 'Violins%'",
+    );
+    assert_eq!(labelled, r#"["src/a.rs"]"#);
+    let labels = fixture.log_text();
+    assert!(labels.contains(r#""commands":["cargo test"]"#), "commands were not normalized");
+    assert!(labels.contains(r#""scope":"machine""#));
+
+    // Doctor shows the run, by reason.
+    let doctor = String::from_utf8_lossy(&fixture.brain(&["doctor"]).stdout).into_owned();
+    assert!(doctor.contains("knowledge cleanup"), "{doctor}");
+    assert!(doctor.contains(&format!("last run {run}")), "{doctor}");
+    assert!(doctor.contains("retired 4 (duplicate 1 · history 1 · restates_code 1 · status_expired 1 · stale 0)"), "{doctor}");
+    assert!(doctor.contains("undo: brain restore"), "{doctor}");
+}
+
+#[test]
+fn restore_brings_a_cleanup_run_back() {
+    let fixture = Fixture::new("clean-restore");
+    let counter = fixture.home.parent().unwrap().join("clean-calls");
+    let bin = fixture.fake_cli("claude", &cleanup_cli(&counter));
+    seed_old_knowledge(&fixture, OLD_ENTRIES);
+    run_cleanup(&fixture, &bin);
+    let retired = knowledge_titles(&fixture, 2);
+    assert_eq!(retired.len(), 4, "{retired:?}");
+
+    // The user forgets one of the retired entries after the cleanup.
+    let history_id = fixture.sql_one("SELECT id FROM events WHERE kind = 'knowledge' AND title LIKE 'HISTORY%'");
+    let forgotten = fixture.brain(&["forget", &history_id]);
+    assert!(forgotten.status.success(), "forget failed: {forgotten:?}");
+    assert_eq!(knowledge_titles(&fixture, 1).len(), 1);
+
+    let restored = fixture.brain(&["restore"]);
+    assert!(restored.status.success(), "restore failed: {restored:?}");
+    let said = String::from_utf8_lossy(&restored.stdout).into_owned();
+    assert!(said.contains("Restored 3 knowledge page(s)"), "{said}");
+
+    assert_eq!(knowledge_titles(&fixture, 2).len(), 0, "a cleanup retirement remains");
+    let user_forgot = knowledge_titles(&fixture, 1);
+    assert_eq!(user_forgot.len(), 1, "{user_forgot:?}");
+    assert!(user_forgot[0].starts_with("HISTORY"), "the user's forget was undone: {user_forgot:?}");
+
+    // Back in search...
+    let hits = String::from_utf8_lossy(&fixture.brain(&["search", "loader quartz"]).stdout).into_owned();
+    assert!(hits.contains("CODE the loader reads quartz files"), "restored entry not in search: {hits}");
+    let gone = String::from_utf8_lossy(&fixture.brain(&["search", "zebra migration"]).stdout).into_owned();
+    assert!(!gone.contains("HISTORY we shipped"), "a user's forget is searchable again: {gone}");
+    // ...and in the primer.
+    let start = start_payload(&fixture.project, "0199a1f2-3c4d-7e8f-9012-3456789abc77", "startup");
+    let primer = injected_context(&fixture.hook("claude-code", "SessionStart", &start)).unwrap_or_default();
+    assert!(primer.contains("Violins need humidity"), "primer lacks live knowledge: {primer}");
+    assert!(!primer.contains("zebra migration"), "the user's forget is primed again: {primer}");
+
+    // The next consolidation does not withdraw the restored duplicate again.
+    run_cleanup(&fixture, &bin);
+    assert_eq!(knowledge_titles(&fixture, 2).len(), 0, "a restored page was withdrawn again");
+
+    // Restoring again, or a run that does not exist, brings nothing.
+    let again = fixture.brain(&["restore"]);
+    assert!(String::from_utf8_lossy(&again.stdout).contains("Restored 0"));
+    let other = fixture.brain(&["restore", "--run", "01ARZ3NDEKTSV4RRFFQ69G5FAV"]);
+    assert!(!other.status.success(), "an unknown run exited 0: {other:?}");
+    assert!(String::from_utf8_lossy(&other.stderr).contains("no cleanup run 01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+}
+
+#[test]
+fn a_second_cleanup_retires_nothing() {
+    let fixture = Fixture::new("clean-twice");
+    let counter = fixture.home.parent().unwrap().join("clean-calls");
+    let bin = fixture.fake_cli("claude", &cleanup_cli(&counter));
+    seed_old_knowledge(&fixture, OLD_ENTRIES);
+    run_cleanup(&fixture, &bin);
+    let calls = || std::fs::read_to_string(&counter).unwrap_or_default().lines().count();
+    let retired = knowledge_titles(&fixture, 2);
+    let spent = calls();
+    assert!(spent >= 1);
+
+    run_cleanup(&fixture, &bin);
+    assert_eq!(knowledge_titles(&fixture, 2), retired, "a finished cleanup retired more");
+    assert_eq!(calls(), spent, "a finished cleanup called the model again");
+
+    // Without the flag it looks again, and finds every entry already labelled.
+    fixture.sql_run("DELETE FROM schema_state WHERE key = 'knowledge_cleaned'");
+    run_cleanup(&fixture, &bin);
+    assert_eq!(knowledge_titles(&fixture, 2), retired, "a repeat cleanup retired more");
+    // Only the entry whose label was refused (outside the enum) is asked again.
+    assert!(calls() <= spent + 1, "a repeat cleanup asked the model about labelled entries");
+}
+
+#[test]
+fn a_replay_rebuilds_cleanup_state() {
+    let fixture = Fixture::new("clean-replay");
+    let counter = fixture.home.parent().unwrap().join("clean-calls");
+    let bin = fixture.fake_cli("claude", &cleanup_cli(&counter));
+    seed_old_knowledge(&fixture, OLD_ENTRIES);
+    run_cleanup(&fixture, &bin);
+    let id = fixture.sql_one("SELECT id FROM events WHERE kind = 'knowledge' AND title LIKE 'CODE%'");
+    assert!(fixture.brain(&["restore"]).status.success());
+    // A second pass of the same kind: retire again is not possible, so forget one.
+    let forget = fixture.sql_one("SELECT id FROM events WHERE kind = 'knowledge' AND title LIKE 'Volcano%'");
+    assert!(fixture.brain(&["forget", &forget]).status.success());
+
+    let snapshot = |fixture: &Fixture| -> String {
+        let conn = rusqlite::Connection::open(fixture.home.join("brain.db")).unwrap();
+        let mut statement = conn
+            .prepare(
+                "SELECT id, forgotten, IFNULL(class, ''), IFNULL(expires_at, ''), IFNULL(cites, '')
+                 FROM events WHERE kind = 'knowledge' ORDER BY id",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok(format!(
+                    "{}|{}|{}|{}|{}",
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?
+                ))
+            })
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let before = snapshot(&fixture);
+    assert!(before.contains("restates_code"), "{before}");
+    assert!(before.contains(&id));
+
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(fixture.home.join(format!("brain.db{suffix}")));
+    }
+    assert!(fixture.brain(&["reindex"]).status.success(), "reindex failed");
+    assert_eq!(snapshot(&fixture), before, "a replay arrived at a different cleanup state");
+}
+
+#[test]
+fn cleanup_respects_its_call_ceiling() {
+    let fixture = Fixture::new("clean-ceiling");
+    let counter = fixture.home.parent().unwrap().join("clean-calls");
+    // The 3rd invocation fails: it is a call like any other.
+    let bin = fixture.fake_cli("claude", &cleanup_cli_failing_at(&counter, 3));
+    // Gibberish titles, and far more of them than 30 calls can label: the
+    // duplicate stage still folds some, so the margin keeps the ceiling the
+    // thing that ends the run.
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut word = || {
+        (0..7)
+            .map(|_| {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                char::from(b'a' + ((seed >> 33) % 26) as u8)
+            })
+            .collect::<String>()
+    };
+    let titles: Vec<String> = (0..2_600).map(|_| format!("{} {} {} {}", word(), word(), word(), word())).collect();
+    let entries: Vec<(&str, &str)> = titles.iter().map(|t| (t.as_str(), "2026-01-01T00:00:00Z")).collect();
+    seed_old_knowledge(&fixture, &entries);
+
+    let calls = || std::fs::read_to_string(&counter).unwrap_or_default().lines().count();
+    let rows = || -> i64 {
+        fixture.sql_one("SELECT CAST(COUNT(*) AS TEXT) FROM summarizer_calls WHERE purpose = 'clean'").parse().unwrap()
+    };
+    for _ in 0..12 {
+        run_cleanup(&fixture, &bin);
+        // The check is made before each batch, so one ladder run may end a
+        // call or two past it.
+        assert!(calls() <= 32, "the cleanup made {} model calls", calls());
+    }
+    assert!((30..=32).contains(&calls()), "the cleanup made {} model calls", calls());
+    assert_eq!(rows(), calls() as i64, "the ledger and the CLI disagree on the calls made");
+    // It ended rather than starting over, with the rest left unlabelled.
+    assert_eq!(fixture.sql_one("SELECT CAST(COUNT(*) AS TEXT) FROM schema_state WHERE key = 'knowledge_cleaned'"), "1");
+    let doctor = String::from_utf8_lossy(&fixture.brain(&["doctor"]).stdout).into_owned();
+    assert!(doctor.contains("left unlabelled"), "{doctor}");
+}

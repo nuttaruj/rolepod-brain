@@ -457,6 +457,24 @@ impl<'a> Ladder<'a> {
             return Ok((Tier::RuleBased, String::new()));
         }
 
+        // A prompt over the ceiling is the caller's bug, not a sick CLI: no rung
+        // could take it, so say so once instead of walking every one, and leave
+        // every breaker alone.
+        if prompt.len() > PROMPT_MAX_BYTES {
+            let first = self.order(preferred_cli).first().map(|spec| spec.cli).unwrap_or_default();
+            self.ledger(&crate::store::SummarizerCall {
+                session: ctx.session.to_string(),
+                purpose: ctx.purpose.to_string(),
+                cli: first.to_string(),
+                model: String::new(),
+                prompt_bytes: prompt.len() as u64,
+                answer_bytes: 0,
+                ms: 0,
+                outcome: "oversize".to_string(),
+            });
+            return Ok((Tier::RuleBased, String::new()));
+        }
+
         let mut attempts = 0usize;
         for spec in self.order(preferred_cli) {
             if attempts >= self.rungs() {
@@ -1845,6 +1863,34 @@ mod tests {
             ladder.record("gemini-cli", Err("rate limited")).unwrap();
         }
         assert!(store.summarizer_in_cooldown("gemini-cli").unwrap());
+    }
+
+    #[test]
+    fn an_oversized_prompt_stops_the_ladder_at_one_row() {
+        let store = Store::open_memory().unwrap();
+        let ladder = Ladder::new(&store, &config("auto"));
+        let ctx = CallContext { purpose: "clean", session: "p" };
+        let spawned = std::cell::Cell::new(0);
+        let (tier, text) = ladder
+            .run_with(
+                &ctx,
+                &"x".repeat(PROMPT_MAX_BYTES + 1),
+                "claude-code",
+                |_| true,
+                |_| Ok(true),
+                |_, _, _, _| {
+                    spawned.set(spawned.get() + 1);
+                    Ok("never".to_string())
+                },
+            )
+            .unwrap();
+        assert_eq!((tier, text.as_str()), (Tier::RuleBased, ""));
+        assert_eq!(spawned.get(), 0);
+        let calls = store.summarizer_calls_since(60).unwrap();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!((calls[0].purpose.as_str(), calls[0].outcome.as_str()), ("clean", "oversize"));
+        // No CLI was marked sick for the caller's mistake.
+        assert!(!store.summarizer_in_cooldown("claude-code").unwrap());
     }
 
     #[test]

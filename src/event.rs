@@ -204,6 +204,23 @@ pub struct Event {
     /// after the fact, so it is recorded now, needed or not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// What kind of knowledge this is (`durable`, `status`, `history`,
+    /// `restates_code`). Set on a Knowledge line or by a `classify` note.
+    /// Additive like `topic`: the schema version does not move.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
+    /// RFC 3339 instant after which the entry is considered stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires: Option<String>,
+    /// Paths of the files the entry cites.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cites: Vec<String>,
+    /// Where the entry applies, when narrower than the project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// Commands the entry names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<String>,
     /// Local processing state — deliberately NOT part of the sync contract.
     #[serde(default)]
     pub consolidated: bool,
@@ -240,6 +257,11 @@ impl Event {
             topic: None,
             agent: None,
             origin: None,
+            class: None,
+            expires: None,
+            cites: Vec::new(),
+            scope: None,
+            commands: Vec::new(),
             consolidated: false,
             extra: serde_json::Map::new(),
         }
@@ -253,7 +275,7 @@ impl Event {
     pub fn is_revision(&self) -> bool {
         matches!(self.kind, EventKind::Tombstone | EventKind::Retire)
             || (self.kind == EventKind::Note
-                && matches!(self.source.hook.as_str(), "correct" | "feedback" | "supersede"))
+                && matches!(self.source.hook.as_str(), "correct" | "feedback" | "supersede" | "classify" | "restore"))
     }
 
     /// Month bucket this event belongs to, from its own timestamp.
@@ -455,6 +477,38 @@ mod tests {
             "fix the login bug",
         ] {
             assert!(!carries_memory_intent(no), "a question read as an order: {no}");
+        }
+    }
+
+    #[test]
+    fn serde_round_trip_reads_old_lines_and_keeps_unknown_fields_in_extra() {
+        let mut event = sample();
+        event.class = Some("durable".into());
+        event.cites = vec!["a".into()];
+        let line = serde_json::to_string(&event).unwrap();
+        let back: Event = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.class.as_deref(), Some("durable"));
+        assert_eq!(back.cites, vec!["a".to_string()]);
+
+        // A line from before the fields existed reads with them empty.
+        let mut plain = serde_json::to_value(sample()).unwrap();
+        let object = plain.as_object_mut().unwrap();
+        for key in ["class", "expires", "cites", "scope", "commands"] {
+            assert!(!object.contains_key(key), "{key} serialised while empty");
+        }
+        object.insert("reason".into(), serde_json::json!("stale"));
+        let old: Event = serde_json::from_value(plain).unwrap();
+        assert!(old.class.is_none() && old.cites.is_empty());
+        assert_eq!(old.extra.get("reason").and_then(|v| v.as_str()), Some("stale"));
+    }
+
+    #[test]
+    fn a_classify_or_restore_note_is_a_revision() {
+        for hook in ["classify", "restore"] {
+            let mut note = sample();
+            note.kind = EventKind::Note;
+            note.source.hook = hook.to_string();
+            assert!(note.is_revision(), "{hook} replays too early");
         }
     }
 

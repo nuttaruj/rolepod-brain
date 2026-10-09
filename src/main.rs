@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+mod clean;
 mod config;
 mod consolidate;
 mod doctor;
@@ -125,6 +126,15 @@ enum Commands {
     /// Runs by itself; this runs it now. It waits for a quiet minute and for
     /// room on the disk for a second copy of the index.
     Compact,
+    /// Bring back the knowledge a cleanup run retired.
+    ///
+    /// Runs by itself nowhere; this is the override. Only entries the cleanup
+    /// still holds retired come back, never one you forgot yourself.
+    Restore {
+        /// The run to undo. Defaults to the cleanup `brain doctor` shows.
+        #[arg(long)]
+        run: Option<String>,
+    },
     /// Read a markdown or text document into this project's memory.
     Ingest {
         /// The file to read. Markdown or plain text; it is copied unchanged
@@ -414,6 +424,7 @@ fn run(command: Commands) -> Result<()> {
         Commands::Uninstall { apply, wipe } => uninstall(apply, wipe),
         Commands::Reindex => reindex(),
         Commands::Compact => compact(),
+        Commands::Restore { run } => restore(run.as_deref()),
         Commands::Ingest { file, force } => {
             let done = ingest::run(&file, force)?;
             if done.unchanged {
@@ -644,6 +655,24 @@ fn compact() -> Result<()> {
     if report.caught > 0 {
         println!("Indexed {} event(s) the log held and the index lacked.", report.caught);
     }
+    Ok(())
+}
+
+/// Undo one knowledge cleanup run, under the run lock like `compact`: a
+/// consolidation that is working must not meet a half-restored run.
+fn restore(run: Option<&str>) -> Result<()> {
+    let paths = Paths::resolve()?;
+    anyhow::ensure!(paths.db().is_file(), "no index at {} to restore into", paths.db().display());
+    let Some(lock) = consolidate::RunLock::take(&consolidate::run_lock_path(&paths))? else {
+        anyhow::bail!("a consolidation run is working; try restore again when it is done");
+    };
+    let store = Store::open(&paths.db())?;
+    // So a retirement a hook missed indexing is seen as one.
+    let _ = consolidate::catch_up_all(&paths, &store, &lock);
+    let result = clean::restore(&paths, &store, run, Some(&lock));
+    drop(lock);
+    let (run, restored) = result?;
+    println!("Restored {restored} knowledge page(s) from cleanup run {run}.");
     Ok(())
 }
 

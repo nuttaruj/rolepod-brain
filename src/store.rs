@@ -199,7 +199,7 @@ const RELATED_SQL: &str = "WITH seed_sessions AS (
                JOIN shared s ON s.session = e.session
                WHERE e.project = ?2 AND e.id != ?1
                      AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
-                     AND e.hook NOT IN ('correct', 'feedback', 'supersede')
+                     AND e.hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')
                ORDER BY s.shared DESC, demoted, authority, e.id DESC
                LIMIT ?3) c
          JOIN events h ON h.id = c.id
@@ -212,7 +212,7 @@ const NEAREST_SQL: &str = "SELECT v.event_id, v.vec, e.confidence
          FROM event_vec v
          JOIN events e ON e.id = v.event_id
          WHERE e.project = ?1 AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
-               AND e.hook NOT IN ('correct', 'feedback', 'supersede')
+               AND e.hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')
                AND (?2 IS NULL OR e.topic = ?2)";
 
 /// The keyword stream of [`Store::search_traced`].
@@ -240,7 +240,7 @@ const KEYWORD_SQL: &str = "WITH matched AS (
          JOIN events e ON e.rowid = events_fts.rowid
          WHERE events_fts MATCH ?1 AND e.project = ?2 AND e.forgotten = 0
                AND e.kind NOT IN ('tombstone', 'retire')
-               AND e.hook NOT IN ('correct', 'feedback', 'supersede')
+               AND e.hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')
                AND (?5 IS NULL OR e.topic = ?5)
      ),
      pool AS (
@@ -1336,6 +1336,10 @@ impl Store {
                 ("events", "team", "INTEGER NOT NULL DEFAULT 0"),
                 ("events", "agent", "TEXT"),
                 ("events", "clamped", "INTEGER NOT NULL DEFAULT 0"),
+                ("events", "class", "TEXT"),
+                ("events", "expires_at", "TEXT"),
+                ("events", "stale_since", "TEXT"),
+                ("events", "cites", "TEXT"),
                 ("summarizer_health", "last_failed_at", "TEXT"),
                 ("session_state", "claimed_at", "TEXT"),
                 ("session_state", "attempts", "INTEGER NOT NULL DEFAULT 0"),
@@ -1427,8 +1431,10 @@ impl Store {
             .execute(
                 "INSERT INTO events
                     (id, ts, workspace, project, session, cli, hook, kind, title, body,
-                     files, topic, invocation, confidence, consolidated, agent, clamped)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                     files, topic, invocation, confidence, consolidated, agent, clamped,
+                     class, expires_at, cites)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                         ?18, ?19, ?20)
                  ON CONFLICT(id) DO UPDATE SET
                      title = excluded.title,
                      body = excluded.body,
@@ -1437,7 +1443,10 @@ impl Store {
                      topic = excluded.topic,
                      invocation = excluded.invocation,
                      consolidated = excluded.consolidated,
-                     agent = excluded.agent",
+                     agent = excluded.agent,
+                     class = COALESCE(excluded.class, class),
+                     expires_at = COALESCE(excluded.expires_at, expires_at),
+                     cites = COALESCE(excluded.cites, cites)",
                 params![
                     event.id,
                     event.ts,
@@ -1456,6 +1465,9 @@ impl Store {
                     i32::from(event.consolidated),
                     event.agent.as_deref(),
                     i32::from(clamped),
+                    event.class.as_deref(),
+                    event.expires.as_deref(),
+                    cites_json(&event.cites),
                 ],
             )
             .context("index event")?;
@@ -1480,13 +1492,47 @@ impl Store {
                 }
             }
             EventKind::Tombstone => {
+                // `forgotten` is 0 live, 1 forgotten by the user, 2 retired by
+                // a cleanup. A cleanup never lowers a user's forget.
+                let sql = if event.source.hook == "clean" {
+                    "UPDATE events SET forgotten = CASE WHEN forgotten = 1 THEN 1 ELSE 2 END
+                     WHERE id = ?1"
+                } else {
+                    "UPDATE events SET forgotten = 1 WHERE id = ?1"
+                };
+                for target in &event.links {
+                    self.conn.execute(sql, params![target]).context("apply tombstone")?;
+                }
+            }
+            // Restore undoes a cleanup and nothing else.
+            EventKind::Note if event.source.hook == "restore" => {
                 for target in &event.links {
                     self.conn
                         .execute(
-                            "UPDATE events SET forgotten = 1 WHERE id = ?1",
+                            "UPDATE events SET forgotten = 0 WHERE id = ?1 AND forgotten = 2",
                             params![target],
                         )
-                        .context("apply tombstone")?;
+                        .context("apply restore")?;
+                    // Remembered so the duplicate fold leaves a restored page
+                    // alone; written on replay too, since replay indexes this note.
+                    self.set_state(&format!("restored:{target}"), &event.id)?;
+                }
+            }
+            // The latest label in log order wins.
+            EventKind::Note if event.source.hook == "classify" => {
+                for target in &event.links {
+                    self.conn
+                        .execute(
+                            "UPDATE events SET class = ?2, expires_at = ?3, cites = ?4
+                             WHERE id = ?1",
+                            params![
+                                target,
+                                event.class.as_deref(),
+                                event.expires.as_deref(),
+                                cites_json(&event.cites)
+                            ],
+                        )
+                        .context("apply classification")?;
                 }
             }
             // A human saying "this is stale" is a judgement the log has to
@@ -2103,7 +2149,7 @@ impl Store {
                  FROM events_tri
                  JOIN events e ON e.rowid = events_tri.rowid
                  WHERE events_tri MATCH ?1 AND e.project = ?2 AND e.forgotten = 0
-                       AND e.kind NOT IN ('tombstone', 'retire') AND e.hook NOT IN ('correct', 'feedback', 'supersede')
+                       AND e.kind NOT IN ('tombstone', 'retire') AND e.hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')
                        AND (?4 IS NULL OR e.topic = ?4)
                  ORDER BY CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END, rank
                  LIMIT ?3",
@@ -2168,7 +2214,7 @@ impl Store {
                  FROM events e
                  JOIN matched m ON m.session = e.session
                  WHERE e.project = ?1 AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
-                       AND e.hook NOT IN ('correct', 'feedback', 'supersede')
+                       AND e.hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')
                        AND (?2 IS NULL OR e.topic = ?2)
              )
              SELECT h.id, h.ts, h.cli, h.kind, h.title,
@@ -2290,7 +2336,7 @@ impl Store {
                    JOIN shared s ON s.session = e.session
                    WHERE e.project = ?1
                          AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
-                         AND e.hook NOT IN ('correct', 'feedback', 'supersede')
+                         AND e.hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')
                          AND (?2 IS NULL OR e.topic = ?2)
                    ORDER BY s.shared DESC, demoted, authority, e.id DESC
                    LIMIT ?3) c
@@ -2372,7 +2418,7 @@ impl Store {
     /// # Errors
     /// Returns an error when a query fails.
     pub fn outline(&self, project: &str, limit: usize) -> Result<Outline> {
-        let live = "forgotten = 0 AND kind NOT IN ('tombstone', 'retire') AND hook NOT IN ('correct', 'feedback', 'supersede')";
+        let live = "forgotten = 0 AND kind NOT IN ('tombstone', 'retire') AND hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')";
         let count = |extra: &str| -> Result<i64> {
             self.conn
                 .query_row(
@@ -2436,7 +2482,7 @@ impl Store {
                 "SELECT id, ts, cli, kind, title, substr(COALESCE(body, ''), 1, 160), session
                  FROM events
                  WHERE id = ?1 AND forgotten = 0 AND kind NOT IN ('tombstone', 'retire')
-                       AND hook NOT IN ('correct', 'feedback', 'supersede')",
+                       AND hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')",
             )
             .context("prepare hits by id")?;
         for id in ids {
@@ -2715,6 +2761,11 @@ impl Store {
                         topic: row.get(11)?,
                         agent: row.get(13)?,
                         origin: None,
+                        class: None,
+                        expires: None,
+                        cites: Vec::new(),
+                        scope: None,
+                        commands: Vec::new(),
                         consolidated: row.get::<_, i32>(12)? != 0,
                         extra: serde_json::Map::new(),
                     })
@@ -2820,7 +2871,7 @@ impl Store {
         "SELECT id, ts, cli, kind, title, session FROM events
          WHERE id IN (SELECT id FROM events
                       WHERE project = ?1 AND forgotten = 0 AND kind NOT IN ('tombstone', 'retire')
-                            AND hook NOT IN ('correct', 'feedback', 'supersede')
+                            AND hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')
                             AND (?4 IS NULL OR kind = ?4)
                             AND (?5 IS NULL OR session = ?5))
                AND (?3 IS NULL OR cli = ?3)
@@ -3414,6 +3465,235 @@ impl Store {
         Ok(rows.filter_map(std::result::Result::ok).collect())
     }
 
+    /// The next live, own, unlabelled knowledge of a project after `after`, by
+    /// id: what the one-time cleanup classifies. A labelled entry has a
+    /// `class`, so a labelled one is never offered twice.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn unlabelled_knowledge(&self, project: &str, after: &str, limit: usize) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM events
+             WHERE project = ?1 AND kind = 'knowledge' AND forgotten = 0 AND team = 0
+                   AND class IS NULL AND id > ?2
+             ORDER BY id LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![project, after, limit as i64], |row| row.get(0))?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// How many live, own knowledge entries of a project have no label.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn unlabelled_knowledge_count(&self, project: &str) -> Result<usize> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE project = ?1 AND kind = 'knowledge' AND forgotten = 0 AND team = 0
+                       AND class IS NULL",
+                params![project],
+                |row| row.get(0),
+            )
+            .context("count unlabelled knowledge")?;
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
+    /// For each id, how many sessions opened it in full.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn opened_counts(&self, ids: &[String]) -> Result<std::collections::HashMap<String, i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT COUNT(*) FROM recalled WHERE event_id = ?1 AND opened = 1")
+            .context("prepare opened counts")?;
+        let mut out = std::collections::HashMap::new();
+        for id in ids {
+            let count: i64 = stmt.query_row(params![id], |row| row.get(0)).context("count opened")?;
+            out.insert(id.clone(), count);
+        }
+        Ok(out)
+    }
+
+    /// Which of these ids a `brain restore` brought back; a fold never
+    /// withdraws them again.
+    ///
+    /// # Errors
+    /// Returns an error when a read fails.
+    pub fn restored_among(&self, ids: &[String]) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for id in ids {
+            if self.state(&format!("restored:{id}"))?.is_some() {
+                out.push(id.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Is this entry retired by a cleanup right now (`forgotten = 2`)? False for
+    /// a live one, one the user forgot, and an unknown id.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn event_cleaned(&self, id: &str) -> Result<bool> {
+        let found: Option<i64> = self
+            .conn
+            .query_row("SELECT 1 FROM events WHERE id = ?1 AND forgotten = 2", params![id], |row| row.get(0))
+            .optional()
+            .context("check cleaned")?;
+        Ok(found.is_some())
+    }
+
+    /// The batch the stale pass reads: one project's events after a cursor,
+    /// oldest first, past a `(ts, rowid)` cursor so events sharing a timestamp
+    /// are never split by a batch boundary. No `kind` filter on purpose, so the
+    /// planner keeps `events_project_ts` and the cursor can advance to the last
+    /// row scanned.
+    fn stale_scan_sql() -> &'static str {
+        "SELECT id, ts, kind, title, rowid FROM events
+         WHERE project = ?1 AND ts >= ?2 AND (ts > ?2 OR rowid > ?3)
+         ORDER BY ts, rowid
+         LIMIT ?4"
+    }
+
+    /// Mark live knowledge whose cited file was edited after it was written.
+    ///
+    /// Reads at most `limit` events after this project's `stale_scan_at:`
+    /// cursor, in ts order, and moves the cursor to the last one scanned: a
+    /// large store is worked off over several rounds instead of one long scan.
+    /// A write-tool observation on a path in a lesson's `cites`, later than
+    /// the lesson, sets `stale_since` to that edit's ts. Teammates' entries
+    /// are left alone, like every other rewrite of knowledge. Returns how many
+    /// lessons became stale.
+    ///
+    /// `stale_since` is local state, never written from the log, so `clear`
+    /// drops the cursor with the rows and a rebuild scans again.
+    ///
+    /// # Errors
+    /// Returns an error when a read or write fails.
+    pub fn mark_stale_knowledge(&self, project: &str, limit: usize) -> Result<usize> {
+        let key = format!("stale_scan_at:{project}");
+        // `<ts>|<rowid>`; an older cursor holds the ts alone, which starts at the
+        // first row of that instant (a row seen twice only re-checks a mark).
+        let saved = self.state(&key)?.unwrap_or_default();
+        let (cursor_ts, cursor_row) = match saved.rsplit_once('|') {
+            Some((ts, row)) => (ts.to_string(), row.parse::<i64>().unwrap_or(0)),
+            None => (saved, 0),
+        };
+        let mut stmt = self.conn.prepare(Self::stale_scan_sql()).context("prepare stale scan")?;
+        let mut rows: Vec<(String, String, String, String, i64)> = stmt
+            .query_map(params![project, cursor_ts, cursor_row, limit as i64], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+            })
+            .context("run stale scan")?
+            .collect::<rusqlite::Result<_>>()
+            .context("read stale scan")?;
+        let Some(last) = rows.last().map(|row| format!("{}|{}", row.1, row.4)) else { return Ok(0) };
+        let scanned: Vec<(String, String, String, String)> =
+            rows.drain(..).map(|(id, ts, kind, title, _)| (id, ts, kind, title)).collect();
+
+        let edits: Vec<&(String, String, String, String)> = scanned
+            .iter()
+            .filter(|(_, _, kind, title)| kind == "observation" && is_write_title(title))
+            .collect();
+        let mut hit: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+        if !edits.is_empty() {
+            let mut cited: std::collections::HashMap<String, Vec<(String, String)>> =
+                std::collections::HashMap::new();
+            let mut lessons = self
+                .conn
+                .prepare(
+                    "SELECT id, ts, cites FROM events
+                     WHERE kind = 'knowledge' AND project = ?1 AND forgotten = 0 AND team = 0
+                           AND stale_since IS NULL AND cites IS NOT NULL",
+                )
+                .context("prepare cited lessons")?;
+            let rows = lessons
+                .query_map([project], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                })
+                .context("run cited lessons")?;
+            for (id, ts, cites) in rows.filter_map(std::result::Result::ok) {
+                let paths: Vec<String> = serde_json::from_str(&cites).unwrap_or_default();
+                for path in paths {
+                    cited.entry(path).or_default().push((id.clone(), ts.clone()));
+                }
+            }
+            if !cited.is_empty() {
+                let mut files = self
+                    .conn
+                    .prepare("SELECT path FROM event_files WHERE event_id = ?1")
+                    .context("prepare edit files")?;
+                for (id, ts, _, _) in edits {
+                    let paths: Vec<String> = files
+                        .query_map([id], |row| row.get(0))
+                        .context("run edit files")?
+                        .filter_map(std::result::Result::ok)
+                        .collect();
+                    for path in paths {
+                        for (lesson, written) in cited.get(&path).into_iter().flatten() {
+                            if written < ts {
+                                hit.entry(lesson.clone()).or_insert_with(|| ts.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (id, edited) in &hit {
+            self.conn
+                .execute(
+                    "UPDATE events SET stale_since = ?2 WHERE id = ?1 AND stale_since IS NULL",
+                    params![id, edited],
+                )
+                .context("mark stale")?;
+        }
+        self.set_state(&key, &last)?;
+        Ok(hit.len())
+    }
+
+    /// Live knowledge of a project that a file edit has made doubtful, oldest
+    /// doubt first, with the files each one cites. The RECHECK section. A page
+    /// a human corrected is left out: the model never judges a person's fix.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn stale_knowledge(&self, project: &str, limit: usize) -> Result<Vec<StaleEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, body, cites FROM events
+             WHERE kind = 'knowledge' AND project = ?1 AND forgotten = 0 AND team = 0
+                   AND stale_since IS NOT NULL
+                   AND NOT EXISTS (SELECT 1 FROM events c WHERE c.id = events.corrected_by
+                                   AND (c.hook = 'correct' OR c.cli = 'human'))
+             ORDER BY stale_since, id
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![project, limit as i64], |row| {
+            let cites: Option<String> = row.get(3)?;
+            Ok(StaleEntry {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                body: row.get(2)?,
+                cites: cites.and_then(|raw| serde_json::from_str(&raw).ok()).unwrap_or_default(),
+            })
+        })?;
+        Ok(rows.filter_map(std::result::Result::ok).collect())
+    }
+
+    /// Believe a lesson again: a `keep` verdict, or a correction just landed.
+    /// The next edit of a cited file marks it stale afresh.
+    ///
+    /// # Errors
+    /// Returns an error when the write fails.
+    pub fn clear_stale(&self, id: &str) -> Result<()> {
+        self.conn
+            .execute("UPDATE events SET stale_since = NULL WHERE id = ?1", params![id])
+            .context("clear stale")?;
+        Ok(())
+    }
+
     /// Recent session summaries for a project, newest first.
     ///
     /// The raw material for durable knowledge: what each session concluded,
@@ -3948,7 +4228,7 @@ impl Store {
                  JOIN entities n ON n.session = e.session AND n.project = e.project
                  WHERE e.project = ?1 AND n.name = ?2 AND e.forgotten = 0
                        AND e.kind NOT IN ('tombstone', 'retire')
-                             AND e.hook NOT IN ('correct', 'feedback', 'supersede')
+                             AND e.hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')
                  ORDER BY CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END, e.id DESC
                  LIMIT ?3",
             )
@@ -4002,6 +4282,25 @@ impl Store {
             )
             .optional()
             .context("check event")?;
+        Ok(found.is_some())
+    }
+
+    /// Can the user still forget this entry? True for live (0) and
+    /// cleaned-up (2) rows; false for one the user already forgot or an
+    /// unknown id.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub fn event_forgettable(&self, id: &str) -> Result<bool> {
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM events WHERE id = ?1 AND forgotten IN (0, 2)",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("check forgettable")?;
         Ok(found.is_some())
     }
 
@@ -4097,6 +4396,23 @@ impl Store {
             )
             .context("record summarizer call")?;
         Ok(())
+    }
+
+    /// Ledger rows of one purpose written at or after `since` (an RFC 3339
+    /// string; empty counts them all): model invocations, not batches.
+    ///
+    /// # Errors
+    /// Returns an error when the read fails.
+    pub fn summarizer_rows_for(&self, purpose: &str, since: &str) -> Result<usize> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM summarizer_calls WHERE purpose = ?1 AND ts >= ?2",
+                params![purpose, since],
+                |row| row.get(0),
+            )
+            .context("count summarizer rows")?;
+        Ok(usize::try_from(count).unwrap_or(0))
     }
 
     /// Summarizer calls made in the last `secs` seconds, oldest first.
@@ -4718,7 +5034,7 @@ impl Store {
         "SELECT session, MIN(cli), COUNT(*), MAX(id), MAX(ts) FROM events
          WHERE project = ?1 AND consolidated = 0 AND forgotten = 0
                AND +kind = 'observation'
-               AND hook NOT IN ('correct', 'feedback', 'supersede')
+               AND hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')
                AND (topic IS NOT NULL
                     OR files != '[]'
                     OR hook IN ('user_prompt_submit', 'before_submit_prompt', 'before_agent')
@@ -5112,6 +5428,10 @@ impl Store {
                  WHEN 'page_update' THEN 3
                  ELSE 4
              END,
+             -- A lesson the clean pass marked stale reads out after the rest
+             -- of its layer, decayed ones included.
+             CASE WHEN {prefix}kind = 'knowledge' AND {prefix}stale_since IS NOT NULL
+                  THEN 1 ELSE 0 END,
              -- Knowledge offered this many times and never once found or
              -- opened sinks behind the rest of its layer; one pull brings it
              -- back. Far slower than the pointer decay below: the line is
@@ -5233,11 +5553,13 @@ impl Store {
             // that only disappears from search has not been withdrawn.
             "SELECT id, ts, kind, title, topic FROM events
              WHERE project = ?1 AND forgotten = 0 AND kind NOT IN ('tombstone', 'retire')
-                   AND hook NOT IN ('correct', 'feedback', 'supersede')
+                   AND hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')
+                   AND (expires_at IS NULL OR expires_at > '{now}')
                    {kind}
              ORDER BY {}, id DESC
              LIMIT ?2",
-            Self::rank("")
+            Self::rank(""),
+            now = jiff::Timestamp::now()
         )
     }
 
@@ -5412,12 +5734,14 @@ impl Store {
              JOIN events e ON e.id = f.event_id
              WHERE f.project = ?1 AND f.path = ?2 AND e.forgotten = 0
                    AND e.kind NOT IN ('tombstone', 'retire')
-                         AND e.hook NOT IN ('correct', 'feedback', 'supersede')
+                         AND e.hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')
+                   AND (e.expires_at IS NULL OR e.expires_at > '{now}')
                    AND NOT (e.kind = 'observation'
                             AND (e.title LIKE 'Read:%' OR e.title LIKE 'Grep:%' OR e.title LIKE 'Glob:%'))
              ORDER BY {}, e.id DESC
              LIMIT ?3",
-            Self::rank("e.")
+            Self::rank("e."),
+            now = jiff::Timestamp::now()
         );
         let mut stmt = self.conn.prepare(&sql).context("prepare file pointers")?;
         let rows = stmt
@@ -5483,18 +5807,22 @@ impl Store {
         let query: String = query.chars().take(PROMPT_QUERY_CHARS).collect();
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare(&format!(
                 // Confidence below zero is a flagged entry: never pushed.
+                // A status past its expiry is never pushed either, though
+                // search still finds it.
                 "SELECT e.id, e.ts, e.kind, e.title, e.topic
                  FROM events_fts
                  JOIN events e ON e.rowid = events_fts.rowid
                  WHERE events_fts MATCH ?1 AND e.project = ?2 AND e.forgotten = 0
                        AND e.kind IN ('knowledge', 'session_summary', 'note')
-                       AND e.hook NOT IN ('correct', 'feedback', 'supersede')
+                       AND e.hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')
                        AND COALESCE(e.confidence, 0) >= 0
+                       AND (e.expires_at IS NULL OR e.expires_at > '{now}')
                  ORDER BY rank
                  LIMIT ?3",
-            )
+                now = jiff::Timestamp::now()
+            ))
             .context("prepare prompt pointers")?;
         let mut read = |fts: &str| -> rusqlite::Result<Vec<Pointer>> {
             stmt.query_map(params![fts, project, limit as i64], Self::pointer_row)?.collect()
@@ -5532,7 +5860,7 @@ impl Store {
             .prepare(
                 "SELECT id, ts, cli, kind, title, session FROM events
                  WHERE project = ?1 AND ts >= ?2 AND forgotten = 0 AND kind NOT IN ('tombstone', 'retire')
-                       AND hook NOT IN ('correct', 'feedback', 'supersede')
+                       AND hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')
                  ORDER BY id
                  LIMIT ?3",
             )
@@ -5887,7 +6215,8 @@ impl Store {
             .execute_batch(
                 "DELETE FROM event_files; DELETE FROM events;
                  DELETE FROM schema_state WHERE key LIKE 'log_tail:%' OR key LIKE 'retention\\_%' ESCAPE '\\'
-                    OR key LIKE 'compact\\_%' ESCAPE '\\';",
+                    OR key LIKE 'compact\\_%' ESCAPE '\\'
+                    OR key LIKE 'stale\\_scan\\_at:%' ESCAPE '\\';",
             )
             .context("clear index")?;
         Ok(())
@@ -5989,6 +6318,45 @@ pub(crate) enum Kinds<'a> {
     /// The kinds that earn a primer line of their own: everything but
     /// observations (and the bookkeeping kinds no read shows).
     Pushed,
+}
+
+/// A lesson a file edit has made doubtful, as the RECHECK section shows it.
+#[derive(Debug, Clone)]
+pub struct StaleEntry {
+    pub id: String,
+    pub title: String,
+    pub body: String,
+    pub cites: Vec<String>,
+}
+
+/// Tools that change a file, in every spelling a host gives them. `title_for`
+/// in `hook.rs` titles a call `"<Tool>: <path>"` for any tool with a path, so
+/// reads, greps and globs share the shape: only these names count as an edit.
+const WRITE_TOOLS: &[&str] = &[
+    "edit",
+    "write",
+    "multiedit",
+    "notebookedit",
+    "write_file",
+    "edit_file",
+    "create_file",
+    "replace",
+    "str_replace",
+    "str_replace_editor",
+    "str_replace_based_edit_tool",
+    "apply_patch",
+    "patch",
+    "search_replace",
+    "write_to_file",
+    "replace_file_content",
+    "multi_replace_file_content",
+];
+
+/// Is this observation title a write-tool call on a path?
+fn is_write_title(title: &str) -> bool {
+    title
+        .split_once(": ")
+        .is_some_and(|(tool, _)| WRITE_TOOLS.iter().any(|name| tool.eq_ignore_ascii_case(name)))
 }
 
 #[derive(Debug, Clone)]
@@ -6099,6 +6467,11 @@ const INDEX_LEAF_CEILINGS: [usize; 3] = [2048, 1024, 512];
 /// parseable and the result keeps its tail; anything else, or a body whose
 /// structure alone is too big, is cut head and tail. Deterministic, so a
 /// reindex reproduces the same row.
+/// The `cites` column: a JSON array, NULL when the list is empty.
+fn cites_json(cites: &[String]) -> Option<String> {
+    (!cites.is_empty()).then(|| serde_json::to_string(cites).unwrap_or_else(|_| "[]".to_string()))
+}
+
 fn clamp_for_index(event: &Event) -> (String, bool) {
     if event.kind != EventKind::Observation || event.body.len() <= INDEX_BODY_MAX {
         return (event.body.clone(), false);
@@ -6890,7 +7263,7 @@ mod tests {
                  FROM events e
                  JOIN matched m ON m.session = e.session
                  WHERE e.project = ?1 AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
-                       AND e.hook NOT IN ('correct', 'feedback', 'supersede')
+                       AND e.hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')
                        AND (?2 IS NULL OR e.topic = ?2)
              )
              SELECT id, ts, cli, kind, title, snip, session FROM candidates
@@ -6996,7 +7369,7 @@ mod tests {
          JOIN shared s ON s.session = e.session
          WHERE e.project = ?1
                AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
-               AND e.hook NOT IN ('correct', 'feedback', 'supersede')
+               AND e.hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')
                AND (?2 IS NULL OR e.topic = ?2)
          ORDER BY s.shared DESC,
                   CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END,
@@ -7047,7 +7420,7 @@ mod tests {
              JOIN events e ON e.rowid = events_fts.rowid
              WHERE events_fts MATCH ?1 AND e.project = ?2 AND e.forgotten = 0
                    AND e.kind NOT IN ('tombstone', 'retire')
-                   AND e.hook NOT IN ('correct', 'feedback', 'supersede')
+                   AND e.hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')
                    AND (?5 IS NULL OR e.topic = ?5)
          )
          SELECT id, ts, cli, kind, title, snip, session FROM (
@@ -8484,7 +8857,7 @@ mod tests {
          WHERE n.name IN (SELECT name FROM subject)
                AND e.project = ?2 AND e.id != ?1
                AND e.forgotten = 0 AND e.kind NOT IN ('tombstone', 'retire')
-               AND e.hook NOT IN ('correct', 'feedback', 'supersede')
+               AND e.hook NOT IN ('correct', 'feedback', 'supersede', 'classify', 'restore')
          GROUP BY e.id
          ORDER BY shared DESC,
                   CASE WHEN e.confidence < 0 THEN 1 ELSE 0 END,
@@ -9811,5 +10184,349 @@ mod tests {
             .map(|hit| hit.title)
             .collect();
         assert!(recalled.contains(&"theirs".to_string()), "a teammate's lesson is not recallable: {recalled:?}");
+    }
+
+    // --- cleanup contract: class / cites / clean / restore ---
+
+    fn knowledge_entry(project: Uuid) -> Event {
+        let mut entry = Event::new(
+            Uuid::nil(),
+            project,
+            Uuid::nil(),
+            Source { cli: "claude-code".into(), hook: "consolidate".into() },
+            EventKind::Knowledge,
+            "Deploys run on Fridays only".into(),
+            String::new(),
+        );
+        entry.consolidated = true;
+        entry
+    }
+
+    #[test]
+    fn an_expired_status_is_not_pushed_but_is_found() {
+        let project = Uuid::from_u128(30);
+        let store = Store::open_memory().unwrap();
+        let mut gone = knowledge_entry(project);
+        gone.id = "01EXPIRED00000000000000000".into();
+        gone.title = "Zebra status deploy is frozen".into();
+        gone.files = vec!["src/frozen.rs".into()];
+        gone.expires = Some("2020-01-01T00:00:00Z".into());
+        let mut live = knowledge_entry(project);
+        live.id = "01LIVE0000000000000000000".into();
+        live.title = "Zebra status deploy is open".into();
+        live.files = vec!["src/frozen.rs".into()];
+        live.expires = Some("2999-01-01T00:00:00Z".into());
+        store.index(&gone).unwrap();
+        store.index(&live).unwrap();
+        let p = project.to_string();
+
+        let ids = |pointers: Vec<Pointer>| pointers.into_iter().map(|x| x.id).collect::<Vec<_>>();
+        for pointers in [
+            store.primer_pointers(&p, 10).unwrap(),
+            store.pointers_of_kind(&p, "knowledge", 10).unwrap(),
+            store.pointers_for_file(&p, "src/frozen.rs", 10).unwrap(),
+            store.prompt_pointers(&p, "zebra status", 10).unwrap(),
+        ] {
+            assert_eq!(ids(pointers), vec![live.id.clone()]);
+        }
+        let hits = store.search(&p, "zebra", None, 10, Recall::Lexical).unwrap();
+        assert!(hits.iter().any(|h| h.id == gone.id), "search must still find it");
+    }
+
+    #[test]
+    fn a_stale_lesson_reads_out_last() {
+        let project = Uuid::from_u128(31);
+        let store = Store::open_memory().unwrap();
+        let mut ids = Vec::new();
+        for (i, name) in ["stale", "decayed", "fresh"].into_iter().enumerate() {
+            let mut e = knowledge_entry(project);
+            e.id = format!("01KNW{i:021}");
+            e.title = format!("{name} lesson");
+            store.index(&e).unwrap();
+            ids.push(e.id);
+        }
+        store.conn.execute("UPDATE events SET stale_since = '2026-10-01T00:00:00Z' WHERE id = ?1", params![ids[0]]).unwrap();
+        store.conn.execute("UPDATE events SET injected_count = 99, read_count = 0 WHERE id = ?1", params![ids[1]]).unwrap();
+        let got: Vec<String> =
+            store.pointers_of_kind(&project.to_string(), "knowledge", 10).unwrap().into_iter().map(|x| x.id).collect();
+        assert_eq!(got, vec![ids[2].clone(), ids[1].clone(), ids[0].clone()]);
+    }
+
+    fn about(target: &Event, kind: EventKind, hook: &str) -> Event {
+        let mut e = Event::new(
+            Uuid::nil(),
+            target.project,
+            Uuid::nil(),
+            Source { cli: "brain".into(), hook: hook.into() },
+            kind,
+            "note".into(),
+            String::new(),
+        );
+        e.links = vec![target.id.clone()];
+        e
+    }
+
+    /// Append to a real log, read it back in replay order, index into a fresh store.
+    fn replayed(events: &[Event]) -> Store {
+        let dir = std::env::temp_dir().join(format!("brain-p2t2-{}", ulid::Ulid::new()));
+        let log = crate::event::EventLog::open(&dir).unwrap();
+        for e in events {
+            log.append(e).unwrap();
+        }
+        let (read, skipped) = log.read_all().unwrap();
+        assert_eq!(skipped, 0);
+        let store = Store::open_memory().unwrap();
+        for e in &read {
+            store.index(e).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        store
+    }
+
+    fn forgotten_of(store: &Store, id: &str) -> i64 {
+        store
+            .conn
+            .query_row("SELECT forgotten FROM events WHERE id = ?1", params![id], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn clean_hides_and_restore_returns() {
+        let target = knowledge_entry(Uuid::from_u128(1));
+        // Same-millisecond ULIDs sort randomly; pin the log order.
+        let mut clean = about(&target, EventKind::Tombstone, "clean");
+        clean.id = "01ZZZZZZZZZZZZZZZZZZZZZZ01".into();
+        let mut restore = about(&target, EventKind::Note, "restore");
+        restore.id = "01ZZZZZZZZZZZZZZZZZZZZZZ02".into();
+        let hidden = replayed(&[target.clone(), clean.clone()]);
+        assert_eq!(forgotten_of(&hidden, &target.id), 2);
+        assert!(!hidden.event_exists(&target.id).unwrap());
+        let back = replayed(&[target.clone(), clean, restore]);
+        assert_eq!(forgotten_of(&back, &target.id), 0);
+        assert!(back.event_exists(&target.id).unwrap());
+    }
+
+    #[test]
+    fn a_user_forget_is_never_restored() {
+        let base = knowledge_entry(Uuid::from_u128(2));
+        let clean = about(&base, EventKind::Tombstone, "clean");
+        let forget = about(&base, EventKind::Tombstone, "forget");
+        let restore = about(&base, EventKind::Note, "restore");
+        // Each ordering is real log order; replay then moves the revisions
+        // after the target and keeps id order among them.
+        for (name, order) in [
+            ("forget, clean, restore", vec![forget.clone(), clean.clone(), restore.clone()]),
+            ("clean, forget, restore", vec![clean.clone(), forget.clone(), restore.clone()]),
+            ("forget, restore", vec![forget.clone(), restore.clone()]),
+        ] {
+            // Ids are ULIDs minted in test order; give them the log order.
+            let mut events = vec![base.clone()];
+            for (i, mut e) in order.into_iter().enumerate() {
+                e.id = format!("01ZZZZZZZZZZZZZZZZZZZZZZ{i:02}");
+                events.push(e);
+            }
+            let store = replayed(&events);
+            assert_eq!(forgotten_of(&store, &base.id), 1, "{name} brought the entry back");
+        }
+        // A cleaned entry can still be forgotten by the user; a forgotten one cannot.
+        let store = replayed(&[base.clone(), clean]);
+        assert!(store.event_forgettable(&base.id).unwrap());
+        store.index(&forget).unwrap();
+        assert!(!store.event_forgettable(&base.id).unwrap());
+        assert!(!store.event_forgettable("no-such-id").unwrap());
+    }
+
+    #[test]
+    fn the_latest_classify_label_wins() {
+        let target = knowledge_entry(Uuid::from_u128(3));
+        let mut first = about(&target, EventKind::Note, "classify");
+        first.id = "01ZZZZZZZZZZZZZZZZZZZZZZ01".into();
+        first.class = Some("status".into());
+        first.expires = Some("2026-11-01T00:00:00Z".into());
+        first.cites = vec!["x".into()];
+        let mut second = about(&target, EventKind::Note, "classify");
+        second.id = "01ZZZZZZZZZZZZZZZZZZZZZZ02".into();
+        second.class = Some("durable".into());
+        let store = replayed(&[second, target.clone(), first]);
+        let row: (Option<String>, Option<String>, Option<String>) = store
+            .conn
+            .query_row(
+                "SELECT class, expires_at, cites FROM events WHERE id = ?1",
+                params![target.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (Some("durable".into()), None, None));
+    }
+
+    #[test]
+    fn knowledge_fields_survive_a_replay() {
+        let mut target = knowledge_entry(Uuid::from_u128(4));
+        target.class = Some("history".into());
+        target.expires = Some("2026-12-01T00:00:00Z".into());
+        target.cites = vec!["a".into(), "b".into()];
+        let store = replayed(&[target.clone()]);
+        let row: (Option<String>, Option<String>, Option<String>) = store
+            .conn
+            .query_row(
+                "SELECT class, expires_at, cites FROM events WHERE id = ?1",
+                params![target.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                Some("history".into()),
+                Some("2026-12-01T00:00:00Z".into()),
+                Some("[\"a\",\"b\"]".into())
+            )
+        );
+        // Re-indexing the same line keeps a later label.
+        let mut label = about(&target, EventKind::Note, "classify");
+        label.class = Some("durable".into());
+        store.index(&label).unwrap();
+        store.index(&knowledge_without_label(&target)).unwrap();
+        let class: Option<String> = store
+            .conn
+            .query_row("SELECT class FROM events WHERE id = ?1", params![target.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(class.as_deref(), Some("durable"));
+    }
+
+    #[test]
+    fn label_and_restore_notes_are_never_pushed_or_found() {
+        let project = Uuid::from_u128(77);
+        let mut target = knowledge_entry(project);
+        target.title = "zorbulon deploys run on Fridays only".into();
+        target.files = vec!["src/zorbulon.rs".into()];
+        let mut notes = Vec::new();
+        for hook in ["classify", "restore"] {
+            let mut note = about(&target, EventKind::Note, hook);
+            note.title = format!("zorbulon {hook}");
+            note.body = format!("zorbulon {hook} body");
+            note.files = target.files.clone();
+            note.consolidated = true;
+            notes.push(note);
+        }
+        let store = Store::open_memory().unwrap();
+        store.index(&target).unwrap();
+        for note in &notes {
+            store.index(note).unwrap();
+        }
+        let hidden = |ids: Vec<String>, what: &str| {
+            assert!(ids.contains(&target.id), "{what} lost the knowledge row");
+            for note in &notes {
+                assert!(!ids.contains(&note.id), "{what} surfaced a {} note", note.source.hook);
+            }
+        };
+        let p = project.to_string();
+        let ids = |pointers: Vec<Pointer>| pointers.into_iter().map(|x| x.id).collect::<Vec<_>>();
+        hidden(ids(store.primer_pointers(&p, 20).unwrap()), "primer_pointers");
+        hidden(ids(store.prompt_pointers(&p, "zorbulon", 20).unwrap()), "prompt_pointers");
+        hidden(ids(store.pointers_for_file(&p, "src/zorbulon.rs", 20).unwrap()), "pointers_for_file");
+        let hits = store.search(&p, "zorbulon", None, 20, Recall::Lexical).unwrap();
+        hidden(hits.into_iter().map(|h| h.id).collect(), "search");
+        let recent = store.recent(&p, None, None, None, 20).unwrap();
+        hidden(recent.into_iter().map(|h| h.id).collect(), "recent");
+    }
+
+    fn knowledge_without_label(target: &Event) -> Event {
+        let mut e = target.clone();
+        e.class = None;
+        e.expires = None;
+        e.cites.clear();
+        e
+    }
+
+    #[test]
+    fn the_stale_scan_reads_the_project_ts_index_and_advances_by_batch() {
+        let store = Store::open_memory().unwrap();
+        let plan: Vec<String> = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", Store::stale_scan_sql()))
+            .unwrap()
+            .query_map(params!["p", "", 0, 5000], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|row| row.starts_with("SEARCH events USING INDEX events_project_ts (project=? AND ts>")),
+            "the stale scan does not read events_project_ts: {plan:#?}"
+        );
+        assert!(
+            !plan.iter().any(|row| row.contains("SCAN") || row.contains("AUTOMATIC") || row.contains("TEMP B-TREE")),
+            "the stale scan scans: {plan:#?}"
+        );
+
+        let project = Uuid::new_v4();
+        for n in 0..5 {
+            let mut e = Event::new(
+                Uuid::nil(),
+                project,
+                Uuid::nil(),
+                Source { cli: "claude-code".into(), hook: "post_tool_use".into() },
+                EventKind::Observation,
+                format!("Read: /repo/f{n}.rs"),
+                String::new(),
+            );
+            e.ts = format!("2026-10-02T00:00:0{n}.000000Z");
+            store.index(&e).unwrap();
+        }
+        let key = format!("stale_scan_at:{project}");
+        store.mark_stale_knowledge(&project.to_string(), 2).unwrap();
+        assert!(store.state(&key).unwrap().unwrap().starts_with("2026-10-02T00:00:01.000000Z|"));
+        store.mark_stale_knowledge(&project.to_string(), 2).unwrap();
+        store.mark_stale_knowledge(&project.to_string(), 2).unwrap();
+        assert!(store.state(&key).unwrap().unwrap().starts_with("2026-10-02T00:00:04.000000Z|"));
+        store.clear().unwrap();
+        assert_eq!(store.state(&key).unwrap(), None, "a rebuild must scan again");
+    }
+
+    #[test]
+    fn a_batch_boundary_inside_one_instant_skips_nothing() {
+        let store = Store::open_memory().unwrap();
+        let project = Uuid::new_v4();
+        let mut ids = Vec::new();
+        for n in 0..5 {
+            let mut e = Event::new(
+                Uuid::nil(),
+                project,
+                Uuid::nil(),
+                Source { cli: "claude-code".into(), hook: "post_tool_use".into() },
+                EventKind::Observation,
+                format!("Edit: /repo/f{n}.rs"),
+                String::new(),
+            );
+            e.ts = "2026-10-02T00:00:00.000000Z".to_string();
+            store.index(&e).unwrap();
+            ids.push(e.id);
+        }
+        let key = format!("stale_scan_at:{project}");
+        let seen = |store: &Store| -> i64 {
+            store.state(&key).unwrap().unwrap().rsplit_once('|').unwrap().1.parse().unwrap()
+        };
+        store.mark_stale_knowledge(&project.to_string(), 2).unwrap();
+        let first = seen(&store);
+        store.mark_stale_knowledge(&project.to_string(), 2).unwrap();
+        let second = seen(&store);
+        store.mark_stale_knowledge(&project.to_string(), 2).unwrap();
+        let third = seen(&store);
+        assert!(first < second && second < third, "{first} {second} {third}: a batch repeated or stopped");
+        assert_eq!(third - first, 3, "events sharing a timestamp were skipped");
+        // An older cursor, holding only a ts, still reads on.
+        store.set_state(&key, "2026-10-02T00:00:00.000000Z").unwrap();
+        store.mark_stale_knowledge(&project.to_string(), 10).unwrap();
+        assert_eq!(seen(&store), third);
+    }
+
+    #[test]
+    fn only_write_tools_count_as_an_edit() {
+        for title in ["Edit: /a.rs", "write: /a.rs", "MultiEdit: /a.rs", "NotebookEdit: /a.ipynb", "apply_patch: /a.rs"] {
+            assert!(is_write_title(title), "{title}");
+        }
+        for title in ["Read: /a.rs", "Grep: /a.rs", "Glob: /a.rs", "Used Edit", "Ran cargo test", "Asked: Edit: x"] {
+            assert!(!is_write_title(title), "{title}");
+        }
     }
 }
