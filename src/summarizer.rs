@@ -131,6 +131,9 @@ pub const SPECS: &[CliSpec] = &[
             "{model}",
             "--strict-mcp-config",
             "--tools=",
+            // Every call otherwise leaves a saved session holding brain's
+            // prompt in the user's history (8k+ of them on one machine).
+            "--no-session-persistence",
             // A summarizer worker is not an agent the user started, so the
             // host must not announce it as one. Without this, a machine
             // draining a backlog sent its owner one push notification per
@@ -155,6 +158,8 @@ pub const SPECS: &[CliSpec] = &[
         // tool needs no sandbox wider than read-only.
         args: &[
             "exec",
+            // No rollout file per call: ~1k a week otherwise.
+            "--ephemeral",
             "-m",
             "{model}",
             "-c",
@@ -1355,6 +1360,17 @@ mod tests {
             "built-in tools must be disabled, and with `=`: the flag is \
              variadic, and a bare --tools \"\" swallows the prompt argument"
         );
+    }
+
+    /// A summarizer call must not leave a saved session in the host CLI's
+    /// history: thousands of them piled up, each holding brain's prompt.
+    #[test]
+    fn claude_and_codex_workers_persist_no_session() {
+        let claude = SPECS.iter().find(|spec| spec.cli == "claude-code").expect("claude spec");
+        assert!(claude.args.contains(&"--no-session-persistence"));
+        let codex = SPECS.iter().find(|spec| spec.cli == "codex").expect("codex spec");
+        let exec = codex.args.iter().position(|a| *a == "exec").expect("exec");
+        assert_eq!(codex.args[exec + 1], "--ephemeral", "an `exec` flag, so right after `exec`");
     }
 
     /// Every summarizer rung must be named the way hooks name it.

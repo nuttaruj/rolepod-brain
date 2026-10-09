@@ -1151,6 +1151,12 @@ directory: two CLIs merging into one store, cross-CLI recall, secrets never
 reaching the log, index rebuild from the log, and degrading gracefully when no
 model is reachable.
 
+`target/` keeps the build of every version. The version is part of each
+artifact's hash, so a version bump leaves the previous build behind for good.
+After a bump, run
+`cargo clean -p rolepod-brain && cargo clean -p rolepod-brain --release`: it
+removes the old builds and keeps the dependencies compiled.
+
 ## License
 
 MIT. See `LICENSE`, and `NOTICE` for third-party attribution.

@@ -776,12 +776,23 @@ fn spawn_consolidation(session: Option<&str>) {
 /// Best-effort: a child that cannot start is simply not started.
 fn spawn_detached(args: &[&str]) {
     let Ok(exe) = std::env::current_exe() else { return };
-    let _ = std::process::Command::new(exe)
-        .args(args)
+    let _ = detached_command(&exe, args).spawn();
+}
+
+/// The command `spawn_detached` runs: no stdio and, on unix, its own process
+/// group, so a terminal hang-up aimed at the hook's group cannot kill it.
+fn detached_command(exe: &std::path::Path, args: &[&str]) -> std::process::Command {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd
 }
 
 /// Which directory this event happened in, or `None` when it cannot be known.
@@ -1387,6 +1398,27 @@ pub fn first_line(input: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_detached_child_gets_its_own_process_group() {
+        let mut child = detached_command(std::path::Path::new("/bin/sleep"), &["5"])
+            .spawn()
+            .unwrap();
+        let pgid_of = |pid: u32| -> u32 {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "pgid=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+        };
+        let child_pgid = pgid_of(child.id());
+        let own_pgid = pgid_of(std::process::id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(child_pgid, child.id());
+        assert_ne!(child_pgid, own_pgid);
+    }
 
     #[test]
     fn a_silenced_process_captures_nothing() {
